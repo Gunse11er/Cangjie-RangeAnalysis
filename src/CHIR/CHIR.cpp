@@ -569,6 +569,7 @@ void ToCHIR::RunRangePropagation()
         }
         builder.GetChirContext().MergeTypes();
     }
+    CHIR::RangePropagation::EmitContestOutput(chirPkg, vra);
     DumpCHIRToFile("RangePropagation");
 }
 

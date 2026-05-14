@@ -1,0 +1,4 @@
+[main.cj, 2, left]
+[main.cj, 3, right]
+[main.cj, 4, total]
+[main.cj, 5, flag]

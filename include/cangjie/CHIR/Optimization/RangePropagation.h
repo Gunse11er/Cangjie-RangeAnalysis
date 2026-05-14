@@ -61,6 +61,14 @@ public:
      * @return functions
      */
     const std::vector<const Func*>& GetFuncsNeedRemoveBlocks() const;
+
+    /**
+     * @brief Emit contest range query output when input.txt exists in the current working directory.
+     * @param package package to query.
+     * @param rangeAnalysisWrapper cached range analysis results.
+     */
+    static void EmitContestOutput(const Ptr<const Package>& package, RangeAnalysisWrapper& rangeAnalysisWrapper);
+
 private:
     struct RewriteInfo {
         Expression* oldExpr;

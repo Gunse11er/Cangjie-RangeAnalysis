@@ -8,9 +8,249 @@
 #include "cangjie/CHIR/Analysis/ConstAnalysis.h"
 #include "cangjie/CHIR/Analysis/Engine.h"
 
+#include <algorithm>
+#include <cctype>
+#include <fstream>
+#include <limits>
+#include <sstream>
 #include <optional>
 
 namespace Cangjie::CHIR {
+
+namespace {
+const std::string CONTEST_INPUT_FILE = "input.txt";
+const std::string CONTEST_OUTPUT_FILE = "output.txt";
+
+struct ContestQuery {
+    std::string fileName;
+    unsigned line{0};
+    std::string variableName;
+    std::string result;
+    Type* type{nullptr};
+    bool valid{true};
+    bool resolved{false};
+};
+
+std::string Trim(const std::string& str)
+{
+    auto begin = std::find_if_not(str.begin(), str.end(), [](unsigned char c) { return std::isspace(c); });
+    auto end = std::find_if_not(str.rbegin(), str.rend(), [](unsigned char c) { return std::isspace(c); }).base();
+    if (begin >= end) {
+        return "";
+    }
+    return std::string(begin, end);
+}
+
+std::string BaseName(const std::string& path)
+{
+    auto pos = path.find_last_of("/\\");
+    return pos == std::string::npos ? path : path.substr(pos + 1);
+}
+
+std::vector<std::string> SplitCommaSeparated(const std::string& str)
+{
+    std::vector<std::string> parts;
+    std::stringstream ss(str);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        parts.emplace_back(Trim(item));
+    }
+    return parts;
+}
+
+ContestQuery MakeInvalidContestQuery()
+{
+    ContestQuery query;
+    query.valid = false;
+    return query;
+}
+
+ContestQuery ParseContestQueryLine(const std::string& line)
+{
+    auto trimmed = Trim(line);
+    if (trimmed.empty()) {
+        return MakeInvalidContestQuery();
+    }
+    if (trimmed.front() != '[' || trimmed.back() != ']') {
+        return MakeInvalidContestQuery();
+    }
+    auto parts = SplitCommaSeparated(trimmed.substr(1, trimmed.size() - 2));
+    if (parts.size() != 3) {
+        return MakeInvalidContestQuery();
+    }
+    ContestQuery query;
+    query.fileName = BaseName(parts[0]);
+    try {
+        size_t parsedSize = 0;
+        auto parsedLine = std::stoul(parts[1], &parsedSize);
+        if (parsedSize != parts[1].size() || parsedLine > std::numeric_limits<unsigned>::max()) {
+            return MakeInvalidContestQuery();
+        }
+        query.line = static_cast<unsigned>(parsedLine);
+    } catch (...) {
+        return MakeInvalidContestQuery();
+    }
+    query.variableName = parts[2];
+    return query;
+}
+
+std::optional<std::vector<ContestQuery>> LoadContestQueries()
+{
+    std::ifstream input(CONTEST_INPUT_FILE);
+    if (!input.is_open()) {
+        return std::nullopt;
+    }
+    std::vector<ContestQuery> queries;
+    std::string line;
+    while (std::getline(input, line)) {
+        queries.emplace_back(ParseContestQueryLine(line));
+    }
+    return queries;
+}
+
+Type* GetQueryValueType(Value* value)
+{
+    auto type = value->GetType();
+    if (type->IsRef()) {
+        return StaticCast<RefType*>(type)->GetRootBaseType();
+    }
+    return type;
+}
+
+std::string FormatSignedInt(int64_t value)
+{
+    std::stringstream ss;
+    ss << value;
+    return ss.str();
+}
+
+std::string FormatUnsignedInt(uint64_t value)
+{
+    std::stringstream ss;
+    ss << value;
+    return ss.str();
+}
+
+std::string FormatSIntValue(const SInt& value, const Type& type)
+{
+    return type.IsUnsignedInteger() ? FormatUnsignedInt(value.UVal()) : FormatSignedInt(value.SVal());
+}
+
+bool IsContestPrintableIntegerInterval(const ConstantRange& range, const Type& type)
+{
+    if (range.IsFullSet() || range.IsEmptySet()) {
+        return false;
+    }
+    return type.IsUnsignedInteger() ? !range.IsWrappedSet() : !range.IsSignWrappedSet();
+}
+
+std::string FormatContestIntegerInterval(const ConstantRange& range, const Type& type)
+{
+    auto upperInclusive = range.Upper() - 1U;
+    std::stringstream ss;
+    ss << "[" << FormatSIntValue(range.Lower(), type) << ", " << FormatSIntValue(upperInclusive, type) << ":1]";
+    return ss.str();
+}
+
+std::string FormatFullIntegerRange(const Type& type)
+{
+    auto width = ToWidth(type);
+    std::stringstream ss;
+    if (type.IsUnsignedInteger()) {
+        ss << "[" << SInt::UMinValue(width).UVal() << ", " << SInt::UMaxValue(width).UVal() << ":1]";
+    } else {
+        ss << "[" << SInt::SMinValue(width).SVal() << ", " << SInt::SMaxValue(width).SVal() << ":1]";
+    }
+    return ss.str();
+}
+
+std::string FormatFallback(Type* type)
+{
+    if (type && type->IsBoolean()) {
+        return "false, true";
+    }
+    if (type && type->IsInteger()) {
+        return FormatFullIntegerRange(*type);
+    }
+    return "[-9223372036854775808, 9223372036854775807:1]";
+}
+
+std::string FormatContestRange(const ValueRange* range, Type* type)
+{
+    if (!type || !range) {
+        return FormatFallback(type);
+    }
+    if (range->GetRangeKind() == ValueRange::RangeKind::BOOL) {
+        const auto& boolRange = StaticCast<const BoolRange&>(*range).GetVal();
+        if (boolRange.IsTrue()) {
+            return "true";
+        }
+        if (boolRange.IsFalse()) {
+            return "false";
+        }
+        return "false, true";
+    }
+    if (range->GetRangeKind() == ValueRange::RangeKind::SINT) {
+        const auto& intRange = StaticCast<const SIntRange&>(*range).GetVal();
+        const auto& numeric = intRange.NumericBound();
+        if (intRange.IsSingleValue()) {
+            return FormatSIntValue(numeric.GetSingleElement(), *type);
+        }
+        if (IsContestPrintableIntegerInterval(numeric, *type)) {
+            return FormatContestIntegerInterval(numeric, *type);
+        }
+        return FormatFallback(type);
+    }
+    return FormatFallback(type);
+}
+
+bool IsSameQueryLocation(const ContestQuery& query, const DebugLocation& location)
+{
+    return query.fileName == BaseName(location.GetFileName()) && query.line == location.GetBeginPos().line;
+}
+
+void RememberQueryType(std::vector<ContestQuery>& queries, const Debug& debug)
+{
+    auto type = GetQueryValueType(debug.GetValue());
+    for (auto& query : queries) {
+        if (!query.valid || query.type || query.variableName != debug.GetSrcCodeIdentifier()) {
+            continue;
+        }
+        if (query.fileName == BaseName(debug.GetDebugLocation().GetFileName()) || query.fileName.empty()) {
+            query.type = type;
+        }
+    }
+}
+
+void ResolveQueryAtDebug(std::vector<ContestQuery>& queries, const Debug& debug, const RangeDomain& state)
+{
+    RememberQueryType(queries, debug);
+    auto type = GetQueryValueType(debug.GetValue());
+    auto range = state.CheckAbstractValue(debug.GetValue());
+    for (auto& query : queries) {
+        if (!query.valid || query.resolved || query.variableName != debug.GetSrcCodeIdentifier()) {
+            continue;
+        }
+        if (!IsSameQueryLocation(query, debug.GetDebugLocation())) {
+            continue;
+        }
+        query.type = type;
+        query.result = FormatContestRange(range, type);
+        query.resolved = true;
+    }
+}
+
+void WriteContestOutput(std::vector<ContestQuery>& queries)
+{
+    std::ofstream output(CONTEST_OUTPUT_FILE, std::ios::trunc);
+    if (!output.is_open()) {
+        return;
+    }
+    for (auto& query : queries) {
+        output << (query.resolved ? query.result : FormatFallback(query.type)) << '\n';
+    }
+}
+} // namespace
 
 std::optional<bool> CheckSingleBool(const ValueRange& vr)
 {
@@ -112,6 +352,30 @@ void RangePropagation::RunOnFunc(const Ptr<const Func>& func, bool isDebug)
     if (doBlockElimination) {
         funcsNeedRemoveBlocks.push_back(func.get());
     }
+}
+
+void RangePropagation::EmitContestOutput(const Ptr<const Package>& package, RangeAnalysisWrapper& rangeAnalysisWrapper)
+{
+    auto queries = LoadContestQueries();
+    if (!queries.has_value()) {
+        return;
+    }
+    const auto actionBeforeVisitExpr = [](const RangeDomain&, Expression*, size_t) {};
+    auto actionAfterVisitExpr = [&queries](const RangeDomain& state, Expression* expr, size_t) {
+        if (expr->GetExprKind() != ExprKind::DEBUGEXPR) {
+            return;
+        }
+        ResolveQueryAtDebug(queries.value(), *StaticCast<Debug*>(expr), state);
+    };
+    const auto actionOnTerminator = [](const RangeDomain&, Terminator*, std::optional<Block*>) {};
+    for (auto func : package->GetGlobalFuncs()) {
+        auto result = rangeAnalysisWrapper.CheckFuncResult(func);
+        if (!result) {
+            continue;
+        }
+        result->VisitWith(actionBeforeVisitExpr, actionAfterVisitExpr, actionOnTerminator);
+    }
+    WriteContestOutput(queries.value());
 }
 
 Ptr<LiteralValue> RangePropagation::GenerateConstExpr(const Ptr<Type>& type, const Ptr<const ValueRange>& rangeVal)
