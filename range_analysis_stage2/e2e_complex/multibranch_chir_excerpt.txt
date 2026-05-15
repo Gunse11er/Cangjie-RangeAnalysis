@@ -1,0 +1,13 @@
+[internal] [noReflectInfo] Func @_CN7default7complexHllb([readOnly] %0: Int64, [readOnly] %1: Int64, [readOnly] %2: Bool) : Int64 // loc: "main.cj"-1-1, scope: 0, linkType: external srcCodeIdentifier: complex
+  %9: Bool = GT(%0, %7) // loc: "main.cj"-3-9, scope: 0, warning loc: "main.cj"-3-11, scope: 0 // Overflow: THROWING
+  Branch(%9, #3, #7) // loc: "main.cj"-3-5, scope: 0 // loc: "main.cj"-3-5, scope: 0, sourceExpr: IF_EXPR
+  %12: Bool = LT(%0, %11) // loc: "main.cj"-5-13, scope: 0, warning loc: "main.cj"-5-15, scope: 0 // Overflow: THROWING
+  Branch(%12, #5, #6) // loc: "main.cj"-5-9, scope: 0 // loc: "main.cj"-5-9, scope: 0, sourceExpr: IF_EXPR
+  %20: Bool = GE(%0, %1) // loc: "main.cj"-18-9, scope: 0, warning loc: "main.cj"-18-11, scope: 0 // Overflow: THROWING
+  Branch(%20, #12, #13) // loc: "main.cj"-18-5, scope: 0 // loc: "main.cj"-18-5, scope: 0, sourceExpr: IF_EXPR
+  %26: Bool = Equal(%2, %24) // loc: "main.cj"-25-9, scope: 0, warning loc: "main.cj"-25-14, scope: 0 // Overflow: THROWING
+  Branch(%26, #15, #16) // loc: "main.cj"-25-5, scope: 0 // loc: "main.cj"-25-5, scope: 0, sourceExpr: IF_EXPR
+  %31: Bool = Not(%2) // loc: "main.cj"-35-9, scope: 0, warning loc: "main.cj"-35-9, scope: 0 // Overflow: THROWING
+  Branch(%31, #21, #22) // loc: "main.cj"-35-5, scope: 0 // loc: "main.cj"-35-5, scope: 0, sourceExpr: IF_EXPR
+  %39: UInt64 = TypeCast(%1) // loc: "main.cj"-1-24, scope: 0, checkTypeCast: false // Overflow: NA
+  MultiBranch(%39, #26, [1, #24], [2, #25]) // loc: "main.cj"-41-25, scope: 0-2

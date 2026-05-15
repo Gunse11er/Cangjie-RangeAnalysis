@@ -1,0 +1,69 @@
+Nat18StringLineIteratorE srcCodeIdentifier: init
+{ // Block Group: 0
+Block #0: // preds: 
+  %2: Unit = Debug(%0, this)
+  %3: Unit = Debug(%1, iteratorData) // loc: "string_common.cj"-309-24, scope: 0, warning loc: "string_common.cj"-309-28, scope: 0
+  [ret] %4: Unit& = Allocate(Unit)
+  GoTo(#1)
+Block #1: // preds: #0
+  GoTo(#2)
+Block #2: // preds: #1
+  %5: Class-_CNat8IteratorIG_E<Struct-_CNat6StringE>& = TypeCast(%0) // checkTypeCast: true // Overflow: NA
+  %6: Unit = Apply(ThisType: Class-_CNat8IteratorIG_E<Struct-_CNat6StringE>&, @_CNat8IteratorIG_E6<init>Hv, %5) // loc: "string_common.cj"-309-5, scope: 0 // isSuperCall
+  %7: Unit = StoreElementByName(%1, %0, iteratorData) // loc: "string_common.cj"-309-24, scope: 0
+  %8: Unit = Constant(unit)
+  %9: Unit = Store(%8, %4) // loc: "string_common.cj"-309-64, scope: 0
+  Exit() // loc: "string_common.cj"-309-64, scope: 0
+Block #3: // preds: 
+}
+
+[internal] [noReflectInfo] [noInline] Func @_CN7default6<main>Hv() : Int64 // kind: mainEntry, loc: "main.cj"-1-1, scope: 0, linkType: external srcCodeIdentifier: main
+{ // Block Group: 0
+Block #0: // preds: 
+  [ret] %0: Int64& = Allocate(Int64)
+  GoTo(#1)
+Block #1: // preds: #0
+  %1: Int64 = Constant(3i) // loc: "main.cj"-2-23, scope: 0
+  [readOnly] %2: Unit = Debug(%1, base) // loc: "main.cj"-2-5, scope: 0, warning loc: "main.cj"-2-9, scope: 0
+  %3: Int64 = Constant(2i) // loc: "main.cj"-3-23, scope: 0
+  [readOnly] %4: Unit = Debug(%3, step) // loc: "main.cj"-3-5, scope: 0, warning loc: "main.cj"-3-9, scope: 0
+  %5: Int64 = Add(%1, %3) // loc: "main.cj"-4-22, scope: 0, warning loc: "main.cj"-4-27, scope: 0 // Overflow: THROWING
+  [readOnly] %6: Unit = Debug(%5, sum) // loc: "main.cj"-4-5, scope: 0, warning loc: "main.cj"-4-9, scope: 0
+  %7: Int64 = Constant(4i) // loc: "main.cj"-5-28, scope: 0
+  %8: Bool = GT(%5, %7) // loc: "main.cj"-5-22, scope: 0, warning loc: "main.cj"-5-26, scope: 0 // Overflow: THROWING
+  [readOnly] %9: Unit = Debug(%8, flag) // loc: "main.cj"-5-5, scope: 0, warning loc: "main.cj"-5-9, scope: 0
+  Branch(%8, #3, #2) // loc: "main.cj"-6-5, scope: 0 // loc: "main.cj"-6-5, scope: 0, sourceExpr: IF_EXPR
+Block #3: // preds: #1 // loc: "main.cj"-6-15, scope: 0
+  %10: Unit = Store(%5, %0) // loc: "main.cj"-7-9, scope: 0
+  Exit() // loc: "main.cj"-7-9, scope: 0
+Block #2: // preds: #4, #1
+  %11: Int64 = Constant(0i) // loc: "main.cj"-9-12, scope: 0
+  %12: Unit = Store(%11, %0) // loc: "main.cj"-9-5, scope: 0
+  Exit() // loc: "main.cj"-9-5, scope: 0
+Block #4: // preds: 
+  GoTo(#2) // skip: dce warning
+Block #5: // preds: 
+}
+
+[compilerAdd] [noReflectInfo] [noInline] [initializer] Func @_CGP7defaultiiHv() : Unit // kind: globalVarInit, linkType: external srcCodeIdentifier: _CGP7defaultiiHv
+{ // Block Group: 0
+Block #0: // preds: 
+  [ret] %0: Unit& = Allocate(Unit)
+  %1: Bool = Load(@$has_applied_pkg_init_func)
+  Branch(%1, #1, #2) // sourceExpr: OTHER
+Block #1: // preds: #0
+  Exit()
+[initializer] Block #2: // preds: #0
+  %2: Bool = Constant(true)
+  %3: Unit = Store(%2, @$has_applied_pkg_init_func)
+  %4: Unit = Apply(@_CGP7defaultfiHv)
+  %5: Unit = Intrinsic/preinitialize()
+  %6: Unit = Apply(@_CGFatUthread_local$iiHv)
+  %7: Unit = Apply(@_CGFatUthread$iiHv)
+  %8: Unit = Apply(@_CGFatU00000003HBDsXiiHv)
+  %9: Unit = Apply(@_CGFatU00000004oVJx9iiHv)
+  %10: Unit = Apply(@_CGFatUstring$iiHv)
+  %11: Unit = Apply(@_CGFatUsleep$iiHv)
+  %12: Unit = Apply(@_CGFatUhashable$iiHv)
+  %13: Unit = Apply(@_CGFatUduration$iiHv)
+  %14: Unit = Apply(@_CGFa

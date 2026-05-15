@@ -266,6 +266,13 @@ bool RangeAnalysis::CheckInQueueTimes(const Block* block, RangeDomain& curState)
 void RangeAnalysis::HandleUnaryExpr(RangeDomain& state, const UnaryExpression* unaryExpr) const
 {
     auto dest = unaryExpr->GetResult();
+    if (unaryExpr->GetExprKind() == ExprKind::NOT && dest->GetType()->IsBoolean()) {
+        auto operand = unaryExpr->GetOperand();
+        auto operandRange = GetBoolDomainFromState(state, operand);
+        if (operandRange.IsNonTrivial()) {
+            return state.Update(dest, std::make_unique<BoolRange>(!operandRange));
+        }
+    }
     return state.SetToBound(dest, true);
 }
 
@@ -441,6 +448,278 @@ void RangeAnalysis::HandleOthersExpr(RangeDomain& state, const Expression* expre
     }
 }
 
+namespace {
+bool IsRelationalExprKind(ExprKind kind)
+{
+    switch (kind) {
+        case ExprKind::LT:
+        case ExprKind::LE:
+        case ExprKind::GT:
+        case ExprKind::GE:
+        case ExprKind::EQUAL:
+        case ExprKind::NOTEQUAL:
+            return true;
+        default:
+            return false;
+    }
+}
+
+RelationalOperation ToRelationalOperation(ExprKind kind)
+{
+    switch (kind) {
+        case ExprKind::LT:
+            return RelationalOperation::LT;
+        case ExprKind::LE:
+            return RelationalOperation::LE;
+        case ExprKind::GT:
+            return RelationalOperation::GT;
+        case ExprKind::GE:
+            return RelationalOperation::GE;
+        case ExprKind::EQUAL:
+            return RelationalOperation::EQ;
+        case ExprKind::NOTEQUAL:
+            return RelationalOperation::NE;
+        default:
+            CJC_ABORT();
+            return RelationalOperation::NE;
+    }
+}
+
+RelationalOperation NegateRelation(RelationalOperation rel)
+{
+    switch (rel) {
+        case RelationalOperation::LT:
+            return RelationalOperation::GE;
+        case RelationalOperation::LE:
+            return RelationalOperation::GT;
+        case RelationalOperation::GT:
+            return RelationalOperation::LE;
+        case RelationalOperation::GE:
+            return RelationalOperation::LT;
+        case RelationalOperation::EQ:
+            return RelationalOperation::NE;
+        case RelationalOperation::NE:
+            return RelationalOperation::EQ;
+    }
+}
+
+RelationalOperation SwapRelation(RelationalOperation rel)
+{
+    switch (rel) {
+        case RelationalOperation::LT:
+            return RelationalOperation::GT;
+        case RelationalOperation::LE:
+            return RelationalOperation::GE;
+        case RelationalOperation::GT:
+            return RelationalOperation::LT;
+        case RelationalOperation::GE:
+            return RelationalOperation::LE;
+        case RelationalOperation::EQ:
+        case RelationalOperation::NE:
+            return rel;
+    }
+}
+
+const Expression* GetDefiningExpr(Value* value)
+{
+    if (value == nullptr || !value->IsLocalVar()) {
+        return nullptr;
+    }
+    return StaticCast<LocalVar*>(value)->GetExpr();
+}
+
+bool IsStateTrackedValue(Value* value)
+{
+    return value != nullptr && (value->IsLocalVar() || value->IsParameter());
+}
+
+bool IsIntegerValue(Value* value)
+{
+    return IsStateTrackedValue(value) && value->GetType()->IsInteger();
+}
+
+bool IsBooleanValue(Value* value)
+{
+    return IsStateTrackedValue(value) && value->GetType()->IsBoolean();
+}
+
+void NarrowBoolValue(RangeDomain& state, Value* value, bool expected)
+{
+    if (!IsBooleanValue(value)) {
+        return;
+    }
+    auto current = RangeAnalysis::GetBoolDomainFromState(state, value);
+    if (current.IsSingleValue() && current.GetSingleValue() != expected) {
+        return;
+    }
+    state.Update(value, std::make_unique<BoolRange>(BoolDomain::FromBool(expected)));
+}
+
+void NarrowSIntValue(RangeDomain& state, Value* value, const SIntDomain& constraint)
+{
+    if (!IsIntegerValue(value)) {
+        return;
+    }
+    const auto& current = RangeAnalysis::GetSIntDomainFromState(state, value);
+    auto narrowed = SIntDomain::Intersects(current, constraint);
+    if (narrowed.IsBottom()) {
+        return;
+    }
+    state.Update(value, std::make_unique<SIntRange>(std::move(narrowed)));
+}
+
+void NarrowSIntByRelationToConstant(RangeDomain& state, Value* value, RelationalOperation rel, const SInt& constant)
+{
+    auto type = value->GetType();
+    NarrowSIntValue(state, value, SIntDomain::FromNumeric(rel, constant, type->IsUnsignedInteger()));
+}
+
+Value* GetSameWidthTypeCastSource(Value* value)
+{
+    auto expr = GetDefiningExpr(value);
+    if (expr == nullptr || expr->GetExprKind() != ExprKind::TYPECAST) {
+        return nullptr;
+    }
+    auto source = StaticCast<const TypeCast*>(expr)->GetSourceValue();
+    if (!IsIntegerValue(source) || ToWidth(*source->GetType()) != ToWidth(*value->GetType())) {
+        return nullptr;
+    }
+    return source;
+}
+
+void NarrowMultiBranchTarget(RangeDomain& state, Value* value, RelationalOperation rel, uint64_t caseVal)
+{
+    if (!IsIntegerValue(value)) {
+        return;
+    }
+    auto width = ToWidth(*value->GetType());
+    NarrowSIntValue(
+        state, value, SIntDomain::FromNumeric(rel, SInt{width, caseVal}, value->GetType()->IsUnsignedInteger()));
+}
+
+void NarrowMultiBranchCondition(RangeDomain& state, Value* cond, RelationalOperation rel, uint64_t caseVal)
+{
+    NarrowMultiBranchTarget(state, cond, rel, caseVal);
+    auto source = GetSameWidthTypeCastSource(cond);
+    if (source != nullptr && source != cond) {
+        NarrowMultiBranchTarget(state, source, rel, caseVal);
+    }
+}
+
+void ApplyIntComparisonConstraint(
+    RangeDomain& state, Value* lhs, Value* rhs, RelationalOperation rel, bool branchCondition)
+{
+    if (!IsIntegerValue(lhs) || !IsIntegerValue(rhs)) {
+        return;
+    }
+    if (!branchCondition) {
+        rel = NegateRelation(rel);
+    }
+
+    const auto& lhsDomain = RangeAnalysis::GetSIntDomainFromState(state, lhs);
+    const auto& rhsDomain = RangeAnalysis::GetSIntDomainFromState(state, rhs);
+    if (rhsDomain.IsSingleValue()) {
+        NarrowSIntByRelationToConstant(state, lhs, rel, rhsDomain.NumericBound().GetSingleElement());
+    }
+    if (lhsDomain.IsSingleValue()) {
+        NarrowSIntByRelationToConstant(state, rhs, SwapRelation(rel), lhsDomain.NumericBound().GetSingleElement());
+    }
+    if (lhs == rhs || ToWidth(*lhs->GetType()) != ToWidth(*rhs->GetType())) {
+        return;
+    }
+    NarrowSIntValue(state, lhs,
+        SIntDomain::FromSymbolic(rel, rhs, ToWidth(*lhs->GetType()), lhs->GetType()->IsUnsignedInteger()));
+    NarrowSIntValue(state, rhs,
+        SIntDomain::FromSymbolic(SwapRelation(rel), lhs, ToWidth(*rhs->GetType()), rhs->GetType()->IsUnsignedInteger()));
+}
+
+void ApplyBoolEqualityConstraint(RangeDomain& state, Value* lhs, Value* rhs, RelationalOperation rel, bool branchCondition)
+{
+    if (!IsBooleanValue(lhs) || !IsBooleanValue(rhs)) {
+        return;
+    }
+    if (!branchCondition) {
+        rel = NegateRelation(rel);
+    }
+    if (rel != RelationalOperation::EQ && rel != RelationalOperation::NE) {
+        return;
+    }
+
+    auto lhsDomain = RangeAnalysis::GetBoolDomainFromState(state, lhs);
+    auto rhsDomain = RangeAnalysis::GetBoolDomainFromState(state, rhs);
+    if (lhsDomain.IsSingleValue()) {
+        auto value = lhsDomain.GetSingleValue();
+        NarrowBoolValue(state, rhs, rel == RelationalOperation::EQ ? value : !value);
+    }
+    if (rhsDomain.IsSingleValue()) {
+        auto value = rhsDomain.GetSingleValue();
+        NarrowBoolValue(state, lhs, rel == RelationalOperation::EQ ? value : !value);
+    }
+}
+
+void ApplyConditionConstraint(RangeDomain& state, Value* condition, bool branchCondition)
+{
+    NarrowBoolValue(state, condition, branchCondition);
+    auto expr = GetDefiningExpr(condition);
+    if (expr == nullptr) {
+        return;
+    }
+    if (expr->GetExprKind() == ExprKind::NOT) {
+        ApplyConditionConstraint(state, StaticCast<const UnaryExpression*>(expr)->GetOperand(), !branchCondition);
+        return;
+    }
+    if (!IsRelationalExprKind(expr->GetExprKind())) {
+        return;
+    }
+
+    auto binary = StaticCast<const BinaryExpression*>(expr);
+    auto lhs = binary->GetLHSOperand();
+    auto rhs = binary->GetRHSOperand();
+    auto rel = ToRelationalOperation(expr->GetExprKind());
+    if (lhs->GetType()->IsInteger() && rhs->GetType()->IsInteger()) {
+        ApplyIntComparisonConstraint(state, lhs, rhs, rel, branchCondition);
+    } else if ((expr->GetExprKind() == ExprKind::EQUAL || expr->GetExprKind() == ExprKind::NOTEQUAL) &&
+        lhs->GetType()->IsBoolean() && rhs->GetType()->IsBoolean()) {
+        ApplyBoolEqualityConstraint(state, lhs, rhs, rel, branchCondition);
+    }
+}
+
+void ApplyMultiBranchConstraint(RangeDomain& state, const MultiBranch* multi, const Block* successor)
+{
+    auto cond = multi->GetCondition();
+    if (!IsIntegerValue(cond)) {
+        return;
+    }
+    auto width = ToWidth(*cond->GetType());
+    auto isUnsigned = cond->GetType()->IsUnsignedInteger();
+    if (successor == multi->GetDefaultBlock()) {
+        for (auto caseVal : multi->GetCaseVals()) {
+            NarrowSIntValue(
+                state, cond, SIntDomain::FromNumeric(RelationalOperation::NE, SInt{width, caseVal}, isUnsigned));
+            auto source = GetSameWidthTypeCastSource(cond);
+            if (source != nullptr && source != cond) {
+                NarrowMultiBranchTarget(state, source, RelationalOperation::NE, caseVal);
+            }
+        }
+        return;
+    }
+
+    std::optional<uint64_t> matchedCase;
+    for (size_t i = 0; i < multi->GetCaseVals().size(); ++i) {
+        if (successor != multi->GetCaseBlockByIndex(i)) {
+            continue;
+        }
+        if (matchedCase.has_value()) {
+            return;
+        }
+        matchedCase = multi->GetCaseValByIndex(i);
+    }
+    if (matchedCase.has_value()) {
+        NarrowMultiBranchCondition(state, cond, RelationalOperation::EQ, matchedCase.value());
+    }
+}
+} // namespace
+
 std::optional<Block*> RangeAnalysis::HandleTerminatorEffect(RangeDomain& state, const Terminator* terminator)
 {
     RangeAnalysis::ExceptionKind res = ExceptionKind::NA;
@@ -472,6 +751,33 @@ std::optional<Block*> RangeAnalysis::HandleTerminatorEffect(RangeDomain& state, 
     }
 
     return std::nullopt;
+}
+
+RangeDomain GetTerminatorStateForSuccessor(
+    const Analysis<RangeDomain>& analysis, const RangeDomain& state, const Terminator* terminator, const Block* successor)
+{
+    (void)analysis;
+    auto edgeState = state;
+    switch (terminator->GetExprKind()) {
+        case ExprKind::BRANCH: {
+            auto branch = StaticCast<const Branch*>(terminator);
+            if (branch->GetTrueBlock() == branch->GetFalseBlock()) {
+                return edgeState;
+            }
+            if (successor == branch->GetTrueBlock()) {
+                ApplyConditionConstraint(edgeState, branch->GetCondition(), true);
+            } else if (successor == branch->GetFalseBlock()) {
+                ApplyConditionConstraint(edgeState, branch->GetCondition(), false);
+            }
+            break;
+        }
+        case ExprKind::MULTIBRANCH:
+            ApplyMultiBranchConstraint(edgeState, StaticCast<const MultiBranch*>(terminator), successor);
+            break;
+        default:
+            break;
+    }
+    return edgeState;
 }
 
 void RangeAnalysis::PrintBranchOptMessage(const Ptr<const Expression>& expr, bool isTrueBlockRemained) const

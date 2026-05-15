@@ -17,6 +17,16 @@
 
 namespace Cangjie::CHIR {
 
+template <typename Domain>
+Domain GetTerminatorStateForSuccessor(
+    const Analysis<Domain>& analysis, const Domain& state, const Terminator* terminator, const Block* successor)
+{
+    (void)analysis;
+    (void)terminator;
+    (void)successor;
+    return state;
+}
+
 template <typename Domain> struct LambdaState {
     /**
      * @brief lambda expression to store state.
@@ -241,7 +251,8 @@ public:
                 std::cout << succ->GetIdentifier() << ":\n" << entryStates->at(succ).ToString() << std::endl;
                 std::cout << bb->GetIdentifier() << ":\n" << state.ToString() << std::endl;
 #endif
-                auto hasChanged = entryStates->at(succ).Join(state);
+                auto succState = GetTerminatorStateForSuccessor(*analysis, state, terminator, succ);
+                auto hasChanged = entryStates->at(succ).Join(succState);
                 if (hasChanged && worklistSet.find(succ) == worklistSet.end()) {
                     worklist.push_back(succ);
                     worklistSet.insert(succ);

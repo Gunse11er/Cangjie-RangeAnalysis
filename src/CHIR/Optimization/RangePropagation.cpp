@@ -14,6 +14,7 @@
 #include <limits>
 #include <sstream>
 #include <optional>
+#include <unordered_map>
 
 namespace Cangjie::CHIR {
 
@@ -30,6 +31,8 @@ struct ContestQuery {
     bool valid{true};
     bool resolved{false};
 };
+
+using ValueNameMap = std::unordered_map<Value*, std::vector<std::string>>;
 
 std::string Trim(const std::string& str)
 {
@@ -209,6 +212,24 @@ bool IsSameQueryLocation(const ContestQuery& query, const DebugLocation& locatio
     return query.fileName == BaseName(location.GetFileName()) && query.line == location.GetBeginPos().line;
 }
 
+bool HasValueName(const ValueNameMap& valueNames, Value* value, const std::string& name)
+{
+    auto it = valueNames.find(value);
+    if (it == valueNames.end()) {
+        return false;
+    }
+    return std::find(it->second.begin(), it->second.end(), name) != it->second.end();
+}
+
+void RememberValueName(ValueNameMap& valueNames, const Debug& debug)
+{
+    auto value = debug.GetValue();
+    auto& names = valueNames[value];
+    if (std::find(names.begin(), names.end(), debug.GetSrcCodeIdentifier()) == names.end()) {
+        names.emplace_back(debug.GetSrcCodeIdentifier());
+    }
+}
+
 void RememberQueryType(std::vector<ContestQuery>& queries, const Debug& debug)
 {
     auto type = GetQueryValueType(debug.GetValue());
@@ -222,8 +243,10 @@ void RememberQueryType(std::vector<ContestQuery>& queries, const Debug& debug)
     }
 }
 
-void ResolveQueryAtDebug(std::vector<ContestQuery>& queries, const Debug& debug, const RangeDomain& state)
+void ResolveQueryAtDebug(
+    std::vector<ContestQuery>& queries, ValueNameMap& valueNames, const Debug& debug, const RangeDomain& state)
 {
+    RememberValueName(valueNames, debug);
     RememberQueryType(queries, debug);
     auto type = GetQueryValueType(debug.GetValue());
     auto range = state.CheckAbstractValue(debug.GetValue());
@@ -237,6 +260,31 @@ void ResolveQueryAtDebug(std::vector<ContestQuery>& queries, const Debug& debug,
         query.type = type;
         query.result = FormatContestRange(range, type);
         query.resolved = true;
+    }
+}
+
+void ResolveQueryAtValue(std::vector<ContestQuery>& queries, const ValueNameMap& valueNames, const DebugLocation& location,
+    Value* value, const RangeDomain& state)
+{
+    for (auto& query : queries) {
+        if (!query.valid || query.resolved || !HasValueName(valueNames, value, query.variableName)) {
+            continue;
+        }
+        if (!IsSameQueryLocation(query, location)) {
+            continue;
+        }
+        auto type = GetQueryValueType(value);
+        query.type = type;
+        query.result = FormatContestRange(state.CheckAbstractValue(value), type);
+        query.resolved = true;
+    }
+}
+
+void ResolveQueryAtExpressionOperands(
+    std::vector<ContestQuery>& queries, const ValueNameMap& valueNames, const Expression& expr, const RangeDomain& state)
+{
+    for (auto operand : expr.GetOperands()) {
+        ResolveQueryAtValue(queries, valueNames, expr.GetDebugLocation(), operand, state);
     }
 }
 
@@ -361,11 +409,13 @@ void RangePropagation::EmitContestOutput(const Ptr<const Package>& package, Rang
         return;
     }
     const auto actionBeforeVisitExpr = [](const RangeDomain&, Expression*, size_t) {};
-    auto actionAfterVisitExpr = [&queries](const RangeDomain& state, Expression* expr, size_t) {
-        if (expr->GetExprKind() != ExprKind::DEBUGEXPR) {
+    ValueNameMap valueNames;
+    auto actionAfterVisitExpr = [&queries, &valueNames](const RangeDomain& state, Expression* expr, size_t) {
+        if (expr->GetExprKind() == ExprKind::DEBUGEXPR) {
+            ResolveQueryAtDebug(queries.value(), valueNames, *StaticCast<Debug*>(expr), state);
             return;
         }
-        ResolveQueryAtDebug(queries.value(), *StaticCast<Debug*>(expr), state);
+        ResolveQueryAtExpressionOperands(queries.value(), valueNames, *expr, state);
     };
     const auto actionOnTerminator = [](const RangeDomain&, Terminator*, std::optional<Block*>) {};
     for (auto func : package->GetGlobalFuncs()) {

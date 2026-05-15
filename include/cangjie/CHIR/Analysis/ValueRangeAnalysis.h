@@ -215,5 +215,8 @@ private:
 
     std::unordered_map<const Block*, uint32_t> inqueueTimes;
 };
+
+RangeDomain GetTerminatorStateForSuccessor(
+    const Analysis<RangeDomain>& analysis, const RangeDomain& state, const Terminator* terminator, const Block* successor);
 } // namespace Cangjie::CHIR
 #endif
