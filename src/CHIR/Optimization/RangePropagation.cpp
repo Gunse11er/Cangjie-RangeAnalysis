@@ -15,6 +15,7 @@
 #include <sstream>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace Cangjie::CHIR {
 
@@ -288,6 +289,40 @@ void ResolveQueryAtExpressionOperands(
     }
 }
 
+bool CanReachBlock(const Block* start, const Block* target, std::unordered_set<const Block*>& visited)
+{
+    if (start == nullptr || target == nullptr || !visited.emplace(start).second) {
+        return false;
+    }
+    if (start == target) {
+        return true;
+    }
+    for (auto successor : start->GetSuccessors()) {
+        if (CanReachBlock(successor, target, visited)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool IsLoopBranchConditionExpr(const Expression& expr)
+{
+    auto parent = expr.GetParentBlock();
+    if (parent == nullptr || parent->GetTerminator()->GetExprKind() != ExprKind::BRANCH) {
+        return false;
+    }
+    auto branch = StaticCast<const Branch*>(parent->GetTerminator());
+    if (branch->GetCondition() != expr.GetResult()) {
+        return false;
+    }
+    std::unordered_set<const Block*> visited;
+    if (CanReachBlock(branch->GetTrueBlock(), parent, visited)) {
+        return true;
+    }
+    visited.clear();
+    return CanReachBlock(branch->GetFalseBlock(), parent, visited);
+}
+
 void WriteContestOutput(std::vector<ContestQuery>& queries)
 {
     std::ofstream output(CONTEST_OUTPUT_FILE, std::ios::trunc);
@@ -356,6 +391,9 @@ void RangePropagation::RunOnFunc(const Ptr<const Func>& func, bool isDebug)
     const auto actionAfterVisitExpr = [this, &toBeRewrited, func](
                                           const RangeDomain& state, Expression* expr, size_t index) {
         auto exprType = expr->GetResult()->GetType();
+        if (IsLoopBranchConditionExpr(*expr)) {
+            return;
+        }
         if (expr->IsBinaryExpr()) {
             if (auto absVal = state.CheckAbstractValue(expr->GetResult()); absVal) {
                 return (void)toBeRewrited.emplace_back(expr, index, GenerateConstExpr(exprType, absVal));
