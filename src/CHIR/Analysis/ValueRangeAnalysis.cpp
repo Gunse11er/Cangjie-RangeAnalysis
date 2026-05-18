@@ -206,7 +206,100 @@ SIntDomain WidenSIntDomain(const SIntDomain& previous, const SIntDomain& current
 struct LoopWidenCandidate {
     Value* value;
     Type* type;
+    bool preserveDuringBodyWidening;
 };
+
+bool CanReachBlockForWidening(const Block* start, const Block* target)
+{
+    if (start == nullptr || target == nullptr) {
+        return false;
+    }
+    std::vector<const Block*> worklist{start};
+    std::unordered_set<const Block*> visited;
+    while (!worklist.empty()) {
+        auto block = worklist.back();
+        worklist.pop_back();
+        if (!visited.emplace(block).second) {
+            continue;
+        }
+        if (block == target) {
+            return true;
+        }
+        for (auto successor : block->GetSuccessors()) {
+            worklist.emplace_back(successor);
+        }
+    }
+    return false;
+}
+
+bool IsLoopHeaderForWidening(const Block* block)
+{
+    if (block == nullptr) {
+        return false;
+    }
+    auto terminator = block->GetTerminator();
+    if (terminator == nullptr || terminator->GetExprKind() != ExprKind::BRANCH) {
+        return false;
+    }
+    auto branch = StaticCast<const Branch*>(terminator);
+    if (CanReachBlockForWidening(branch->GetTrueBlock(), block)) {
+        return true;
+    }
+    return CanReachBlockForWidening(branch->GetFalseBlock(), block);
+}
+
+bool IsRelationalExprKindForWidening(ExprKind kind)
+{
+    switch (kind) {
+        case ExprKind::LT:
+        case ExprKind::LE:
+        case ExprKind::GT:
+        case ExprKind::GE:
+        case ExprKind::EQUAL:
+        case ExprKind::NOTEQUAL:
+            return true;
+        default:
+            return false;
+    }
+}
+
+const Expression* GetDefiningExprForWidening(Value* value)
+{
+    auto local = DynamicCast<LocalVar*>(value);
+    if (local == nullptr) {
+        return nullptr;
+    }
+    return local->GetExpr();
+}
+
+bool IsLoopConditionLoadForWidening(Value* value)
+{
+    auto expr = GetDefiningExprForWidening(value);
+    if (expr == nullptr || expr->GetExprKind() != ExprKind::LOAD) {
+        return false;
+    }
+    auto header = expr->GetParentBlock();
+    if (!IsLoopHeaderForWidening(header)) {
+        return false;
+    }
+    auto branch = StaticCast<const Branch*>(header->GetTerminator());
+    auto condExpr = GetDefiningExprForWidening(branch->GetCondition());
+    if (condExpr == nullptr || condExpr->GetExprMajorKind() != ExprMajorKind::BINARY_EXPR ||
+        !IsRelationalExprKindForWidening(condExpr->GetExprKind())) {
+        return false;
+    }
+    auto binary = StaticCast<const BinaryExpression*>(condExpr);
+    return binary->GetLHSOperand() == value || binary->GetRHSOperand() == value;
+}
+
+bool ShouldPreserveLoopGuardValueDuringBodyWidening(const Block* block, Value* value)
+{
+    auto expr = GetDefiningExprForWidening(value);
+    if (expr == nullptr || expr->GetParentBlock() == nullptr || expr->GetParentBlock() == block) {
+        return false;
+    }
+    return IsLoopConditionLoadForWidening(value);
+}
 
 const SIntDomain& GetSIntDomainFromState(const RangeDomain& state, Value* value, Type* type)
 {
@@ -222,19 +315,20 @@ const SIntDomain& GetSIntDomainFromState(const RangeDomain& state, Value* value,
     return StaticCast<const SIntRange*>(absVal)->GetVal();
 }
 
-void AddWidenCandidate(
-    std::vector<LoopWidenCandidate>& candidates, std::unordered_set<Value*>& seen, Value* value, Type* type)
+void AddWidenCandidate(std::vector<LoopWidenCandidate>& candidates, std::unordered_set<Value*>& seen, Value* value,
+    Type* type, bool preserveDuringBodyWidening = false)
 {
     if (value == nullptr || type == nullptr || !type->IsInteger() || seen.find(value) != seen.end()) {
         return;
     }
     seen.emplace(value);
-    candidates.emplace_back(LoopWidenCandidate{value, type});
+    candidates.emplace_back(LoopWidenCandidate{value, type, preserveDuringBodyWidening});
 }
 
-void AddWidenCandidate(std::vector<LoopWidenCandidate>& candidates, std::unordered_set<Value*>& seen, Value* value)
+void AddWidenCandidate(std::vector<LoopWidenCandidate>& candidates, std::unordered_set<Value*>& seen, Value* value,
+    bool preserveDuringBodyWidening = false)
 {
-    AddWidenCandidate(candidates, seen, value, value == nullptr ? nullptr : value->GetType());
+    AddWidenCandidate(candidates, seen, value, value == nullptr ? nullptr : value->GetType(), preserveDuringBodyWidening);
 }
 
 void AddReferencedIntegerObjectCandidate(
@@ -257,7 +351,8 @@ std::vector<LoopWidenCandidate> CollectLoopWidenCandidates(RangeDomain& state, c
     for (auto expr : block->GetExpressions()) {
         AddWidenCandidate(candidates, seen, expr->GetResult());
         for (auto operand : expr->GetOperands()) {
-            AddWidenCandidate(candidates, seen, operand);
+            AddWidenCandidate(candidates, seen, operand,
+                ShouldPreserveLoopGuardValueDuringBodyWidening(block, operand));
         }
         switch (expr->GetExprKind()) {
             case ExprKind::LOAD: {
@@ -280,7 +375,8 @@ std::vector<LoopWidenCandidate> CollectLoopWidenCandidates(RangeDomain& state, c
 LoopRangeSnapshot CaptureLoopRangeSnapshot(RangeDomain& state, const Block* block)
 {
     LoopRangeSnapshot snapshot;
-    for (auto [value, type] : CollectLoopWidenCandidates(state, block)) {
+    for (auto [value, type, preserveDuringBodyWidening] : CollectLoopWidenCandidates(state, block)) {
+        (void)preserveDuringBodyWidening;
         snapshot.emplace(value, std::make_unique<SIntDomain>(GetSIntDomainFromState(state, value, type)));
     }
     return snapshot;
@@ -297,7 +393,10 @@ const SIntDomain& GetPreviousLoopRange(const LoopRangeSnapshot& previousRanges, 
 
 void ApplyLoopWidening(RangeDomain& state, const LoopRangeSnapshot& previousRanges, const Block* block)
 {
-    for (auto [value, type] : CollectLoopWidenCandidates(state, block)) {
+    for (auto [value, type, preserveDuringBodyWidening] : CollectLoopWidenCandidates(state, block)) {
+        if (preserveDuringBodyWidening) {
+            continue;
+        }
         const auto& current = GetSIntDomainFromState(state, value, type);
         const auto& previous = GetPreviousLoopRange(previousRanges, value, type);
         auto widened = WidenSIntDomain(previous, current);
@@ -310,6 +409,265 @@ void ApplyLoopWidening(RangeDomain& state, const LoopRangeSnapshot& previousRang
 inline bool IsBasicBinaryExpr(const Expression& expr)
 {
     return expr.GetExprKind() >= ExprKind::ADD && expr.GetExprKind() <= ExprKind::MOD;
+}
+
+inline bool IsBitwiseBinaryExpr(ExprKind kind)
+{
+    return kind == ExprKind::BITAND || kind == ExprKind::BITOR || kind == ExprKind::BITXOR;
+}
+
+inline bool IsShiftBinaryExpr(ExprKind kind)
+{
+    return kind == ExprKind::LSHIFT || kind == ExprKind::RSHIFT;
+}
+
+inline bool IsLogicalBinaryExpr(ExprKind kind)
+{
+    return kind == ExprKind::AND || kind == ExprKind::OR;
+}
+
+ConstantRange RangeFromMinMax(const SInt& min, const SInt& max, bool isUnsigned)
+{
+    auto lower = ConstantRange::From(RelationalOperation::GE, min, !isUnsigned);
+    auto upper = ConstantRange::From(RelationalOperation::LE, max, !isUnsigned);
+    return lower.IntersectWith(upper, PreferFromBool(isUnsigned));
+}
+
+SIntDomain ComputeNegRange(const SIntDomain& operand, const Ptr<Type>& type, OverflowStrategy ov)
+{
+    auto width = ToWidth(*type);
+    auto isUnsigned = type->IsUnsignedInteger();
+    if (operand.IsBottom()) {
+        return SIntDomain::Bottom(width, isUnsigned);
+    }
+    if (operand.IsSingleValue()) {
+        auto value = operand.NumericBound().GetSingleElement();
+        if (isUnsigned) {
+            uint64_t res = 0;
+            auto isOverflow =
+                OverflowChecker::IsUIntOverflow(type->GetTypeKind(), ExprKind::NEG, 0, value.UVal(), ov, &res);
+            if (isOverflow && ov == OverflowStrategy::THROWING) {
+                return SIntDomain::Top(width, true);
+            }
+            return {ConstantRange{SInt{width, res}}, true};
+        }
+        int64_t res = 0;
+        auto isOverflow =
+            OverflowChecker::IsIntOverflow(type->GetTypeKind(), ExprKind::NEG, 0, value.SVal(), ov, &res);
+        if (isOverflow && ov == OverflowStrategy::THROWING) {
+            return SIntDomain::Top(width, false);
+        }
+        return {ConstantRange{SInt{width, static_cast<uint64_t>(res)}}, false};
+    }
+    if (ov == OverflowStrategy::SATURATING || ov == OverflowStrategy::CHECKED) {
+        return SIntDomain::Top(width, isUnsigned);
+    }
+    return {operand.NumericBound().Negate(), isUnsigned};
+}
+
+SIntDomain ComputeBitNotRange(const SIntDomain& operand, bool isUnsigned)
+{
+    auto width = operand.Width();
+    if (operand.IsBottom()) {
+        return SIntDomain::Bottom(width, isUnsigned);
+    }
+    return {operand.NumericBound().Negate().Subtract(SInt{width, 1u}), isUnsigned};
+}
+
+std::optional<unsigned> GetShiftAmount(const SIntDomain& range, bool isUnsigned, IntWidth lhsWidth)
+{
+    if (!range.IsSingleValue()) {
+        return std::nullopt;
+    }
+    auto value = range.NumericBound().GetSingleElement();
+    if (!isUnsigned && value.Slt(0)) {
+        return std::nullopt;
+    }
+    auto amount = value.UVal();
+    if (amount >= static_cast<unsigned>(lhsWidth)) {
+        return std::nullopt;
+    }
+    return static_cast<unsigned>(amount);
+}
+
+SInt ApplyExactBitwise(ExprKind kind, const SInt& lhs, const SInt& rhs, bool isUnsigned)
+{
+    switch (kind) {
+        case ExprKind::BITAND: {
+            auto res = lhs;
+            res &= rhs;
+            return res;
+        }
+        case ExprKind::BITOR: {
+            auto res = lhs;
+            res |= rhs;
+            return res;
+        }
+        case ExprKind::BITXOR: {
+            auto res = lhs;
+            res ^= rhs;
+            return res;
+        }
+        case ExprKind::LSHIFT:
+            return lhs.Shl(rhs);
+        case ExprKind::RSHIFT:
+            return isUnsigned ? lhs.LShr(rhs) : lhs.Ashr(rhs);
+        default:
+            CJC_ABORT();
+            return lhs;
+    }
+}
+
+std::optional<SIntDomain> TryComputeShiftRange(
+    ExprKind kind, const SIntDomain& lhs, const SIntDomain& rhs, bool rhsUnsigned, bool destUnsigned)
+{
+    auto width = lhs.Width();
+    auto amount = GetShiftAmount(rhs, rhsUnsigned, width);
+    if (!amount) {
+        return SIntDomain::Top(width, destUnsigned);
+    }
+    if (lhs.IsBottom()) {
+        return SIntDomain::Bottom(width, destUnsigned);
+    }
+    if (lhs.IsSingleValue()) {
+        return SIntDomain{ConstantRange{ApplyExactBitwise(kind, lhs.NumericBound().GetSingleElement(),
+                                          rhs.NumericBound().GetSingleElement(), destUnsigned)},
+            destUnsigned};
+    }
+    if (*amount == 0U) {
+        return SIntDomain{lhs.NumericBound(), destUnsigned};
+    }
+
+    auto& range = lhs.NumericBound();
+    if (kind == ExprKind::LSHIFT) {
+        if (destUnsigned) {
+            if (range.IsWrappedSet()) {
+                return std::nullopt;
+            }
+            auto min = range.UMinValue();
+            auto max = range.UMaxValue();
+            auto maxBeforeShift = SInt::UMaxValue(width).LShr(*amount);
+            if (max.Ugt(maxBeforeShift)) {
+                return std::nullopt;
+            }
+            return SIntDomain{RangeFromMinMax(min.Shl(*amount), max.Shl(*amount), true), true};
+        }
+        if (range.IsSignWrappedSet()) {
+            return std::nullopt;
+        }
+        auto min = range.SMinValue();
+        auto max = range.SMaxValue();
+        auto maxBeforeShift = SInt::SMaxValue(width).LShr(*amount);
+        if (min.Slt(0) || max.Sgt(maxBeforeShift)) {
+            return std::nullopt;
+        }
+        return SIntDomain{RangeFromMinMax(min.Shl(*amount), max.Shl(*amount), false), false};
+    }
+
+    if (destUnsigned) {
+        if (range.IsWrappedSet()) {
+            return std::nullopt;
+        }
+        return SIntDomain{
+            RangeFromMinMax(range.UMinValue().LShr(*amount), range.UMaxValue().LShr(*amount), true), true};
+    }
+    if (range.IsSignWrappedSet()) {
+        return std::nullopt;
+    }
+    return SIntDomain{
+        RangeFromMinMax(range.SMinValue().AShr(*amount), range.SMaxValue().AShr(*amount), false), false};
+}
+
+std::optional<SIntDomain> TryComputeBitAndWithMask(const SIntDomain& value, const SInt& mask, bool destUnsigned)
+{
+    auto width = value.Width();
+    if (mask.IsZero()) {
+        return SIntDomain{ConstantRange{SInt::Zero(width)}, destUnsigned};
+    }
+    if (mask.IsAllOnes()) {
+        return SIntDomain{value.NumericBound(), destUnsigned};
+    }
+    auto& range = value.NumericBound();
+    if (destUnsigned && !range.IsWrappedSet() && (range.UMaxValue().UVal() & ~mask.UVal()) == 0U) {
+        return SIntDomain{range, true};
+    }
+    if (destUnsigned || !mask.IsSignBitSet()) {
+        return SIntDomain{RangeFromMinMax(SInt::Zero(width), mask, destUnsigned), destUnsigned};
+    }
+    return std::nullopt;
+}
+
+std::optional<SIntDomain> TryComputeBitOrWithMask(const SIntDomain& value, const SInt& mask, bool destUnsigned)
+{
+    auto width = value.Width();
+    if (mask.IsZero()) {
+        return SIntDomain{value.NumericBound(), destUnsigned};
+    }
+    auto& range = value.NumericBound();
+    if (destUnsigned && !range.IsWrappedSet() && !mask.IsSignBitSet() &&
+        (range.UMaxValue().UVal() & mask.UVal()) == 0U) {
+        auto min = range.UMinValue();
+        min |= mask;
+        auto max = range.UMaxValue();
+        max |= mask;
+        return SIntDomain{RangeFromMinMax(min, max, true), true};
+    }
+    if (destUnsigned) {
+        return SIntDomain{RangeFromMinMax(mask, SInt::UMaxValue(width), true), true};
+    }
+    if (mask.IsSignBitSet()) {
+        return SIntDomain{RangeFromMinMax(mask, SInt::AllOnes(width), false), false};
+    }
+    return std::nullopt;
+}
+
+std::optional<SIntDomain> TryComputeBitwiseRange(ExprKind kind, const SIntDomain& lhs, const SIntDomain& rhs,
+    Value* lhsValue, Value* rhsValue, bool rhsUnsigned, bool destUnsigned)
+{
+    auto width = lhs.Width();
+    if (lhs.IsBottom() || rhs.IsBottom()) {
+        return SIntDomain::Bottom(width, destUnsigned);
+    }
+    if (IsShiftBinaryExpr(kind)) {
+        return TryComputeShiftRange(kind, lhs, rhs, rhsUnsigned, destUnsigned);
+    }
+    if (lhs.IsSingleValue() && rhs.IsSingleValue()) {
+        return SIntDomain{ConstantRange{ApplyExactBitwise(
+                              kind, lhs.NumericBound().GetSingleElement(), rhs.NumericBound().GetSingleElement(),
+                              destUnsigned)},
+            destUnsigned};
+    }
+    if (lhsValue == rhsValue) {
+        if (kind == ExprKind::BITXOR) {
+            return SIntDomain{ConstantRange{SInt::Zero(width)}, destUnsigned};
+        }
+        return SIntDomain{lhs.NumericBound(), destUnsigned};
+    }
+    if (rhs.IsSingleValue()) {
+        auto mask = rhs.NumericBound().GetSingleElement();
+        if (kind == ExprKind::BITAND) {
+            return TryComputeBitAndWithMask(lhs, mask, destUnsigned);
+        }
+        if (kind == ExprKind::BITOR) {
+            return TryComputeBitOrWithMask(lhs, mask, destUnsigned);
+        }
+        if (kind == ExprKind::BITXOR && mask.IsZero()) {
+            return SIntDomain{lhs.NumericBound(), destUnsigned};
+        }
+    }
+    if (lhs.IsSingleValue()) {
+        auto mask = lhs.NumericBound().GetSingleElement();
+        if (kind == ExprKind::BITAND) {
+            return TryComputeBitAndWithMask(rhs, mask, destUnsigned);
+        }
+        if (kind == ExprKind::BITOR) {
+            return TryComputeBitOrWithMask(rhs, mask, destUnsigned);
+        }
+        if (kind == ExprKind::BITXOR && mask.IsZero()) {
+            return SIntDomain{rhs.NumericBound(), destUnsigned};
+        }
+    }
+    return std::nullopt;
 }
 
 template <> const std::string Analysis<RangeDomain>::name = "range-analysis";
@@ -448,6 +806,21 @@ void RangeAnalysis::HandleUnaryExpr(RangeDomain& state, const UnaryExpression* u
             return state.Update(dest, std::make_unique<BoolRange>(!operandRange));
         }
     }
+    if (dest->GetType()->IsInteger()) {
+        auto operand = unaryExpr->GetOperand();
+        const auto& operandRange = GetSIntDomainFromState(state, operand);
+        if (unaryExpr->GetExprKind() == ExprKind::NEG) {
+            auto range = ComputeNegRange(operandRange, dest->GetType(), unaryExpr->GetOverflowStrategy());
+            if (range.IsNonTrivial()) {
+                return state.Update(dest, std::make_unique<SIntRange>(std::move(range)));
+            }
+        } else if (unaryExpr->GetExprKind() == ExprKind::BITNOT) {
+            auto range = ComputeBitNotRange(operandRange, dest->GetType()->IsUnsignedInteger());
+            if (range.IsNonTrivial()) {
+                return state.Update(dest, std::make_unique<SIntRange>(std::move(range)));
+            }
+        }
+    }
     return state.SetToBound(dest, true);
 }
 
@@ -547,28 +920,39 @@ void RangeAnalysis::HandleBinaryExpr(RangeDomain& state, const BinaryExpression*
         return state.SetToBound(binaryExpr->GetResult(), true);
     }
     if (dest->GetType()->IsInteger()) {
-        if (!IsBasicBinaryExpr(*binaryExpr)) {
+        auto kind = binaryExpr->GetExprKind();
+        if (!IsBasicBinaryExpr(*binaryExpr) && !IsBitwiseBinaryExpr(kind) && !IsShiftBinaryExpr(kind)) {
             return state.SetToBound(binaryExpr->GetResult(), true);
         }
         const auto& lRange = GetSIntDomainFromState(state, lhs);
         const auto& rRange = GetSIntDomainFromState(state, rhs);
+        if (IsBitwiseBinaryExpr(kind) || IsShiftBinaryExpr(kind)) {
+            auto res = TryComputeBitwiseRange(kind, lRange, rRange, lhs, rhs, rhs->GetType()->IsUnsignedInteger(),
+                dest->GetType()->IsUnsignedInteger());
+            if (res && res->IsNonTrivial()) {
+                return state.Update(dest, std::make_unique<SIntRange>(std::move(*res)));
+            }
+            return state.SetToBound(binaryExpr->GetResult(), true);
+        }
         auto ov = binaryExpr->GetOverflowStrategy();
         auto isUnsigned = IsUnsignedArithmetic(*binaryExpr);
         if (lRange.IsSingleValue() && rRange.IsSingleValue()) {
             auto domain = CheckSingleValueOverflow(
-                CHIRArithmeticBinopArgs{lRange, rRange, lhs, rhs, binaryExpr->GetExprKind(), ov, isUnsigned},
-                binaryExpr, binaryExpr->GetExprKind(), *diag);
+                CHIRArithmeticBinopArgs{lRange, rRange, lhs, rhs, kind, ov, isUnsigned}, binaryExpr, kind, *diag);
             state.Update(dest, std::make_unique<SIntRange>(domain));
             return;
         }
-        auto res = ComputeArithmeticBinop(
-            CHIRArithmeticBinopArgs{lRange, rRange, lhs, rhs, binaryExpr->GetExprKind(), ov, isUnsigned});
+        auto res = ComputeArithmeticBinop(CHIRArithmeticBinopArgs{lRange, rRange, lhs, rhs, kind, ov, isUnsigned});
         if (res.IsNonTrivial()) {
             return state.Update(dest, std::make_unique<SIntRange>(res));
         }
     }
     if (dest->GetType()->IsBoolean()) {
-        auto res = GenerateBoolRangeFromBinaryOp(state, binaryExpr);
+        auto kind = binaryExpr->GetExprKind();
+        auto res = IsLogicalBinaryExpr(kind)
+            ? (kind == ExprKind::AND ? LogicalAnd(GetBoolDomainFromState(state, lhs), GetBoolDomainFromState(state, rhs))
+                                      : LogicalOr(GetBoolDomainFromState(state, lhs), GetBoolDomainFromState(state, rhs)))
+            : GenerateBoolRangeFromBinaryOp(state, binaryExpr);
         if (res.IsNonTrivial()) {
             return state.Update(dest, std::make_unique<BoolRange>(res));
         }
@@ -699,6 +1083,7 @@ bool CanReachBlock(const Block* start, const Block* target, std::unordered_set<c
 bool IsLoopBranch(const Branch* branch);
 bool NarrowSIntByRelationToConstant(RangeDomain& state, Value* value, RelationalOperation rel, const SInt& constant);
 std::optional<int64_t> GetUpdateStepFromLocation(Value* value, Value* location);
+bool ApplyConditionConstraint(RangeDomain& state, Value* condition, bool branchCondition);
 
 const Expression* GetDefiningExpr(Value* value)
 {
@@ -754,10 +1139,47 @@ bool NarrowSIntValue(RangeDomain& state, Value* value, const SIntDomain& constra
     return true;
 }
 
+bool NarrowLoadedSIntLocation(RangeDomain& state, Value* value, const SIntDomain& constraint)
+{
+    auto expr = GetDefiningExpr(value);
+    if (expr == nullptr || expr->GetExprKind() != ExprKind::LOAD) {
+        return true;
+    }
+    auto location = StaticCast<const Load*>(expr)->GetLocation();
+    if (location == nullptr || !location->GetType()->IsRef()) {
+        return true;
+    }
+    auto refType = StaticCast<RefType*>(location->GetType());
+    auto rootType = refType->GetRootBaseType();
+    if (rootType == nullptr || !rootType->IsInteger() || ToWidth(*rootType) != constraint.Width()) {
+        return true;
+    }
+    auto object = state.CheckAbstractObjectRefBy(location);
+    if (object == nullptr) {
+        return true;
+    }
+    const auto& current = GetSIntDomainFromState(state, object, rootType);
+    auto narrowed = SIntDomain::Intersects(current, constraint);
+    if (narrowed.IsBottom()) {
+        state.Update(object,
+            std::make_unique<SIntRange>(SIntDomain::Bottom(ToWidth(*rootType), rootType->IsUnsignedInteger())));
+        return true;
+    }
+    state.Update(object, std::make_unique<SIntRange>(std::move(narrowed)));
+    return true;
+}
+
 bool NarrowSIntByRelationToConstant(RangeDomain& state, Value* value, RelationalOperation rel, const SInt& constant)
 {
     auto type = value->GetType();
-    return NarrowSIntValue(state, value, SIntDomain::FromNumeric(rel, constant, type->IsUnsignedInteger()));
+    auto constraint = SIntDomain::FromNumeric(rel, constant, type->IsUnsignedInteger());
+    if (!NarrowSIntValue(state, value, constraint)) {
+        return false;
+    }
+    if (rel != RelationalOperation::NE) {
+        return NarrowLoadedSIntLocation(state, value, constraint);
+    }
+    return true;
 }
 
 std::optional<SInt> GetSingleIntFromDefiningConstant(Value* value)
@@ -775,6 +1197,28 @@ std::optional<SInt> GetSingleIntFromDefiningConstant(Value* value)
         return std::nullopt;
     }
     return domain.NumericBound().GetSingleElement();
+}
+
+std::optional<bool> GetSingleBoolFromDefiningConstant(Value* value)
+{
+    auto expr = GetDefiningExpr(value);
+    if (expr == nullptr || expr->GetExprKind() != ExprKind::CONSTANT) {
+        return std::nullopt;
+    }
+    auto literal = StaticCast<const Constant*>(expr)->GetValue();
+    if (literal == nullptr || !literal->IsBoolLiteral()) {
+        return std::nullopt;
+    }
+    return StaticCast<BoolLiteral*>(literal)->GetVal();
+}
+
+std::optional<bool> GetSingleBoolFromStateOrConstant(const RangeDomain& state, Value* value)
+{
+    auto domain = RangeAnalysis::GetBoolDomainFromState(state, value);
+    if (domain.IsSingleValue()) {
+        return domain.GetSingleValue();
+    }
+    return GetSingleBoolFromDefiningConstant(value);
 }
 
 bool IsLoadFromLocation(Value* value, Value* location)
@@ -1306,21 +1750,142 @@ bool ApplyBoolEqualityConstraint(RangeDomain& state, Value* lhs, Value* rhs, Rel
         return true;
     }
 
-    auto lhsDomain = RangeAnalysis::GetBoolDomainFromState(state, lhs);
-    auto rhsDomain = RangeAnalysis::GetBoolDomainFromState(state, rhs);
-    if (lhsDomain.IsSingleValue()) {
-        auto value = lhsDomain.GetSingleValue();
+    auto lhsValue = GetSingleBoolFromStateOrConstant(state, lhs);
+    auto rhsValue = GetSingleBoolFromStateOrConstant(state, rhs);
+    if (lhsValue.has_value()) {
+        auto value = lhsValue.value();
         if (!NarrowBoolValue(state, rhs, rel == RelationalOperation::EQ ? value : !value)) {
             return false;
         }
     }
-    if (rhsDomain.IsSingleValue()) {
-        auto value = rhsDomain.GetSingleValue();
+    if (rhsValue.has_value()) {
+        auto value = rhsValue.value();
         if (!NarrowBoolValue(state, lhs, rel == RelationalOperation::EQ ? value : !value)) {
             return false;
         }
     }
     return true;
+}
+
+bool ApplyLogicalBoolConstraint(
+    RangeDomain& state, const BinaryExpression* binary, ExprKind kind, bool branchCondition)
+{
+    auto lhs = binary->GetLHSOperand();
+    auto rhs = binary->GetRHSOperand();
+    if (!IsBooleanValue(lhs) || !IsBooleanValue(rhs)) {
+        return true;
+    }
+
+    auto lhsValue = GetSingleBoolFromStateOrConstant(state, lhs);
+    auto rhsValue = GetSingleBoolFromStateOrConstant(state, rhs);
+    if (kind == ExprKind::OR) {
+        if (lhsValue.has_value()) {
+            if (lhsValue.value()) {
+                return branchCondition;
+            }
+            return ApplyConditionConstraint(state, rhs, branchCondition);
+        }
+        if (rhsValue.has_value()) {
+            if (rhsValue.value()) {
+                return branchCondition;
+            }
+            return ApplyConditionConstraint(state, lhs, branchCondition);
+        }
+        if (!branchCondition) {
+            return ApplyConditionConstraint(state, lhs, false) && ApplyConditionConstraint(state, rhs, false);
+        }
+        return true;
+    }
+
+    if (kind == ExprKind::AND) {
+        if (lhsValue.has_value()) {
+            if (!lhsValue.value()) {
+                return !branchCondition;
+            }
+            return ApplyConditionConstraint(state, rhs, branchCondition);
+        }
+        if (rhsValue.has_value()) {
+            if (!rhsValue.value()) {
+                return !branchCondition;
+            }
+            return ApplyConditionConstraint(state, lhs, branchCondition);
+        }
+        if (branchCondition) {
+            return ApplyConditionConstraint(state, lhs, true) && ApplyConditionConstraint(state, rhs, true);
+        }
+    }
+    return true;
+}
+
+std::optional<bool> FindStoredBoolConstant(const Block* block, Value* location)
+{
+    auto exprs = block->GetExpressions();
+    for (auto it = exprs.rbegin(); it != exprs.rend(); ++it) {
+        if ((*it)->GetExprKind() != ExprKind::STORE) {
+            continue;
+        }
+        auto store = StaticCast<const Store*>(*it);
+        if (store->GetLocation() != location) {
+            continue;
+        }
+        return GetSingleBoolFromDefiningConstant(store->GetValue());
+    }
+    return std::nullopt;
+}
+
+struct ShortCircuitBoolAlias {
+    Value* source;
+    bool inverted;
+};
+
+std::optional<ShortCircuitBoolAlias> GetShortCircuitBoolAlias(Value* condition)
+{
+    auto expr = GetDefiningExpr(condition);
+    if (expr == nullptr || expr->GetExprKind() != ExprKind::LOAD) {
+        return std::nullopt;
+    }
+    auto location = StaticCast<const Load*>(expr)->GetLocation();
+    auto loadBlock = expr->GetParentBlock();
+    if (location == nullptr || loadBlock == nullptr) {
+        return std::nullopt;
+    }
+    auto preds = loadBlock->GetPredecessors();
+    if (preds.size() != 2) {
+        return std::nullopt;
+    }
+
+    const Block* controller = nullptr;
+    for (auto pred : preds) {
+        auto predPreds = pred->GetPredecessors();
+        if (predPreds.size() != 1) {
+            return std::nullopt;
+        }
+        if (controller == nullptr) {
+            controller = predPreds.front();
+        } else if (controller != predPreds.front()) {
+            return std::nullopt;
+        }
+    }
+    auto terminator = controller == nullptr ? nullptr : controller->GetTerminator();
+    if (terminator == nullptr || terminator->GetExprKind() != ExprKind::BRANCH) {
+        return std::nullopt;
+    }
+    auto branch = StaticCast<const Branch*>(terminator);
+    auto trueBlock = branch->GetTrueBlock();
+    auto falseBlock = branch->GetFalseBlock();
+    if ((trueBlock != preds[0] && trueBlock != preds[1]) || (falseBlock != preds[0] && falseBlock != preds[1])) {
+        return std::nullopt;
+    }
+    auto trueValue = FindStoredBoolConstant(trueBlock, location);
+    auto falseValue = FindStoredBoolConstant(falseBlock, location);
+    if (!trueValue.has_value() || !falseValue.has_value() || trueValue.value() == falseValue.value()) {
+        return std::nullopt;
+    }
+    auto source = branch->GetCondition();
+    if (source == condition || !IsBooleanValue(source)) {
+        return std::nullopt;
+    }
+    return ShortCircuitBoolAlias{source, !trueValue.value() && falseValue.value()};
 }
 
 bool ApplyConditionConstraint(RangeDomain& state, Value* condition, bool branchCondition)
@@ -1329,8 +1894,23 @@ bool ApplyConditionConstraint(RangeDomain& state, Value* condition, bool branchC
     if (expr == nullptr) {
         return NarrowBoolValue(state, condition, branchCondition);
     }
+    if (auto alias = GetShortCircuitBoolAlias(condition); alias.has_value()) {
+        if (!ApplyConditionConstraint(state, alias->source, alias->inverted ? !branchCondition : branchCondition)) {
+            return false;
+        }
+        (void)NarrowBoolValue(state, condition, branchCondition);
+        return true;
+    }
     if (expr->GetExprKind() == ExprKind::NOT) {
         if (!ApplyConditionConstraint(state, StaticCast<const UnaryExpression*>(expr)->GetOperand(), !branchCondition)) {
+            return false;
+        }
+        (void)NarrowBoolValue(state, condition, branchCondition);
+        return true;
+    }
+    if ((expr->GetExprKind() == ExprKind::AND || expr->GetExprKind() == ExprKind::OR) &&
+        expr->GetExprMajorKind() == ExprMajorKind::BINARY_EXPR) {
+        if (!ApplyLogicalBoolConstraint(state, StaticCast<const BinaryExpression*>(expr), expr->GetExprKind(), branchCondition)) {
             return false;
         }
         (void)NarrowBoolValue(state, condition, branchCondition);
