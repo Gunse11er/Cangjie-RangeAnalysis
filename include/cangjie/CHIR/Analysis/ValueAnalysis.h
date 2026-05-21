@@ -430,6 +430,11 @@ public:
         }
     }
 
+    void SetUnreachable()
+    {
+        this->kind = ReachableKind::UNREACHABLE;
+    }
+
 private:
     Ref* CreateNewRef(const Expression* expr = nullptr, bool createTwoLevelRef = false)
     {

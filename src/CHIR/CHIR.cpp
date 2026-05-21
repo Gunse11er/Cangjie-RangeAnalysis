@@ -536,6 +536,7 @@ void ToCHIR::RunRangePropagation()
     Utils::ProfileRecorder recorder("CHIR Opt", "Range Propagation");
     AnalysisWrapper<RangeAnalysis, RangeDomain> vra(builder);
     vra.RunOnPackage(chirPkg, opts.chirDebugOptimizer, opts.GetJobs(), &diag);
+    CHIR::RangePropagation::EmitContestOutput(chirPkg, vra);
     size_t threadNum = opts.GetJobs();
     DeadCodeElimination dce(builder, diag, *chirPkg);
     if (threadNum == 1) {
