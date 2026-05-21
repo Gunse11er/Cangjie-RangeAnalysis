@@ -1,0 +1,16 @@
+// Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+// This source file is part of the Cangjie project, licensed under Apache-2.0
+// with Runtime Library Exception.
+//
+// See https://cangjie-lang.cn/pages/LICENSE for license information.
+
+WARN_GROUP("unused", UNUSED)
+WARN_GROUP("unused-main", UNUSED_MAIN)
+WARN_GROUP("driver-arg", DRIVER_ARG)
+WARN_GROUP("deprecated", DEPRECATED)
+WARN_GROUP("unsupport-compile-source", UNSUPPORT_COMPILE_SOURCE)
+WARN_GROUP("package-import", PACKAGE_IMPORT)
+WARN_GROUP("parser", PARSER)
+WARN_GROUP("semantics", SEMANTICS)
+WARN_GROUP("interpreter", INTERPRETER)
+WARN_GROUP("apilevel-check", APILEVEL_CHECK)

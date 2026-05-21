@@ -1,0 +1,29 @@
+// Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+// This source file is part of the Cangjie project, licensed under Apache-2.0
+// with Runtime Library Exception.
+//
+// See https://cangjie-lang.cn/pages/LICENSE for license information.
+
+ERROR(chir_diag_begin, "")
+ERROR(chir_var_might_circular_dependency, "%s might have circular dependency")
+ERROR(chir_file_might_circular_dependency, "%s might have file circular dependency")
+ERROR(chir_used_before_initialization, "variable '%s' is used before initialization")
+
+// sancov pass
+ERROR(chir_sancov_illegal_usage_of_pc_table, "use '--sanitizer-coverage-pc-table, [inline-bool-flag|inline-8bit-counters|trace-pc-guard]' instead")
+ERROR(chir_sancov_illegal_usage_of_level, "'--sanitizer-coverage-level' is illegal here")
+
+// interpreter
+ERROR(interp_cannot_interp_node, "['%s'] failed to interpret node '%s'")
+ERROR(interp_malloc_failed, "failed allocating memory")
+ERROR(interp_unsupported, "['%s'] unsupported '%s'")
+ERROR(interp_unsupported_type, "['%s'] unsupported type '%s'")
+ERROR(interp_cannot_convert_array2ffi, "cannot convert array to FFI value")
+ERROR(interp_cannot_load_incremental_bchir, "could not load previous incremental BCHIR")
+
+// const eval
+ERROR(const_eval_exception, "an exception was thrown while evaluating constant")
+ERROR(const_eval_load_dep, "failed to load const eval dependency '%s'")
+ERROR(const_eval_unsupported, "tried to run non-const code in const eval")
+
+ERROR(chir_diag_end, "")

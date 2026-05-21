@@ -1,0 +1,11 @@
+// Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+// This source file is part of the Cangjie project, licensed under Apache-2.0
+// with Runtime Library Exception.
+//
+// See https://cangjie-lang.cn/pages/LICENSE for license information.
+
+ERROR(frontend_diag_begin, "")
+ERROR(frontend_failed_to_detect_cangjie_home, "failed to detect cangjie home, reason: %s")
+ERROR(frontend_failed_to_detect_cangjie_modules, "failed to detect cangjie modules, reason: %s")
+ERROR(frontend_invalid_output_path, "can not generate file to path: '%s'")
+ERROR(frontend_diag_end, "")

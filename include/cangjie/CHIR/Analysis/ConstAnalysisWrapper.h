@@ -1,0 +1,192 @@
+// Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+// This source file is part of the Cangjie project, licensed under Apache-2.0
+// with Runtime Library Exception.
+//
+// See https://cangjie-lang.cn/pages/LICENSE for license information.
+
+#ifndef CANGJIE_CHIR_ANALYSIS_CONST_ANALYSISWRAPPER_H
+#define CANGJIE_CHIR_ANALYSIS_CONST_ANALYSISWRAPPER_H
+
+#include "cangjie/CHIR/Analysis/Engine.h"
+#include "cangjie/CHIR/Analysis/ConstAnalysis.h"
+#include "cangjie/CHIR/IR/Package.h"
+#include "cangjie/Utils/TaskQueue.h"
+
+#include <future>
+
+namespace Cangjie::CHIR {
+/**
+ * @brief wrapper class of constant analysis pass, using to do parallel or check works.
+ */
+class ConstAnalysisWrapper {
+public:
+    /**
+     * @brief wrapper of const analysis.
+     * @param builder CHIR builder for generating IR.
+     */
+    explicit ConstAnalysisWrapper(CHIRBuilder& builder);
+
+    /**
+     * @brief main method to analysis from wrapper class.
+     * @tparam Args the args type of analysis.
+     * @param package package to do optimization.
+     * @param isDebug flag whether print debug log.
+     * @param threadNum thread num to do analysis
+     * @param args args of analysis
+     */
+    template <typename... Args>
+    void RunOnPackage(const Package* package, bool isDebug, size_t threadNum, Args&&... args)
+    {
+        if (threadNum == 1) {
+            RunOnPackageInSerial(package, isDebug, std::forward<Args>(args)...);
+        } else {
+            RunOnPackageInParallel(package, isDebug, threadNum, std::forward<Args>(args)...);
+        }
+    }
+
+    /**
+     * @brief main method to analysis from wrapper class per function.
+     * @tparam Args the args type of analysis.
+     * @param func function CHIR IR to do optimization.
+     * @param isDebug flag whether print debug log.
+     * @param args args of analysis
+     * @return result of analysis per function
+     */
+    template <typename... Args>
+    std::unique_ptr<Results<ConstDomain>> RunOnFunc(const Func* func, bool isDebug, Args&&... args)
+    {
+        auto analysis =
+            std::make_unique<ConstAnalysis<ConstStatePool>>(func, builder, isDebug, std::forward<Args>(args)...);
+        auto engine = Engine<ConstDomain>(func, std::move(analysis));
+        return engine.IterateToFixpoint();
+    }
+
+    /**
+     * @brief main method to analysis from wrapper class per function using pool domain.
+     * @tparam Args the args type of analysis.
+     * @param func function CHIR IR to do optimization.
+     * @param isDebug flag whether print debug log.
+     * @param args args of analysis
+     * @return result of analysis per function
+     */
+    template <typename... Args>
+    std::unique_ptr<Results<ConstPoolDomain>> RunOnFuncWithPool(const Func* func, bool isDebug, Args&&... args)
+    {
+        auto analysis =
+            std::make_unique<ConstAnalysis<ConstActivePool>>(func, builder, isDebug, std::forward<Args>(args)...);
+        auto engine = Engine<ConstPoolDomain>(func, std::move(analysis));
+        return engine.IterateToFixpoint();
+    }
+
+    /**
+     * @brief return result of analysis for certain function
+     * @param func function to return analysis result
+     * @return analysis result
+     */
+    Results<ConstDomain>* CheckFuncResult(const Func& func);
+
+    /**
+     * @brief return result of analysis for certain function
+     * @param func function to return analysis result
+     * @return analysis result
+     */
+    Results<ConstPoolDomain>* CheckFuncActiveResult(const Func& func);
+
+    /**
+     * @brief clear analysis result
+     */
+    void InvalidateAllAnalysisResults();
+
+private:
+    enum class AnalysisStrategy {
+        SkipAnalysis,
+        FullStatePool,
+        ActiveStatePool
+    };
+
+    AnalysisStrategy ChooseAnalysisStrategy(const Func& func);
+
+    /// Compute block size helpers
+    static size_t GetBlockSize(const Expression& expr);
+    static size_t CountBlockSize(const Func& func);
+
+    template <typename... Args>
+    void RunOnPackageInSerial(const Package* package, bool isDebug, Args&&... args)
+    {
+        SetUpGlobalVarState(*package, isDebug, std::forward<Args>(args)...);
+        for (auto func : package->GetGlobalFuncs()) {
+            auto judgeRes = ChooseAnalysisStrategy(*func);
+            if (judgeRes == AnalysisStrategy::ActiveStatePool) {
+                if (auto res = RunOnFuncWithPool(func, isDebug, std::forward<Args>(args)...)) {
+                    resultsPoolMap.emplace(func, std::move(res));
+                }
+            } else if (judgeRes == AnalysisStrategy::FullStatePool) {
+                if (auto res = RunOnFunc(func, isDebug, std::forward<Args>(args)...)) {
+                    resultsMap.emplace(func, std::move(res));
+                }
+            }
+        }
+    }
+
+    template <typename... Args>
+    void RunOnPackageInParallel(const Package* package, bool isDebug, size_t threadNum, Args&&... args)
+    {
+        SetUpGlobalVarState(*package, isDebug, std::forward<Args>(args)...);
+        Utils::TaskQueue taskQueue(threadNum);
+        using ResTy = std::unique_ptr<Results<ConstDomain>>;
+        using ResTyPool = std::unique_ptr<Results<ConstPoolDomain>>;
+        std::vector<Cangjie::Utils::TaskResult<ResTy>> results;
+        std::vector<Cangjie::Utils::TaskResult<ResTyPool>> resultsPool;
+        for (auto func : package->GetGlobalFuncs()) {
+            auto judgeRes = ChooseAnalysisStrategy(*func);
+            if (judgeRes == AnalysisStrategy::ActiveStatePool) {
+                resultsPool.emplace_back(taskQueue.AddTask<ResTyPool>(
+                    [func, isDebug, &args..., this]() {
+                            return RunOnFuncWithPool(func, isDebug, std::forward<Args>(args)...);
+                        },
+                    // Roughly use the number of Blocks as the cost of task weight
+                    func->GetBody()->GetBlocks().size()));
+            } else if (judgeRes == AnalysisStrategy::FullStatePool) {
+                results.emplace_back(taskQueue.AddTask<ResTy>(
+                    [func, isDebug, &args..., this]() {
+                            return RunOnFunc(func, isDebug, std::forward<Args>(args)...);
+                        },
+                    func->GetBody()->GetBlocks().size()));
+            }
+        }
+
+        taskQueue.RunAndWaitForAllTasksCompleted();
+
+        for (auto& result : results) {
+            if (auto res = result.get()) {
+                resultsMap.emplace(res->func, std::move(res));
+            }
+        }
+        for (auto& result: resultsPool) {
+            if (auto res = result.get()) {
+                resultsPoolMap.emplace(res->func, std::move(res));
+            }
+        }
+    }
+
+    template <typename... Args> void SetUpGlobalVarState(const Package& package, bool isDebug, Args&&... args)
+    {
+        ConstAnalysis<ConstStatePool>::InitialiseLetGVState(package, builder);
+        for (auto gv : package.GetGlobalVars()) {
+            if (auto init = gv->GetInitFunc();
+                gv->TestAttr(Attribute::READONLY) && init && resultsMap.find(init) == resultsMap.end()) {
+                // Multiple global vars may be initialised in the same function.
+                // e.g. let (x, y) = (1, 2)
+                resultsMap.emplace(init, RunOnFunc(init, isDebug, std::forward<Args>(args)...));
+            }
+        }
+    }
+
+    std::unordered_map<const Func*, std::unique_ptr<Results<ConstDomain>>> resultsMap;
+    std::unordered_map<const Func*, std::unique_ptr<Results<ConstPoolDomain>>> resultsPoolMap;
+    CHIRBuilder& builder;
+};
+
+} // namespace Cangjie::CHIR
+
+#endif

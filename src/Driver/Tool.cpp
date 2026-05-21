@@ -1,0 +1,313 @@
+// Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+// This source file is part of the Cangjie project, licensed under Apache-2.0
+// with Runtime Library Exception.
+//
+// See https://cangjie-lang.cn/pages/LICENSE for license information.
+
+/**
+ * @file
+ *
+ * This file implements Tool class and its functions.
+ */
+
+#include "cangjie/Driver/Tool.h"
+
+#ifdef _WIN32
+#include <windows.h>
+#include <iomanip>
+#else
+#include <spawn.h>
+#include <cstring>
+#include <sys/wait.h>
+#endif
+#include <fstream>
+#include <type_traits>
+
+#include "cangjie/Utils/FileUtil.h"
+#include "cangjie/Utils/Semaphore.h"
+#include "cangjie/Driver/TempFileManager.h"
+#include "cangjie/Driver/Utils.h"
+
+using namespace Cangjie;
+namespace {
+#ifdef _WIN32
+std::string GetSystemErrorMessage(DWORD errCode)
+{
+    if (errCode == 0) {
+        return "";
+    }
+    LPWSTR wMsgBuf = nullptr;
+    DWORD size =
+        FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+            NULL, errCode, MAKELANGID(LANG_ENGLISH, SUBLANG_DEFAULT), (LPWSTR)&wMsgBuf, 0, NULL);
+    if (size == 0 || wMsgBuf == nullptr) {
+        return "Unknown system error code: " + std::to_string(errCode);
+    }
+
+    std::wstring wmessage(wMsgBuf, size);
+
+    LocalFree(wMsgBuf);
+
+    while (!wmessage.empty() && (wmessage.back() == L'\r' || wmessage.back() == L'\n')) {
+        wmessage.pop_back();
+    }
+
+    if (wmessage.empty()) {
+        return "";
+    }
+    int utf8_size = WideCharToMultiByte(CP_UTF8, 0, wmessage.c_str(), (int)wmessage.length(), NULL, 0, NULL, NULL);
+    std::string result(utf8_size, 0);
+    WideCharToMultiByte(CP_UTF8, 0, wmessage.c_str(), (int)wmessage.length(), &result[0], utf8_size, NULL, NULL);
+
+    return result;
+}
+#else
+std::string GetSystemErrorMessage(int error)
+{
+    constexpr size_t buffSize = 512;
+    char buf[buffSize] = {0};
+    auto handleError = [&buf](auto res) -> std::string {
+        using T = decltype(res);
+        if constexpr (std::is_integral_v<T>) {
+            // POSIX
+            return res != 0 ? "" : std::string(buf);
+        } else {
+            // GNU
+            return res ? std::string(res) : "";
+        }
+    };
+    // Generic lambda defers semantic checks until instantiation.
+    return handleError(strerror_r(error, buf, buffSize));
+}
+#endif
+} // namespace
+#ifdef __APPLE__
+const static std::string LD_LIBRARY_PATH = "DYLD_LIBRARY_PATH";
+const static std::string LD_PRELOAD = "DYLD_INSERT_LIBRARIES";
+#elif !defined(_WIN32)
+const static std::string LD_LIBRARY_PATH = "LD_LIBRARY_PATH";
+const static std::string LD_PRELOAD = "LD_PRELOAD";
+#endif
+
+void Tool::AppendMultiArgs(const std::string& argStr)
+{
+    auto splitArgs = Utils::SplitString(argStr, " ");
+    for (const auto& a : splitArgs) {
+        if (!a.empty()) {
+            args.emplace_back(a);
+        }
+    }
+}
+
+std::string Tool::GenerateCommand() const
+{
+    std::string tempCommand;
+    std::string argStr;
+    auto& argList = GetArgs();
+    std::for_each(argList.begin(), argList.end(), [&argStr](const std::string& s) {
+#ifdef _WIN32
+        argStr = argStr + FileUtil::GetQuoted(s) + " ";
+#else
+        argStr = argStr + GetSingleQuoted(s) + " ";
+#endif
+    });
+#ifndef _WIN32
+    if (!GetLdLibraryPath().empty()) {
+        tempCommand = "LD_LIBRARY_PATH=" + GetSingleQuoted(GetLdLibraryPath()) + ":$" + LD_LIBRARY_PATH + " ";
+    }
+#endif
+
+#ifdef _WIN32
+    tempCommand += FileUtil::GetQuoted(name);
+#else
+    tempCommand += GetSingleQuoted(name);
+#endif
+    tempCommand += " " + argStr;
+#ifdef _WIN32
+    // Command run as `cmd /C`. The leading double quote will be removed by `cmd` causing the semantic of command
+    // changes. Extra pair of double quotes is added to make the command works when there is leading double quote.
+    return "\"" + tempCommand + "\"";
+#else
+    return tempCommand;
+#endif
+}
+
+bool Tool::InternalImplementedCommandExec() const
+{
+    bool res = false;
+    if (type == ToolType::INTERNAL_IMPLEMENTED && name == "CacheCopy") {
+        auto& arguments = GetFullArgs();
+        // arguments[0] - name of command
+        // arguments[1] - absolute name of srcFile
+        std::ifstream srcStream(arguments[1], std::ios::binary);
+        // arguments[2] - absolute name of destFile
+        std::ofstream destStream(arguments[2], std::ios::binary);
+        destStream << srcStream.rdbuf();
+        destStream.close();
+#ifdef _WIN32
+        FileUtil::HideFile(FileUtil::GetDirPath(arguments[2]));
+#endif
+        res = true;
+    }
+    return res;
+}
+
+std::unique_ptr<ToolFuture> Tool::Execute(bool verbose) const
+{
+    if (verbose) {
+        Println(FileUtil::Normalize(GetCommandString()));
+    }
+    // If the file is deleted, the subsequent commands are not executed.
+    if (TempFileManager::Instance().IsDeleted()) {
+        return nullptr;
+    }
+    return Run();
+}
+
+#ifdef _WIN32
+std::unique_ptr<ToolFuture> Tool::Run() const
+{
+    if (type == ToolType::INTERNAL_IMPLEMENTED) {
+        Utils::Semaphore::Get().Acquire();
+        return std::make_unique<ThreadFuture>(std::async(&Tool::InternalImplementedCommandExec, this));
+    }
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    auto& arguments = GetFullArgs();
+    std::ostringstream oss;
+    for (size_t i = 0; i < arguments.size(); ++i) {
+        if (i != 0) {
+            oss << " ";
+        }
+        if (arguments[i].empty() || arguments[i].find_first_of("\t \"&\'()*<>\\`^|\n") != std::string::npos) {
+            oss << std::quoted(arguments[i]);
+        } else {
+            oss << arguments[i];
+        }
+    }
+    std::string commandLine = oss.str();
+
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    ZeroMemory(&pi, sizeof(pi));
+    Utils::Semaphore::Get().Acquire();
+    if (!CreateProcessA(
+        name.c_str(), const_cast<char*>(commandLine.c_str()), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+        Utils::Semaphore::Get().Release();
+        return std::make_unique<ErrorFuture>(GetSystemErrorMessage(GetLastError()));
+    }
+
+    return std::make_unique<WindowsProcessFuture>(pi);
+}
+#else
+std::unique_ptr<ToolFuture> Tool::Run() const
+{
+    if (type == ToolType::INTERNAL_IMPLEMENTED) {
+        Utils::Semaphore::Get().Acquire();
+        return std::make_unique<ThreadFuture>(std::async(&Tool::InternalImplementedCommandExec, this));
+    }
+    auto& arguments = GetFullArgs();
+
+    // Convert arguments to char * array for argv argument.
+    std::vector<char*> rawArgumentArray = {};
+    rawArgumentArray.resize(arguments.size() + 1);
+    size_t index = 0;
+    while (index < arguments.size()) {
+        rawArgumentArray[index] = const_cast<char*>(arguments[index].c_str());
+        index++;
+    }
+    rawArgumentArray[index] = nullptr;
+
+    // Note: `childEnvironment` must be alive until the call of `posix_spawn` finishes. The c pointer
+    // of environment we get will be invalid if `childEnvironment` is destroyed too early.
+    std::list<std::string> childEnvironment = BuildEnvironmentVector();
+
+    // Make an array for envp argument.
+    std::vector<char*> rawEnvironmentArray;
+    for (const std::string& s : std::as_const(childEnvironment)) {
+        rawEnvironmentArray.emplace_back(const_cast<char*>(s.c_str()));
+    }
+    rawEnvironmentArray.push_back(nullptr);
+
+    pid_t pid;
+    int status = 0;
+    Utils::Semaphore::Get().Acquire();
+    // If name has no directory separator, then it should be a program name that needs to be
+    // searched in PATH. `posix_spawnp` does program searches for us.
+    if (name.find_first_of(DIR_SEPARATOR) == std::string::npos) {
+        status =
+            posix_spawnp(&pid, name.c_str(), nullptr, nullptr, rawArgumentArray.data(), rawEnvironmentArray.data());
+    } else {
+        status = posix_spawn(&pid, name.c_str(), nullptr, nullptr, rawArgumentArray.data(), rawEnvironmentArray.data());
+    }
+
+    // Failed to start the child process
+    if (status != 0) {
+        Utils::Semaphore::Get().Release();
+        return std::make_unique<ErrorFuture>(GetSystemErrorMessage(status));
+    }
+
+    return std::make_unique<LinuxProcessFuture>(pid);
+}
+
+std::list<std::string> Tool::BuildEnvironmentVector() const
+{
+    std::list<std::string> environment;
+    // Append our ld library path to the front of LD_LIBRARY_PATH
+    if (ldLibraryPath.empty()) {
+        if (environmentVars.find(LD_LIBRARY_PATH) != environmentVars.end()) {
+            environment.emplace_back(LD_LIBRARY_PATH + "=" + environmentVars.at(LD_LIBRARY_PATH));
+        }
+    } else {
+        std::string newLdLibraryPath = ldLibraryPath;
+        // If LD_LIBRARY_PATH is empty, we don't append `:` or ld.so will treat the trailing empty path as ".".
+        // See documentation of ld.so for details.
+        if (environmentVars.find(LD_LIBRARY_PATH) != environmentVars.end() &&
+            !environmentVars.at(LD_LIBRARY_PATH).empty()) {
+            newLdLibraryPath += ":" + environmentVars.at(LD_LIBRARY_PATH);
+        }
+        environment.emplace_back(LD_LIBRARY_PATH + "=" + newLdLibraryPath);
+    }
+
+    const static std::unordered_set<std::string> blocklist = {
+        // Linux specific
+        LD_LIBRARY_PATH,
+        LD_PRELOAD,          // Preload shared libraries
+        "LD_AUDIT",          // Audit libraries
+        "LD_DEBUG",          // Debugging
+        "LD_PROFILE",        // Profiling
+        "LD_TRACE_LOADED_OBJECTS", // Trace loaded objects
+
+        // macOS specific
+        "DYLD_INSERT_LIBRARIES",       // Preload libraries on macOS
+        "DYLD_FRAMEWORK_PATH",         // Framework search path
+        "DYLD_FALLBACK_FRAMEWORK_PATH", // Fallback framework path
+        "DYLD_FALLBACK_LIBRARY_PATH",   // Fallback library path
+        "DYLD_VERSIONED_FRAMEWORK_PATH", // Versioned framework path
+        "DYLD_VERSIONED_LIBRARY_PATH",   // Versioned library path
+        "DYLD_PRINT_LIBRARIES",         // Print loaded libraries
+        "DYLD_PRINT_TO_FILE",           // Print to file
+
+        // Compiler specific
+        "RUSTC_WRAPPER",     // Rust compiler wrapper
+        "LLVM_SYS_*",        // LLVM system variables
+        "MLIR_SYS_*",        // MLIR system variables
+        "TABLEGEN_*",        // TableGen variables
+    };
+
+    for (const auto& environmentVar : environmentVars) {
+        // Skip blocklisted environment variables
+        if (blocklist.find(environmentVar.first) != blocklist.end()) {
+            continue;
+        }
+        // Also skip variables that match patterns like LLVM_SYS_*, MLIR_SYS_*, TABLEGEN_*
+        if (environmentVar.first.find("LLVM_SYS_") == 0 ||
+            environmentVar.first.find("MLIR_SYS_") == 0 ||
+            environmentVar.first.find("TABLEGEN_") == 0) {
+            continue;
+        }
+        environment.emplace_back(environmentVar.first + "=" + environmentVar.second);
+    }
+    return environment;
+}
+#endif

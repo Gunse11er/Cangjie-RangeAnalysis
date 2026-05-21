@@ -1,0 +1,31 @@
+name: "问题咨询|Question"
+description: "如果您对仓颉社区有疑问，欢迎反馈咨询。  If you have any questions about the community, feel free to provide feedback and inquiries."
+title: "[Question]: "
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢提出问题，我们将安排人答复！| Thanks for raising the question. We will arrange for a response.
+  - type: textarea
+    attributes:
+      label: "问题描述 | Describe the problem that occurred."
+      description: "提供尽可能多的信息描述产生了什么问题：| Provide as much information as possible describing what problem occurred."
+    validations:
+      required: true
+  - type: checkboxes
+    id: version
+    attributes:
+      label: "受影响的分支版本 | Involved Branches"
+      description: "请选择您的问题涉及的分支版本：| Please select the involved branch versions."
+      options:
+        - label: dev
+          required: false
+        - label: main
+          required: false
+        - label: release/1.0
+          required: false
+        - label: release/OpenHarmony-release-6.0
+          required: false
+    validations:
+      required: true

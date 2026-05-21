@@ -1,0 +1,147 @@
+// Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+// This source file is part of the Cangjie project, licensed under Apache-2.0
+// with Runtime Library Exception.
+//
+// See https://cangjie-lang.cn/pages/LICENSE for license information.
+
+/* LSP example
+ */
+
+import systemlib
+import BuiltinLib
+import utilLib
+
+class PageRankList <: Page {
+    public init() {
+        let a = 1
+        print("PageRankList${a}\n");
+    }
+    public init(a:Int32) {
+        print("PageRankList222\n");
+    }
+    public var categoryId = StateString("")
+    public var title = StateString("全站必听");
+    public var id = StateString("M3BQ-DDywPu2eCbko");
+    public var limit = StateInt(40);
+    public var index: Int32 = 0;
+
+    public func setTitle(val: String) {
+        this.title.value = val;
+        this.;
+        }
+    // List item right name
+    public let listItem1RightName = Text(
+        content: "未知艺术家",
+        style: TextStyle(
+            lines: 1,
+            color: Color(51, 51, 51)
+        )
+    )
+    // List item left name
+    public let listItem1LeftName = Text(
+        content: "My favority",
+        style: TextStyle(
+            lines: 1,
+            color: Color(136, 136, 136)
+        )
+    )
+    // List item image src and style
+    public let listItemImage = Image(
+        src: "/Common/Image/ic_play.svg",
+        style: "imgStyle"
+    )
+}
+
+main(): Int64 {
+    var testString2 : String;
+    testString2 = "Hello";
+    if (testString2 != "Hello") {
+        return 1;
+    }
+
+    var value1 : PageRankList = PageRankList();
+    var value2 : PageRankList = PageRankList(123);
+    var value3 : PageRankList = PageRankList(321);
+    // class member variables
+    if (value1.No != 20) {
+        return 2;
+    }
+    if (value1.index != 30) {
+        return 3;
+    }
+    // class member functions
+    value1.setTitle("Quick app Rune language demo");
+
+    var index: Int32 = value1.index;
+    let testarr = {1, 2, 3, 4, 5};
+    for (index in testarr) {
+        index = index + 5;
+    }
+    while index < 20 {
+        print("The value of index is ${index}");
+        index = index + 1;
+    }
+
+    return 0;
+}
+
+open class Color {
+    private var r: UInt8 = 0;
+    private var g: UInt8 = 0;
+    private var b: UInt8 = 0;
+    public init(r: UInt8, g: UInt8, b: UInt8) {
+        this.r = r;
+        this.g = g;
+        this.b = b;
+    }
+}
+
+class StateInt {
+    public var value: Int32;
+
+    public init(value: Int32) {
+        this.value = value;
+    }
+}
+
+class StateString {
+    public var value: String;
+    public init(value: String) {
+        this.value = value;
+    }
+}
+
+class TextStyle {
+    /* Sets the number of text lines. -1 indicates that the number is not limited. */
+    public var lines: Int32 = -1;
+    /* Sets the text color. */
+    public var color: Color = Color(0, 0, 0);
+    public init() {}
+    public init(lines: Int32 = -1, color: Color = Color(0, 0, 0)) {
+        // text Style
+        this.lines = lines;
+        this.color = color;
+    }
+}
+
+class Text {
+    public var content: String;
+    public var style: TextStyle = TextStyle();
+    public init(content: String = "", style: TextStyle = TextStyle()) {
+        this.content = content;
+        this.style = style;
+    }
+}
+
+class Image {
+    public var src: String;
+    public var style: String;
+    public init(src: String, style: String) {
+        this.src = src
+        this.style = style
+    }
+}
+
+open class Page {
+    public var No : Int32;
+}
