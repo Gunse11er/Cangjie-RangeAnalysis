@@ -38,6 +38,7 @@
 
 - 变量与常量比较：用 `SIntDomain::FromNumeric(...)` 生成数值区间约束，再与当前状态求交。
 - 变量与变量比较：在两侧位宽一致时，用 `SIntDomain::FromSymbolic(...)` 记录符号关系，并在左右两侧分别写入正向与反向关系。
+- `UInt64` 等无符号整数比较：在普通区间求交误判为 bottom 时，按 unsigned numeric bound 重新做一次保守交集，避免 `u < C` 这类 true edge 被错误丢弃。
 
 例如 `if (x < 10)`：
 
@@ -69,6 +70,7 @@
 - `src/CHIR/Analysis/ValueRangeAnalysis.cpp`
   - 新增分支条件提取、关系取反、左右关系交换、整数/布尔收窄、MultiBranch 收窄逻辑。
   - 新增布尔 `NOT` 的直接范围计算。
+  - 增强 unsigned integer narrowing：当 `SIntDomain::Intersects` 对 `UInt64` 约束交集给出 bottom 时，使用 unsigned preferred range 重新计算 numeric 交集，保留 `u < C`、`u <= C`、`u > C`、`u >= C` 两侧的正确边约束。
 - `src/CHIR/Optimization/RangePropagation.cpp`
   - 增强比赛 I/O 查询：除 `Debug(value, variableName)` 外，也可以在同一源码行的普通表达式 operand 上，使用已记录的 value-name 映射读取状态。
   - 该增强用于验证 `match` case block 中没有 branch-local `Debug(tag)` 时的 MultiBranch case 收窄结果。
@@ -173,6 +175,64 @@ true
 
 已执行 `diff -u expected_output.txt output.txt`，结果一致。
 
+### 4.5 UInt64 分支收窄增量验证
+
+验证目录：
+
+```text
+/home/gunseller/project/cangjie_compiler/range_analysis_stage2/e2e_uint_branch
+```
+
+源程序核心逻辑：
+
+```cj
+func unsignedBranch(u: UInt64): Int64 {
+    if (u < 10) {
+        let uLtTen: UInt64 = u
+        if (u >= 4) {
+            let uMid: UInt64 = u
+        } else {
+            let uLow: UInt64 = u
+        }
+    } else {
+        let uGeTen: UInt64 = u
+    }
+    if (u <= 15) {
+        let uLeFifteen: UInt64 = u
+    } else {
+        let uGtFifteen: UInt64 = u
+    }
+    if (u > 0) {
+        let uPositive: UInt64 = u
+    } else {
+        let uZero: UInt64 = u
+    }
+    if (u >= 20) {
+        let uAtLeastTwenty: UInt64 = u
+    } else {
+        let uBelowTwenty: UInt64 = u
+    }
+    return 0
+}
+```
+
+生成的 `output.txt`：
+
+```text
+[0, 9:1]
+[4, 9:1]
+[0, 3:1]
+[10, 18446744073709551615:1]
+[0, 15:1]
+[16, 18446744073709551615:1]
+[1, 18446744073709551615:1]
+0
+[20, 18446744073709551615:1]
+[0, 19:1]
+```
+
+已使用临时验证编译器 `build/build/bin/cjc.stage2.uint` 执行 `diff -u expected_output.txt output.txt`，结果一致。该用例覆盖 unsigned true edge、false edge、嵌套交集、零值边界和 `UInt64::MAX` 上界打印。
+
 ## 5. 阶段 2 验收状态
 
 | 验收项 | 状态 | 说明 |
@@ -181,6 +241,7 @@ true
 | 布尔变量分支收窄 | 通过 | `flag` true/false 边输出单值 |
 | `!flag` 条件收窄 | 通过 | true 边输出 `false`，false 边输出 `true` |
 | 变量与常量比较 | 通过 | 使用数值区间求交，输出可见精确区间 |
+| UInt64 分支比较 | 通过 | `u < C` / `u <= C` / `u > C` / `u >= C` 两侧均可按 unsigned 语义收窄 |
 | 变量与变量比较 | 通过 | 已写入符号约束；当前 I/O 对纯符号关系仍以 sound 输出为主 |
 | MultiBranch case 处理 | 通过 | 已支持 CHIR `MULTIBRANCH` case/default 出边约束，并可在 `match` case 1/2 中查询到 `tag = 1` / `tag = 2` |
 | 阶段 1 I/O 闭环兼容 | 通过 | 继续通过 `input.txt` / `output.txt` 验证 |

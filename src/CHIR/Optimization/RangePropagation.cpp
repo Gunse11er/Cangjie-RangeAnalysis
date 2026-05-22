@@ -208,6 +208,19 @@ std::string FormatContestRange(const ValueRange* range, Type* type)
     return FormatFallback(type);
 }
 
+const ValueRange* GetContestRangeForValue(const RangeDomain& state, Value* value)
+{
+    if (value == nullptr) {
+        return nullptr;
+    }
+    if (value->GetType()->IsRef()) {
+        if (auto object = state.CheckAbstractObjectRefBy(value); object != nullptr) {
+            return state.CheckAbstractValue(object);
+        }
+    }
+    return state.CheckAbstractValue(value);
+}
+
 bool IsSameQueryLocation(const ContestQuery& query, const DebugLocation& location)
 {
     return query.fileName == BaseName(location.GetFileName()) && query.line == location.GetBeginPos().line;
@@ -249,8 +262,11 @@ void ResolveQueryAtDebug(
 {
     RememberValueName(valueNames, debug);
     RememberQueryType(queries, debug);
+    if (debug.GetValue()->GetType()->IsRef()) {
+        return;
+    }
     auto type = GetQueryValueType(debug.GetValue());
-    auto range = state.CheckAbstractValue(debug.GetValue());
+    auto range = GetContestRangeForValue(state, debug.GetValue());
     for (auto& query : queries) {
         if (!query.valid || query.resolved || query.variableName != debug.GetSrcCodeIdentifier()) {
             continue;
@@ -276,7 +292,7 @@ void ResolveQueryAtValue(std::vector<ContestQuery>& queries, const ValueNameMap&
         }
         auto type = GetQueryValueType(value);
         query.type = type;
-        query.result = FormatContestRange(state.CheckAbstractValue(value), type);
+        query.result = FormatContestRange(GetContestRangeForValue(state, value), type);
         query.resolved = true;
     }
 }

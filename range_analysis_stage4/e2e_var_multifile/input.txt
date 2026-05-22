@@ -1,0 +1,3 @@
+[helper.cj, 2, local]
+[helper.cj, 5, localSmall]
+[helper.cj, 8, localLarge]

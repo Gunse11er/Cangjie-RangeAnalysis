@@ -1122,13 +1122,29 @@ bool NarrowBoolValue(RangeDomain& state, Value* value, bool expected)
     return true;
 }
 
+SIntDomain IntersectForNarrowing(const SIntDomain& current, const SIntDomain& constraint)
+{
+    auto narrowed = SIntDomain::Intersects(current, constraint);
+    if (!narrowed.IsBottom() || !current.IsUnsigned() || !constraint.IsUnsigned() ||
+        current.Width() != constraint.Width()) {
+        return narrowed;
+    }
+
+    auto unsignedNumeric =
+        current.NumericBound().IntersectWith(constraint.NumericBound(), PreferredRangeType::Unsigned);
+    if (unsignedNumeric.IsEmptySet()) {
+        return SIntDomain::Bottom(current.Width(), current.IsUnsigned());
+    }
+    return SIntDomain{unsignedNumeric, current.IsUnsigned()};
+}
+
 bool NarrowSIntValue(RangeDomain& state, Value* value, const SIntDomain& constraint)
 {
     if (!IsIntegerValue(value)) {
         return true;
     }
     const auto& current = RangeAnalysis::GetSIntDomainFromState(state, value);
-    auto narrowed = SIntDomain::Intersects(current, constraint);
+    auto narrowed = IntersectForNarrowing(current, constraint);
     if (narrowed.IsBottom()) {
         auto type = value->GetType();
         state.Update(value,
@@ -1159,7 +1175,7 @@ bool NarrowLoadedSIntLocation(RangeDomain& state, Value* value, const SIntDomain
         return true;
     }
     const auto& current = GetSIntDomainFromState(state, object, rootType);
-    auto narrowed = SIntDomain::Intersects(current, constraint);
+    auto narrowed = IntersectForNarrowing(current, constraint);
     if (narrowed.IsBottom()) {
         state.Update(object,
             std::make_unique<SIntRange>(SIntDomain::Bottom(ToWidth(*rootType), rootType->IsUnsignedInteger())));
