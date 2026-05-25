@@ -87,6 +87,6 @@ true
 
 ## 后续可优化
 
-- `UInt64` 条件分支如 `if (u < 8)` 当前仍可能保持全域输出；这是 sound 的，但精度不如 `u & 7` 这类表达式内 mask narrowing。后续可以把 unsigned branch narrowing 单独补强。
-- `x | mask` 对 signed 非负区间目前偏保守，可在能证明非负且 mask 不碰符号位时进一步收窄。
+- `UInt64` 条件分支 narrowing 已由 `range_analysis_stage2/e2e_uint_branch` 覆盖；如隐藏用例出现更复杂的 unsigned 变量-变量比较，仍建议保持保守。
+- `x | mask` 对 signed 非负区间已补充保守收窄；复杂 mask 重叠场景仍只输出 `[mask, SMax]`，避免不安全精确化。
 - intrinsic 摘要仍未扩展，建议后续基于真实隐藏用例中出现频率最高的纯函数/内建函数逐个加入白名单。

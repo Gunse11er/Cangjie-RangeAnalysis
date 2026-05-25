@@ -62,11 +62,7 @@ public:
      */
     const std::vector<const Func*>& GetFuncsNeedRemoveBlocks() const;
 
-    /**
-     * @brief Emit contest range query output when input.txt exists in the current working directory.
-     * @param package package to query.
-     * @param rangeAnalysisWrapper cached range analysis results.
-     */
+    // 当当前工作目录存在 input.txt 时输出竞赛值域查询结果。
     static void EmitContestOutput(const Ptr<const Package>& package, RangeAnalysisWrapper& rangeAnalysisWrapper);
 
 private:

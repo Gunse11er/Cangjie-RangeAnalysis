@@ -177,6 +177,8 @@ private:
 
     void HandleBinaryExpr(RangeDomain& state, const BinaryExpression* binaryExpr);
 
+    std::optional<SIntDomain> TryComputeSimpleInductionUpdateRange(const BinaryExpression* binaryExpr) const;
+
     void HandleOthersExpr(RangeDomain& state, const Expression* expression);
 
     // ======================= Transfer functions for terminators ======================= //
@@ -216,6 +218,7 @@ private:
     std::unordered_map<const Block*, uint32_t> inqueueTimes;
 };
 
+    // 构造 RangeAnalysis 在某条终结符后继边上传播的状态。
 RangeDomain GetTerminatorStateForSuccessor(
     const Analysis<RangeDomain>& analysis, const RangeDomain& state, const Terminator* terminator, const Block* successor);
 } // namespace Cangjie::CHIR

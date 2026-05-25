@@ -9,3 +9,7 @@
 [main.cj, 14, xorZero]
 [main.cj, 15, andFalse]
 [main.cj, 16, orTrue]
+[main.cj, 23, signedSmall]
+[main.cj, 24, signedOrMask]
+[main.cj, 26, signedNonNeg]
+[main.cj, 27, signedOrOne]

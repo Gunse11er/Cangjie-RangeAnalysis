@@ -528,6 +528,7 @@ void ToCHIR::RunConstantPropagation()
     DumpCHIRToFile("ConstantPropagation");
 }
 
+// 执行 CHIR RangePropagation，并在值域分析完成后输出竞赛查询结果。
 void ToCHIR::RunRangePropagation()
 {
     if (!opts.IsCHIROptimizationLevelOverO2()) {

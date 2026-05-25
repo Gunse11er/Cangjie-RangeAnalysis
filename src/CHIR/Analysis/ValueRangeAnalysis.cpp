@@ -116,11 +116,13 @@ template <> RangeValueDomain HandleNonNullLiteralValue<RangeValueDomain>(const L
     }
 }
 
+// 初始化 RangeAnalysis，并保存诊断器以便表达式 transfer 报告算术错误。
 RangeAnalysis::RangeAnalysis(const Func* func, CHIRBuilder& builder, bool isDebug, const Ptr<DiagAdapter>& diag)
     : ValueAnalysis(func, builder, isDebug), diag(diag)
 {
 }
 
+// 析构时清理当前分析实例对应的循环快照。
 RangeAnalysis::~RangeAnalysis()
 {
     std::lock_guard<std::mutex> lock(loopRangeSnapshotsMtx);
@@ -158,16 +160,19 @@ const SIntDomain& GetDefaultIntCache(const Ptr<Type>& ty)
     return ty->IsUnsignedInteger() ? unsignedRange[width] : signedRange[width];
 }
 
+// 按指定符号语义比较两个 SInt 是否严格小于。
 bool StrictlyLess(const SInt& lhs, const SInt& rhs, bool isUnsigned)
 {
     return isUnsigned ? lhs.Ult(rhs) : lhs.Slt(rhs);
 }
 
+// 按指定符号语义比较两个 SInt 是否严格大于。
 bool StrictlyGreater(const SInt& lhs, const SInt& rhs, bool isUnsigned)
 {
     return isUnsigned ? lhs.Ugt(rhs) : lhs.Sgt(rhs);
 }
 
+// 对整数区间执行单边 widening，保证循环不动点收敛。
 SIntDomain WidenSIntDomain(const SIntDomain& previous, const SIntDomain& current)
 {
     auto width = current.Width();
@@ -209,6 +214,7 @@ struct LoopWidenCandidate {
     bool preserveDuringBodyWidening;
 };
 
+// 判断后继路径是否可以回到候选循环头。
 bool CanReachBlockForWidening(const Block* start, const Block* target)
 {
     if (start == nullptr || target == nullptr) {
@@ -232,6 +238,7 @@ bool CanReachBlockForWidening(const Block* start, const Block* target)
     return false;
 }
 
+// 识别适合作为 widening 头部的循环分支块。
 bool IsLoopHeaderForWidening(const Block* block)
 {
     if (block == nullptr) {
@@ -248,6 +255,7 @@ bool IsLoopHeaderForWidening(const Block* block)
     return CanReachBlockForWidening(branch->GetFalseBlock(), block);
 }
 
+// 判断表达式类型是否是可用作循环 guard 的关系比较。
 bool IsRelationalExprKindForWidening(ExprKind kind)
 {
     switch (kind) {
@@ -263,6 +271,7 @@ bool IsRelationalExprKindForWidening(ExprKind kind)
     }
 }
 
+// 获取 widening 逻辑使用的局部值定义表达式。
 const Expression* GetDefiningExprForWidening(Value* value)
 {
     auto local = DynamicCast<LocalVar*>(value);
@@ -272,6 +281,7 @@ const Expression* GetDefiningExprForWidening(Value* value)
     return local->GetExpr();
 }
 
+// 判断某个值是否是循环 guard 直接使用的 load。
 bool IsLoopConditionLoadForWidening(Value* value)
 {
     auto expr = GetDefiningExprForWidening(value);
@@ -292,6 +302,7 @@ bool IsLoopConditionLoadForWidening(Value* value)
     return binary->GetLHSOperand() == value || binary->GetRHSOperand() == value;
 }
 
+// 判断循环体 widening 时是否应保留 guard load 的精度。
 bool ShouldPreserveLoopGuardValueDuringBodyWidening(const Block* block, Value* value)
 {
     auto expr = GetDefiningExprForWidening(value);
@@ -301,6 +312,7 @@ bool ShouldPreserveLoopGuardValueDuringBodyWidening(const Block* block, Value* v
     return IsLoopConditionLoadForWidening(value);
 }
 
+// 从状态中读取整数域，缺失时返回类型全域。
 const SIntDomain& GetSIntDomainFromState(const RangeDomain& state, Value* value, Type* type)
 {
     CJC_ASSERT(type != nullptr && type->IsInteger());
@@ -315,6 +327,7 @@ const SIntDomain& GetSIntDomainFromState(const RangeDomain& state, Value* value,
     return StaticCast<const SIntRange*>(absVal)->GetVal();
 }
 
+// 将带类型的整数值加入循环 widening 候选集。
 void AddWidenCandidate(std::vector<LoopWidenCandidate>& candidates, std::unordered_set<Value*>& seen, Value* value,
     Type* type, bool preserveDuringBodyWidening = false)
 {
@@ -325,12 +338,14 @@ void AddWidenCandidate(std::vector<LoopWidenCandidate>& candidates, std::unorder
     candidates.emplace_back(LoopWidenCandidate{value, type, preserveDuringBodyWidening});
 }
 
+// 将整数值按自身类型加入循环 widening 候选集。
 void AddWidenCandidate(std::vector<LoopWidenCandidate>& candidates, std::unordered_set<Value*>& seen, Value* value,
     bool preserveDuringBodyWidening = false)
 {
     AddWidenCandidate(candidates, seen, value, value == nullptr ? nullptr : value->GetType(), preserveDuringBodyWidening);
 }
 
+// 将 ref 背后的整数抽象对象加入 widening 候选集。
 void AddReferencedIntegerObjectCandidate(
     RangeDomain& state, std::vector<LoopWidenCandidate>& candidates, std::unordered_set<Value*>& seen, Value* value)
 {
@@ -344,6 +359,7 @@ void AddReferencedIntegerObjectCandidate(
     AddWidenCandidate(candidates, seen, state.CheckAbstractObjectRefBy(value), refType->GetRootBaseType());
 }
 
+// 收集 block 中可能需要循环 widening 的整数值和 ref 对象。
 std::vector<LoopWidenCandidate> CollectLoopWidenCandidates(RangeDomain& state, const Block* block)
 {
     std::vector<LoopWidenCandidate> candidates;
@@ -372,6 +388,7 @@ std::vector<LoopWidenCandidate> CollectLoopWidenCandidates(RangeDomain& state, c
     return candidates;
 }
 
+// 在 widening 前捕获当前 block 的整数值域快照。
 LoopRangeSnapshot CaptureLoopRangeSnapshot(RangeDomain& state, const Block* block)
 {
     LoopRangeSnapshot snapshot;
@@ -382,6 +399,7 @@ LoopRangeSnapshot CaptureLoopRangeSnapshot(RangeDomain& state, const Block* bloc
     return snapshot;
 }
 
+// 查询上一轮循环快照中的值域，缺失时回退到类型全域。
 const SIntDomain& GetPreviousLoopRange(const LoopRangeSnapshot& previousRanges, Value* value, Type* type)
 {
     auto it = previousRanges.find(value);
@@ -391,6 +409,7 @@ const SIntDomain& GetPreviousLoopRange(const LoopRangeSnapshot& previousRanges, 
     return *it->second;
 }
 
+// 对重复访问的循环 block 应用候选整数值 widening。
 void ApplyLoopWidening(RangeDomain& state, const LoopRangeSnapshot& previousRanges, const Block* block)
 {
     for (auto [value, type, preserveDuringBodyWidening] : CollectLoopWidenCandidates(state, block)) {
@@ -411,21 +430,25 @@ inline bool IsBasicBinaryExpr(const Expression& expr)
     return expr.GetExprKind() >= ExprKind::ADD && expr.GetExprKind() <= ExprKind::MOD;
 }
 
+// 判断是否是整数位运算二元表达式。
 inline bool IsBitwiseBinaryExpr(ExprKind kind)
 {
     return kind == ExprKind::BITAND || kind == ExprKind::BITOR || kind == ExprKind::BITXOR;
 }
 
+// 判断是否是整数移位二元表达式。
 inline bool IsShiftBinaryExpr(ExprKind kind)
 {
     return kind == ExprKind::LSHIFT || kind == ExprKind::RSHIFT;
 }
 
+// 判断是否是布尔逻辑二元表达式。
 inline bool IsLogicalBinaryExpr(ExprKind kind)
 {
     return kind == ExprKind::AND || kind == ExprKind::OR;
 }
 
+// 根据闭区间端点构造 ConstantRange。
 ConstantRange RangeFromMinMax(const SInt& min, const SInt& max, bool isUnsigned)
 {
     auto lower = ConstantRange::From(RelationalOperation::GE, min, !isUnsigned);
@@ -433,6 +456,7 @@ ConstantRange RangeFromMinMax(const SInt& min, const SInt& max, bool isUnsigned)
     return lower.IntersectWith(upper, PreferFromBool(isUnsigned));
 }
 
+// 根据溢出策略计算整数一元负号的值域。
 SIntDomain ComputeNegRange(const SIntDomain& operand, const Ptr<Type>& type, OverflowStrategy ov)
 {
     auto width = ToWidth(*type);
@@ -465,6 +489,7 @@ SIntDomain ComputeNegRange(const SIntDomain& operand, const Ptr<Type>& type, Ove
     return {operand.NumericBound().Negate(), isUnsigned};
 }
 
+// 利用 ~x == -x - 1 计算按位取反值域。
 SIntDomain ComputeBitNotRange(const SIntDomain& operand, bool isUnsigned)
 {
     auto width = operand.Width();
@@ -474,6 +499,7 @@ SIntDomain ComputeBitNotRange(const SIntDomain& operand, bool isUnsigned)
     return {operand.NumericBound().Negate().Subtract(SInt{width, 1u}), isUnsigned};
 }
 
+// 从右操作数值域中提取合法常量移位量。
 std::optional<unsigned> GetShiftAmount(const SIntDomain& range, bool isUnsigned, IntWidth lhsWidth)
 {
     if (!range.IsSingleValue()) {
@@ -490,6 +516,7 @@ std::optional<unsigned> GetShiftAmount(const SIntDomain& range, bool isUnsigned,
     return static_cast<unsigned>(amount);
 }
 
+// 对单点操作数精确计算位运算或移位结果。
 SInt ApplyExactBitwise(ExprKind kind, const SInt& lhs, const SInt& rhs, bool isUnsigned)
 {
     switch (kind) {
@@ -518,6 +545,7 @@ SInt ApplyExactBitwise(ExprKind kind, const SInt& lhs, const SInt& rhs, bool isU
     }
 }
 
+// 尝试为常量移位量的移位表达式计算 sound 区间。
 std::optional<SIntDomain> TryComputeShiftRange(
     ExprKind kind, const SIntDomain& lhs, const SIntDomain& rhs, bool rhsUnsigned, bool destUnsigned)
 {
@@ -578,6 +606,7 @@ std::optional<SIntDomain> TryComputeShiftRange(
         RangeFromMinMax(range.SMinValue().AShr(*amount), range.SMaxValue().AShr(*amount), false), false};
 }
 
+// 利用 mask 规则尝试收窄 x & mask 的值域。
 std::optional<SIntDomain> TryComputeBitAndWithMask(const SIntDomain& value, const SInt& mask, bool destUnsigned)
 {
     auto width = value.Width();
@@ -597,6 +626,7 @@ std::optional<SIntDomain> TryComputeBitAndWithMask(const SIntDomain& value, cons
     return std::nullopt;
 }
 
+// 利用 mask 规则尝试收窄 x | mask 的值域。
 std::optional<SIntDomain> TryComputeBitOrWithMask(const SIntDomain& value, const SInt& mask, bool destUnsigned)
 {
     auto width = value.Width();
@@ -618,9 +648,21 @@ std::optional<SIntDomain> TryComputeBitOrWithMask(const SIntDomain& value, const
     if (mask.IsSignBitSet()) {
         return SIntDomain{RangeFromMinMax(mask, SInt::AllOnes(width), false), false};
     }
+    // 对已知非负的有符号值，保守推导 x | mask 的非负结果区间。
+    if (!range.IsSignWrappedSet() && range.SMinValue().Sge(0)) {
+        if ((range.SMaxValue().UVal() & mask.UVal()) == 0U) {
+            auto min = range.SMinValue();
+            min |= mask;
+            auto max = range.SMaxValue();
+            max |= mask;
+            return SIntDomain{RangeFromMinMax(min, max, false), false};
+        }
+        return SIntDomain{RangeFromMinMax(mask, SInt::SMaxValue(width), false), false};
+    }
     return std::nullopt;
 }
 
+// 尝试为位运算和移位表达式计算保守整数区间。
 std::optional<SIntDomain> TryComputeBitwiseRange(ExprKind kind, const SIntDomain& lhs, const SIntDomain& rhs,
     Value* lhsValue, Value* rhsValue, bool rhsUnsigned, bool destUnsigned)
 {
@@ -697,6 +739,7 @@ BoolDomain RangeAnalysis::GetBoolDomainFromState(const RangeDomain& state, const
     return StaticCast<const BoolRange*>(absVal)->GetVal();
 }
 
+// 从分析状态读取整数值域，未知时返回该类型的完整默认区间。
 const SIntDomain& RangeAnalysis::GetSIntDomainFromState(const RangeDomain& state, const Ptr<Value>& value)
 {
     CJC_ASSERT(value->GetType()->IsInteger());
@@ -711,6 +754,7 @@ const SIntDomain& RangeAnalysis::GetSIntDomainFromState(const RangeDomain& state
     return StaticCast<const SIntRange*>(absVal)->GetVal();
 }
 
+// 根据普通表达式类别分派对应 transfer，并在调试模式下打印可见值域。
 void RangeAnalysis::HandleNormalExpressionEffect(RangeDomain& state, const Expression* expression)
 {
     switch (expression->GetExprMajorKind()) {
@@ -754,6 +798,7 @@ void RangeAnalysis::HandleNormalExpressionEffect(RangeDomain& state, const Expre
     }
 }
 
+// 由二元比较或布尔等值表达式生成 BoolDomain 结果。
 BoolDomain RangeAnalysis::GenerateBoolRangeFromBinaryOp(
     RangeDomain& state, const Ptr<const BinaryExpression>& binaryExpr) const
 {
@@ -770,6 +815,7 @@ BoolDomain RangeAnalysis::GenerateBoolRangeFromBinaryOp(
     return ComputeEqualityBoolBinop(lRange, rRange, binaryExpr->GetExprKind());
 }
 
+// 统计 block 入队次数，并在硬上限前应用循环 widening 快照。
 bool RangeAnalysis::CheckInQueueTimes(const Block* block, RangeDomain& curState)
 {
     if (inqueueTimes.count(block) == 0) {
@@ -796,6 +842,7 @@ bool RangeAnalysis::CheckInQueueTimes(const Block* block, RangeDomain& curState)
     return false;
 }
 
+// 处理一元布尔和整数表达式的值域转移。
 void RangeAnalysis::HandleUnaryExpr(RangeDomain& state, const UnaryExpression* unaryExpr) const
 {
     auto dest = unaryExpr->GetResult();
@@ -878,6 +925,7 @@ bool CheckDivZero(ExprKind exprKind, const Ptr<const BinaryExpression>& binary, 
     return false;
 }
 
+// 对单点算术表达式执行精确计算，并处理除零和 throwing 溢出诊断。
 SIntDomain CheckSingleValueOverflow(
     const CHIRArithmeticBinopArgs& args, const Ptr<const BinaryExpression>& expr, ExprKind exprKind, DiagAdapter& diag)
 {
@@ -911,6 +959,7 @@ SIntDomain CheckSingleValueOverflow(
     }
 }
 
+// 处理算术、位运算、移位、关系和布尔二元表达式的值域转移。
 void RangeAnalysis::HandleBinaryExpr(RangeDomain& state, const BinaryExpression* binaryExpr)
 {
     auto dest = binaryExpr->GetResult();
@@ -923,6 +972,10 @@ void RangeAnalysis::HandleBinaryExpr(RangeDomain& state, const BinaryExpression*
         auto kind = binaryExpr->GetExprKind();
         if (!IsBasicBinaryExpr(*binaryExpr) && !IsBitwiseBinaryExpr(kind) && !IsShiftBinaryExpr(kind)) {
             return state.SetToBound(binaryExpr->GetResult(), true);
+        }
+        if (auto inductionRange = TryComputeSimpleInductionUpdateRange(binaryExpr);
+            inductionRange.has_value() && inductionRange->IsNonTrivial()) {
+            return state.Update(dest, std::make_unique<SIntRange>(std::move(inductionRange.value())));
         }
         const auto& lRange = GetSIntDomainFromState(state, lhs);
         const auto& rRange = GetSIntDomainFromState(state, rhs);
@@ -960,6 +1013,7 @@ void RangeAnalysis::HandleBinaryExpr(RangeDomain& state, const BinaryExpression*
     state.SetToBound(binaryExpr->GetResult(), true);
 }
 
+// 计算整数 typecast 后的值域，并在安全时保留非负符号约束。
 SIntDomain RangeAnalysis::ComputeTypeCast(RangeDomain& state, PtrSymbol oldSymbol, const SIntDomain& v,
     IntWidth dstSize, bool dstUnsigned, OverflowStrategy ov) const
 {
@@ -988,6 +1042,7 @@ SIntDomain RangeAnalysis::ComputeTypeCast(RangeDomain& state, PtrSymbol oldSymbo
     return SIntDomain{numericRange, std::move(mp), v.IsUnsigned()};
 }
 
+// 处理 typecast 等其它表达式，并对未知结果设置保守 Top 或 TopRef。
 void RangeAnalysis::HandleOthersExpr(RangeDomain& state, const Expression* expression)
 {
     switch (expression->GetExprKind()) {
@@ -1008,6 +1063,7 @@ void RangeAnalysis::HandleOthersExpr(RangeDomain& state, const Expression* expre
 }
 
 namespace {
+// 判断是否是能产生分支约束的比较表达式。
 bool IsRelationalExprKind(ExprKind kind)
 {
     switch (kind) {
@@ -1023,6 +1079,7 @@ bool IsRelationalExprKind(ExprKind kind)
     }
 }
 
+// 将 CHIR 比较表达式类型转换为值域关系枚举。
 RelationalOperation ToRelationalOperation(ExprKind kind)
 {
     switch (kind) {
@@ -1044,6 +1101,7 @@ RelationalOperation ToRelationalOperation(ExprKind kind)
     }
 }
 
+// 获取关系的逻辑取反形式，用于 false 边。
 RelationalOperation NegateRelation(RelationalOperation rel)
 {
     switch (rel) {
@@ -1062,6 +1120,7 @@ RelationalOperation NegateRelation(RelationalOperation rel)
     }
 }
 
+// 交换左右操作数时同步转换关系方向。
 RelationalOperation SwapRelation(RelationalOperation rel)
 {
     switch (rel) {
@@ -1085,6 +1144,7 @@ bool NarrowSIntByRelationToConstant(RangeDomain& state, Value* value, Relational
 std::optional<int64_t> GetUpdateStepFromLocation(Value* value, Value* location);
 bool ApplyConditionConstraint(RangeDomain& state, Value* condition, bool branchCondition);
 
+// 获取局部 SSA 值的定义表达式。
 const Expression* GetDefiningExpr(Value* value)
 {
     if (value == nullptr || !value->IsLocalVar()) {
@@ -1093,21 +1153,25 @@ const Expression* GetDefiningExpr(Value* value)
     return StaticCast<LocalVar*>(value)->GetExpr();
 }
 
+// 判断值是否可被 RangeDomain 状态跟踪。
 bool IsStateTrackedValue(Value* value)
 {
     return value != nullptr && (value->IsLocalVar() || value->IsParameter());
 }
 
+// 判断值是否是可跟踪的整数值。
 bool IsIntegerValue(Value* value)
 {
     return IsStateTrackedValue(value) && value->GetType()->IsInteger();
 }
 
+// 判断值是否是可跟踪的布尔值。
 bool IsBooleanValue(Value* value)
 {
     return IsStateTrackedValue(value) && value->GetType()->IsBoolean();
 }
 
+// 将布尔值收窄到分支期望的真假值。
 bool NarrowBoolValue(RangeDomain& state, Value* value, bool expected)
 {
     if (!IsBooleanValue(value)) {
@@ -1122,6 +1186,7 @@ bool NarrowBoolValue(RangeDomain& state, Value* value, bool expected)
     return true;
 }
 
+// 对两个整数域求交，必要时用 unsigned 语义重试。
 SIntDomain IntersectForNarrowing(const SIntDomain& current, const SIntDomain& constraint)
 {
     auto narrowed = SIntDomain::Intersects(current, constraint);
@@ -1138,6 +1203,7 @@ SIntDomain IntersectForNarrowing(const SIntDomain& current, const SIntDomain& co
     return SIntDomain{unsignedNumeric, current.IsUnsigned()};
 }
 
+// 将可跟踪整数值与约束域求交以完成收窄。
 bool NarrowSIntValue(RangeDomain& state, Value* value, const SIntDomain& constraint)
 {
     if (!IsIntegerValue(value)) {
@@ -1155,6 +1221,7 @@ bool NarrowSIntValue(RangeDomain& state, Value* value, const SIntDomain& constra
     return true;
 }
 
+// 将 load 的收窄结果反向传播到其引用的整数对象。
 bool NarrowLoadedSIntLocation(RangeDomain& state, Value* value, const SIntDomain& constraint)
 {
     auto expr = GetDefiningExpr(value);
@@ -1185,6 +1252,7 @@ bool NarrowLoadedSIntLocation(RangeDomain& state, Value* value, const SIntDomain
     return true;
 }
 
+// 按照与常量的关系收窄整数值。
 bool NarrowSIntByRelationToConstant(RangeDomain& state, Value* value, RelationalOperation rel, const SInt& constant)
 {
     auto type = value->GetType();
@@ -1198,6 +1266,7 @@ bool NarrowSIntByRelationToConstant(RangeDomain& state, Value* value, Relational
     return true;
 }
 
+// 从定义常量中读取单点整数值。
 std::optional<SInt> GetSingleIntFromDefiningConstant(Value* value)
 {
     auto expr = GetDefiningExpr(value);
@@ -1215,6 +1284,7 @@ std::optional<SInt> GetSingleIntFromDefiningConstant(Value* value)
     return domain.NumericBound().GetSingleElement();
 }
 
+// 从定义常量中读取单点布尔值。
 std::optional<bool> GetSingleBoolFromDefiningConstant(Value* value)
 {
     auto expr = GetDefiningExpr(value);
@@ -1228,6 +1298,7 @@ std::optional<bool> GetSingleBoolFromDefiningConstant(Value* value)
     return StaticCast<BoolLiteral*>(literal)->GetVal();
 }
 
+// 优先从状态读取单点布尔值，失败时回退到定义常量。
 std::optional<bool> GetSingleBoolFromStateOrConstant(const RangeDomain& state, Value* value)
 {
     auto domain = RangeAnalysis::GetBoolDomainFromState(state, value);
@@ -1237,6 +1308,7 @@ std::optional<bool> GetSingleBoolFromStateOrConstant(const RangeDomain& state, V
     return GetSingleBoolFromDefiningConstant(value);
 }
 
+// 判断某个值是否是从指定 ref 位置 load 出来的。
 bool IsLoadFromLocation(Value* value, Value* location)
 {
     auto expr = GetDefiningExpr(value);
@@ -1244,6 +1316,7 @@ bool IsLoadFromLocation(Value* value, Value* location)
         StaticCast<const Load*>(expr)->GetLocation() == location;
 }
 
+// 读取可用于单调更新判断的非负整数常量。
 std::optional<SInt> GetNonNegativeDefiningConstant(Value* value)
 {
     auto constant = GetSingleIntFromDefiningConstant(value);
@@ -1256,6 +1329,7 @@ std::optional<SInt> GetNonNegativeDefiningConstant(Value* value)
     return std::nullopt;
 }
 
+// 判断存储值是否来自同一位置加非负常量。
 bool IsNonDecreasingValueFromLocation(Value* value, Value* location)
 {
     if (IsLoadFromLocation(value, location)) {
@@ -1272,12 +1346,63 @@ bool IsNonDecreasingValueFromLocation(Value* value, Value* location)
         (IsLoadFromLocation(rhs, location) && GetNonNegativeDefiningConstant(lhs).has_value());
 }
 
+// 判断前驱是否能回到 header，从而构成回边。
+// 在不穿过 header 的前提下检查可达性，用于区分内层循环 preheader 和真正回边。
+bool CanReachBlockAvoidingHeader(
+    const Block* start, const Block* target, const Block* header, std::unordered_set<const Block*>& visited)
+{
+    if (start == nullptr || target == nullptr || start == header || !visited.emplace(start).second) {
+        return false;
+    }
+    if (start == target) {
+        return true;
+    }
+    for (auto successor : start->GetSuccessors()) {
+        if (CanReachBlockAvoidingHeader(successor, target, header, visited)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// 判断 header 的某个后继是否是能回到 header 的循环体入口。
+bool IsLoopBodySuccessor(const Branch* branch, const Block* successor)
+{
+    auto header = branch == nullptr ? nullptr : branch->GetParentBlock();
+    if (branch != nullptr &&
+        (branch->GetSourceExpr() == SourceExpr::WHILE_EXPR || branch->GetSourceExpr() == SourceExpr::DO_WHILE_EXPR)) {
+        return successor == branch->GetTrueBlock();
+    }
+    std::unordered_set<const Block*> visited;
+    return CanReachBlock(successor, header, visited);
+}
+
 bool IsBackedgePredecessor(const Block* header, const Block* pred)
 {
+    auto terminator = header == nullptr ? nullptr : header->GetTerminator();
+    if (terminator != nullptr && terminator->GetExprKind() == ExprKind::BRANCH) {
+        auto branch = StaticCast<const Branch*>(terminator);
+        bool hasLoopBodySuccessor = false;
+        std::vector<const Block*> successors{branch->GetTrueBlock(), branch->GetFalseBlock()};
+        for (auto successor : successors) {
+            if (!IsLoopBodySuccessor(branch, successor)) {
+                continue;
+            }
+            hasLoopBodySuccessor = true;
+            std::unordered_set<const Block*> visited;
+            if (CanReachBlockAvoidingHeader(successor, pred, header, visited)) {
+                return true;
+            }
+        }
+        if (hasLoopBodySuccessor) {
+            return false;
+        }
+    }
     std::unordered_set<const Block*> visited;
     return CanReachBlock(header, pred, visited);
 }
 
+// 检查所有回边 store 是否都是非递减更新。
 bool HasNonDecreasingBackedgeStore(const Block* header, Value* location)
 {
     bool hasBackedge = false;
@@ -1299,6 +1424,7 @@ bool HasNonDecreasingBackedgeStore(const Block* header, Value* location)
     return hasBackedge;
 }
 
+// 查找循环入口边对循环携带位置写入的唯一常量。
 std::optional<SInt> FindIncomingStoreConstant(const Block* header, Value* location)
 {
     if (!HasNonDecreasingBackedgeStore(header, location)) {
@@ -1332,6 +1458,7 @@ std::optional<SInt> FindIncomingStoreConstant(const Block* header, Value* locati
     return incoming;
 }
 
+// 将循环入口常量恢复为递增归纳 load 的下界。
 bool RestoreLoopIncomingLowerBound(RangeDomain& state, Value* value)
 {
     auto expr = GetDefiningExpr(value);
@@ -1347,16 +1474,19 @@ bool RestoreLoopIncomingLowerBound(RangeDomain& state, Value* value)
     return NarrowSIntByRelationToConstant(state, value, RelationalOperation::GE, incoming.value());
 }
 
+// 判断关系是否为左操作数提供上界。
 bool HasUpperBoundRelation(RelationalOperation rel)
 {
     return rel == RelationalOperation::LT || rel == RelationalOperation::LE || rel == RelationalOperation::EQ;
 }
 
+// 判断关系是否为左操作数提供下界。
 bool HasLowerBoundRelation(RelationalOperation rel)
 {
     return rel == RelationalOperation::GT || rel == RelationalOperation::GE || rel == RelationalOperation::EQ;
 }
 
+// 从定义常量中读取有符号整数值。
 std::optional<int64_t> GetSignedConstantFromDefiningConstant(Value* value)
 {
     if (value == nullptr || !value->GetType()->IsInteger() || value->GetType()->IsUnsignedInteger()) {
@@ -1369,6 +1499,7 @@ std::optional<int64_t> GetSignedConstantFromDefiningConstant(Value* value)
     return constant->SVal();
 }
 
+// 如果值是 load 表达式，返回其 ref 位置。
 Value* GetLoadLocation(Value* value)
 {
     auto expr = GetDefiningExpr(value);
@@ -1378,6 +1509,7 @@ Value* GetLoadLocation(Value* value)
     return StaticCast<const Load*>(expr)->GetLocation();
 }
 
+// 对有符号 step 取负，并排除 int64 最小值溢出。
 std::optional<int64_t> NegateSignedStep(int64_t step)
 {
     if (step == std::numeric_limits<int64_t>::min()) {
@@ -1386,6 +1518,7 @@ std::optional<int64_t> NegateSignedStep(int64_t step)
     return -step;
 }
 
+// 提取循环携带位置更新时使用的常量步长。
 std::optional<int64_t> GetUpdateStepFromLocation(Value* value, Value* location)
 {
     auto expr = GetDefiningExpr(value);
@@ -1421,6 +1554,7 @@ std::optional<int64_t> GetUpdateStepFromLocation(Value* value, Value* location)
     return NegateSignedStep(rhsStep.value());
 }
 
+// 查找循环回边上唯一的常量更新步长。
 std::optional<int64_t> FindSingleBackedgeStep(const Block* header, Value* location)
 {
     std::optional<int64_t> step;
@@ -1461,6 +1595,7 @@ std::optional<int64_t> FindSingleBackedgeStep(const Block* header, Value* locati
     return step;
 }
 
+// 查找循环入口边写入的唯一有符号常量。
 std::optional<int64_t> FindIncomingSignedStoreConstant(const Block* header, Value* location)
 {
     std::optional<int64_t> incoming;
@@ -1497,6 +1632,7 @@ std::optional<int64_t> FindIncomingSignedStoreConstant(const Block* header, Valu
     return incoming;
 }
 
+// 将循环入口常量恢复为递减归纳 load 的上界。
 bool RestoreLoopIncomingUpperBound(RangeDomain& state, Value* value)
 {
     auto location = GetLoadLocation(value);
@@ -1521,6 +1657,7 @@ struct SimpleInductionCondition {
     int64_t bound;
 };
 
+// 识别 load(location) 与有符号常量比较形成的循环 guard。
 std::optional<SimpleInductionCondition> GetSimpleInductionCondition(Value* condition)
 {
     auto expr = GetDefiningExpr(condition);
@@ -1553,6 +1690,7 @@ std::optional<SimpleInductionCondition> GetSimpleInductionCondition(Value* condi
     return std::nullopt;
 }
 
+// 返回指定 CHIR 整数宽度下的有符号最小值和最大值。
 std::pair<int64_t, int64_t> SignedLimits(IntWidth width)
 {
     if (width == IntWidth::I64) {
@@ -1564,18 +1702,21 @@ std::pair<int64_t, int64_t> SignedLimits(IntWidth width)
     return {min, max};
 }
 
+// 判断扩展精度计算结果是否仍适配目标有符号宽度。
 bool FitsSignedWidth(__int128 value, IntWidth width)
 {
     auto [min, max] = SignedLimits(width);
     return value >= static_cast<__int128>(min) && value <= static_cast<__int128>(max);
 }
 
+// 计算正数归纳变量推导中使用的向上整除。
 __int128 CeilDivPositive(__int128 numerator, __int128 denominator)
 {
     CJC_ASSERT(numerator > 0 && denominator > 0);
     return (numerator + denominator - 1) / denominator;
 }
 
+// 计算可证明常量步长归纳变量的精确循环退出值。
 std::optional<SInt> ComputeExactInductionExit(
     int64_t init, int64_t step, RelationalOperation relation, int64_t bound, IntWidth width)
 {
@@ -1622,8 +1763,13 @@ std::optional<SInt> ComputeExactInductionExit(
     return SInt{width, static_cast<uint64_t>(static_cast<int64_t>(exact))};
 }
 
+// 判断分支后继是否会离开该分支块所在循环。
 bool IsLoopExitSuccessor(const Branch* branch, const Block* successor)
 {
+    if (branch != nullptr &&
+        (branch->GetSourceExpr() == SourceExpr::WHILE_EXPR || branch->GetSourceExpr() == SourceExpr::DO_WHILE_EXPR)) {
+        return successor == branch->GetFalseBlock();
+    }
     if (!IsLoopBranch(branch)) {
         return false;
     }
@@ -1631,6 +1777,7 @@ bool IsLoopExitSuccessor(const Branch* branch, const Block* successor)
     return !CanReachBlock(successor, branch->GetParentBlock(), visited);
 }
 
+// 在识别出简单归纳模式时将循环退出状态收窄为精确值。
 bool TryNarrowSimpleInductionExit(RangeDomain& state, const Branch* branch, const Block* successor)
 {
     if (!IsLoopExitSuccessor(branch, successor)) {
@@ -1663,6 +1810,7 @@ bool TryNarrowSimpleInductionExit(RangeDomain& state, const Branch* branch, cons
     return true;
 }
 
+// 获取同宽整数 typecast 的源值，用于回推 case 约束。
 Value* GetSameWidthTypeCastSource(Value* value)
 {
     auto expr = GetDefiningExpr(value);
@@ -1676,6 +1824,7 @@ Value* GetSameWidthTypeCastSource(Value* value)
     return source;
 }
 
+// 使用单个 case 常量收窄 MultiBranch 目标值。
 bool NarrowMultiBranchTarget(RangeDomain& state, Value* value, RelationalOperation rel, uint64_t caseVal)
 {
     if (!IsIntegerValue(value)) {
@@ -1686,6 +1835,7 @@ bool NarrowMultiBranchTarget(RangeDomain& state, Value* value, RelationalOperati
         state, value, SIntDomain::FromNumeric(rel, SInt{width, caseVal}, value->GetType()->IsUnsignedInteger()));
 }
 
+// 收窄 MultiBranch 条件，并在存在同宽 typecast 时回推源值。
 bool NarrowMultiBranchCondition(RangeDomain& state, Value* cond, RelationalOperation rel, uint64_t caseVal)
 {
     if (!NarrowMultiBranchTarget(state, cond, rel, caseVal)) {
@@ -1698,6 +1848,7 @@ bool NarrowMultiBranchCondition(RangeDomain& state, Value* cond, RelationalOpera
     return true;
 }
 
+// 将整数比较约束应用到分支边状态。
 bool ApplyIntComparisonConstraint(
     RangeDomain& state, Value* lhs, Value* rhs, RelationalOperation rel, bool branchCondition)
 {
@@ -1754,6 +1905,7 @@ bool ApplyIntComparisonConstraint(
     return true;
 }
 
+// 将布尔相等或不等约束应用到分支边状态。
 bool ApplyBoolEqualityConstraint(RangeDomain& state, Value* lhs, Value* rhs, RelationalOperation rel, bool branchCondition)
 {
     if (!IsBooleanValue(lhs) || !IsBooleanValue(rhs)) {
@@ -1783,6 +1935,7 @@ bool ApplyBoolEqualityConstraint(RangeDomain& state, Value* lhs, Value* rhs, Rel
     return true;
 }
 
+// 处理 && 和 || 条件中的布尔恒等式与短路约束。
 bool ApplyLogicalBoolConstraint(
     RangeDomain& state, const BinaryExpression* binary, ExprKind kind, bool branchCondition)
 {
@@ -1833,6 +1986,7 @@ bool ApplyLogicalBoolConstraint(
     return true;
 }
 
+// 在一个 block 中查找最后一次写入 ref 位置的布尔常量。
 std::optional<bool> FindStoredBoolConstant(const Block* block, Value* location)
 {
     auto exprs = block->GetExpressions();
@@ -1854,6 +2008,7 @@ struct ShortCircuitBoolAlias {
     bool inverted;
 };
 
+// 从 lowered 短路布尔临时 load 中恢复原始 flag。
 std::optional<ShortCircuitBoolAlias> GetShortCircuitBoolAlias(Value* condition)
 {
     auto expr = GetDefiningExpr(condition);
@@ -1904,6 +2059,7 @@ std::optional<ShortCircuitBoolAlias> GetShortCircuitBoolAlias(Value* condition)
     return ShortCircuitBoolAlias{source, !trueValue.value() && falseValue.value()};
 }
 
+// 将所有支持的分支条件约束应用到出边状态。
 bool ApplyConditionConstraint(RangeDomain& state, Value* condition, bool branchCondition)
 {
     auto expr = GetDefiningExpr(condition);
@@ -1954,6 +2110,7 @@ bool ApplyConditionConstraint(RangeDomain& state, Value* condition, bool branchC
     return true;
 }
 
+// 对 MultiBranch 的 case/default 后继应用对应约束。
 bool ApplyMultiBranchConstraint(RangeDomain& state, const MultiBranch* multi, const Block* successor)
 {
     auto cond = multi->GetCondition();
@@ -1994,6 +2151,7 @@ bool ApplyMultiBranchConstraint(RangeDomain& state, const MultiBranch* multi, co
     return true;
 }
 
+// 带 visited 集合检查 CFG 可达性，用于循环检测。
 bool CanReachBlock(const Block* start, const Block* target, std::unordered_set<const Block*>& visited)
 {
     if (start == nullptr || target == nullptr || !visited.emplace(start).second) {
@@ -2010,6 +2168,7 @@ bool CanReachBlock(const Block* start, const Block* target, std::unordered_set<c
     return false;
 }
 
+// 判断分支是否有后继路径回到自身 block。
 bool IsLoopBranch(const Branch* branch)
 {
     auto parent = branch->GetParentBlock();
@@ -2022,6 +2181,93 @@ bool IsLoopBranch(const Branch* branch)
 }
 } // namespace
 
+// 识别简单归纳变量的 i +/- const 更新，并直接推导更新表达式结果范围。
+std::optional<SIntDomain> RangeAnalysis::TryComputeSimpleInductionUpdateRange(
+    const BinaryExpression* binaryExpr) const
+{
+    auto dest = binaryExpr->GetResult();
+    if (!dest->GetType()->IsInteger() || dest->GetType()->IsUnsignedInteger()) {
+        return std::nullopt;
+    }
+
+    auto lhs = binaryExpr->GetLHSOperand();
+    auto rhs = binaryExpr->GetRHSOperand();
+    Value* loadValue = nullptr;
+    Value* location = nullptr;
+    std::optional<int64_t> updateStep;
+    switch (binaryExpr->GetExprKind()) {
+        case ExprKind::ADD:
+            if ((location = GetLoadLocation(lhs)) != nullptr) {
+                loadValue = lhs;
+                updateStep = GetSignedConstantFromDefiningConstant(rhs);
+            } else if ((location = GetLoadLocation(rhs)) != nullptr) {
+                loadValue = rhs;
+                updateStep = GetSignedConstantFromDefiningConstant(lhs);
+            }
+            break;
+        case ExprKind::SUB:
+            location = GetLoadLocation(lhs);
+            if (location != nullptr) {
+                loadValue = lhs;
+                auto rhsStep = GetSignedConstantFromDefiningConstant(rhs);
+                updateStep = rhsStep.has_value() ? NegateSignedStep(rhsStep.value()) : std::nullopt;
+            }
+            break;
+        default:
+            break;
+    }
+    if (location == nullptr || loadValue == nullptr || !updateStep.has_value() || updateStep.value() == 0) {
+        return std::nullopt;
+    }
+
+    auto loadExpr = GetDefiningExpr(loadValue);
+    if (loadExpr == nullptr || loadExpr->GetExprKind() != ExprKind::LOAD) {
+        return std::nullopt;
+    }
+    auto header = loadExpr->GetParentBlock();
+    auto terminator = header == nullptr ? nullptr : header->GetTerminator();
+    if (terminator == nullptr || terminator->GetExprKind() != ExprKind::BRANCH) {
+        return std::nullopt;
+    }
+    auto branch = StaticCast<const Branch*>(terminator);
+    if (branch->GetSourceExpr() != SourceExpr::WHILE_EXPR && branch->GetSourceExpr() != SourceExpr::DO_WHILE_EXPR) {
+        return std::nullopt;
+    }
+
+    auto condition = GetSimpleInductionCondition(branch->GetCondition());
+    if (!condition.has_value() || condition->location != location) {
+        return std::nullopt;
+    }
+    auto loopStep = FindSingleBackedgeStep(header, location);
+    auto init = FindIncomingSignedStoreConstant(header, location);
+    if (!loopStep.has_value() || !init.has_value() || loopStep.value() != updateStep.value()) {
+        return std::nullopt;
+    }
+
+    auto width = ToWidth(*dest->GetType());
+    auto exactExit =
+        ComputeExactInductionExit(init.value(), loopStep.value(), condition->relation, condition->bound, width);
+    if (!exactExit.has_value()) {
+        return std::nullopt;
+    }
+    __int128 firstUpdate = static_cast<__int128>(init.value()) + static_cast<__int128>(updateStep.value());
+    if (!FitsSignedWidth(firstUpdate, width)) {
+        return std::nullopt;
+    }
+    __int128 lastUpdate = static_cast<__int128>(exactExit->SVal());
+    __int128 lower = firstUpdate < lastUpdate ? firstUpdate : lastUpdate;
+    __int128 upper = firstUpdate < lastUpdate ? lastUpdate : firstUpdate;
+    if (!FitsSignedWidth(lower, width) || !FitsSignedWidth(upper, width)) {
+        return std::nullopt;
+    }
+
+    auto lowerValue = SInt{width, static_cast<uint64_t>(static_cast<int64_t>(lower))};
+    auto upperValue = SInt{width, static_cast<uint64_t>(static_cast<int64_t>(upper))};
+    return SIntDomain::Intersects(SIntDomain::FromNumeric(RelationalOperation::GE, lowerValue, false),
+        SIntDomain::FromNumeric(RelationalOperation::LE, upperValue, false));
+}
+
+// 处理终结符转移效果，并折叠可证明确定的终结符。
 std::optional<Block*> RangeAnalysis::HandleTerminatorEffect(RangeDomain& state, const Terminator* terminator)
 {
     RangeAnalysis::ExceptionKind res = ExceptionKind::NA;
@@ -2055,6 +2301,7 @@ std::optional<Block*> RangeAnalysis::HandleTerminatorEffect(RangeDomain& state, 
     return std::nullopt;
 }
 
+// 为分支和 MultiBranch 后继构造边专属 RangeDomain 状态。
 RangeDomain GetTerminatorStateForSuccessor(
     const Analysis<RangeDomain>& analysis, const RangeDomain& state, const Terminator* terminator, const Block* successor)
 {
@@ -2097,6 +2344,7 @@ void RangeAnalysis::PrintBranchOptMessage(const Ptr<const Expression>& expr, boo
     std::cout << message;
 }
 
+// 仅在条件为单点且不是循环 guard 时选择分支后继。
 std::optional<Block*> RangeAnalysis::HandleBranchTerminator(const RangeDomain& state, const Branch* branch) const
 {
     if (IsLoopBranch(branch)) {
@@ -2113,6 +2361,7 @@ std::optional<Block*> RangeAnalysis::HandleBranchTerminator(const RangeDomain& s
     return condVal.IsTrue() ? branch->GetTrueBlock() : branch->GetFalseBlock();
 }
 
+// 在条件为单点 case 值时选择 MultiBranch 后继。
 std::optional<Block*> RangeAnalysis::HandleMultiBranchTerminator(
     const RangeDomain& state, const MultiBranch* multi) const
 {

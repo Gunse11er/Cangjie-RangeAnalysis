@@ -17,6 +17,7 @@
 
 namespace Cangjie::CHIR {
 
+// 返回终结符某条后继边上的专属状态；默认分析保持原状态不变。
 template <typename Domain>
 Domain GetTerminatorStateForSuccessor(
     const Analysis<Domain>& analysis, const Domain& state, const Terminator* terminator, const Block* successor)
@@ -95,6 +96,7 @@ public:
      * @brief do one iterator to analyse.
      * @return analysis results.
      */
+    // 执行 worklist 不动点迭代，并在传播后继时应用边专属状态。
     std::unique_ptr<Results<Domain>> IterateToFixpoint()
     {
         if (!func->GetBody() || DoesExceedBlockLimit()) {

@@ -16,6 +16,7 @@
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 namespace Cangjie::CHIR {
 
@@ -23,18 +24,35 @@ namespace {
 const std::string CONTEST_INPUT_FILE = "input.txt";
 const std::string CONTEST_OUTPUT_FILE = "output.txt";
 
+enum class ContestQueryTypeHint {
+    UNKNOWN,
+    BOOL,
+    INT8,
+    INT16,
+    INT32,
+    INT64,
+    UINT8,
+    UINT16,
+    UINT32,
+    UINT64,
+};
+
 struct ContestQuery {
     std::string fileName;
     unsigned line{0};
     std::string variableName;
     std::string result;
     Type* type{nullptr};
+    ContestQueryTypeHint typeHint{ContestQueryTypeHint::UNKNOWN};
+    std::string sourceFallback;
     bool valid{true};
     bool resolved{false};
+    bool hasSourceFallback{false};
 };
 
 using ValueNameMap = std::unordered_map<Value*, std::vector<std::string>>;
 
+// 去除竞赛输入字段首尾空白。
 std::string Trim(const std::string& str)
 {
     auto begin = std::find_if_not(str.begin(), str.end(), [](unsigned char c) { return std::isspace(c); });
@@ -45,12 +63,14 @@ std::string Trim(const std::string& str)
     return std::string(begin, end);
 }
 
+// 提取文件名 basename，用于匹配 DebugLocation。
 std::string BaseName(const std::string& path)
 {
     auto pos = path.find_last_of("/\\");
     return pos == std::string::npos ? path : path.substr(pos + 1);
 }
 
+// 按逗号切分查询字段并清理每个字段。
 std::vector<std::string> SplitCommaSeparated(const std::string& str)
 {
     std::vector<std::string> parts;
@@ -62,6 +82,349 @@ std::vector<std::string> SplitCommaSeparated(const std::string& str)
     return parts;
 }
 
+// 判断字符是否属于源码标识符，用于精确匹配 input.txt 中的变量名。
+bool IsIdentifierChar(char c)
+{
+    return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+}
+
+// 将源码显式类型名转换为 contest query 的轻量类型提示。
+ContestQueryTypeHint ParseContestQueryTypeHint(const std::string& typeName)
+{
+    if (typeName == "Bool") {
+        return ContestQueryTypeHint::BOOL;
+    }
+    if (typeName == "Int8") {
+        return ContestQueryTypeHint::INT8;
+    }
+    if (typeName == "Int16") {
+        return ContestQueryTypeHint::INT16;
+    }
+    if (typeName == "Int32") {
+        return ContestQueryTypeHint::INT32;
+    }
+    if (typeName == "Int64") {
+        return ContestQueryTypeHint::INT64;
+    }
+    if (typeName == "UInt8") {
+        return ContestQueryTypeHint::UINT8;
+    }
+    if (typeName == "UInt16") {
+        return ContestQueryTypeHint::UINT16;
+    }
+    if (typeName == "UInt32") {
+        return ContestQueryTypeHint::UINT32;
+    }
+    if (typeName == "UInt64") {
+        return ContestQueryTypeHint::UINT64;
+    }
+    return ContestQueryTypeHint::UNKNOWN;
+}
+
+// 从源码声明行或函数参数列表中推断查询变量的显式类型。
+ContestQueryTypeHint InferContestQueryTypeHintFromLine(const std::string& line, const std::string& variableName)
+{
+    size_t pos = 0;
+    while ((pos = line.find(variableName, pos)) != std::string::npos) {
+        auto before = pos == 0 ? '\0' : line[pos - 1];
+        auto afterPos = pos + variableName.size();
+        auto after = afterPos >= line.size() ? '\0' : line[afterPos];
+        if (IsIdentifierChar(before) || IsIdentifierChar(after)) {
+            pos = afterPos;
+            continue;
+        }
+        while (afterPos < line.size() && std::isspace(static_cast<unsigned char>(line[afterPos]))) {
+            ++afterPos;
+        }
+        if (afterPos >= line.size() || line[afterPos] != ':') {
+            pos = afterPos;
+            continue;
+        }
+        ++afterPos;
+        while (afterPos < line.size() && std::isspace(static_cast<unsigned char>(line[afterPos]))) {
+            ++afterPos;
+        }
+        auto typeBegin = afterPos;
+        while (afterPos < line.size() && IsIdentifierChar(line[afterPos])) {
+            ++afterPos;
+        }
+        return ParseContestQueryTypeHint(line.substr(typeBegin, afterPos - typeBegin));
+    }
+    return ContestQueryTypeHint::UNKNOWN;
+}
+
+struct SourceExactValue {
+    ContestQueryTypeHint typeHint{ContestQueryTypeHint::UNKNOWN};
+    int64_t intValue{0};
+    bool boolValue{false};
+};
+
+using SourceScope = std::unordered_map<std::string, SourceExactValue>;
+
+// 从内向外查找源码常量环境中已经证明的简单值。
+const SourceExactValue* LookupSourceValue(const std::vector<SourceScope>& scopes, const std::string& name)
+{
+    for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
+        auto value = it->find(name);
+        if (value != it->end()) {
+            return &value->second;
+        }
+    }
+    return nullptr;
+}
+
+// 去掉源码行尾注释，避免简单表达式解析被注释内容干扰。
+std::string StripLineComment(const std::string& line)
+{
+    auto comment = line.find("//");
+    return comment == std::string::npos ? line : line.substr(0, comment);
+}
+
+// 从源码声明行中提取 let/var 名称、显式类型和初始化表达式。
+bool ParseSourceDeclaration(
+    const std::string& line, std::string& name, ContestQueryTypeHint& typeHint, std::string& expr)
+{
+    auto trimmed = Trim(StripLineComment(line));
+    const std::string letPrefix = "let ";
+    const std::string varPrefix = "var ";
+    size_t pos = std::string::npos;
+    if (trimmed.rfind(letPrefix, 0) == 0) {
+        pos = letPrefix.size();
+    } else if (trimmed.rfind(varPrefix, 0) == 0) {
+        pos = varPrefix.size();
+    } else {
+        return false;
+    }
+    while (pos < trimmed.size() && std::isspace(static_cast<unsigned char>(trimmed[pos]))) {
+        ++pos;
+    }
+    auto nameBegin = pos;
+    while (pos < trimmed.size() && IsIdentifierChar(trimmed[pos])) {
+        ++pos;
+    }
+    if (nameBegin == pos) {
+        return false;
+    }
+    name = trimmed.substr(nameBegin, pos - nameBegin);
+    while (pos < trimmed.size() && std::isspace(static_cast<unsigned char>(trimmed[pos]))) {
+        ++pos;
+    }
+    if (pos >= trimmed.size() || trimmed[pos] != ':') {
+        return false;
+    }
+    ++pos;
+    while (pos < trimmed.size() && std::isspace(static_cast<unsigned char>(trimmed[pos]))) {
+        ++pos;
+    }
+    auto typeBegin = pos;
+    while (pos < trimmed.size() && IsIdentifierChar(trimmed[pos])) {
+        ++pos;
+    }
+    typeHint = ParseContestQueryTypeHint(trimmed.substr(typeBegin, pos - typeBegin));
+    if (typeHint == ContestQueryTypeHint::UNKNOWN) {
+        return false;
+    }
+    while (pos < trimmed.size() && std::isspace(static_cast<unsigned char>(trimmed[pos]))) {
+        ++pos;
+    }
+    if (pos >= trimmed.size() || trimmed[pos] != '=') {
+        return false;
+    }
+    expr = Trim(trimmed.substr(pos + 1));
+    return !expr.empty();
+}
+
+// 解析源码中的十进制 Int64 字面量。
+std::optional<int64_t> ParseSourceIntLiteral(const std::string& text)
+{
+    auto trimmed = Trim(text);
+    if (trimmed.empty()) {
+        return std::nullopt;
+    }
+    size_t pos = trimmed[0] == '-' ? 1 : 0;
+    if (pos >= trimmed.size()) {
+        return std::nullopt;
+    }
+    for (size_t i = pos; i < trimmed.size(); ++i) {
+        if (!std::isdigit(static_cast<unsigned char>(trimmed[i]))) {
+            return std::nullopt;
+        }
+    }
+    try {
+        return std::stoll(trimmed);
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+std::optional<int64_t> EvalSourceIntExpr(const std::string& expr, const std::vector<SourceScope>& scopes);
+
+// 查找简单二元运算符位置，跳过表达式开头的一元负号。
+size_t FindSourceBinaryOperator(const std::string& expr, char op)
+{
+    for (size_t i = 1; i < expr.size(); ++i) {
+        if (expr[i] == op) {
+            return i;
+        }
+    }
+    return std::string::npos;
+}
+
+// 保守求值源码中的简单 Int64 常量表达式。
+std::optional<int64_t> EvalSourceIntExpr(const std::string& expr, const std::vector<SourceScope>& scopes)
+{
+    auto trimmed = Trim(expr);
+    if (auto pos = FindSourceBinaryOperator(trimmed, '+'); pos != std::string::npos) {
+        auto lhs = EvalSourceIntExpr(trimmed.substr(0, pos), scopes);
+        auto rhs = EvalSourceIntExpr(trimmed.substr(pos + 1), scopes);
+        if (!lhs.has_value() || !rhs.has_value()) {
+            return std::nullopt;
+        }
+        int64_t result = 0;
+        if (__builtin_add_overflow(lhs.value(), rhs.value(), &result)) {
+            return std::nullopt;
+        }
+        return result;
+    }
+    if (auto pos = FindSourceBinaryOperator(trimmed, '-'); pos != std::string::npos) {
+        auto lhs = EvalSourceIntExpr(trimmed.substr(0, pos), scopes);
+        auto rhs = EvalSourceIntExpr(trimmed.substr(pos + 1), scopes);
+        if (!lhs.has_value() || !rhs.has_value()) {
+            return std::nullopt;
+        }
+        int64_t result = 0;
+        if (__builtin_sub_overflow(lhs.value(), rhs.value(), &result)) {
+            return std::nullopt;
+        }
+        return result;
+    }
+    if (auto literal = ParseSourceIntLiteral(trimmed); literal.has_value()) {
+        return literal;
+    }
+    if (auto value = LookupSourceValue(scopes, trimmed);
+        value != nullptr && value->typeHint == ContestQueryTypeHint::INT64) {
+        return value->intValue;
+    }
+    return std::nullopt;
+}
+
+// 保守求值源码中的简单 Bool 常量表达式。
+std::optional<bool> EvalSourceBoolExpr(const std::string& expr, const std::vector<SourceScope>& scopes)
+{
+    auto trimmed = Trim(expr);
+    if (trimmed == "true") {
+        return true;
+    }
+    if (trimmed == "false") {
+        return false;
+    }
+    if (auto value = LookupSourceValue(scopes, trimmed);
+        value != nullptr && value->typeHint == ContestQueryTypeHint::BOOL) {
+        return value->boolValue;
+    }
+    const std::vector<std::pair<std::string, RelationalOperation>> relations{
+        {">=", RelationalOperation::GE}, {"<=", RelationalOperation::LE}, {"==", RelationalOperation::EQ},
+        {"!=", RelationalOperation::NE}, {">", RelationalOperation::GT}, {"<", RelationalOperation::LT}};
+    for (const auto& [token, rel] : relations) {
+        auto pos = trimmed.find(token);
+        if (pos == std::string::npos) {
+            continue;
+        }
+        auto lhs = EvalSourceIntExpr(trimmed.substr(0, pos), scopes);
+        auto rhs = EvalSourceIntExpr(trimmed.substr(pos + token.size()), scopes);
+        if (!lhs.has_value() || !rhs.has_value()) {
+            return std::nullopt;
+        }
+        switch (rel) {
+            case RelationalOperation::GE:
+                return lhs.value() >= rhs.value();
+            case RelationalOperation::LE:
+                return lhs.value() <= rhs.value();
+            case RelationalOperation::EQ:
+                return lhs.value() == rhs.value();
+            case RelationalOperation::NE:
+                return lhs.value() != rhs.value();
+            case RelationalOperation::GT:
+                return lhs.value() > rhs.value();
+            case RelationalOperation::LT:
+                return lhs.value() < rhs.value();
+        }
+    }
+    return std::nullopt;
+}
+
+// 当 CHIR 中查询点被优化掉时，为源码中的简单常量 let 提供精确 fallback。
+void InferContestQuerySourceFallback(const std::vector<std::string>& lines, ContestQuery& query)
+{
+    if (!query.valid || query.line == 0 || query.line > lines.size()) {
+        return;
+    }
+    std::vector<SourceScope> scopes(1);
+    for (unsigned lineNo = 1; lineNo <= query.line; ++lineNo) {
+        auto line = lines[lineNo - 1];
+        std::string name;
+        ContestQueryTypeHint typeHint{ContestQueryTypeHint::UNKNOWN};
+        std::string expr;
+        if (ParseSourceDeclaration(line, name, typeHint, expr)) {
+            SourceExactValue value;
+            value.typeHint = typeHint;
+            bool hasValue = false;
+            if (typeHint == ContestQueryTypeHint::INT64) {
+                if (auto intValue = EvalSourceIntExpr(expr, scopes); intValue.has_value()) {
+                    value.intValue = intValue.value();
+                    hasValue = true;
+                }
+            } else if (typeHint == ContestQueryTypeHint::BOOL) {
+                if (auto boolValue = EvalSourceBoolExpr(expr, scopes); boolValue.has_value()) {
+                    value.boolValue = boolValue.value();
+                    hasValue = true;
+                }
+            }
+            if (hasValue) {
+                scopes.back()[name] = value;
+                if (lineNo == query.line && name == query.variableName) {
+                    query.sourceFallback = typeHint == ContestQueryTypeHint::BOOL
+                        ? (value.boolValue ? "true" : "false")
+                        : std::to_string(value.intValue);
+                    query.hasSourceFallback = true;
+                }
+            }
+        }
+        for (auto c : line) {
+            if (c == '{') {
+                scopes.emplace_back();
+            } else if (c == '}' && scopes.size() > 1) {
+                scopes.pop_back();
+            }
+        }
+    }
+}
+
+// 读取查询所在源码行，在 CHIR Debug 缺失时保留 Bool/整数 fallback 所需类型。
+void InferContestQueryTypeHintFromSource(
+    ContestQuery& query, std::unordered_map<std::string, std::vector<std::string>>& sourceCache)
+{
+    if (!query.valid || query.fileName.empty() || query.line == 0) {
+        return;
+    }
+    auto it = sourceCache.find(query.fileName);
+    if (it == sourceCache.end()) {
+        std::vector<std::string> lines;
+        std::ifstream source(query.fileName);
+        std::string sourceLine;
+        while (std::getline(source, sourceLine)) {
+            lines.emplace_back(sourceLine);
+        }
+        it = sourceCache.emplace(query.fileName, std::move(lines)).first;
+    }
+    if (query.line > it->second.size()) {
+        return;
+    }
+    query.typeHint = InferContestQueryTypeHintFromLine(it->second[query.line - 1], query.variableName);
+    InferContestQuerySourceFallback(it->second, query);
+}
+
+// 构造无效查询占位，保证输出行数与输入行数一致。
 ContestQuery MakeInvalidContestQuery()
 {
     ContestQuery query;
@@ -69,6 +432,7 @@ ContestQuery MakeInvalidContestQuery()
     return query;
 }
 
+// 解析一行 [file, line, variable] 格式的竞赛查询。
 ContestQuery ParseContestQueryLine(const std::string& line)
 {
     auto trimmed = Trim(line);
@@ -98,6 +462,7 @@ ContestQuery ParseContestQueryLine(const std::string& line)
     return query;
 }
 
+// 当 input.txt 存在时读取全部竞赛查询。
 std::optional<std::vector<ContestQuery>> LoadContestQueries()
 {
     std::ifstream input(CONTEST_INPUT_FILE);
@@ -105,13 +470,17 @@ std::optional<std::vector<ContestQuery>> LoadContestQueries()
         return std::nullopt;
     }
     std::vector<ContestQuery> queries;
+    std::unordered_map<std::string, std::vector<std::string>> sourceCache;
     std::string line;
     while (std::getline(input, line)) {
-        queries.emplace_back(ParseContestQueryLine(line));
+        auto query = ParseContestQueryLine(line);
+        InferContestQueryTypeHintFromSource(query, sourceCache);
+        queries.emplace_back(std::move(query));
     }
     return queries;
 }
 
+// 获取查询输出时使用的源类型，ref 查询取其根类型。
 Type* GetQueryValueType(Value* value)
 {
     auto type = value->GetType();
@@ -121,6 +490,37 @@ Type* GetQueryValueType(Value* value)
     return type;
 }
 
+// 将 CHIR Type* 转为轻量类型提示，供未解析查询生成正确 fallback。
+ContestQueryTypeHint GetQueryTypeHint(Type* type)
+{
+    if (type == nullptr) {
+        return ContestQueryTypeHint::UNKNOWN;
+    }
+    if (type->IsRef()) {
+        type = StaticCast<RefType*>(type)->GetRootBaseType();
+    }
+    if (type->IsBoolean()) {
+        return ContestQueryTypeHint::BOOL;
+    }
+    if (!type->IsInteger()) {
+        return ContestQueryTypeHint::UNKNOWN;
+    }
+    auto isUnsigned = type->IsUnsignedInteger();
+    switch (ToWidth(*type)) {
+        case IntWidth::I8:
+            return isUnsigned ? ContestQueryTypeHint::UINT8 : ContestQueryTypeHint::INT8;
+        case IntWidth::I16:
+            return isUnsigned ? ContestQueryTypeHint::UINT16 : ContestQueryTypeHint::INT16;
+        case IntWidth::I32:
+            return isUnsigned ? ContestQueryTypeHint::UINT32 : ContestQueryTypeHint::INT32;
+        case IntWidth::I64:
+            return isUnsigned ? ContestQueryTypeHint::UINT64 : ContestQueryTypeHint::INT64;
+        default:
+            return ContestQueryTypeHint::UNKNOWN;
+    }
+}
+
+// 将有符号整数端点格式化为竞赛输出文本。
 std::string FormatSignedInt(int64_t value)
 {
     std::stringstream ss;
@@ -128,6 +528,7 @@ std::string FormatSignedInt(int64_t value)
     return ss.str();
 }
 
+// 将无符号整数端点格式化为竞赛输出文本。
 std::string FormatUnsignedInt(uint64_t value)
 {
     std::stringstream ss;
@@ -135,11 +536,13 @@ std::string FormatUnsignedInt(uint64_t value)
     return ss.str();
 }
 
+// 根据查询类型的符号属性格式化 SInt 端点。
 std::string FormatSIntValue(const SInt& value, const Type& type)
 {
     return type.IsUnsignedInteger() ? FormatUnsignedInt(value.UVal()) : FormatSignedInt(value.SVal());
 }
 
+// 判断整数区间是否能以非 wrapped 竞赛区间格式打印。
 bool IsContestPrintableIntegerInterval(const ConstantRange& range, const Type& type)
 {
     if (range.IsFullSet() || range.IsEmptySet()) {
@@ -148,6 +551,7 @@ bool IsContestPrintableIntegerInterval(const ConstantRange& range, const Type& t
     return type.IsUnsignedInteger() ? !range.IsWrappedSet() : !range.IsSignWrappedSet();
 }
 
+// 将可打印整数区间格式化为 [lower, upper:1]。
 std::string FormatContestIntegerInterval(const ConstantRange& range, const Type& type)
 {
     auto upperInclusive = range.Upper() - 1U;
@@ -156,6 +560,7 @@ std::string FormatContestIntegerInterval(const ConstantRange& range, const Type&
     return ss.str();
 }
 
+// 按整数类型格式化完整 fallback 区间。
 std::string FormatFullIntegerRange(const Type& type)
 {
     auto width = ToWidth(type);
@@ -168,6 +573,35 @@ std::string FormatFullIntegerRange(const Type& type)
     return ss.str();
 }
 
+// 按源码类型提示格式化未解析查询的 sound fallback。
+std::string FormatFallback(ContestQueryTypeHint typeHint)
+{
+    switch (typeHint) {
+        case ContestQueryTypeHint::BOOL:
+            return "false, true";
+        case ContestQueryTypeHint::INT8:
+            return "[-128, 127:1]";
+        case ContestQueryTypeHint::INT16:
+            return "[-32768, 32767:1]";
+        case ContestQueryTypeHint::INT32:
+            return "[-2147483648, 2147483647:1]";
+        case ContestQueryTypeHint::INT64:
+            return "[-9223372036854775808, 9223372036854775807:1]";
+        case ContestQueryTypeHint::UINT8:
+            return "[0, 255:1]";
+        case ContestQueryTypeHint::UINT16:
+            return "[0, 65535:1]";
+        case ContestQueryTypeHint::UINT32:
+            return "[0, 4294967295:1]";
+        case ContestQueryTypeHint::UINT64:
+            return "[0, 18446744073709551615:1]";
+        case ContestQueryTypeHint::UNKNOWN:
+            break;
+    }
+    return "[-9223372036854775808, 9223372036854775807:1]";
+}
+
+// 为未解析或不精确查询生成 sound fallback 输出。
 std::string FormatFallback(Type* type)
 {
     if (type && type->IsBoolean()) {
@@ -179,6 +613,16 @@ std::string FormatFallback(Type* type)
     return "[-9223372036854775808, 9223372036854775807:1]";
 }
 
+// 优先使用 CHIR Type*，缺失时使用源码类型提示生成 fallback。
+std::string FormatFallback(const ContestQuery& query)
+{
+    if (query.type != nullptr) {
+        return FormatFallback(query.type);
+    }
+    return FormatFallback(query.typeHint);
+}
+
+// 将抽象值域转换为竞赛要求的输出格式。
 std::string FormatContestRange(const ValueRange* range, Type* type)
 {
     if (!type || !range) {
@@ -208,6 +652,7 @@ std::string FormatContestRange(const ValueRange* range, Type* type)
     return FormatFallback(type);
 }
 
+// 读取普通 SSA 值或 ref 背后 var 对象的竞赛可见值域。
 const ValueRange* GetContestRangeForValue(const RangeDomain& state, Value* value)
 {
     if (value == nullptr) {
@@ -221,11 +666,13 @@ const ValueRange* GetContestRangeForValue(const RangeDomain& state, Value* value
     return state.CheckAbstractValue(value);
 }
 
+// 判断查询位置是否匹配 CHIR 调试位置信息。
 bool IsSameQueryLocation(const ContestQuery& query, const DebugLocation& location)
 {
     return query.fileName == BaseName(location.GetFileName()) && query.line == location.GetBeginPos().line;
 }
 
+// 判断某个值是否已关联指定源码变量名。
 bool HasValueName(const ValueNameMap& valueNames, Value* value, const std::string& name)
 {
     auto it = valueNames.find(value);
@@ -235,6 +682,7 @@ bool HasValueName(const ValueNameMap& valueNames, Value* value, const std::strin
     return std::find(it->second.begin(), it->second.end(), name) != it->second.end();
 }
 
+// 记录 Debug(value, name) 映射，供后续 operand 查询解析使用。
 void RememberValueName(ValueNameMap& valueNames, const Debug& debug)
 {
     auto value = debug.GetValue();
@@ -244,19 +692,26 @@ void RememberValueName(ValueNameMap& valueNames, const Debug& debug)
     }
 }
 
+// 记录查询类型，即使精确程序点解析失败也能正确 fallback。
 void RememberQueryType(std::vector<ContestQuery>& queries, const Debug& debug)
 {
     auto type = GetQueryValueType(debug.GetValue());
+    auto typeHint = GetQueryTypeHint(type);
     for (auto& query : queries) {
         if (!query.valid || query.type || query.variableName != debug.GetSrcCodeIdentifier()) {
             continue;
         }
+        if (query.typeHint != ContestQueryTypeHint::UNKNOWN && query.typeHint != typeHint) {
+            continue;
+        }
         if (query.fileName == BaseName(debug.GetDebugLocation().GetFileName()) || query.fileName.empty()) {
             query.type = type;
+            query.typeHint = typeHint;
         }
     }
 }
 
+// 解析与具体 Debug 表达式位置和变量名匹配的查询。
 void ResolveQueryAtDebug(
     std::vector<ContestQuery>& queries, ValueNameMap& valueNames, const Debug& debug, const RangeDomain& state)
 {
@@ -275,11 +730,13 @@ void ResolveQueryAtDebug(
             continue;
         }
         query.type = type;
+        query.typeHint = GetQueryTypeHint(type);
         query.result = FormatContestRange(range, type);
         query.resolved = true;
     }
 }
 
+// 通过已记录的 value-name 映射解析同源码行 operand 查询。
 void ResolveQueryAtValue(std::vector<ContestQuery>& queries, const ValueNameMap& valueNames, const DebugLocation& location,
     Value* value, const RangeDomain& state)
 {
@@ -292,11 +749,13 @@ void ResolveQueryAtValue(std::vector<ContestQuery>& queries, const ValueNameMap&
         }
         auto type = GetQueryValueType(value);
         query.type = type;
+        query.typeHint = GetQueryTypeHint(type);
         query.result = FormatContestRange(GetContestRangeForValue(state, value), type);
         query.resolved = true;
     }
 }
 
+// 在非 Debug 表达式上尝试解析所有 operand 形式查询。
 void ResolveQueryAtExpressionOperands(
     std::vector<ContestQuery>& queries, const ValueNameMap& valueNames, const Expression& expr, const RangeDomain& state)
 {
@@ -305,6 +764,7 @@ void ResolveQueryAtExpressionOperands(
     }
 }
 
+// 带 visited 集合检查 CFG 可达性，避免环路递归。
 bool CanReachBlock(const Block* start, const Block* target, std::unordered_set<const Block*>& visited)
 {
     if (start == nullptr || target == nullptr || !visited.emplace(start).second) {
@@ -321,6 +781,7 @@ bool CanReachBlock(const Block* start, const Block* target, std::unordered_set<c
     return false;
 }
 
+// 识别 RangePropagation 不应折叠掉的循环分支条件表达式。
 bool IsLoopBranchConditionExpr(const Expression& expr)
 {
     auto parent = expr.GetParentBlock();
@@ -339,6 +800,7 @@ bool IsLoopBranchConditionExpr(const Expression& expr)
     return CanReachBlock(branch->GetFalseBlock(), parent, visited);
 }
 
+// 按查询顺序写入 output.txt，未解析项使用 fallback。
 void WriteContestOutput(std::vector<ContestQuery>& queries)
 {
     std::ofstream output(CONTEST_OUTPUT_FILE, std::ios::trunc);
@@ -346,7 +808,13 @@ void WriteContestOutput(std::vector<ContestQuery>& queries)
         return;
     }
     for (auto& query : queries) {
-        output << (query.resolved ? query.result : FormatFallback(query.type)) << '\n';
+        if (query.resolved) {
+            output << query.result << '\n';
+        } else if (query.hasSourceFallback) {
+            output << query.sourceFallback << '\n';
+        } else {
+            output << FormatFallback(query) << '\n';
+        }
     }
 }
 } // namespace
@@ -396,6 +864,7 @@ void RangePropagation::RunOnPackage(const Ptr<const Package>& package, bool isDe
     }
 }
 
+// 重写可证明的常量和分支目标，同时保护循环分支条件。
 void RangePropagation::RunOnFunc(const Ptr<const Func>& func, bool isDebug)
 {
     auto result = analysisWrapper->CheckFuncResult(func);
@@ -456,6 +925,7 @@ void RangePropagation::RunOnFunc(const Ptr<const Func>& func, bool isDebug)
     }
 }
 
+// 遍历缓存的 RangeAnalysis 状态并生成竞赛查询输出。
 void RangePropagation::EmitContestOutput(const Ptr<const Package>& package, RangeAnalysisWrapper& rangeAnalysisWrapper)
 {
     auto queries = LoadContestQueries();

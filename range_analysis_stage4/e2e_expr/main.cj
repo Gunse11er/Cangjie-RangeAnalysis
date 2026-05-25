@@ -17,6 +17,18 @@ func expr(x: Int64, u: UInt64, flag: Bool): Int64 {
     return x
 }
 
+func signedOrScenario(x: Int64): Int64 {
+    if (x >= 0) {
+        if (x <= 7) {
+            let signedSmall: Int64 = x
+            let signedOrMask: Int64 = signedSmall | 8
+        }
+        let signedNonNeg: Int64 = x
+        let signedOrOne: Int64 = signedNonNeg | 1
+    }
+    return x
+}
+
 main(): Int64 {
-    return expr(3, 2, true)
+    return expr(3, 2, true) + signedOrScenario(5)
 }

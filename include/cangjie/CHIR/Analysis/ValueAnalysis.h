@@ -430,6 +430,7 @@ public:
         }
     }
 
+    /// 将当前抽象状态标记为不可达。
     void SetUnreachable()
     {
         this->kind = ReachableKind::UNREACHABLE;
