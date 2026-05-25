@@ -116,9 +116,9 @@ index ef131f40..77903332 100644
 --- a/include/cangjie/CHIR/Analysis/Engine.h
 +++ b/include/cangjie/CHIR/Analysis/Engine.h
 @@ -17,6 +17,16 @@
- 
+
  namespace Cangjie::CHIR {
- 
+
 +template <typename Domain>
 +Domain GetTerminatorStateForSuccessor(
 +    const Analysis<Domain>& analysis, const Domain& state, const Terminator* terminator, const Block* successor)
@@ -149,7 +149,7 @@ index 0425c841..81a95019 100644
 @@ -430,6 +430,11 @@ public:
          }
      }
- 
+
 +    void SetUnreachable()
 +    {
 +        this->kind = ReachableKind::UNREACHABLE;
@@ -163,7 +163,7 @@ index 52f33d1d..6a35116a 100644
 --- a/include/cangjie/CHIR/Analysis/ValueRangeAnalysis.h
 +++ b/include/cangjie/CHIR/Analysis/ValueRangeAnalysis.h
 @@ -215,5 +215,8 @@ private:
- 
+
      std::unordered_map<const Block*, uint32_t> inqueueTimes;
  };
 +
@@ -198,14 +198,14 @@ index c4f5f488..3d468b5c 100644
 +++ b/src/CHIR/Analysis/ValueRangeAnalysis.cpp
 @@ -7,10 +7,20 @@
  #include "cangjie/CHIR/Analysis/ValueRangeAnalysis.h"
- 
+
  #include <climits>
 +#include <limits>
 +#include <mutex>
 +#include <unordered_set>
  #include "cangjie/CHIR/Checker/OverflowChecking.h"
  #include "cangjie/CHIR/Analysis/Arithmetic.h"
- 
+
  namespace Cangjie::CHIR {
 +namespace {
 +using LoopRangeSnapshot = std::unordered_map<Value*, std::unique_ptr<SIntDomain>>;
@@ -218,24 +218,24 @@ index c4f5f488..3d468b5c 100644
  {
  }
 @@ -113,9 +123,13 @@ RangeAnalysis::RangeAnalysis(const Func* func, CHIRBuilder& builder, bool isDebu
- 
+
  RangeAnalysis::~RangeAnalysis()
  {
 +    std::lock_guard<std::mutex> lock(loopRangeSnapshotsMtx);
 +    loopRangeSnapshots.erase(this);
  }
- 
+
 -const int MAX_INQUEUE_TIMES = 4;
 +const int LOOP_WIDENING_START_TIMES = 4;
 +const int LOOP_WIDENING_SNAPSHOT_START_TIMES = LOOP_WIDENING_START_TIMES - 1;
 +const int MAX_INQUEUE_TIMES = 32;
- 
+
  bool CanAnalyse(const Ptr<Type>& type)
  {
 @@ -144,11 +158,518 @@ const SIntDomain& GetDefaultIntCache(const Ptr<Type>& ty)
      return ty->IsUnsignedInteger() ? unsignedRange[width] : signedRange[width];
  }
- 
+
 +bool StrictlyLess(const SInt& lhs, const SInt& rhs, bool isUnsigned)
 +{
 +    return isUnsigned ? lhs.Ult(rhs) : lhs.Slt(rhs);
@@ -488,7 +488,7 @@ index c4f5f488..3d468b5c 100644
  {
      return expr.GetExprKind() >= ExprKind::ADD && expr.GetExprKind() <= ExprKind::MOD;
  }
- 
+
 +inline bool IsBitwiseBinaryExpr(ExprKind kind)
 +{
 +    return kind == ExprKind::BITAND || kind == ExprKind::BITOR || kind == ExprKind::BITXOR;
@@ -800,7 +800,7 @@ index c4f5f488..3d468b5c 100644
 +    }
      return state.SetToBound(dest, true);
  }
- 
+
 @@ -365,28 +920,39 @@ void RangeAnalysis::HandleBinaryExpr(RangeDomain& state, const BinaryExpression*
          return state.SetToBound(binaryExpr->GetResult(), true);
      }
@@ -850,7 +850,7 @@ index c4f5f488..3d468b5c 100644
 @@ -441,48 +1007,1101 @@ void RangeAnalysis::HandleOthersExpr(RangeDomain& state, const Expression* expre
      }
  }
- 
+
 -std::optional<Block*> RangeAnalysis::HandleTerminatorEffect(RangeDomain& state, const Terminator* terminator)
 +namespace {
 +bool IsRelationalExprKind(ExprKind kind)
@@ -913,7 +913,7 @@ index c4f5f488..3d468b5c 100644
 +            return RelationalOperation::NE;
      }
 +}
- 
+
 -    return std::nullopt;
 +RelationalOperation NegateRelation(RelationalOperation rel)
 +{
@@ -932,7 +932,7 @@ index c4f5f488..3d468b5c 100644
 +            return RelationalOperation::EQ;
 +    }
  }
- 
+
 -void RangeAnalysis::PrintBranchOptMessage(const Ptr<const Expression>& expr, bool isTrueBlockRemained) const
 +RelationalOperation SwapRelation(RelationalOperation rel)
  {
@@ -953,7 +953,7 @@ index c4f5f488..3d468b5c 100644
 +            return rel;
 +    }
  }
- 
+
 -std::optional<Block*> RangeAnalysis::HandleBranchTerminator(const RangeDomain& state, const Branch* branch) const
 +bool CanReachBlock(const Block* start, const Block* target, std::unordered_set<const Block*>& visited);
 +bool IsLoopBranch(const Branch* branch);
@@ -2007,7 +2007,7 @@ index 1de44ed7..92a7e799 100644
 @@ -8,10 +8,333 @@
  #include "cangjie/CHIR/Analysis/ConstAnalysis.h"
  #include "cangjie/CHIR/Analysis/Engine.h"
- 
+
 +#include <algorithm>
 +#include <cctype>
 +#include <fstream>
@@ -2016,9 +2016,9 @@ index 1de44ed7..92a7e799 100644
  #include <optional>
 +#include <unordered_map>
 +#include <unordered_set>
- 
+
  namespace Cangjie::CHIR {
- 
+
 +namespace {
 +const std::string CONTEST_INPUT_FILE = "input.txt";
 +const std::string CONTEST_OUTPUT_FILE = "output.txt";
@@ -2351,7 +2351,7 @@ index 1de44ed7..92a7e799 100644
 @@ -114,6 +440,32 @@ void RangePropagation::RunOnFunc(const Ptr<const Func>& func, bool isDebug)
      }
  }
- 
+
 +void RangePropagation::EmitContestOutput(const Ptr<const Package>& package, RangeAnalysisWrapper& rangeAnalysisWrapper)
 +{
 +    auto queries = LoadContestQueries();
