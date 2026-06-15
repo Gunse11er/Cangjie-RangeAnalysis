@@ -130,7 +130,7 @@ inline void AddByValAttribute(llvm::Argument* value, uint64_t align = 8)
 #endif
 }
 
-inline bool ShouldReturnVoid(const CHIR::Func& func)
+inline bool ShouldReturnVoid(const CHIR::Function& func)
 {
     return Utils::In(func.GetFuncKind(),
         {

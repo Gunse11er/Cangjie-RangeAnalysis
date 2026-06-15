@@ -28,9 +28,9 @@ void InsertGetObjCClass::HandleImpl(InteropContext& ctx)
             auto interfaceMirror = As<ASTKind::INTERFACE_DECL>(mirror);
             auto getObjCClassDecl = ctx.factory.CreateGetObjCClassDecl(*interfaceMirror);
             CJC_NULLPTR_CHECK(getObjCClassDecl);
-            getObjCClassDecl->funcBody->body = CreateBlock(
-                Nodes(ctx.factory.CreateThrowStaticMethodCallOnInterfaceExpr(*mirror->curFile)
-            ), getObjCClassDecl->ty);
+            getObjCClassDecl->funcBody->body =
+                CreateBlock(Nodes(ctx.factory.CreateThrowStaticMethodCallOnInterfaceExpr(*mirror->curFile)),
+                    getObjCClassDecl->GetTy());
             interfaceMirror->body->decls.emplace_back(std::move(getObjCClassDecl));
         } else if (mirror->astKind == ASTKind::CLASS_DECL) {
             auto classMirror = As<ASTKind::CLASS_DECL>(mirror);

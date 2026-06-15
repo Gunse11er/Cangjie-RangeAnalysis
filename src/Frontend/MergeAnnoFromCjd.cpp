@@ -64,22 +64,22 @@ bool IsSameType(Ptr<Type> lt, Ptr<Ty> rty);
 // Only extend's extendedType or class/struct/enum/interface/extend's inheritedType can be in.
 bool IsSameType(Ptr<Type> lt, Ptr<Type> rt)
 {
-    CJC_ASSERT(Ty::IsTyCorrect(rt->ty));
+    CJC_ASSERT(Ty::IsTyCorrect(rt->GetTy()));
     switch (lt->astKind) {
         case ASTKind::REF_TYPE: {
             auto lrt = StaticCast<RefType>(lt);
             if (rt->astKind != ASTKind::REF_TYPE) {
                 return false;
             }
-            auto rrtName = rt->ty->IsPrimitive() ? rt->ty->String() : rt->ty->name;
+            auto rrtName = rt->GetTy()->IsPrimitive() ? rt->GetTy()->String() : rt->GetTy()->name;
             if (lrt->ref.identifier.Val() != rrtName) {
                 return false;
             }
-            if (lrt->typeArguments.size() != rt->ty->typeArgs.size()) {
+            if (lrt->typeArguments.size() != rt->GetTy()->typeArgs.size()) {
                 return false;
             }
             for (size_t i = 0; i < lrt->typeArguments.size(); ++i) {
-                if (!IsSameType(lrt->typeArguments[i].get(), rt->ty->typeArgs[i])) {
+                if (!IsSameType(lrt->typeArguments[i].get(), rt->GetTy()->typeArgs[i])) {
                     return false;
                 }
             }
@@ -100,7 +100,7 @@ bool IsSameType(Ptr<Type> lt, Ptr<Type> rt)
             break;
         }
         case ASTKind::OPTION_TYPE: {
-            if (!IsSameType(lt, rt->ty)) {
+            if (!IsSameType(lt, rt->GetTy())) {
                 return false;
             }
             break;
@@ -108,13 +108,13 @@ bool IsSameType(Ptr<Type> lt, Ptr<Type> rt)
         case ASTKind::PRIMITIVE_TYPE: {
             auto lpt = StaticCast<PrimitiveType>(lt);
             auto lptName = lpt->str;
-            auto rtyName = rt->ty->IsPrimitive() ? rt->ty->String() : rt->ty->name;
+            auto rtyName = rt->GetTy()->IsPrimitive() ? rt->GetTy()->String() : rt->GetTy()->name;
             lptName = lptName == "Rune" ? "UInt8" : lptName;
             rtyName = rtyName == "Rune" ? "UInt8" : rtyName;
             if (lptName != rtyName) {
                 return false;
             }
-            if (lpt->kind != rt->ty->kind) {
+            if (lpt->kind != rt->TyKind()) {
                 return false;
             }
             break;
@@ -253,14 +253,14 @@ bool IsSameGeneric(Ptr<Generic> lg, Ptr<Generic> rg)
     auto& lgc = lg->genericConstraints;
     auto& rgc = rg->genericConstraints;
     for (size_t i = 0; i < lg->genericConstraints.size(); ++i) {
-        if (!IsSameType(lgc[i]->type.get(), rgc[i]->type->ty)) {
+        if (!IsSameType(lgc[i]->type.get(), rgc[i]->type->GetTy())) {
             return false;
         }
         if (lgc[i]->upperBounds.size() != rgc[i]->upperBounds.size()) {
             return false;
         }
         for (size_t j = 0; j < lgc[i]->upperBounds.size(); ++j) {
-            if (!IsSameType(lgc[i]->upperBounds[j].get(), rgc[i]->upperBounds[j]->ty)) {
+            if (!IsSameType(lgc[i]->upperBounds[j].get(), rgc[i]->upperBounds[j]->GetTy())) {
                 return false;
             }
         }
@@ -282,7 +282,7 @@ bool IsSameFuncByIdentifier(Ptr<FuncBody> lb, Ptr<FuncBody> rb)
     for (size_t i = 0; i < lb->paramLists[0]->params.size(); ++i) {
         Ptr<FuncParam> expandedParam = lb->paramLists[0]->params[i].get();
         if (auto mep = DynamicCast<MacroExpandParam>(lb->paramLists[0]->params[i].get());
-            mep && mep->invocation.identifier == "APILevel") {
+            mep && mep->invocation.macroCallDiagInfo.identifier == "APILevel") {
             ExpandToAPILevel(mep->invocation);
             CopyBasicInfo(mep, mep->invocation.decl->annotations.back().get());
             expandedParam = StaticCast<FuncParam>(mep->invocation.decl.get());
@@ -290,11 +290,11 @@ bool IsSameFuncByIdentifier(Ptr<FuncBody> lb, Ptr<FuncBody> rb)
         if (expandedParam->identifier.Val() != rb->paramLists[0]->params[i]->identifier.Val()) {
             return false;
         }
-        if (!IsSameType(expandedParam->type.get(), rb->paramLists[0]->params[i]->ty)) {
+        if (!IsSameType(expandedParam->type.get(), rb->paramLists[0]->params[i]->GetTy())) {
             return false;
         }
-        CJC_ASSERT(rb->ty->IsFunc());
-        auto lFuncTy = StaticCast<FuncTy>(rb->ty);
+        CJC_ASSERT(rb->GetTy()->IsFunc());
+        auto lFuncTy = StaticCast<FuncTy>(rb->GetTy());
         if (lb->retType && !IsSameType(lb->retType.get(), lFuncTy->retTy)) {
             return false;
         }
@@ -391,8 +391,8 @@ bool IsSameDeclByIdentifier(Ptr<Decl> l, Ptr<Decl> r)
         case ASTKind::MACRO_EXPAND_DECL: {
             auto lmed = StaticCast<MacroExpandDecl>(l);
             auto rmed = StaticCast<MacroExpandDecl>(r);
-            if (lmed->invocation.fullName != rmed->invocation.fullName ||
-                lmed->invocation.identifier != rmed->invocation.identifier) {
+            if (lmed->invocation.macroCallDiagInfo.fullName != rmed->invocation.macroCallDiagInfo.fullName ||
+                lmed->invocation.macroCallDiagInfo.identifier != rmed->invocation.macroCallDiagInfo.identifier) {
                 return false;
             }
             break;
@@ -401,7 +401,7 @@ bool IsSameDeclByIdentifier(Ptr<Decl> l, Ptr<Decl> r)
         case ASTKind::PROP_DECL: {
             auto lvd = StaticCast<VarDecl>(l);
             auto rvd = StaticCast<VarDecl>(r);
-            if (lvd->type && !IsSameType(lvd->type.get(), rvd->ty)) {
+            if (lvd->type && !IsSameType(lvd->type.get(), rvd->GetTy())) {
                 return false;
             }
             break;
@@ -424,7 +424,7 @@ void MergeTopLevelDecl(
     auto topDeclMapInsert = [&topDeclMapping](OwnedPtr<Decl>& toplevelDecl) {
         Ptr<Decl> expandedDecl = toplevelDecl.get();
         if (auto med = DynamicCast<MacroExpandDecl>(toplevelDecl.get());
-            med && med->invocation.identifier == "APILevel") {
+            med && med->invocation.macroCallDiagInfo.identifier == "APILevel") {
             ExpandToAPILevel(med->invocation);
             CopyBasicInfo(med, med->invocation.decl->annotations.back().get());
             expandedDecl = med->invocation.decl.get();
@@ -477,7 +477,8 @@ void MergeMemberDecl(std::pair<const Ptr<Decl>, Ptr<Decl>>& declPair)
     std::unordered_map<Ptr<Decl>, Ptr<Decl>> memberMapping;
     for (auto& member : declPair.first->GetMemberDeclPtrs()) {
         Ptr<Decl> extendedDecl = member;
-        if (auto med = DynamicCast<MacroExpandDecl>(member); med && med->invocation.identifier == "APILevel") {
+        if (auto med = DynamicCast<MacroExpandDecl>(member);
+            med && med->invocation.macroCallDiagInfo.identifier == "APILevel") {
             ExpandToAPILevel(med->invocation);
             CopyBasicInfo(med, med->invocation.decl->annotations.back().get());
             extendedDecl = med->invocation.decl.get();
@@ -512,7 +513,7 @@ void MergeMemberDecl(std::pair<const Ptr<Decl>, Ptr<Decl>>& declPair)
         for (size_t i = 0; i < s->funcBody->paramLists[0]->params.size(); ++i) {
             Ptr<FuncParam> expandedParam = s->funcBody->paramLists[0]->params[i].get();
             if (auto mep = DynamicCast<MacroExpandParam>(s->funcBody->paramLists[0]->params[i].get());
-                mep && mep->invocation.identifier == "APILevel") {
+                mep && mep->invocation.macroCallDiagInfo.identifier == "APILevel") {
                 ExpandToAPILevel(mep->invocation);
                 CopyBasicInfo(mep, mep->invocation.decl->annotations.back().get());
                 expandedParam = StaticCast<FuncParam>(mep->invocation.decl.get());

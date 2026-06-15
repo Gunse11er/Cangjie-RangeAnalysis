@@ -18,7 +18,7 @@ static_assert(sizeof(Number) == 8);
 std::unordered_map<const CustomTypeDef*, const InheritableDecl*> g_typeMap{};
 std::unordered_map<const Value*, AnnoInstanceValue> g_valueMap{};
 /// map annoFactoryFunc to original Decl, used to write back annotation info
-std::unordered_map<const Func*, const AST::Decl*> g_annoFactoryMap{};
+std::unordered_map<const Function*, const AST::Decl*> g_annoFactoryMap{};
 
 AnnoInstanceValue GetValue(const Value& v);
 AnnoInstanceValue CreateValue(const LiteralValue& v)
@@ -90,7 +90,7 @@ AnnoInstanceValue CreateValueOfCustomTypeDef(const Value& v)
             auto nothingExprCheck = StaticCast<LocalVar>(store->GetValue())->GetExpr();
             if (auto constant = DynamicCast<Constant>(nothingExprCheck)) {
                 if (constant->GetValue()->IsNullLiteral()) {
-                    std::cerr << nothingExprCheck->GetResult()->ToString() << '\n';
+                    std::cerr << nothingExprCheck->GetResult()->ToString(0) << '\n';
                     CJC_ASSERT(false && "Invalid node from interpreter.");
                 }
             }
@@ -145,9 +145,10 @@ AnnoInstanceValue CreateValue(const Value& v)
             }
         }
         if (auto l = DynamicCast<Load>(obj->GetExpr())) {
-            if (auto gv = DynamicCast<GlobalVar>(l->GetLocation())) {
+            if (l->GetLocation()->IsGlobalVarWithInitializer()) {
                 // load of gv, valid iff the location is a const global variable lifted from annotationsArray.
                 // Threotically we check it's of Annotation class type, but we do not have such utilities.
+                auto gv = StaticCast<GlobalVar*>(l->GetLocation());
                 CJC_ASSERT(gv->GetType()->StripAllRefs()->IsClass());
                 auto ret = GetValue(*gv);
                 CJC_ASSERT(ret.Object());
@@ -170,7 +171,7 @@ AnnoInstanceValue GetValue(const Value& v)
     return CreateValue(v);
 }
 
-std::vector<AnnoInstance> CreateAnnoInstFromConstEval(const Func& func)
+std::vector<AnnoInstance> CreateAnnoInstFromConstEval(const Function& func)
 {
     auto arrRef = func.GetReturnValue();
     auto users = arrRef->GetUsers();
@@ -203,7 +204,7 @@ std::vector<AnnoInstance> CreateAnnoInstFromConstEval(const Func& func)
 AnnoMap CreateAnnoInstFromConstEvalRes(ConstEvalResult& ev)
 {
     std::unordered_map<const Decl*, std::vector<AnnoInstance>> annoInstMap{};
-    for (auto func : ev.pkg->GetGlobalFuncs()) {
+    for (auto func : ev.pkg->GetGlobalFuncsWithBody()) {
         if (func->GetFuncKind() == FuncKind::ANNOFACTORY_FUNC) {
             auto v = CreateAnnoInstFromConstEval(*func);
             if (!v.empty()) {
@@ -327,7 +328,7 @@ private:
     /// a const decl.
     bool IsConst(InheritableDecl& type)
     {
-        if (type.ty->IsString()) {
+        if (type.GetTy()->IsString()) {
             return true;
         }
         if (auto em = DynamicCast<EnumDecl>(&type)) {
@@ -356,7 +357,7 @@ private:
         }
         auto& fun = StaticCast<FuncDecl>(cons);
         for (auto& p : fun.funcBody->paramLists[0]->params) {
-            if (!IsConst(p->ty)) {
+            if (!IsConst(p->GetTy())) {
                 return false;
             }
         }
@@ -550,7 +551,7 @@ private:
         if (auto d = DynamicCast<InheritableDecl>(&decl)) {
             return TakeSubPkg(*d);
         }
-        if (auto t = DynamicCast<TypeAliasDecl>(&decl)) {
+        if (Is<TypeAliasDecl>(&decl)) {
             /// type alias are replaced after SEMA
             return false;
         }
@@ -560,8 +561,8 @@ private:
         if (Is<PropDecl>(decl)) {
             return false;
         }
-        if (auto var = DynamicCast<VarDecl>(&decl); var && !var->isVar && !var->TestAttr(AST::Attribute::STATIC) &&
-            IsConstType(var->ty)) {
+        if (auto var = DynamicCast<VarDecl>(&decl);
+            var && !var->isVar && !var->TestAttr(AST::Attribute::STATIC) && IsConstType(var->GetTy())) {
             if (var->outerDecl) {
                 return true;
             }
@@ -637,10 +638,10 @@ private:
     bool MustSave(InheritableDecl& type)
     {
         if (auto extend = DynamicCast<ExtendDecl>(&type)) {
-            if (auto decl = DynamicCast<InheritableDecl>(Ty::GetDeclOfTy(extend->ty))) {
+            if (auto decl = DynamicCast<InheritableDecl>(Ty::GetDeclOfTy(extend->GetTy()))) {
                 return TakeSubPkg(*decl);
             }
-            auto ty = extend->ty;
+            auto ty = extend->GetTy();
             return ty->kind != TypeKind::TYPE_VARRAY;
         }
         return (Is<ClassDecl>(type) && type.TestAnyAttr(AST::Attribute::OPEN, AST::Attribute::ABSTRACT)) ||
@@ -653,7 +654,7 @@ private:
             return it->second;
         }
         bool ret{false};
-        if (type.ty->IsString()) {
+        if (type.GetTy()->IsString()) {
             ret = true;
         }
         // save extend because it may contain a member decl with @!Annotations.
@@ -708,7 +709,7 @@ OwnedPtr<ConstEvalResult> ComputeAnnotations(AST::Package& pkg, CompilerInstance
         doCompute = false;
     }
     // CJMP does not fully support Annotation
-    if (ci.invocation.globalOptions.commonPartCjo != std::nullopt ||
+    if (ci.invocation.globalOptions.commonPartCjos.size() > 0 ||
         ci.invocation.globalOptions.outputMode == GlobalOptions::OutputMode::CHIR) {
         doCompute = false;
     }

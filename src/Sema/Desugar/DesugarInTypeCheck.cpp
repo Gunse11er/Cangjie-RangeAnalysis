@@ -35,7 +35,7 @@ using namespace TypeCheckUtil;
 namespace {
 OwnedPtr<AST::Expr> TryDesugarFunctionCallExpr(OwnedPtr<AST::Expr> base)
 {
-    if (!Ty::IsInitialTy(base->ty) && base->ty->kind != TypeKind::TYPE_FUNC) {
+    if (!Ty::IsInitialTy(base->GetTy()) && base->TyKind() != TypeKind::TYPE_FUNC) {
         // Try to desugar base as base.operator().
         // NOTE: 'curFile' and 'curMacroCall' will be set from caller of current method.
         auto newBase = MakeOwnedNode<MemberAccess>();
@@ -105,7 +105,7 @@ void IgnoreEmptyIntersection(std::vector<Ptr<Type>>& baseArgs)
 {
     for (auto it = baseArgs.begin(); it != baseArgs.end();) {
         CJC_ASSERT(*it != nullptr);
-        auto iTy = DynamicCast<IntersectionTy*>((*it)->ty);
+        auto iTy = DynamicCast<IntersectionTy*>((*it)->GetTy());
         bool isEmpty = iTy && iTy->tys.empty();
         it = isEmpty ? baseArgs.erase(it) : it + 1;
     }
@@ -313,7 +313,7 @@ void DesugarOperatorOverloadExpr(ASTContext& ctx, BinaryExpr& be)
     CopyBasicInfo(be.rightExpr.get(), funcArg.get());
     ctx.RemoveTypeCheckCache(*funcArg);
     funcArg->expr = std::move(be.rightExpr);
-    funcArg->ty = funcArg->expr->ty;
+    funcArg->SetTy(funcArg->expr->GetTy());
     callExpr->args.push_back(std::move(funcArg));
     callExpr->sourceExpr = &be;
     be.desugarExpr = std::move(callExpr);
@@ -568,7 +568,7 @@ void TypeChecker::TypeCheckerImpl::DesugarPointerCall(ASTContext& ctx, CallExpr&
     ctx.RemoveTypeCheckCache(*pointerExpr);
     ctx.RemoveTypeCheckCache(*(pointerExpr->type));
     auto baseFuncTy =
-        ce.baseFunc->ty ? typeManager.SubstituteTypeAliasInTy(*ce.baseFunc->ty) : TypeManager::GetInvalidTy();
+        ce.baseFunc->GetTy() ? typeManager.SubstituteTypeAliasInTy(*ce.baseFunc->GetTy()) : TypeManager::GetInvalidTy();
     CJC_ASSERT(baseFuncTy);
     auto typeArgs = baseFuncTy->typeArgs;
     auto baseArgs = ce.baseFunc->GetTypeArgs();
@@ -579,9 +579,9 @@ void TypeChecker::TypeCheckerImpl::DesugarPointerCall(ASTContext& ctx, CallExpr&
     if (usefulTypeArg) {
         argTy = typeArgs[0];
     } else if (!baseArgs.empty()) {
-        argTy = baseArgs[0]->ty;
+        argTy = baseArgs[0]->GetTy();
     }
-    pointerExpr->type->ty = typeManager.GetPointerTy(argTy);
+    pointerExpr->type->SetTy(typeManager.GetPointerTy(argTy));
     if (!ce.args.empty()) {
         pointerExpr->arg = std::move(ce.args[0]);
     }
@@ -604,7 +604,7 @@ void TypeChecker::TypeCheckerImpl::DesugarArrayCall(ASTContext& ctx, CallExpr& c
     ctx.RemoveTypeCheckCache(*arrayExpr);
     ctx.RemoveTypeCheckCache(*(arrayExpr->type));
     auto baseFuncTy =
-        ce.baseFunc->ty ? typeManager.SubstituteTypeAliasInTy(*ce.baseFunc->ty) : TypeManager::GetInvalidTy();
+        ce.baseFunc->GetTy() ? typeManager.SubstituteTypeAliasInTy(*ce.baseFunc->GetTy()) : TypeManager::GetInvalidTy();
     CJC_ASSERT(baseFuncTy);
     auto typeArgs = typeManager.GetTypeArgs(*baseFuncTy); // ArrayTy has 'dims', must using function to get arguments.
     auto baseArgs = ce.baseFunc->GetTypeArgs();
@@ -615,21 +615,21 @@ void TypeChecker::TypeCheckerImpl::DesugarArrayCall(ASTContext& ctx, CallExpr& c
             argTy = typeArgs[0];
         }
         if (typeArgs[0]->IsGeneric() && !baseArgs.empty()) {
-            argTy = baseArgs[0]->ty;
+            argTy = baseArgs[0]->GetTy();
         }
-        arrayExpr->type->ty = typeManager.GetVArrayTy(*argTy, varrTy->size);
+        arrayExpr->type->SetTy(typeManager.GetVArrayTy(*argTy, varrTy->size));
         arrayExpr->isValueArray = true;
     } else {
         // Eg: type A<T> = Array<T>; A(size, v), type args of this A is not useful.
         bool usefulTypeArg = !typeArgs.empty() && (!typeArgs[0]->IsGeneric() || !baseArgs.empty());
         if (usefulTypeArg) {
-            arrayExpr->type->ty = typeManager.GetArrayTy(typeArgs[0], 1);
+            arrayExpr->type->SetTy(typeManager.GetArrayTy(typeArgs[0], 1));
         } else {
             Ptr<Ty> argTy = TypeManager::GetInvalidTy();
             if (!baseArgs.empty()) {
-                argTy = baseArgs[0]->ty;
+                argTy = baseArgs[0]->GetTy();
             }
-            arrayExpr->type->ty = typeManager.GetArrayTy(argTy, 1);
+            arrayExpr->type->SetTy(typeManager.GetArrayTy(argTy, 1));
         }
     }
     for (auto& it : ce.args) {

@@ -27,7 +27,7 @@ size_t ConstAnalysisWrapper::GetBlockSize(const Expression& expr)
 }
 
 // Count all blocks in func, including lambda expr.
-size_t ConstAnalysisWrapper::CountBlockSize(const Func& func)
+size_t ConstAnalysisWrapper::CountBlockSize(const Function& func)
 {
     size_t blockSize = func.GetBody()->GetBlocks().size();
     if (blockSize > OVERHEAD_BLOCK_SIZE) {
@@ -48,7 +48,7 @@ ConstAnalysisWrapper::ConstAnalysisWrapper(CHIRBuilder& builder) : builder(build
 {
 }
 
-Results<ConstDomain>* ConstAnalysisWrapper::CheckFuncResult(const Func& func)
+Results<ConstDomain>* ConstAnalysisWrapper::CheckFuncResult(const Function& func)
 {
     if (auto it = resultsMap.find(&func); it != resultsMap.end()) {
         return it->second.get();
@@ -58,7 +58,7 @@ Results<ConstDomain>* ConstAnalysisWrapper::CheckFuncResult(const Func& func)
     }
 }
 
-Results<ConstPoolDomain>* ConstAnalysisWrapper::CheckFuncActiveResult(const Func& func)
+Results<ConstPoolDomain>* ConstAnalysisWrapper::CheckFuncActiveResult(const Function& func)
 {
     if (auto it = resultsPoolMap.find(&func); it != resultsPoolMap.end()) {
         return it->second.get();
@@ -73,7 +73,7 @@ void ConstAnalysisWrapper::InvalidateAllAnalysisResults()
     resultsMap.clear();
 };
 
-ConstAnalysisWrapper::AnalysisStrategy ConstAnalysisWrapper::ChooseAnalysisStrategy(const Func& func)
+ConstAnalysisWrapper::AnalysisStrategy ConstAnalysisWrapper::ChooseAnalysisStrategy(const Function& func)
 {
     if (resultsMap.find(&func) != resultsMap.end() ||
         resultsPoolMap.find(&func) != resultsPoolMap.end()) {
@@ -85,7 +85,7 @@ ConstAnalysisWrapper::AnalysisStrategy ConstAnalysisWrapper::ChooseAnalysisStrat
         return AnalysisStrategy::SkipAnalysis;
     }
     if (IsSTDFunction(func)) {
-        return AnalysisStrategy::FullStatePool;
+        return AnalysisStrategy::FullStatePool;;
     }
     size_t blockSize = CountBlockSize(func);
     if (blockSize > OVERHEAD_BLOCK_SIZE) {

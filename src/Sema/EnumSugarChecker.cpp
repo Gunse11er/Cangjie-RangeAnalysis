@@ -38,7 +38,7 @@ bool TypeChecker::EnumSugarChecker::CheckVarDeclTargets()
         for (auto& it : varDeclTargets) {
             diagBuilder.AddNote(*it, DiagKind::sema_found_candidate_decl);
         }
-        refExpr.ty = TypeManager::GetInvalidTy();
+        refExpr.SetTy(TypeManager::GetInvalidTy());
         return false;
     }
     return true;
@@ -63,9 +63,10 @@ void TypeChecker::EnumSugarChecker::CheckGenericEnumSugarWithTypeArgs(Ptr<EnumDe
         return;
     }
     for (size_t i = 0; i < refExpr.typeArguments.size(); ++i) {
-        typeMapping[StaticCast<GenericsTy*>(ed->generic->typeParameters[i]->ty)] = refExpr.typeArguments[i]->ty;
+        typeMapping[StaticCast<GenericsTy*>(ed->generic->typeParameters[i]->GetTy())] =
+            refExpr.typeArguments[i]->GetTy();
     }
-    refExpr.ty = typeChecker.typeManager.GetInstantiatedTy(refExpr.ty, typeMapping);
+    refExpr.SetTy(typeChecker.typeManager.GetInstantiatedTy(refExpr.GetTy(), typeMapping));
 }
 
 void TypeChecker::EnumSugarChecker::CheckGenericEnumSugarWithoutTypeArgs(Ptr<const EnumDecl> ed)
@@ -85,7 +86,7 @@ Ptr<Decl> TypeChecker::EnumSugarChecker::CheckEnumSugarTargets()
     auto it = std::find_if(enumSugarTargets.cbegin(), enumSugarTargets.cend(),
         [](Ptr<const Decl> decl) { return decl->astKind == ASTKind::VAR_DECL; });
     Ptr<Decl> target = it != enumSugarTargets.cend() ? *it : enumSugarTargets.front();
-    refExpr.ty = target->ty;
+    refExpr.SetTy(target->GetTy());
     // Handle generic enum field sugar like: .century<Int32>.
     auto ed = DynamicCast<EnumDecl*>(target->outerDecl);
     if (refExpr.typeArguments.empty()) {

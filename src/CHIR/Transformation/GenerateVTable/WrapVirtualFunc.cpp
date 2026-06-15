@@ -29,7 +29,7 @@ bool FuncTypeMatch(const FuncType& parentFuncType, const FuncType& curFuncType)
 }
 
 bool JudgeIfNeedVirtualWrapper(
-    const VirtualMethodInfo& parentFuncInfo, const FuncBase& virtualFunc, const Type& selfTy, CHIRBuilder& builder)
+    const VirtualMethodInfo& parentFuncInfo, const Function& virtualFunc, const Type& selfTy, CHIRBuilder& builder)
 {
     /** if struct and enum inherit interface, for non-static function, wrapper func is needed
      *  because `this` in struct is value type, and in interface is ref type
@@ -72,7 +72,7 @@ bool JudgeIfNeedVirtualWrapper(
 }
 
 // maybe we can not deserialize virutal wrapper function, because it's not in source code
-void TryDeleteVirtuallWrapperFunc(CustomTypeDef& customTypeDef, FuncBase& finalFunc, CHIRBuilder& builder)
+void TryDeleteVirtuallWrapperFunc(CustomTypeDef& customTypeDef, Function& finalFunc, CHIRBuilder& builder)
 {
     if (!customTypeDef.TestAttr(Attribute::SPECIFIC)) {
         return;
@@ -80,8 +80,7 @@ void TryDeleteVirtuallWrapperFunc(CustomTypeDef& customTypeDef, FuncBase& finalF
     if (!finalFunc.TestAttr(Attribute::FINAL)) {
         return;
     }
-    auto allMethods = customTypeDef.GetMethods();
-    for (auto method : allMethods) {
+    for (auto method : customTypeDef.GetMethods()) {
         if (!method->TestAttr(Attribute::DESERIALIZED) || !method->TestAttr(Attribute::VIRTUAL)) {
             continue;
         }
@@ -90,7 +89,7 @@ void TryDeleteVirtuallWrapperFunc(CustomTypeDef& customTypeDef, FuncBase& finalF
             continue;
         }
         if (finalFunc.GetFuncType()->IsEqualOrSubTypeOf(*method->GetFuncType(), builder)) {
-            method->FuncBase::DestroySelf();
+            method->Function::DestroySelf();
             return;
         }
     }
@@ -117,12 +116,11 @@ void WrapVirtualFunc::CheckAndWrap(CustomTypeDef& customTypeDef)
         CJC_ASSERT(parentVTable.GetMethodNum() == vtableIt.GetMethodNum());
         for (size_t i = 0; i < vtableIt.GetMethodNum(); ++i) {
             auto& curVirMethodInfo = vtableIt.GetVirtualMethods()[i];
-            if (curVirMethodInfo.GetVirtualMethod() == nullptr) {
+            if (curVirMethodInfo.GetVirtualMethod()->IsPureAbstract()) {
                 continue;
             }
             auto& parentVirMethodInfo = parentVTable.GetVirtualMethods()[i];
-            auto wrapper = CreateVirtualWrapperIfNeeded(
-                curVirMethodInfo, parentVirMethodInfo, *selfTy, customTypeDef, *parentTy);
+            auto wrapper = CreateVirtualWrapperIfNeeded(curVirMethodInfo, parentVirMethodInfo, *selfTy, customTypeDef, *parentTy);
             if (incrementalKind != IncreKind::INVALID) {
                 HandleVirtualFuncWrapperForIncrCompilation(wrapper, *curVirMethodInfo.GetVirtualMethod());
             }
@@ -134,7 +132,7 @@ void WrapVirtualFunc::CheckAndWrap(CustomTypeDef& customTypeDef)
     }
 }
 
-void WrapVirtualFunc::HandleVirtualFuncWrapperForIncrCompilation(const FuncBase* wrapper, const FuncBase& curFunc)
+void WrapVirtualFunc::HandleVirtualFuncWrapperForIncrCompilation(const Function* wrapper, const Function& curFunc)
 {
     CJC_ASSERT(!curFunc.GetSrcCodeIdentifier().empty());
     const auto& cachedVirDep = increCachedInfo.virtualFuncDep;
@@ -196,7 +194,7 @@ WrapVirtualFunc::WrapperFuncGenericTable WrapVirtualFunc::GetReplaceTableForVirt
     return resultTable;
 }
 
-void WrapVirtualFunc::CreateWrapperFuncBody(Func& wrapperFunc,
+void WrapVirtualFunc::CreateWrapperFuncBody(Function& wrapperFunc,
     const VirtualMethodInfo& childFuncInfo, Type& selfTy, WrapVirtualFunc::WrapperFuncGenericTable& genericTable)
 {
     /*
@@ -305,7 +303,7 @@ FuncType* WrapVirtualFunc::RemoveThisArg(FuncType* funcTy)
 }
 
 // change this function to class method, to much args in functions called by this function
-FuncBase* WrapVirtualFunc::CreateVirtualWrapperIfNeeded(const VirtualMethodInfo& funcInfo,
+Function* WrapVirtualFunc::CreateVirtualWrapperIfNeeded(const VirtualMethodInfo& funcInfo,
     const VirtualMethodInfo& parentFuncInfo, Type& selfTy, CustomTypeDef& customTypeDef, const ClassType& parentTy)
 {
     auto curFunc = funcInfo.GetVirtualMethod();
@@ -334,40 +332,37 @@ FuncBase* WrapVirtualFunc::CreateVirtualWrapperIfNeeded(const VirtualMethodInfo&
     bool isImported =
         customTypeDef.TestAttr(Attribute::IMPORTED) && parentTy.GetCustomTypeDef()->TestAttr(Attribute::IMPORTED);
     bool parentIsFromExtend = ParentDefIsFromExtend(customTypeDef, *parentTy.GetClassDef());
-    FuncBase* funcBase = nullptr;
+    auto wrapperFunc = builder.CreateFunction(wrapperTy,
+        funcIdentifier, funcSrcIdentifier, rawMangledName, packageName, genericTable.funcGenericTypeParams);
+    wrapperFunc->Set<WrappedRawMethod>(curFunc);
+    wrapperFunc->AppendAttributeInfo(curFunc->GetAttributeInfo());
+    wrapperFunc->EnableAttr(Attribute::NO_REFLECT_INFO);
+    wrapperFunc->EnableAttr(Attribute::NO_DEBUG_INFO);
     if (isImported && !parentIsFromExtend) {
-        funcBase = builder.CreateImportedVarOrFunc<ImportedFunc>(wrapperTy,
-            funcIdentifier, funcSrcIdentifier, rawMangledName, packageName, genericTable.funcGenericTypeParams);
+        wrapperFunc->EnableAttr(Attribute::IMPORTED);
     } else {
-        funcBase = builder.CreateFunc(INVALID_LOCATION, wrapperTy, funcIdentifier, funcSrcIdentifier, "", packageName,
-            genericTable.funcGenericTypeParams);
+        wrapperFunc->DisableAttr(Attribute::IMPORTED);
     }
-    CJC_NULLPTR_CHECK(funcBase);
-    funcBase->Set<WrappedRawMethod>(curFunc);
-    funcBase->AppendAttributeInfo(curFunc->GetAttributeInfo());
-    funcBase->EnableAttr(Attribute::NO_REFLECT_INFO);
-    funcBase->EnableAttr(Attribute::NO_DEBUG_INFO);
-    customTypeDef.AddMethod(funcBase);
+    customTypeDef.AddMethod(wrapperFunc);
     // For cjmp, try delete virutal wrapper function when final func gererated.
-    TryDeleteVirtuallWrapperFunc(customTypeDef, *funcBase, builder);
-    funcBase->Set<LinkTypeInfo>(Linkage::EXTERNAL);
+    TryDeleteVirtuallWrapperFunc(customTypeDef, *wrapperFunc, builder);
+    wrapperFunc->Set<LinkTypeInfo>(Linkage::EXTERNAL);
     if (parentIsFromExtend) {
         // weak_odr is invalid in windows, we have to set internal
         if (targetIsWin) {
-            funcBase->Set<LinkTypeInfo>(Linkage::INTERNAL);
+            wrapperFunc->Set<LinkTypeInfo>(Linkage::INTERNAL);
         } else {
-            funcBase->Set<LinkTypeInfo>(Linkage::WEAK_ODR);
+            wrapperFunc->Set<LinkTypeInfo>(Linkage::WEAK_ODR);
         }
     }
 
-    wrapperCache[std::move(funcIdentifier)] = funcBase;
+    wrapperCache[std::move(funcIdentifier)] = wrapperFunc;
     if (isImported && !parentIsFromExtend) {
-        return funcBase;
+        return wrapperFunc;
     }
     // 5. Create the function body if the raw function is not imported
-    auto func = StaticCast<Func*>(funcBase);
-    CreateWrapperFuncBody(*func, funcInfo, selfTy, genericTable);
-    return func;
+    CreateWrapperFuncBody(*wrapperFunc, funcInfo, selfTy, genericTable);
+    return wrapperFunc;
 }
 
 VirtualWrapperDepMap&& WrapVirtualFunc::GetCurVirtFuncWrapDep()

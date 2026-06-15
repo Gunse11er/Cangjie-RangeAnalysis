@@ -51,7 +51,7 @@ template <> const std::string Analysis<MaybeInitDomain>::name = "maybe-init";
 template <> const std::optional<unsigned> Analysis<MaybeInitDomain>::blockLimit = std::nullopt;
 template <> const AnalysisKind GenKillDomain<MaybeInitDomain>::mustOrMaybe = AnalysisKind::MAYBE;
 
-MaybeInitAnalysis::MaybeInitAnalysis(const Func* func, const ConstructorInitInfo* ctorInitInfo)
+MaybeInitAnalysis::MaybeInitAnalysis(const Function* func, const ConstructorInitInfo* ctorInitInfo)
     : GenKillAnalysis(func), ctorInitInfo(ctorInitInfo)
 {
     size_t allocateIdx = ctorInitInfo->localMemberNums;
@@ -142,7 +142,7 @@ void MaybeInitAnalysis::HandleApplyExpr(MaybeInitDomain& state, const Apply* app
     // Check if it is a call to another init function of this class/struct
     auto callee = apply->GetCallee();
     if (callee->IsFuncWithBody()) {
-        auto calleeFunc = VirtualCast<Func*>(callee);
+        auto calleeFunc = StaticCast<Function*>(callee);
         if (calleeFunc->IsConstructor() &&
             calleeFunc->GetOuterDeclaredOrExtendedDef() == ctorInitInfo->thisCustomDef &&
             apply->GetArgs()[0] == func->GetParam(0)) {

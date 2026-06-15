@@ -23,7 +23,7 @@ public:
      */
     static void RunOnPackage(const Package& package, bool isDebug);
 private:
-    static void RunOnFunc(const Func& func, bool isDebug);
+    static void RunOnFunc(const Function& func, bool isDebug);
 };
 } // namespace Cangjie::CHIR
 

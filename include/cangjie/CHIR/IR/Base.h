@@ -11,10 +11,14 @@
 #include <typeinfo>
 
 #include "cangjie/CHIR/IR/Annotation.h"
+#include "cangjie/CHIR/IR/AttributeInfo.h"
 
 namespace Cangjie::CHIR {
 class Base {
 public:
+    // ===--------------------------------------------------------------------===//
+    // Annotation
+    // ===--------------------------------------------------------------------===//
     template <typename T, typename... Args> void Set(Args&&... args)
     {
         anno.Set<T>(std::forward<Args>(args)...);
@@ -31,47 +35,41 @@ public:
     {
         return anno.Get<T>();
     }
-    template <class T>
-    T& GetAnno()
+
+    template <class T> T& GetAnno()
     {
         return anno.GetAnno<T>();
     }
 
-    virtual const DebugLocation& GetDebugLocation() const { return anno.GetDebugLocation(); }
-    inline void SetDebugLocation(const DebugLocation& loc)
-    {
-        anno.SetDebugLocation(loc);
-    }
-    inline void SetDebugLocation(DebugLocation&& loc)
-    {
-        anno.SetDebugLocation(std::move(loc));
-    }
+    const AnnotationMap& GetAnno() const;
 
-    void CopyAnnotationMapFrom(const Base& other)
-    {
-        anno = other.anno;
-    }
+    // ===--------------------------------------------------------------------===//
+    // Debug Location
+    // ===--------------------------------------------------------------------===//
+    virtual const DebugLocation& GetDebugLocation() const;
+    void SetDebugLocation(const DebugLocation& newLoc);
+    void SetDebugLocation(DebugLocation&& newLoc);
 
-    std::string ToStringAnnotationMap() const { return anno.ToString(); }
+    // ===--------------------------------------------------------------------===//
+    // Attribute
+    // ===--------------------------------------------------------------------===//
+    AttributeInfo GetAttributeInfo() const;
+    void AppendAttributeInfo(const AttributeInfo& info);
+    void DisableAttr(Attribute attr);
+    void EnableAttr(Attribute attr);
+    bool TestAttr(Attribute attr) const;
 
-    const AnnotationMap& GetAnno() const
-    {
-        return anno;
-    }
-
-    AnnotationMap MoveAnnotation()
-    {
-        return std::move(anno);
-    }
-    void SetAnnotation(AnnotationMap&& ot)
-    {
-        anno = std::move(ot);
-    }
-
+    // ===--------------------------------------------------------------------===//
+    // Others
+    // ===--------------------------------------------------------------------===//
+    void CopyBaseInfoFrom(const Base& other);
+    std::string BaseCommentToString() const;
     virtual ~Base() = default;
 
-private:
+protected:
     AnnotationMap anno;
+    DebugLocation loc{};
+    AttributeInfo attributes;
 };
 }
 #endif

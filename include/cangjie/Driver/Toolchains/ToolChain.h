@@ -126,7 +126,7 @@ protected:
                     return "/lib/ld-musl-x86_64.so.1";
                 }
                 if (tripleInfo.env == Triple::Environment::ANDROID) {
-                    return "/system/bin/linker64";
+                    return tripleInfo.arch == Triple::ArchType::ARM32 ?  "/system/bin/linker" : "/system/bin/linker64";
                 }
                 if (tripleInfo.arch == Triple::ArchType::X86_64) {
                     return "/lib64/ld-linux-x86-64.so.2";

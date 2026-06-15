@@ -30,7 +30,7 @@ static bool IsUnnecessarySuperCall(const AST::Node& node)
     }
     if (auto re = DynamicCast<AST::RefExpr>(ce->baseFunc.get()); re && re->isSuper) {
         // Super call of 'Object' can be ignored.
-        return ce->ty->IsObject();
+        return ce->GetTy()->IsObject();
     }
     return false;
 }

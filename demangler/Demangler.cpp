@@ -350,8 +350,8 @@ bool Demangler<T>::IsQualifiedType() const
     if (IsPrimitive<T>(mangledName[currentIndex])) {
         return true;
     }
-    // The {'C', 'R', 'N', 'T', 'P', 'A', 'k', 'V'} belong to the legal qualified type prefix.
-    for (auto prefix : { 'C', 'R', 'N', 'T', 'P', 'A', 'k', 'V' }) {
+    // The {'C', 'R', 'F', 'N', 'T', 'P', 'A', 'k', 'V', 'G'} belong to the legal qualified type prefix.
+    for (auto prefix : { 'C', 'R', 'F', 'N', 'T', 'P', 'A', 'k', 'V', 'G' }) {
         if (mangledName[currentIndex] == prefix) {
             return true;
         }
@@ -366,7 +366,7 @@ bool Demangler<T>::IsDecl() const
 }
 
 template<typename T>
-void Demangler<T>::ErrorLog(const char* msg) const
+void Demangler<T>::ErrorLog([[maybe_unused]] const char* msg) const
 {
 #if defined(MRT_DEBUG) && (MRT_DEBUG == 1) && !defined(BUILD_LIB_CANGJIE_DEMANGLE)
     PRINT_ERROR("'%s' is not a valid mangling name.\n ", mangledName.Str());
@@ -379,7 +379,7 @@ void Demangler<T>::ErrorLog(const char* msg) const
 }
 
 template<typename T>
-bool Demangler<T>::MatchForward(const char pattern[], uint32_t len) const
+bool Demangler<T>::MatchForward(const char pattern[], size_t len) const
 {
     auto maxLen = mangledName.Length() - currentIndex;
     len = len > maxLen ? maxLen : len;
@@ -727,7 +727,7 @@ DemangleInfo<T> Demangler<T>::DemanglePackageName()
     if (pkg.IsEmpty()) {
         pkg = DemangleStringName();
         auto pos = pkg.Find(':');
-        if (pos > -1 && pkg.Length() - static_cast<size_t>(pos) > 0) {
+        if (pos > -1 && pkg.Length() - static_cast<size_t>(pos) > 1) {
             pkg = pkg.SubStr(0, pos) + T{':'} + pkg.SubStr(pos, pkg.Length() - static_cast<size_t>(pos));
         }
     }
@@ -1143,7 +1143,7 @@ DemangleInfo<T> Demangler<T>::DemangleVArray()
 {
     DemangleInfo<T> di{ MANGLE_VARRAY_STR, TypeKind::TUPLE };
     SkipChar(MANGLE_VARRAY_PREFIX);
-    uint32_t num = DemangleManglingNumber();
+    uint32_t num = static_cast<uint32_t>(DemangleManglingNumber());
     di.genericTypes = DemangleGenericTypes().GetFullName(scopeResolution, num);
     return di;
 }

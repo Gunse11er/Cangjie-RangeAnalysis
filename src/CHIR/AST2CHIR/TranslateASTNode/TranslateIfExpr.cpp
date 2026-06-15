@@ -18,7 +18,7 @@ bool Translator::CanOptimizeToSwitch(const LetPatternDestructor& let) const
     if (let.patterns[0]->astKind == ASTKind::WILDCARD_PATTERN) {
         return false;
     }
-    const auto& type = let.initializer->ty;
+    const auto& type = let.initializer->GetTy();
     bool validSelectorTy = IsOptimizableTy(type) ||
         (type->IsEnum() && IsOptimizableEnumTy(type));
     if (!validSelectorTy) {
@@ -104,7 +104,7 @@ protected:
     {
         // Type of if expression may be type of expected target,
         // we need to check all branch for real nothing typed control flow.
-        return ifExpr.elseBody && ifExpr.thenBody->ty->IsNothing() && ifExpr.elseBody->ty->IsNothing();
+        return ifExpr.elseBody && ifExpr.thenBody->GetTy()->IsNothing() && ifExpr.elseBody->GetTy()->IsNothing();
     }
 
     DanglingBlock TranslateNormalCondition(const Expr& cond, bool isRightmost)
@@ -204,7 +204,7 @@ protected:
 
     DanglingBlock TranslateLetPatternAsTable(const LetPatternDestructor& let, bool isRightmost)
     {
-        auto selectorTy = let.initializer->ty;
+        auto selectorTy = let.initializer->GetTy();
         auto selectorVal = tr.TranslateExprArg(*let.initializer);
         // Previously checked that selector ty is integer, char or enum.
         auto enumDecl = DynamicCast<AST::EnumDecl>(AST::Ty::GetDeclOfTy(selectorTy));
@@ -239,7 +239,7 @@ protected:
         auto tb = CreateBlock();
         auto fb = CreateBlock();
         auto firstDefaultBlock = fb;
-        auto firstSelectorVal = GetEnumIDValue(*let.initializer->ty, enumVal);
+        auto firstSelectorVal = GetEnumIDValue(*let.initializer->GetTy(), enumVal);
         Translator::EnumMatchInfo matchInfo;
         {
             Translator::ScopeContext context(tr);
@@ -324,7 +324,7 @@ protected:
         }
         tr.currentBlock = baseBlock;
         Type* targetType;
-        if (auto enumTy = DynamicCast<AST::EnumTy>(let.initializer->ty)) {
+        if (auto enumTy = DynamicCast<AST::EnumTy>(let.initializer->GetTy())) {
             targetType = tr.GetSelectorType(*enumTy);
         } else {
             targetType = tr.builder.GetUInt64Ty();
@@ -364,11 +364,6 @@ protected:
     Ptr<Block> GetBlockByAST(const AST::Block& block)
     {
         return tr.GetBlockByAST(block);
-    }
-    template <class... Args>
-    void CreateWrappedStore(Args&&... args)
-    {
-        tr.CreateWrappedStore(std::forward<Args>(args)...);
     }
     ///@}
 
@@ -418,7 +413,7 @@ class TranslateIfExpr final : private TranslateCondCtrlExpr {
     {
         if (block.body.size() == 1) {
             if (auto lit = DynamicCast<LitConstExpr>(&*block.body[0])) {
-                return lit->ty->IsUnit();
+                return lit->GetTy()->IsUnit();
             } else {
                 return false;
             }
@@ -432,7 +427,7 @@ public:
     Ptr<Value> Translate(const IfExpr& e1)
     {
         e = &e1;
-        auto ifType = tr.TranslateType(*e1.ty);
+        auto ifType = tr.TranslateType(*e1.GetTy());
         // generate an Allocate(Unit&) for debugging, so that the if expr can be stepped in
         bool forceGenerateUnit = opts.enableCompileDebug && IsEmptyIf(e1);
         if ((!HasTypeOfNothing(e1) && !ifType->IsUnit()) || forceGenerateUnit) {
@@ -480,8 +475,8 @@ protected:
         trueBlock->SetDebugLocation(tr.TranslateLocation(*e->thenBody));
         if (e->TestAttr(AST::Attribute::IMPLICIT_ADD) &&
             e->condExpr->TestAttr(AST::Attribute::COMPILER_ADD)) {
-            if (auto cond = DynamicCast<LitConstExpr>(&*e->condExpr); cond && cond->ty->IsBoolean() &&
-                cond->constNumValue.asBoolean) {
+            if (auto cond = DynamicCast<LitConstExpr>(&*e->condExpr);
+                cond && cond->GetTy()->IsBoolean() && cond->constNumValue.asBoolean) {
                 // generated from for in desugar, condition is a constant true
                 trueBlock->Set<SkipCheck>(SkipKind::SKIP_DCE_WARNING);
             }

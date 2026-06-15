@@ -58,6 +58,8 @@ void Collector::AddSymbol(ASTContext& ctx, const NodeInfo& nodeInfo, bool buildT
 
 void Collector::CollectPackageNode(ASTContext& ctx, Package& package, bool buildTrie)
 {
+    // Update position limit for symbol collector to ensure Searcher API works correctly.
+    UpdatePosLimit(package);
     scopeManager.Reset();
     auto nodeInfo = NodeInfo(package, package.fullPackageName, ctx.currentScopeLevel, TOPLEVEL_SCOPE_NAME);
     AddSymbol(ctx, nodeInfo, buildTrie);
@@ -398,7 +400,8 @@ void Collector::CollectTypeAliasDecl(ASTContext& ctx, TypeAliasDecl& tad, bool b
 void Collector::CollectMacroExpandDecl(ASTContext& ctx, MacroExpandDecl& med, bool buildTrie)
 {
     CollectAnnotations(ctx, med.annotations, buildTrie);
-    auto nodeInfo = NodeInfo(med, med.invocation.fullName, ctx.currentScopeLevel, ctx.currentScopeName);
+    auto nodeInfo =
+        NodeInfo(med, med.invocation.macroCallDiagInfo.fullName, ctx.currentScopeLevel, ctx.currentScopeName);
     AddSymbol(ctx, nodeInfo, buildTrie);
     if (med.invocation.decl) {
         WalkMacroCall(med, med.invocation.decl);
@@ -410,7 +413,8 @@ void Collector::CollectMacroExpandDecl(ASTContext& ctx, MacroExpandDecl& med, bo
 
 void Collector::CollectMacroExpandExpr(ASTContext& ctx, MacroExpandExpr& mee, bool buildTrie)
 {
-    auto nodeInfo = NodeInfo(mee, mee.invocation.fullName, ctx.currentScopeLevel, ctx.currentScopeName);
+    auto nodeInfo =
+        NodeInfo(mee, mee.invocation.macroCallDiagInfo.fullName, ctx.currentScopeLevel, ctx.currentScopeName);
     AddSymbol(ctx, nodeInfo, buildTrie);
     if (mee.invocation.decl) {
         WalkMacroCall(mee, mee.invocation.decl);
@@ -422,7 +426,8 @@ void Collector::CollectMacroExpandExpr(ASTContext& ctx, MacroExpandExpr& mee, bo
 
 void Collector::CollectMacroExpandParam(ASTContext& ctx, MacroExpandParam& mep, bool buildTrie)
 {
-    auto nodeInfo = NodeInfo(mep, mep.invocation.fullName, ctx.currentScopeLevel, ctx.currentScopeName);
+    auto nodeInfo =
+        NodeInfo(mep, mep.invocation.macroCallDiagInfo.fullName, ctx.currentScopeLevel, ctx.currentScopeName);
     AddSymbol(ctx, nodeInfo, buildTrie);
     if (mep.invocation.decl) {
         WalkMacroCall(mep, mep.invocation.decl);

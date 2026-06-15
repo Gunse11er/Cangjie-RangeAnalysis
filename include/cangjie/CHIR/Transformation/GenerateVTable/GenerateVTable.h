@@ -21,7 +21,8 @@ namespace Cangjie {
 namespace CHIR {
 class GenerateVTable {
 public:
-    GenerateVTable(Package& pkg, const std::vector<CustomTypeDef*>& defs, CHIRBuilder& b, const GlobalOptions& opts);
+    GenerateVTable(Package& pkg, const std::vector<CustomTypeDef*>& defs,
+        CHIRBuilder& b, const GlobalOptions& opts, const std::string& passName);
 
     /**
      * @brief Create VTable.
@@ -57,14 +58,15 @@ public:
     void UpdateFuncCall();
 
 private:
-    FuncBase* GetMutFuncWrapper(const Type& thisType, const std::vector<Value*>& args,
-        const std::vector<Type*>& instTypeArgs, Type& retType, const FuncBase& callee);
+    Function* GetMutFuncWrapper(const Type& thisType, const std::vector<Value*>& args,
+        const std::vector<Type*>& instTypeArgs, Type& retType, const Function& callee);
 
     const Package& package;
     const std::vector<CustomTypeDef*>& candidateDefs;
     CHIRBuilder& builder;
     const GlobalOptions& opts;
-    std::unordered_map<std::string, FuncBase*> mutFuncWrappers;
+    std::string passName;
+    std::unordered_map<std::string, Function*> mutFuncWrappers;
 };
 } // namespace CHIR
 } // namespace Cangjie

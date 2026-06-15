@@ -33,15 +33,15 @@ public:
     bool IsClass() const;
     bool IsInterface() const;
 
-    std::string ToString() const override;
-
     /**
      * @brief Whether this class is user defined annotation.
      *
      * @return return true for classes that are marked with the @Annotation annotation.
      */
     bool IsAnnotation() const;
-    void SetAnnotation(bool value);
+    void SetAnnotationTargets(std::vector<GlobalVar*>&& targets);
+    std::vector<GlobalVar*> GetAnnotationTargets() const;
+
     // ===--------------------------------------------------------------------===//
     // Super Parent
     // ===--------------------------------------------------------------------===//
@@ -53,16 +53,10 @@ public:
     // ===--------------------------------------------------------------------===//
     // Member Function
     // ===--------------------------------------------------------------------===//
-    void AddMethod(class FuncBase* method, bool recordOrder = true) override;
-    void AddAbstractMethod(AbstractMethodInfo methodInfo, bool recordOrder = true);
-    std::vector<AbstractMethodInfo> GetAbstractMethods() const;
-    void SetAbstractMethods(const std::vector<AbstractMethodInfo>& methods);
-    const std::vector<std::string>& GetAllMethodMangledNames() const;
-    void SetAllMethodMangledNames(const std::vector<std::string>& names);
-    FuncBase* GetFinalizer() const;
+    Function* GetFinalizer() const;
 
 protected:
-    void PrintComment(std::stringstream& ss) const override;
+    std::string AddExtraComment() const override;
     
 private:
     explicit ClassDef(std::string srcCodeIdentifier, std::string identifier,
@@ -73,10 +67,11 @@ private:
     void PrintAbstractMethod(std::stringstream& ss) const;
 
     bool isClass = false;           // class or interface
-    bool isAnnotation = false;      // whether the class is modified by @Annotation
+    // @Annotation[target: [Type, Parameter ...]]
+    // class A {}
+    // we will create global var for every target
+    std::optional<std::vector<GlobalVar*>> annotationTargets;
     ClassType* superClassTy = nullptr;
-    std::vector<AbstractMethodInfo> abstractMethods;
-    std::vector<std::string> allMethodMangledNames;
 };
 } // namespace Cangjie::CHIR
 

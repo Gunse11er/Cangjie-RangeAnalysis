@@ -15,16 +15,16 @@ using namespace Sema;
 Ptr<Ty> TypeChecker::TypeCheckerImpl::SynPerformExpr(ASTContext& ctx, PerformExpr& pe)
 {
     CJC_NULLPTR_CHECK(pe.expr); // Parser guarantees.
-    auto exprTy = Synthesize(ctx, pe.expr.get());
+    auto exprTy = Synthesize({ctx, SynPos::EXPR_ARG}, pe.expr.get());
     if (!Ty::IsTyCorrect(exprTy)) {
-        pe.ty = TypeManager::GetInvalidTy();
-        return pe.ty;
+        pe.SetTy(TypeManager::GetInvalidTy());
+        return pe.GetTy();
     }
     if (auto commandTy = PromoteToCommandTy(*pe.expr, *exprTy); commandTy) {
-        pe.ty = (*commandTy)->typeArgs[0];
+        pe.SetTy((*commandTy)->typeArgs[0]);
     } else {
-        pe.ty = TypeManager::GetInvalidTy();
+        pe.SetTy(TypeManager::GetInvalidTy());
     }
-    
-    return pe.ty;
+
+    return pe.GetTy();
 }

@@ -30,8 +30,7 @@ bool IsSpecialFunction(const FuncDecl& fd)
         return true;
     }
     auto isGetCommandLineArgsFunc = fd.fullPackageName == CORE_PACKAGE_NAME && fd.identifier == GET_COMMAND_LINE_ARGS;
-    auto isImplictUsed =
-        Utils::In<std::string>(fd.fullPackageName, {CORE_PACKAGE_NAME, AST_PACKAGE_NAME}) &&
+    auto isImplictUsed = Utils::In<std::string>(fd.fullPackageName, {CORE_PACKAGE_NAME, AST_PACKAGE_NAME}) &&
         fd.TestAttr(Attribute::IMPLICIT_USED);
     auto isToAny = fd.identifier == TO_ANY;
     auto isMainInvoke = fd.identifier == MAIN_INVOKE;
@@ -250,6 +249,9 @@ private:
     // since all propDecl accesses will be rearraged to getter/setter function which belongs to the propDecl.
     void SetTargetLinkage(Ptr<Decl> target)
     {
+        if (target->TestAttr(Attribute::IMPORTED)) {
+            return;
+        }
         if (auto fd = DynamicCast<FuncDecl>(target)) {
             SetFuncTargetLinkage(*fd);
         } else if (auto vd = DynamicCast<VarDecl>(target)) {
@@ -257,7 +259,7 @@ private:
         } else if (auto tad = DynamicCast<TypeAliasDecl>(target)) {
             tad->linkage = Linkage::EXTERNAL;
         } else {
-            AddExportedTy(target->ty);
+            AddExportedTy(target->GetTy());
         }
     }
     void SetFuncTargetLinkage(FuncDecl& fd, bool byTy = false);
@@ -329,7 +331,10 @@ void ExternalLinkageAnalyzer::PerformPublicType(const OwnedPtr<Decl>& decl)
         return;
     }
     for (auto& super : id->GetAllSuperDecls()) {
-        AddExportedTy(super->ty);
+        if (super->TestAttr(Attribute::IMPORTED)) {
+            continue;
+        }
+        AddExportedTy(super->GetTy());
     }
 
     if (auto classDecl = DynamicCast<ClassDecl>(decl.get())) {
@@ -353,7 +358,7 @@ void ExternalLinkageAnalyzer::HandleMemberDeclInTopLevelDecl(Decl& decl)
             return;
         }
         if (fd->IsExportedDecl()) {
-            AddExportedTy(fd->ty);
+            AddExportedTy(fd->GetTy());
             if (CanBeSrcExported(*fd)) {
                 AddSrcExportedDecl(fd);
             }
@@ -365,7 +370,7 @@ void ExternalLinkageAnalyzer::HandleMemberDeclInTopLevelDecl(Decl& decl)
         return;
     }
     if (IsMemberInMemLayout(*vd)) {
-        AddExportedTy(vd->ty);
+        AddExportedTy(vd->GetTy());
     }
     if (IsInstMemberVarInGenericDecl(*vd)) {
         AddSrcExportedDecl(vd);
@@ -373,7 +378,7 @@ void ExternalLinkageAnalyzer::HandleMemberDeclInTopLevelDecl(Decl& decl)
     if (!vd->IsExportedDecl()) {
         return;
     }
-    AddExportedTy(vd->ty);
+    AddExportedTy(vd->GetTy());
     if (auto pd = DynamicCast<PropDecl>(vd); pd && (pd->isConst || pd->HasAnno(AnnotationKind::FROZEN))) {
         for (auto& getter : std::as_const(pd->getters)) {
             AddSrcExportedDecl(getter.get());
@@ -476,7 +481,7 @@ void ExternalLinkageAnalyzer::AnalyzeExternalLinkageByExportedTy()
         }
 
         auto decl = Ty::GetDeclPtrOfTy(ty);
-        if (!decl) {
+        if (!decl || decl->TestAttr(Attribute::IMPORTED)) {
             continue;
         }
         decl->linkage = Linkage::EXTERNAL;
@@ -534,12 +539,12 @@ void ExternalLinkageAnalyzer::SetFuncTargetLinkage(FuncDecl& fd, [[maybe_unused]
     if (CanBeSrcExported(fd)) {
         AddSrcExportedDecl(&fd);
     }
-    AddExportedTy(fd.ty);
+    AddExportedTy(fd.GetTy());
     if (fd.outerDecl) {
         fd.outerDecl->linkage = Linkage::EXTERNAL;
         if (auto id = DynamicCast<InheritableDecl>(fd.outerDecl)) {
             for (auto& type : std::as_const(id->inheritedTypes)) {
-                AddExportedTy(type->ty);
+                AddExportedTy(type->GetTy());
             }
         }
     }
@@ -579,12 +584,12 @@ void ExternalLinkageAnalyzer::SetVarTargetLinkage(VarDecl& vd, bool byTy, bool i
         IsMemberVarShouldBeSrcExported(vd)) {
         AddSrcExportedDecl(&vd);
     }
-    AddExportedTy(vd.ty);
+    AddExportedTy(vd.GetTy());
     if (vd.outerDecl) {
         vd.outerDecl->linkage = Linkage::EXTERNAL;
         if (auto id = DynamicCast<InheritableDecl>(vd.outerDecl)) {
             for (auto& type : std::as_const(id->inheritedTypes)) {
-                AddExportedTy(type->ty);
+                AddExportedTy(type->GetTy());
             }
         }
     }

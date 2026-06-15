@@ -8,7 +8,7 @@
 #define CANGJIE_CHIR_TRANSFORMATION_DEAD_CODE_ELIMINATION_H
 
 #include "cangjie/CHIR/IR/CHIRBuilder.h"
-#include "cangjie/CHIR/Utils/DiagAdapter.h"
+#include "cangjie/Basic/DiagnosticEngine.h"
 #include "cangjie/CHIR/IR/Expression/Terminator.h"
 #include "cangjie/CHIR/IR/Package.h"
 #include "cangjie/Utils/TaskQueue.h"
@@ -25,7 +25,7 @@ public:
      * @param diag cangjie error or warning reporter.
      * @param curPkg this package.
      */
-    explicit DeadCodeElimination(CHIRBuilder& builder, DiagAdapter& diag, const Package& curPkg);
+    explicit DeadCodeElimination(CHIRBuilder& builder, DiagnosticEngine& diag, const Package& curPkg);
 
     /**
      * @brief process to do useless function elimination.
@@ -60,7 +60,7 @@ public:
      * @param funcs functions to do dead code elimination.
      * @param isDebug flag whether print debug log.
      */
-    void UnreachableBlockElimination(const std::vector<const Func*>& funcs, bool isDebug) const;
+    void UnreachableBlockElimination(const std::vector<const Function*>& funcs, bool isDebug) const;
     /**
      * @brief process to report unreachable block warning.
      * @param package package to report warning.
@@ -85,22 +85,22 @@ public:
 
 private:
     CHIRBuilder& builder;
-    DiagAdapter& diag;
+    DiagnosticEngine& diag;
     const Package& curPkg;
 
     // =============== Functions for Useless Variable Check =============== //
     void UselessVariableCheckForFunc(const BlockGroup& funcBody, bool isDebug);
     bool CheckOneUsers(const std::vector<Expression*>& users) const;
     bool CheckTwoUsers(const std::vector<Expression*>& users) const;
-    void UselessExprEliminationForFunc(const Func& func, bool isDebug) const;
+    void UselessExprEliminationForFunc(const Function& func, bool isDebug) const;
     
     // =============== Functions for Nothing type Check =============== //
     void NothingTypeExprEliminationForFunc(BlockGroup& funcBody, bool isDebug);
     
     static bool CheckAllUsersIsNotUse(const Value& value, const std::vector<Expression*>& users);
 
-    // =============== Functions for Useless Func Elimination =============== //
-    bool CheckUselessFunc(const Func& func, const GlobalOptions& opts, bool usingReflectPackage);
+    // =============== Functions for Useless Function Elimination =============== //
+    bool CheckUselessFunc(const Function& func, const GlobalOptions& opts, bool usingReflectPackage);
 
     // =============== Functions for Unreachable Block Elimination =============== //
     bool CheckUselessBlock(const Block& block) const;
@@ -118,7 +118,7 @@ private:
 
     // =============== Functions for dce reporter =============== //
     void TryReportUnusedOnExpr(Expression& expr, const GlobalOptions& opts, bool blockUsed);
-    void ReportUnusedFunc(const Func& func, const GlobalOptions& opts);
+    void ReportUnusedFunc(const Function& func, const GlobalOptions& opts);
     void ReportUnusedGlobalVar(const GlobalVar& globalVar);
     void DiagUnusedVariable(const Debug& expr);
     void ReportUnusedLocalVariable(const Expression& expr, bool isDebug);

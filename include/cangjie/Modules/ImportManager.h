@@ -96,7 +96,7 @@ public:
     /** This should not be used for source package. */
     const AST::OrderedDeclSet& GetPackageMembersByName(const AST::Package& package, const std::string& name) const;
     /** Get accessible 'targetPackage' decls from 'srcPackage'. NOTE: used by LSP */
-    AST::OrderedDeclSet GetPackageMembers(
+    std::map<std::string, AST::OrderedDeclSet> GetPackageMembers(
         const std::string& srcFullPackageName, const std::string& targetFullPackageName) const;
     std::vector<std::pair<std::string, std::vector<Ptr<AST::Decl>>>> GetImportedDecls(const AST::File& file) const;
 
@@ -199,6 +199,11 @@ public:
         return result;
     }
 
+    /**
+     * process std dependency，where 'fullPackageName' comes from .bc inputs
+     */
+    bool AnalyzeDepStdPkgsOfBC(const std::string& fullPackageName);
+    
     bool IsMacroRelatedPackageName(const std::string& fullPackageName) const;
 
     /**
@@ -303,7 +308,6 @@ public:
     void SetImportedPackageFromASTNode(std::vector<OwnedPtr<AST::Package>>& pkgs);
     using DeclImportsMap = std::unordered_map<Ptr<const AST::Decl>, std::vector<Ptr<const AST::ImportSpec>>>;
     /**
-     * Note: After the macro expansion, the ImportSpec pointer returned by this interface might be unreliable.
      * @param fullPackageName [in]: full package name.
      * @return map of imported decl to the 'ImportSpec' which imports the decl.
      */
@@ -449,6 +453,9 @@ private:
     void HandleStdPackage(const std::string& fullPackageName, const std::string& cjoPath, bool isRecursive = false);
 
     void AddImportedDeclsForSourcePackage(const AST::Package& pkg);
+    void AddImportedDeclsForFile(const AST::Package& pkg, const AST::File& file);
+    void RemoveDeclsImportedByImports(
+        const std::string& fullPackageName, const std::vector<OwnedPtr<AST::ImportSpec>>& imports);
 
     /**
      * Get information of dependency packages of @param pkg in json format.

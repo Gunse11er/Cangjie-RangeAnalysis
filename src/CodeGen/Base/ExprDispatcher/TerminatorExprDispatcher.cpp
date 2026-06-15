@@ -26,43 +26,30 @@
 #include "cangjie/CHIR/IR/Value/Value.h"
 
 namespace Cangjie::CodeGen {
-llvm::Value* HandleExitExpression(IRBuilder2& irBuilder, const CHIR::Exit& exitExpr)
+namespace {
+void HandleExitDebugInfo(IRBuilder2& irBuilder, const CHIR::Exit& exitExpr)
 {
     auto& cgMod = irBuilder.GetCGModule();
     auto& cgCtx = irBuilder.GetCGContext();
     if (cgCtx.debugValue) {
         CJC_ASSERT(cgCtx.GetCompileOptions().enableCompileDebug);
         auto thisValue = irBuilder.GetInsertCGFunction()->GetArgByIndexFromCHIR(0);
-        auto curCHIRFunc = DynamicCast<const CHIR::Func*>(&irBuilder.GetInsertCGFunction()->GetOriginal());
-        CJC_NULLPTR_CHECK(curCHIRFunc);
-        auto thisTy = curCHIRFunc->GetParam(0)->GetType();
+        const auto& curCHIRFunc = StaticCast<const CHIR::Function&>(irBuilder.GetInsertCGFunction()->GetOriginal());
+        auto thisTy = curCHIRFunc.GetParam(0)->GetType();
         auto cgType = CGType::GetOrCreate(cgMod, thisTy);
         auto thisCGValue = CGValue(thisValue, cgType);
         auto payload = irBuilder.GetPayloadFromObject(cgCtx.debugValue);
         irBuilder.CreateStore(CGValue(payload, cgType), thisCGValue);
     }
     if (auto func = irBuilder.GetInsertFunction(); func && func->hasFnAttribute(HAS_WITH_TI_WRAPPER_ATTR)) {
-        auto debugLocOfRetExpr = exitExpr.GetDebugLocation();
-        cgCtx.AddDebugLocOfRetExpr(func, debugLocOfRetExpr);
+        cgCtx.AddDebugLocOfRetExpr(func, exitExpr.GetDebugLocation());
     }
-    auto parentFunc = exitExpr.GetTopLevelFunc();
-    CJC_NULLPTR_CHECK(parentFunc);
-    auto retTy = parentFunc->GetReturnType();
-#ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
-    if (retTy->IsUnit() || retTy->IsNothing() || retTy->IsVoid()) {
-        return irBuilder.CreateRetVoid();
-    }
-#endif
-    auto ret = parentFunc->GetReturnValue();
-    if (retTy->IsRawArray()) {
-        CJC_ASSERT(ret && ret->GetExpr()->GetExprKind() == CHIR::ExprKind::RAW_ARRAY_ALLOCATE);
-        return irBuilder.CreateRet(**(cgMod | ret));
-    }
-    CJC_ASSERT_WITH_MSG(ret, "An unexpected nullptr is passed by CHIR.");
-    CJC_ASSERT(ret->GetExpr()->GetExprKind() == CHIR::ExprKind::ALLOCATE);
-    auto retVal = **(cgMod | ret);
-    auto retType = CGType::GetOrCreate(cgMod, ret->GetType()->GetTypeArgs()[0])->GetLLVMType();
-#ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
+}
+
+llvm::Value* CreateRetFromSlot(
+    IRBuilder2& irBuilder, const CHIR::Function& parentFunc, llvm::Value* retAddr, llvm::Type* retType)
+{
+    auto& cgMod = irBuilder.GetCGModule();
     auto llvmRetType = irBuilder.getCurrentFunctionReturnType();
     if (llvmRetType->isVoidTy()) {
         return irBuilder.CreateRetVoid();
@@ -70,11 +57,48 @@ llvm::Value* HandleExitExpression(IRBuilder2& irBuilder, const CHIR::Exit& exitE
     auto curLLVMFunc = irBuilder.GetInsertFunction();
     CJC_NULLPTR_CHECK(curLLVMFunc);
     if (curLLVMFunc->hasFnAttribute(CodeGen::CFUNC_ATTR)) {
-        retVal = cgMod.GetCGCFFI().ProcessRetValue(*llvmRetType, *retVal, irBuilder);
+        auto retVal = cgMod.GetCGCFFI().ProcessRetValue(*llvmRetType, *retAddr, irBuilder);
         return irBuilder.CreateRet(retVal);
     }
-#endif
-    return irBuilder.CreateRet(irBuilder.CreateLoad(retType, retVal));
+    if (parentFunc.Get<CHIR::OverrideSrcFuncType>() && !curLLVMFunc->hasStructRetAttr()) {
+        retType = llvmRetType;
+    }
+    return irBuilder.CreateRet(irBuilder.CreateLoad(retType, retAddr));
+}
+
+bool IsVoidLikeReturn(const CHIR::Type& retTy)
+{
+    return retTy.IsUnit() || retTy.IsNothing() || retTy.IsVoid();
+}
+
+llvm::Value* EmitDirectRet(IRBuilder2& irBuilder, const CHIR::LocalVar& ret)
+{
+    auto& cgMod = irBuilder.GetCGModule();
+    // RawArray returns are lowered as direct values instead of going through a return slot.
+    CJC_ASSERT(ret.GetExpr()->GetExprKind() == CHIR::ExprKind::RAW_ARRAY_ALLOCATE);
+    return irBuilder.CreateRet(**(cgMod | &ret));
+}
+} // namespace
+
+llvm::Value* HandleExitExpression(IRBuilder2& irBuilder, const CHIR::Exit& exitExpr)
+{
+    auto& cgMod = irBuilder.GetCGModule();
+    HandleExitDebugInfo(irBuilder, exitExpr);
+    auto parentFunc = exitExpr.GetTopLevelFunc();
+    CJC_NULLPTR_CHECK(parentFunc);
+    auto retTy = parentFunc->GetReturnType();
+    if (IsVoidLikeReturn(*retTy)) {
+        return irBuilder.CreateRetVoid();
+    }
+    auto ret = parentFunc->GetReturnValue();
+    CJC_ASSERT_WITH_MSG(ret, "An unexpected nullptr is passed by CHIR.");
+    if (retTy->IsRawArray()) {
+        return EmitDirectRet(irBuilder, *ret);
+    }
+    CJC_ASSERT(ret->GetExpr()->GetExprKind() == CHIR::ExprKind::ALLOCATE);
+    auto retAddr = **(cgMod | ret);
+    auto retType = CGType::GetOrCreate(cgMod, ret->GetType()->GetTypeArgs()[0])->GetLLVMType();
+    return CreateRetFromSlot(irBuilder, *parentFunc, retAddr, retType);
 }
 
 llvm::Value* HandleTerminatorExpression(IRBuilder2& irBuilder, const CHIR::Expression& chirExpr)

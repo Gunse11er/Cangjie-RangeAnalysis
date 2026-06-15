@@ -94,7 +94,7 @@ private:
 
     void AddVertex(const Decl& v)
     {
-        if (!Ty::IsTyCorrect(v.ty) || v.ty->HasGeneric()) {
+        if (!Ty::IsTyCorrect(v.GetTy()) || v.GetTy()->HasGeneric()) {
             return;
         }
         vertices.emplace(&v);
@@ -111,7 +111,8 @@ private:
 
     void AddArc(const Decl& u, const Decl& v)
     {
-        if (!Ty::IsTyCorrect(u.ty) || u.ty->HasGeneric() || !Ty::IsTyCorrect(v.ty) || v.ty->HasGeneric()) {
+        if (!Ty::IsTyCorrect(u.GetTy()) || u.GetTy()->HasGeneric() || !Ty::IsTyCorrect(v.GetTy()) ||
+            v.GetTy()->HasGeneric()) {
             return;
         }
         AddVertex(u);
@@ -143,10 +144,10 @@ private:
         CJC_NULLPTR_CHECK(sd.body);
         for (auto& d : sd.body->decls) {
             CJC_NULLPTR_CHECK(d);
-            if (d->astKind != ASTKind::VAR_DECL || d->TestAttr(Attribute::STATIC) || !Ty::IsTyCorrect(d->ty)) {
+            if (d->astKind != ASTKind::VAR_DECL || d->TestAttr(Attribute::STATIC) || !Ty::IsTyCorrect(d->GetTy())) {
                 continue;
             }
-            AddArcs(sd, *d->ty);
+            AddArcs(sd, *d->GetTy());
         }
     }
 
@@ -158,8 +159,8 @@ private:
                 CJC_ASSERT(fd->funcBody && fd->funcBody->paramLists.size() == 1 && fd->funcBody->paramLists.front());
                 for (auto& param : fd->funcBody->paramLists.front()->params) {
                     CJC_NULLPTR_CHECK(param);
-                    if (Ty::IsTyCorrect(param->ty)) {
-                        AddArcs(ed, *param->ty);
+                    if (Ty::IsTyCorrect(param->GetTy())) {
+                        AddArcs(ed, *param->GetTy());
                     }
                 }
             }
@@ -254,8 +255,8 @@ private:
 
 void CheckAndUpdateDeclTyWithNewTy(Decl& decl, const EnumTy& specifiedTy, TypeManager& typeManager)
 {
-    if (decl.ty->IsTuple()) {
-        auto tupleTy = RawStaticCast<TupleTy*>(decl.ty);
+    if (decl.GetTy()->IsTuple()) {
+        auto tupleTy = RawStaticCast<TupleTy*>(decl.GetTy());
         bool hasSpecifiedTy =
             std::find_if(tupleTy->typeArgs.begin(), tupleTy->typeArgs.end(),
                 [&specifiedTy](auto& typeArg) { return typeArg == &specifiedTy; }) != tupleTy->typeArgs.end();
@@ -274,13 +275,13 @@ void CheckAndUpdateDeclTyWithNewTy(Decl& decl, const EnumTy& specifiedTy, TypeMa
                 vec.emplace_back(elemTy);
             }
         }
-        decl.ty = typeManager.GetTupleTy(vec);
-    } else if (decl.ty == &specifiedTy) {
-        auto enumTy = RawStaticCast<EnumTy*>(decl.ty);
+        decl.SetTy(typeManager.GetTupleTy(vec));
+    } else if (decl.GetTy() == &specifiedTy) {
+        auto enumTy = RawStaticCast<EnumTy*>(decl.GetTy());
         auto newTy = typeManager.GetRefEnumTy(*enumTy->declPtr, enumTy->typeArgs);
         enumTy->hasCorrespondRefEnumTy = true;
         newTy->decl = enumTy->decl;
-        decl.ty = newTy;
+        decl.SetTy(newTy);
     }
 }
 } // namespace
@@ -333,7 +334,7 @@ void TypeChecker::TypeCheckerImpl::PerformRecursiveTypesElimination()
         auto& inEdges = scc.InEdges(*ed);
         for (auto u : inEdges) {
             CJC_NULLPTR_CHECK(u);
-            UpdateMemberVariableTy(*u, *StaticCast<EnumTy*>(ed->ty));
+            UpdateMemberVariableTy(*u, *StaticCast<EnumTy*>(ed->GetTy()));
         }
         scc.RemoveVertex(*ed);
         auto subSCCs = scc.StronglyConnectedComponents();

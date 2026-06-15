@@ -43,7 +43,7 @@ Value* Translator::TranslateVArrayAssign(const AssignExpr& assign)
     CJC_ASSERT(se->IsVArrayAccess());
 
     const auto& loc = TranslateLocation(assign);
-    auto lhsType = chirTy.TranslateType(*se->ty);
+    auto lhsType = chirTy.TranslateType(*se->GetTy());
 
     CJC_ASSERT(se->indexExprs.size() == 1);
     auto indexLoc = TranslateLocation(*se->indexExprs[0]);
@@ -63,11 +63,7 @@ Value* Translator::TranslateVArrayAssign(const AssignExpr& assign)
         CJC_ASSERT(lhsBase->GetType()->IsRef());
 
         auto index = TranslateExprArg(*se->indexExprs[0]);
-        auto callContext = IntrisicCallContext {
-            .kind = IntrinsicKind::VARRAY_SET,
-            .args = std::vector<Value*>({lhsBase, TypeCastOrBoxIfNeeded(*rhs, *lhsType, loc), index})
-        };
-        CreateAndAppendExpression<Intrinsic>(loc, builder.GetUnitTy(), callContext, currentBlock);
+        CreateAndAppendVArraySet(*lhsBase, *rhs, *index, *lhsType, loc);
         return nullptr;
     }
 
@@ -90,33 +86,52 @@ Value* Translator::TranslateVArrayAssign(const AssignExpr& assign)
     auto lhs = CreateAndAppendExpression<Intrinsic>(lhsType, arrGetContext, currentBlock)->GetResult();
     if (assign.op == TokenKind::AND_ASSIGN) {
         auto res = TransShortCircuitAnd(lhs, *assign.rightExpr, loc);
-        auto arrSetContext = IntrisicCallContext {
-            .kind = IntrinsicKind::VARRAY_SET,
-            .args = std::vector<Value*>({lhsBase, TypeCastOrBoxIfNeeded(*res, *lhsType, loc), index})
-        };
-        CreateAndAppendExpression<Intrinsic>(loc, builder.GetUnitTy(), arrSetContext, currentBlock);
+        CreateAndAppendVArraySet(*lhsBase, *res, *index, *lhsType, loc);
     } else if (assign.op == TokenKind::OR_ASSIGN) {
         auto res = TransShortCircuitOr(lhs, *assign.rightExpr, loc);
-        auto arrSetContext = IntrisicCallContext {
-            .kind = IntrinsicKind::VARRAY_SET,
-            .args = std::vector<Value*>({lhsBase, TypeCastOrBoxIfNeeded(*res, *lhsType, loc), index})
-        };
-        CreateAndAppendExpression<Intrinsic>(loc, builder.GetUnitTy(), arrSetContext, currentBlock);
+        CreateAndAppendVArraySet(*lhsBase, *res, *index, *lhsType, loc);
     } else {
         // normal compound assign, e.g a[0] += b
         auto rhsValue = TranslateExprArg(*assign.rightExpr);
         bool mayHaveException = OverloadableExprMayThrowException(assign, *lhs->GetType());
-        auto binaryOpResult = TryCreateWithOV<BinaryExpression>(currentBlock, mayHaveException, assign.overflowStrategy,
-            loc, lhs->GetType(), op2ExprKind.at(COMPOUND_ASSIGN_EXPR_MAP.at(assign.op)), lhs, rhsValue)
-                                  ->GetResult();
-
-        auto arrSetContext = IntrisicCallContext {
-            .kind = IntrinsicKind::VARRAY_SET,
-            .args = std::vector<Value*>({lhsBase, TypeCastOrBoxIfNeeded(*binaryOpResult, *lhsType, loc), index})
-        };
-        CreateAndAppendExpression<Intrinsic>(loc, builder.GetUnitTy(), arrSetContext, currentBlock);
+        auto binaryOpResult = TryCreateWithOV<BinaryExpression>(
+            currentBlock, mayHaveException, assign.overflowStrategy,
+            loc, lhs->GetType(), op2ExprKind.at(COMPOUND_ASSIGN_EXPR_MAP.at(assign.op)), lhs, rhsValue)->GetResult();
+        CreateAndAppendVArraySet(*lhsBase, *binaryOpResult, *index, *lhsType, loc);
     }
     return nullptr;
+}
+
+void Translator::CreateAndAppendVArraySet(
+    Value& lhs, Value& rhs, Value& index, Type& elementType, const DebugLocation& loc)
+{
+    // VArraySet doesn't need to care about exception handling, because Sema does all checking for it
+    auto arrSetContext = IntrisicCallContext {
+        .kind = IntrinsicKind::VARRAY_SET,
+        .args = std::vector<Value*>({&lhs, TypeCastOrBoxIfNeeded(rhs, elementType, loc), &index})
+    };
+    CreateAndAppendExpression<Intrinsic>(loc, builder.GetUnitTy(), arrSetContext, currentBlock);
+}
+
+void Translator::CreateAndAppendWrappedStoreElementByName(
+    const DebugLocation& loc, Value& rhs, Value& lhs, const std::vector<std::string>& path)
+{
+    auto lhsCustomType = StaticCast<CustomType*>(lhs.GetType()->StripAllRefs());
+    auto memberType = GetInstMemberTypeByName(*lhsCustomType, path, builder);
+    auto castedRhs = TypeCastOrBoxIfNeeded(rhs, *memberType, loc);
+    CreateAndAppendExpression<StoreElementByName>(loc, builder.GetUnitTy(), castedRhs, &lhs, path, currentBlock);
+}
+
+void Translator::CreateAndAppendWrappedStore(Value& rhs, Value& lhs, const DebugLocation& loc)
+{
+    CreateAndAppendWrappedStore(rhs, lhs, *currentBlock, loc);
+}
+
+void Translator::CreateAndAppendWrappedStore(Value& rhs, Value& lhs, Block& parent, const DebugLocation& loc)
+{
+    auto resultType = StaticCast<RefType*>(lhs.GetType())->GetBaseType();
+    auto castedRhs = TypeCastOrBoxIfNeeded(rhs, *resultType, loc);
+    CreateAndAppendExpression<Store>(loc, builder.GetUnitTy(), castedRhs, &lhs, &parent);
 }
 
 Value* Translator::TranslateCompoundAssign(const AssignExpr& assign)
@@ -142,7 +157,6 @@ Value* Translator::TranslateCompoundAssign(const AssignExpr& assign)
 
     // 2) Get the LHS part "X" as right-value
     Value* lhsRightValue = nullptr;
-    Type* storeTargetTy = nullptr;
     if (!lhsLeftValuePath.empty()) {
         // If the path is not empty, it means the "X" is some member access chain like:
         //      A.b.c
@@ -155,14 +169,12 @@ Value* Translator::TranslateCompoundAssign(const AssignExpr& assign)
         auto getMemberRef = CreateGetElementRefWithPath(
             leftValLoc, lhsLeftValueBase, lhsLeftValuePath, currentBlock, *lhsLeftValueBaseCustomType);
         auto memberType = StaticCast<RefType*>(getMemberRef->GetType())->GetBaseType();
-        storeTargetTy = memberType;
         auto loadMember = CreateAndAppendExpression<Load>(leftValLoc, memberType, getMemberRef, currentBlock);
         lhsRightValue = loadMember->GetResult();
     } else {
         // If the path is empty, it means the "X" is some simple expression like reference to other
         // variables or function call, therefore we just need to get the right value from the left value by loading
         CJC_ASSERT(!lhsLeftValueBaseTy->IsRef());
-        storeTargetTy = lhsLeftValueBaseTy;
         auto loadMember = CreateAndAppendExpression<Load>(loc, lhsLeftValueBaseTy, lhsLeftValueBase, currentBlock);
         lhsRightValue = loadMember->GetResult();
     }
@@ -181,14 +193,12 @@ Value* Translator::TranslateCompoundAssign(const AssignExpr& assign)
             lhsRightValue->GetType(), op2ExprKind.at(COMPOUND_ASSIGN_EXPR_MAP.at(assign.op)), lhsRightValue, rhs);
         compoundValue = binOp->GetResult();
     }
-    compoundValue = TypeCastOrBoxIfNeeded(*compoundValue, *storeTargetTy, loc);
 
     // 4) Implement the store
     if (!lhsLeftValuePath.empty()) {
-        CreateAndAppendExpression<StoreElementByName>(
-            loc, builder.GetUnitTy(), compoundValue, lhsLeftValueBase, lhsLeftValuePath, currentBlock);
+        CreateAndAppendWrappedStoreElementByName(loc, *compoundValue, *lhsLeftValueBase, lhsLeftValuePath);
     } else {
-        CreateAndAppendExpression<Store>(loc, builder.GetUnitTy(), compoundValue, lhsLeftValueBase, currentBlock);
+        CreateAndAppendWrappedStore(*compoundValue, *lhsLeftValueBase, loc);
     }
     return nullptr;
 }
@@ -199,9 +209,9 @@ Value* Translator::TranslateTrivialAssign(const AST::AssignExpr& assign)
     auto leftValLoc = TranslateLocation(*assign.leftValue);
     auto rightValLoc = TranslateLocation(*assign.rightExpr);
 
-    Value* rhs;
+    Value* rhs = nullptr;
     std::vector<std::string> path;
-    Value* lhs;
+    Value* lhs = nullptr;
 
     if (assign.leftValue->mapExpr) {
         // compound assignment, left first, right second
@@ -227,13 +237,9 @@ Value* Translator::TranslateTrivialAssign(const AST::AssignExpr& assign)
     }
     CJC_ASSERT(lhs && lhs->GetType()->IsRef());
     if (!path.empty()) {
-        auto lhsCustomType = StaticCast<CustomType*>(lhs->GetType()->StripAllRefs());
-        auto memberType = GetInstMemberTypeByName(*lhsCustomType, path, builder);
-        rhs = TypeCastOrBoxIfNeeded(*rhs, *memberType, loc);
-        CreateAndAppendExpression<StoreElementByName>(loc, builder.GetUnitTy(), rhs, lhs, path, currentBlock);
+        CreateAndAppendWrappedStoreElementByName(loc, *rhs, *lhs, path);
     } else {
-        rhs = TypeCastOrBoxIfNeeded(*rhs, *StaticCast<RefType*>(lhs->GetType())->GetBaseType(), loc);
-        CreateAndAppendExpression<Store>(loc, builder.GetUnitTy(), rhs, lhs, currentBlock);
+        CreateAndAppendWrappedStore(*rhs, *lhs, loc);
     }
     return nullptr;
 }

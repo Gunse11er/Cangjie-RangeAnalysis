@@ -31,7 +31,7 @@ public:
     void RunOnPackage(const Ptr<const Package>& package, bool isDebug);
 
 private:
-    void RunOnFunc(const Ptr<Func>& func, bool isDebug);
+    void RunOnFunc(const Ptr<Function>& func, bool isDebug);
 
     Ptr<Constant> CheckCanRewriteLambda(const Ptr<Expression>& expr) const;
 

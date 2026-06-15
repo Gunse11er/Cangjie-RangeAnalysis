@@ -18,6 +18,55 @@
 #include "cangjie/CHIR/IR/Value/Value.h"
 
 namespace Cangjie::CodeGen {
+namespace {
+llvm::Value* TryGetSpecialRetValueStorage(IRBuilder2& irBuilder, const CHIR::Allocate& alloca)
+{
+    auto parentFunc = alloca.GetTopLevelFunc();
+    if (!parentFunc || parentFunc->GetReturnValue() != alloca.GetResult()) {
+        return nullptr;
+    }
+
+    auto llvmFunc = irBuilder.GetCGModule().GetOrInsertCGFunction(parentFunc)->GetRawFunction();
+    if (llvmFunc->hasStructRetAttr()) {
+        return llvmFunc->getArg(0);
+    }
+
+    auto overrideSrcFuncType = parentFunc->Get<CHIR::OverrideSrcFuncType>();
+    if (!overrideSrcFuncType || !DeRef(*alloca.GetType())->IsBox()) {
+        return nullptr;
+    }
+
+    auto retValueCGType = CGType::GetOrCreate(irBuilder.GetCGModule(), overrideSrcFuncType->GetReturnType());
+    return retValueCGType->GetSize() ? irBuilder.CreateEntryAlloca(*retValueCGType) : nullptr;
+}
+
+void TryEmitNullInitForDebugLocalClass(IRBuilder2& irBuilder, const CHIR::Allocate& alloca, llvm::Value* result)
+{
+    if (irBuilder.GetCGContext().GetCompileOptions().optimizationLevel != GlobalOptions::OptimizationLevel::O0) {
+        return;
+    }
+    auto* localVar = alloca.GetResult();
+    if (!localVar || localVar->GetSrcCodeIdentifier().empty()) {
+        return;
+    }
+    auto chirType = DeRef(*alloca.GetType());
+    if (!chirType->IsClass() || !llvm::isa<llvm::AllocaInst>(result)) {
+        return;
+    }
+
+    // Zero the stack slot for class-type variables at -O0 so cjdb does not read
+    // garbage typeinfo pointers before the variable is initialised.
+    auto allocTy = llvm::cast<llvm::AllocaInst>(result)->getAllocatedType();
+    auto nullPtr = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(allocTy));
+    auto entryBB = &irBuilder.GetInsertBlock()->getParent()->getEntryBlock();
+    auto savedIP = irBuilder.saveIP();
+    irBuilder.SetInsertPoint(entryBB->getTerminator());
+    auto storeInst = irBuilder.CreateStore(nullPtr, result);
+    storeInst->setDebugLoc(llvm::DebugLoc());
+    irBuilder.restoreIP(savedIP);
+}
+} // namespace
+
 llvm::Value* HandleLoadExpr(IRBuilder2& irBuilder, const CHIR::Load& load)
 {
     auto& cgMod = irBuilder.GetCGModule();
@@ -81,11 +130,11 @@ llvm::Value* HandleStoreExpr(IRBuilder2& irBuilder, const CHIR::Store& store)
     if (auto var = DynamicCast<CHIR::LocalVar*>(addr); var && var->IsRetValue() &&
         store.GetTopLevelFunc()->Get<CHIR::OverrideSrcFuncType>() && DeRef(*addr->GetType())->IsBox()) {
         auto overrideSrcRetType = store.GetTopLevelFunc()->Get<CHIR::OverrideSrcFuncType>()->GetReturnType();
-        auto ptrCGType = CGType::GetOrCreate(
+        auto retAddrCGType = CGType::GetOrCreate(
             cgMod, CGType::GetRefTypeOf(cgMod.GetCGContext().GetCHIRBuilder(), *overrideSrcRetType));
-        auto valueCGType = CGType::GetOrCreate(cgMod, overrideSrcRetType);
-        auto valCGType = !overrideSrcRetType->IsGeneric() ? ptrCGType : valueCGType;
-        bool needBoxExpr = overrideSrcRetType->IsGeneric() || !valueCGType->GetSize();
+        auto retValueCGType = CGType::GetOrCreate(cgMod, overrideSrcRetType);
+        bool needBoxExpr = overrideSrcRetType->IsGeneric() || !retValueCGType->GetSize();
+        auto storeValCGType = overrideSrcRetType->IsGeneric() ? retValueCGType : retAddrCGType;
         auto valueToStore = valueVal.GetRawValue();
         if (!needBoxExpr) {
             if (auto valueVar = DynamicCast<CHIR::LocalVar*>(value);
@@ -95,8 +144,8 @@ llvm::Value* HandleStoreExpr(IRBuilder2& irBuilder, const CHIR::Store& store)
             }
         }
 
-        return irBuilder.CreateStore(CGValue(valueToStore, valCGType, valueVal.IsSRetArg()),
-            CGValue((cgMod | addr)->GetRawValue(), ptrCGType, (cgMod | addr)->IsSRetArg()),
+        return irBuilder.CreateStore(CGValue(valueToStore, storeValCGType, valueVal.IsSRetArg()),
+            CGValue((cgMod | addr)->GetRawValue(), retAddrCGType, (cgMod | addr)->IsSRetArg()),
             DeRef(*addr->GetType())->GetTypeArgs()[0]);
     }
     return irBuilder.CreateStore(valueVal, *(cgMod | addr));
@@ -173,7 +222,7 @@ llvm::Value* HandleGetElementRef(IRBuilder2& irBuilder, const CHIR::GetElementRe
     auto opTy = DeRef(*getEleRef.GetOperand(0)->GetType());
     bool isAutoEnv =
         opTy->IsClass() && IsClosureConversionEnvClass(*StaticCast<CHIR::ClassType*>(opTy)->GetClassDef());
-    bool isLambda = dynamic_cast<const CHIR::Func*>(&irBuilder.GetInsertCGFunction()->GetOriginal())->IsLambda();
+    bool isLambda = dynamic_cast<const CHIR::Function*>(&irBuilder.GetInsertCGFunction()->GetOriginal())->IsLambda();
     if (isLambda && irBuilder.GetCGContext().GetCompileOptions().enableCompileDebug && isAutoEnv) {
         irBuilder.CreateEnvDeclare(getEleRef, retValue);
     }
@@ -201,7 +250,8 @@ void HandleStoreElementRef(IRBuilder2& irBuilder, const CHIR::StoreElementRef& s
         // - we are in the scope of a struct instance method(without "$withTI" postfix),
         //   the "struct" mentioned above is the `this` parameter of the method.
         if (IsTypeContainsRef(srcCGType->GetLLVMType())) {
-            irBuilder.CallGCWriteAgg({tmp, payloadPtr, value->GetRawValue(), size});
+            irBuilder.CallGCWriteAgg(
+                srcCGType->GetLayoutType(), {tmp, payloadPtr, value->GetRawValue(), size});
         } else {
             irBuilder.CreateMemCpy(payloadPtr, llvm::MaybeAlign(), value->GetRawValue(), llvm::MaybeAlign(), size);
         }
@@ -229,15 +279,13 @@ llvm::Value* HandleMemoryExpression(IRBuilder2& irBuilder, const CHIR::Expressio
             auto& alloca = StaticCast<const CHIR::Allocate&>(chirExpr);
             // Opt: For the function that returns value by an `sret` argument,
             // we don't need to allocate another place to store the return value.
-            if (auto parentFunc = alloca.GetTopLevelFunc();
-                parentFunc && parentFunc->GetReturnValue() == alloca.GetResult()) {
-                auto llvmFunc = irBuilder.GetCGModule().GetOrInsertCGFunction(parentFunc)->GetRawFunction();
-                if (llvmFunc->hasStructRetAttr()) {
-                    return llvmFunc->getArg(0);
-                }
+            if (auto retValueStorage = TryGetSpecialRetValueStorage(irBuilder, alloca)) {
+                return retValueStorage;
             }
             irBuilder.EmitLocation(CHIRExprWrapper(alloca));
-            return GenerateAllocate(irBuilder, CHIRAllocateWrapper(alloca));
+            auto result = GenerateAllocate(irBuilder, CHIRAllocateWrapper(alloca));
+            TryEmitNullInitForDebugLocalClass(irBuilder, alloca, result);
+            return result;
         }
         case CHIR::ExprKind::LOAD: {
             auto& load = StaticCast<const CHIR::Load&>(chirExpr);

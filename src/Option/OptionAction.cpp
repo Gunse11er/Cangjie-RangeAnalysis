@@ -76,9 +76,8 @@ const std::unordered_map<std::string, uint8_t> COMPILE_TARGET_MAP = {
 #endif
 
 const std::unordered_map<std::string, ArchType> STRING_ARCH_MAP = {
-    {"x86_64", ArchType::X86_64}, {"aarch64", ArchType::AARCH64},
-    {"arm", ArchType::ARM32}, {"arm64", ArchType::ARM64},
-    {"unknown", ArchType::UNKNOWN}
+    {"x86_64", ArchType::X86_64}, {"aarch64", ArchType::AARCH64}, {"arm64", ArchType::ARM64},
+    {"arm", ArchType::ARM32}, {"unknown", ArchType::UNKNOWN}
 };
 
 const std::unordered_map<std::string, OSType> STRING_OS_MAP = {
@@ -251,17 +250,21 @@ bool ParseTargetTriple(GlobalOptions& opts, const std::string& triple)
             }
         }
         if (!opts.target.apiLevel.empty()) {
+#ifndef CANGJIE_ENABLE_GCOV
             try {
+#endif
                 const int num{std::stoi(opts.target.apiLevel)};
                 // The default Android magic version number is 10000.
                 // The minimum Android API level that cangjie supports.
-                if (num < 26 || num > 10000) {
+                if (num < 23 || num > 10000) {
                     Errorln("The Android API level is not supported in the target."
-                        " Please use a valid API level which is larger than 26.");
+                        " Please use a valid API level which is larger than 23.");
                 }
+#ifndef CANGJIE_ENABLE_GCOV
             } catch (std::exception const&) {
                 Errorln("The Android API level is illegal. Please use a valid API level which is greater than or equal to 26.");
             }
+#endif
         }
     } else {
         Errorln("The environment \"" + envStr + "\" is not found or supported!");
@@ -623,6 +626,22 @@ std::unordered_map<Options::ID, std::function<bool(GlobalOptions&, OptionArgInst
         return true;
     }},
     { Options::ID::COMPILE_AS_EXE, OPTION_TRUE_ACTION(opts.enableCompileAsExe = true) },
+
+    { Options::ID::LTO_KEEP_PKG_VISIBILITY, [](GlobalOptions& opts, const OptionArgInstance& arg) {
+    if (arg.value.empty()) {
+        opts.ltoHideAllPkgs = true;
+    } else {
+        auto pkgs = SplitString(arg.value, ",");
+        for (auto pkg : pkgs) {
+            TrimString(pkg);
+            if (!pkg.empty()) {
+                opts.AddLtoVisiblePkg(pkg);
+            }
+        }
+    }
+    return true;
+    }},
+
     { Options::ID::TARGET, [](GlobalOptions& opts, const OptionArgInstance& arg) {
         return ParseTargetTriple(opts, arg.value);
     }},
@@ -653,8 +672,28 @@ std::unordered_map<Options::ID, std::function<bool(GlobalOptions&, OptionArgInst
          return false;
      }},
 #endif
-    { Options::ID::COMMON_PART_PATH, [](GlobalOptions& opts, const OptionArgInstance& arg) {
-        opts.commonPartCjo = opts.ValidateInputFilePath(arg.value, DiagKindRefactor::driver_invalid_binary_file);
+    { Options::ID::COMMON_PART_CJO, [](GlobalOptions& opts, const OptionArgInstance& arg) {
+        auto commonPartCjo = GlobalOptions::ValidateInputFilePath(
+            arg.value, DiagKindRefactor::driver_invalid_binary_file);
+        if (commonPartCjo.has_value()) {
+            opts.commonPartCjos.emplace_back(commonPartCjo.value());
+        } else {
+            DiagnosticEngine diag;
+            diag.DiagnoseRefactor(DiagKindRefactor::no_such_file_or_directory, DEFAULT_POSITION, arg.value);
+        }
+
+        return true;
+    }},
+    { Options::ID::COMMON_PART_CHIR, [](GlobalOptions& opts, const OptionArgInstance& arg) {
+        auto commonChirFile = GlobalOptions::ValidateInputFilePath(
+            arg.value, DiagKindRefactor::no_such_file_or_directory);
+        if (commonChirFile.has_value()) {
+            opts.commonPartChirs.push_back(commonChirFile.value());
+        } else {
+            DiagnosticEngine diag;
+            diag.DiagnoseRefactor(DiagKindRefactor::no_such_file_or_directory, DEFAULT_POSITION, arg.value);
+        }
+
         return true;
     }},
     { Options::ID::INCRE_COMPILE, OPTION_TRUE_ACTION(opts.enIncrementalCompilation = true) },
@@ -742,6 +781,7 @@ std::unordered_map<Options::ID, std::function<bool(GlobalOptions&, OptionArgInst
     }},
     { Options::ID::EXPORT_FOR_TESTS, [](GlobalOptions& opts, [[maybe_unused]] OptionArgInstance& arg) {
         opts.exportForTest = true;
+        opts.enableCompileTest = true;
         return true;
     }},
     // ---------- MOCKING OPTIONS ----------
@@ -829,7 +869,7 @@ std::unordered_map<Options::ID, std::function<bool(GlobalOptions&, OptionArgInst
             opts.enableHotReload = false;
         }
         opts.enableOutputType = true;
-            return true;
+        return true;
     }},
     { Options::ID::COMPILE_TARGET, [](GlobalOptions& opts, const OptionArgInstance& arg) {
         CJC_ASSERT(COMPILE_TARGET_MAP.count(arg.value) != 0);
@@ -865,6 +905,10 @@ std::unordered_map<Options::ID, std::function<bool(GlobalOptions&, OptionArgInst
     }},
     { Options::ID::OUTPUT_JAVA_GEN_DIR, [](GlobalOptions& opts, const OptionArgInstance& arg) {
         opts.outputJavaGenDir = {arg.value};
+        return true;
+    }},
+    { Options::ID::OUTPUT_OBJC_GEN_DIR, [](GlobalOptions& opts, const OptionArgInstance& arg) {
+        opts.outputObjCGenDir = {arg.value};
         return true;
     }},
     { Options::ID::SAVE_TEMPS, [](GlobalOptions& opts, const OptionArgInstance& arg) {
@@ -903,10 +947,6 @@ std::unordered_map<Options::ID, std::function<bool(GlobalOptions&, OptionArgInst
         return true;
     }},
     { Options::ID::DISABLE_SEMA_VIC, OPTION_TRUE_ACTION(opts.disableSemaVic = true)},
-    { Options::ID::DISABLE_INSTANTIATION, [](GlobalOptions& opts, [[maybe_unused]] OptionArgInstance& arg) {
-        opts.disableInstantiation = true;
-        return true;
-    }},
     { Options::ID::DEBUG_CODEGEN, OPTION_TRUE_ACTION(opts.codegenDebugMode = true) },
     { Options::ID::CHIR_OPT_DEBUG, OPTION_TRUE_ACTION(opts.chirDebugOptimizer = true) },
     { Options::ID::DUMP_AST, OPTION_TRUE_ACTION(opts.dumpAST = true)},

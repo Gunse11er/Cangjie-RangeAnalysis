@@ -24,6 +24,11 @@ namespace {
 const std::string CONTEST_INPUT_FILE = "input.txt";
 const std::string CONTEST_OUTPUT_FILE = "output.txt";
 
+bool IsGlobalVarInCurrentPackage(const Value* value)
+{
+    return value != nullptr && value->IsGlobalVar() && !value->IsImportedVar();
+}
+
 enum class ContestQueryTypeHint {
     UNKNOWN,
     BOOL,
@@ -52,6 +57,15 @@ struct ContestQuery {
 
 using ValueNameMap = std::unordered_map<Value*, std::vector<std::string>>;
 
+struct ContestAggregate {
+    Type* type{nullptr};
+    unsigned firstDebugLine{std::numeric_limits<unsigned>::max()};
+    std::optional<std::vector<SInt>> exactValues;
+};
+
+using ContestAggregateMap = std::unordered_map<std::string, ContestAggregate>;
+constexpr size_t MAX_CONTEST_EXACT_VALUES = 16;
+
 // 去除竞赛输入字段首尾空白。
 std::string Trim(const std::string& str)
 {
@@ -68,6 +82,38 @@ std::string BaseName(const std::string& path)
 {
     auto pos = path.find_last_of("/\\");
     return pos == std::string::npos ? path : path.substr(pos + 1);
+}
+
+std::string MakeContestAggregateKey(const std::string& fileName, const std::string& variableName)
+{
+    return fileName + "\0" + variableName;
+}
+
+std::vector<SInt> NormalizeContestExactValues(std::vector<SInt> values)
+{
+    std::sort(values.begin(), values.end(), [](const SInt& lhs, const SInt& rhs) {
+        if (lhs.Width() != rhs.Width()) {
+            return static_cast<unsigned>(lhs.Width()) < static_cast<unsigned>(rhs.Width());
+        }
+        return lhs.UVal() < rhs.UVal();
+    });
+    values.erase(std::unique(values.begin(), values.end()), values.end());
+    return values;
+}
+
+std::optional<std::vector<SInt>> MergeContestExactValues(
+    const std::optional<std::vector<SInt>>& lhs, const std::vector<SInt>& rhs)
+{
+    std::vector<SInt> values;
+    if (lhs.has_value()) {
+        values.insert(values.end(), lhs->begin(), lhs->end());
+    }
+    values.insert(values.end(), rhs.begin(), rhs.end());
+    values = NormalizeContestExactValues(std::move(values));
+    if (values.empty() || values.size() > MAX_CONTEST_EXACT_VALUES) {
+        return std::nullopt;
+    }
+    return values;
 }
 
 // 按逗号切分查询字段并清理每个字段。
@@ -560,6 +606,22 @@ std::string FormatContestIntegerInterval(const ConstantRange& range, const Type&
     return ss.str();
 }
 
+std::string FormatExactSIntValues(std::vector<SInt> values, const Type& type)
+{
+    std::sort(values.begin(), values.end(), [&type](const SInt& lhs, const SInt& rhs) {
+        return type.IsUnsignedInteger() ? lhs.Ult(rhs) : lhs.Slt(rhs);
+    });
+    values.erase(std::unique(values.begin(), values.end()), values.end());
+    std::stringstream ss;
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i != 0) {
+            ss << ", ";
+        }
+        ss << FormatSIntValue(values[i], type);
+    }
+    return ss.str();
+}
+
 // 按整数类型格式化完整 fallback 区间。
 std::string FormatFullIntegerRange(const Type& type)
 {
@@ -639,7 +701,11 @@ std::string FormatContestRange(const ValueRange* range, Type* type)
         return "false, true";
     }
     if (range->GetRangeKind() == ValueRange::RangeKind::SINT) {
-        const auto& intRange = StaticCast<const SIntRange&>(*range).GetVal();
+        const auto& sintRange = StaticCast<const SIntRange&>(*range);
+        if (sintRange.GetExactValues().has_value()) {
+            return FormatExactSIntValues(*sintRange.GetExactValues(), *type);
+        }
+        const auto& intRange = sintRange.GetVal();
         const auto& numeric = intRange.NumericBound();
         if (intRange.IsSingleValue()) {
             return FormatSIntValue(numeric.GetSingleElement(), *type);
@@ -653,6 +719,16 @@ std::string FormatContestRange(const ValueRange* range, Type* type)
 }
 
 // 读取普通 SSA 值或 ref 背后 var 对象的竞赛可见值域。
+// Let a later precise contextual answer replace an earlier full-range answer.
+bool ShouldRecordContestResult(const ContestQuery& query, const std::string& result, Type* type)
+{
+    if (!query.resolved) {
+        return true;
+    }
+    auto fallback = FormatFallback(type);
+    return query.result == fallback && result != fallback;
+}
+
 const ValueRange* GetContestRangeForValue(const RangeDomain& state, Value* value)
 {
     if (value == nullptr) {
@@ -664,6 +740,63 @@ const ValueRange* GetContestRangeForValue(const RangeDomain& state, Value* value
         }
     }
     return state.CheckAbstractValue(value);
+}
+
+void RememberContestAggregateFirstLine(
+    ContestAggregateMap& aggregates, const DebugLocation& location, const std::string& variableName, Type* type)
+{
+    auto& aggregate = aggregates[MakeContestAggregateKey(BaseName(location.GetFileName()), variableName)];
+    aggregate.type = aggregate.type == nullptr ? type : aggregate.type;
+    aggregate.firstDebugLine = std::min(aggregate.firstDebugLine, location.GetBeginPos().line);
+}
+
+void RecordContestAggregateValue(ContestAggregateMap& aggregates, const ValueNameMap& valueNames,
+    const DebugLocation& location, Value* value, const RangeDomain& state)
+{
+    auto names = valueNames.find(value);
+    if (names == valueNames.end()) {
+        return;
+    }
+    auto range = GetContestRangeForValue(state, value);
+    if (range == nullptr || range->GetRangeKind() != ValueRange::RangeKind::SINT) {
+        return;
+    }
+    const auto& sintRange = StaticCast<const SIntRange&>(*range);
+    if (!sintRange.GetExactValues().has_value()) {
+        return;
+    }
+    auto type = GetQueryValueType(value);
+    auto fileName = BaseName(location.GetFileName());
+    for (const auto& name : names->second) {
+        auto& aggregate = aggregates[MakeContestAggregateKey(fileName, name)];
+        aggregate.type = aggregate.type == nullptr ? type : aggregate.type;
+        if (aggregate.firstDebugLine != std::numeric_limits<unsigned>::max() &&
+            location.GetBeginPos().line == aggregate.firstDebugLine) {
+            continue;
+        }
+        aggregate.exactValues = MergeContestExactValues(aggregate.exactValues, *sintRange.GetExactValues());
+    }
+}
+
+void ApplyContestAggregates(std::vector<ContestQuery>& queries, const ContestAggregateMap& aggregates)
+{
+    for (auto& query : queries) {
+        auto it = aggregates.find(MakeContestAggregateKey(query.fileName, query.variableName));
+        if (it == aggregates.end() || !it->second.exactValues.has_value() || it->second.exactValues->size() <= 1) {
+            continue;
+        }
+        if (query.resolved && query.line != it->second.firstDebugLine) {
+            continue;
+        }
+        auto type = query.type == nullptr ? it->second.type : query.type;
+        if (type == nullptr || !type->IsInteger()) {
+            continue;
+        }
+        query.type = type;
+        query.typeHint = GetQueryTypeHint(type);
+        query.result = FormatExactSIntValues(*it->second.exactValues, *type);
+        query.resolved = true;
+    }
 }
 
 // 判断查询位置是否匹配 CHIR 调试位置信息。
@@ -712,26 +845,32 @@ void RememberQueryType(std::vector<ContestQuery>& queries, const Debug& debug)
 }
 
 // 解析与具体 Debug 表达式位置和变量名匹配的查询。
-void ResolveQueryAtDebug(
-    std::vector<ContestQuery>& queries, ValueNameMap& valueNames, const Debug& debug, const RangeDomain& state)
+void ResolveQueryAtDebug(std::vector<ContestQuery>& queries, ValueNameMap& valueNames,
+    ContestAggregateMap& aggregates, const Debug& debug, const RangeDomain& state)
 {
     RememberValueName(valueNames, debug);
     RememberQueryType(queries, debug);
+    RememberContestAggregateFirstLine(
+        aggregates, debug.GetDebugLocation(), debug.GetSrcCodeIdentifier(), GetQueryValueType(debug.GetValue()));
     if (debug.GetValue()->GetType()->IsRef()) {
         return;
     }
     auto type = GetQueryValueType(debug.GetValue());
     auto range = GetContestRangeForValue(state, debug.GetValue());
     for (auto& query : queries) {
-        if (!query.valid || query.resolved || query.variableName != debug.GetSrcCodeIdentifier()) {
+        if (!query.valid || query.variableName != debug.GetSrcCodeIdentifier()) {
             continue;
         }
         if (!IsSameQueryLocation(query, debug.GetDebugLocation())) {
             continue;
         }
+        auto result = FormatContestRange(range, type);
+        if (!ShouldRecordContestResult(query, result, type)) {
+            continue;
+        }
         query.type = type;
         query.typeHint = GetQueryTypeHint(type);
-        query.result = FormatContestRange(range, type);
+        query.result = std::move(result);
         query.resolved = true;
     }
 }
@@ -741,25 +880,30 @@ void ResolveQueryAtValue(std::vector<ContestQuery>& queries, const ValueNameMap&
     Value* value, const RangeDomain& state)
 {
     for (auto& query : queries) {
-        if (!query.valid || query.resolved || !HasValueName(valueNames, value, query.variableName)) {
+        if (!query.valid || !HasValueName(valueNames, value, query.variableName)) {
             continue;
         }
         if (!IsSameQueryLocation(query, location)) {
             continue;
         }
         auto type = GetQueryValueType(value);
+        auto result = FormatContestRange(GetContestRangeForValue(state, value), type);
+        if (!ShouldRecordContestResult(query, result, type)) {
+            continue;
+        }
         query.type = type;
         query.typeHint = GetQueryTypeHint(type);
-        query.result = FormatContestRange(GetContestRangeForValue(state, value), type);
+        query.result = std::move(result);
         query.resolved = true;
     }
 }
 
 // 在非 Debug 表达式上尝试解析所有 operand 形式查询。
-void ResolveQueryAtExpressionOperands(
-    std::vector<ContestQuery>& queries, const ValueNameMap& valueNames, const Expression& expr, const RangeDomain& state)
+void ResolveQueryAtExpressionOperands(std::vector<ContestQuery>& queries, const ValueNameMap& valueNames,
+    ContestAggregateMap& aggregates, const Expression& expr, const RangeDomain& state)
 {
     for (auto operand : expr.GetOperands()) {
+        RecordContestAggregateValue(aggregates, valueNames, expr.GetDebugLocation(), operand, state);
         ResolveQueryAtValue(queries, valueNames, expr.GetDebugLocation(), operand, state);
     }
 }
@@ -842,7 +986,7 @@ std::optional<SInt> CheckSingleSInt(const ValueRange& vr)
 }
 
 RangePropagation::RangePropagation(
-    CHIRBuilder& builder, RangeAnalysisWrapper* rangeAnalysisWrapper, DiagAdapter* diag, bool enIncre)
+    CHIRBuilder& builder, RangeAnalysisWrapper* rangeAnalysisWrapper, DiagnosticEngine& diag, bool enIncre)
     : builder(builder), analysisWrapper(rangeAnalysisWrapper), diag(diag), enIncre(enIncre)
 {
 }
@@ -852,20 +996,20 @@ const OptEffectCHIRMap& RangePropagation::GetEffectMap() const
     return effectMap;
 }
 
-const std::vector<const Func*>& RangePropagation::GetFuncsNeedRemoveBlocks() const
+const std::vector<const Function*>& RangePropagation::GetFuncsNeedRemoveBlocks() const
 {
     return funcsNeedRemoveBlocks;
 }
 
 void RangePropagation::RunOnPackage(const Ptr<const Package>& package, bool isDebug)
 {
-    for (auto func : package->GetGlobalFuncs()) {
+    for (auto func : package->GetGlobalFuncsWithBody()) {
         RunOnFunc(func, isDebug);
     }
 }
 
 // 重写可证明的常量和分支目标，同时保护循环分支条件。
-void RangePropagation::RunOnFunc(const Ptr<const Func>& func, bool isDebug)
+void RangePropagation::RunOnFunc(const Ptr<const Function>& func, bool isDebug)
 {
     auto result = analysisWrapper->CheckFuncResult(func);
     if (!result) {
@@ -934,21 +1078,31 @@ void RangePropagation::EmitContestOutput(const Ptr<const Package>& package, Rang
     }
     const auto actionBeforeVisitExpr = [](const RangeDomain&, Expression*, size_t) {};
     ValueNameMap valueNames;
-    auto actionAfterVisitExpr = [&queries, &valueNames](const RangeDomain& state, Expression* expr, size_t) {
+    ContestAggregateMap aggregates;
+    auto actionAfterVisitExpr = [&queries, &valueNames, &aggregates](const RangeDomain& state, Expression* expr, size_t) {
         if (expr->GetExprKind() == ExprKind::DEBUGEXPR) {
-            ResolveQueryAtDebug(queries.value(), valueNames, *StaticCast<Debug*>(expr), state);
+            ResolveQueryAtDebug(queries.value(), valueNames, aggregates, *StaticCast<Debug*>(expr), state);
             return;
         }
-        ResolveQueryAtExpressionOperands(queries.value(), valueNames, *expr, state);
+        ResolveQueryAtExpressionOperands(queries.value(), valueNames, aggregates, *expr, state);
     };
     const auto actionOnTerminator = [](const RangeDomain&, Terminator*, std::optional<Block*>) {};
-    for (auto func : package->GetGlobalFuncs()) {
+    auto resolveQueries = [&](Results<RangeDomain>& result) {
+        result.VisitWith(actionBeforeVisitExpr, actionAfterVisitExpr, actionOnTerminator);
+    };
+
+    for (auto func : package->GetGlobalFuncsWithBody()) {
         auto result = rangeAnalysisWrapper.CheckFuncResult(func);
         if (!result) {
             continue;
         }
-        result->VisitWith(actionBeforeVisitExpr, actionAfterVisitExpr, actionOnTerminator);
+        resolveQueries(*result);
     }
+
+    RangeAnalysis::VisitContextSensitiveResults(
+        [&](const Function*, const std::string&, Results<RangeDomain>& result) { resolveQueries(result); });
+
+    ApplyContestAggregates(queries.value(), aggregates);
     WriteContestOutput(queries.value());
 }
 
@@ -1009,7 +1163,7 @@ GlobalVar* RecordLoadEffectMap(const Ptr<const Load>& load)
 {
     GlobalVar* gv = nullptr;
     auto loc = load->GetLocation();
-    if (loc->IsGlobalVarInCurPackage()) {
+    if (IsGlobalVarInCurrentPackage(loc)) {
         // let a = 3
         // Load(gv_a)
         gv = DynamicCast<GlobalVar*>(loc);
@@ -1019,7 +1173,7 @@ GlobalVar* RecordLoadEffectMap(const Ptr<const Load>& load)
         auto locExpr = StaticCast<LocalVar*>(loc)->GetExpr();
         if (locExpr->GetExprKind() == ExprKind::GET_ELEMENT_REF) {
             auto base = StaticCast<GetElementRef*>(locExpr)->GetLocation();
-            if (base->IsGlobalVarInCurPackage()) {
+            if (IsGlobalVarInCurrentPackage(base)) {
                 gv = DynamicCast<GlobalVar*>(base);
             }
         }
@@ -1035,7 +1189,7 @@ GlobalVar* RecordFieldEffectMap(const Ptr<const Field>& field)
         auto baseExpr = StaticCast<LocalVar*>(base)->GetExpr();
         if (baseExpr->GetExprKind() == ExprKind::LOAD) {
             auto loc = StaticCast<Load*>(baseExpr)->GetLocation();
-            if (loc->IsGlobalVarInCurPackage()) {
+            if (IsGlobalVarInCurrentPackage(loc)) {
                 // let a = (1, 2); a[0]
                 // %0 = Load(gv_a); %1 = Field(%0, 0)
                 gv = DynamicCast<GlobalVar*>(loc);
@@ -1047,7 +1201,7 @@ GlobalVar* RecordFieldEffectMap(const Ptr<const Field>& field)
 
 static std::mutex g_mtx;
 OptEffectCHIRMap RangePropagation::effectMap;
-void RangePropagation::RecordEffectMap(const Expression* expr, const Func* func) const
+void RangePropagation::RecordEffectMap(const Expression* expr, const Function* func) const
 {
     if (!enIncre) {
         return;
@@ -1060,7 +1214,7 @@ void RangePropagation::RecordEffectMap(const Expression* expr, const Func* func)
     }
     if (gv) {
         std::lock_guard<std::mutex> guard(g_mtx);
-        effectMap[gv].emplace(const_cast<Func*>(func));
+        effectMap[gv].emplace(const_cast<Function*>(func));
     }
 }
 
@@ -1101,7 +1255,7 @@ void RangePropagation::CheckVarrayIndex(const Ptr<Intrinsic>& intrin, const Rang
         auto geLowerBound{ComputeRelIntBinop({indexRange, zeroNode, index, nullptr, ExprKind::GE, false})};
         if (ltUpperBound.IsFalse() || geLowerBound.IsFalse()) {
             auto bd =
-                diag->DiagnoseRefactor(DiagKindRefactor::chir_idx_out_of_bounds, ToRange(intrin->GetDebugLocation()));
+                diag.DiagnoseRefactor(DiagKindRefactor::chir_idx_out_of_bounds, ToRange(intrin->GetDebugLocation()));
             std::stringstream ss;
             ss << "range of index " << i - begin << " is (" << indexRange.ToString()
                << "), however the size of varray is " + std::to_string(size);

@@ -28,13 +28,12 @@ void CheckInitMethod::HandleImpl(TypeCheckContext& ctx)
             continue;
         }
         auto& method = *StaticAs<ASTKind::FUNC_DECL>(member);
-        auto fTy = DynamicCast<FuncTy*>(method.ty);
+        auto fTy = DynamicCast<FuncTy*>(method.GetTy());
         if (!fTy || !method.funcBody->retType) {
             continue;
         }
         auto retTy = fTy->retTy;
-        auto mirrorTy = method.outerDecl->ty;
-
+        auto mirrorTy = method.outerDecl->GetTy();
         if (ctx.typeManager.IsTyEqual(retTy, mirrorTy)) {
             continue;
         }

@@ -11,17 +11,17 @@
 
 using namespace Cangjie::CHIR;
 
-GetOrThrowResultDomain::GetOrThrowResultDomain(std::unordered_map<const Value*, size_t>* argIdxMap)
+GetOrThrowResultDomain::GetOrThrowResultDomain(std::unordered_map<const Value*, size_t>* ArgIdxMap)
     : AbstractDomain(),
-      getOrThrowResults(std::vector<FlatSet<const Apply>>(argIdxMap->size(), FlatSet<const Apply>(false))),
-      argIdxMap(argIdxMap)
+      GetOrThrowResults(std::vector<FlatSet<const Apply*>>(ArgIdxMap->size(), FlatSet<const Apply*>(false))),
+      ArgIdxMap(ArgIdxMap)
 {
 }
 
 bool GetOrThrowResultDomain::Join(const GetOrThrowResultDomain& rhs)
 {
     this->kind = ReachableKind::REACHABLE;
-    return VectorJoin(getOrThrowResults, rhs.getOrThrowResults);
+    return VectorJoin(GetOrThrowResults, rhs.GetOrThrowResults);
 }
 
 std::string GetOrThrowResultDomain::ToString() const
@@ -31,7 +31,7 @@ std::string GetOrThrowResultDomain::ToString() const
     } else {
         std::stringstream ss;
         ss << "{ ";
-        for (auto& result : getOrThrowResults) {
+        for (auto& result : GetOrThrowResults) {
             ss << result.ToString() << ", ";
         }
         ss << "}";
@@ -41,8 +41,8 @@ std::string GetOrThrowResultDomain::ToString() const
 
 const Apply* GetOrThrowResultDomain::CheckGetOrThrowResult(const Value* location) const
 {
-    if (auto it = argIdxMap->find(location); it != argIdxMap->end()) {
-        return getOrThrowResults[it->second].GetElem().value_or(nullptr);
+    if (auto it = ArgIdxMap->find(location); it != ArgIdxMap->end()) {
+        return GetOrThrowResults[it->second].GetElem().value_or(nullptr);
     } else {
         return nullptr;
     }
@@ -51,7 +51,7 @@ const Apply* GetOrThrowResultDomain::CheckGetOrThrowResult(const Value* location
 template <> const std::string Analysis<GetOrThrowResultDomain>::name = "getOrThrow-result";
 template <> const std::optional<unsigned> Analysis<GetOrThrowResultDomain>::blockLimit = std::nullopt;
 
-GetOrThrowResultAnalysis::GetOrThrowResultAnalysis(const Func* func, bool isDebug) : Analysis(func, isDebug)
+GetOrThrowResultAnalysis::GetOrThrowResultAnalysis(const Function* func, bool isDebug) : Analysis(func, isDebug)
 {
     size_t argIdx = 0;
     for (auto bb : func->GetBody()->GetBlocks()) {
@@ -60,8 +60,8 @@ GetOrThrowResultAnalysis::GetOrThrowResultAnalysis(const Func* func, bool isDebu
                 auto apply = StaticCast<const Apply*>(expr);
                 CJC_ASSERT(apply->GetArgs().size() > 0);
                 auto arg = apply->GetArgs()[0];
-                if (auto it = argIdxMap.find(arg); it == argIdxMap.end()) {
-                    argIdxMap.emplace(arg, argIdx++);
+                if (auto it = ArgIdxMap.find(arg); it == ArgIdxMap.end()) {
+                    ArgIdxMap.emplace(arg, argIdx++);
                 }
             }
         }
@@ -70,7 +70,7 @@ GetOrThrowResultAnalysis::GetOrThrowResultAnalysis(const Func* func, bool isDebu
 
 GetOrThrowResultDomain GetOrThrowResultAnalysis::Bottom()
 {
-    return GetOrThrowResultDomain(&argIdxMap);
+    return GetOrThrowResultDomain(&ArgIdxMap);
 }
 
 // Set the initial state of the Function entryBB to Top to make sure the
@@ -80,7 +80,7 @@ GetOrThrowResultDomain GetOrThrowResultAnalysis::Bottom()
 void GetOrThrowResultAnalysis::InitializeFuncEntryState(GetOrThrowResultDomain& state)
 {
     state.kind = ReachableKind::REACHABLE;
-    for (auto i = state.getOrThrowResults.begin(); i != state.getOrThrowResults.end(); ++i) {
+    for (auto i = state.GetOrThrowResults.begin(); i != state.GetOrThrowResults.end(); ++i) {
         i->SetToBound(/* isTop = */ true);
     }
 }
@@ -91,11 +91,11 @@ void GetOrThrowResultAnalysis::PropagateExpressionEffect(GetOrThrowResultDomain&
         auto apply = StaticCast<const Apply*>(expression);
         CJC_ASSERT(apply->GetArgs().size() > 0);
         auto arg = apply->GetArgs()[0];
-        if (auto it = argIdxMap.find(arg); it != argIdxMap.end()) {
+        if (auto it = ArgIdxMap.find(arg); it != ArgIdxMap.end()) {
             // Update the result of getOrThrow when the arg of getOrThrow is
             // first seen in this block;
-            if (state.getOrThrowResults[it->second].IsBottom() || state.getOrThrowResults[it->second].IsTop()) {
-                state.getOrThrowResults[it->second].UpdateElem(apply);
+            if (state.GetOrThrowResults[it->second].IsBottom() || state.GetOrThrowResults[it->second].IsTop()) {
+                state.GetOrThrowResults[it->second].UpdateElem(apply);
             }
         }
     }

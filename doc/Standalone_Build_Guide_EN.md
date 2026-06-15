@@ -15,7 +15,7 @@ The current frontend compiler build supports:
 
 ### Environment Dependencies
 
-The standalone compiler build environment is largely consistent with the integrated build environment, except for the additional dependency on googletest for executing UTs. For detailed information, please refer to [Cangjie Build Guide (Ubuntu 22.04) - Environment Preparation].  
+The standalone compiler build environment is largely consistent with the integrated build environment, except for the additional dependency on googletest for executing UTs. For detailed information, please refer to [Cangjie Build Guide (Ubuntu 22.04) - Environment Preparation](https://gitcode.com/Cangjie/cangjie_build/blob/main/doc_en/linux.md#2-environment-preparation).  
 For googletest dependency installation, refer to [General Build Guide](https://github.com/google/googletest/blob/main/googletest/README.md). Alternatively, you can temporarily disable UT builds during compilation using the [`--no-test`](#build-options) option.
 
 ### Build Commands
@@ -43,7 +43,7 @@ python3 build.py install;
 
 1. The `build.py clean` command clears temporary files in the workspace.
 2. The `build.py build` command initiates compilation:
-   - The secondary option `-t` (i.e., `--build-type`) specifies the build product type, which can be `release`, `debug`, or `relwithdebuginfo`.
+   - The secondary option `-t` (i.e., `--build-type`) specifies the build product type, which can be `release`, `debug`, or `relwithdebinfo`.
    - The secondary option `--build-cjdb` enables cjdb (lldb) compilation. For more details about cjdb, refer to [cjdb Tool Introduction](https://gitcode.com/Cangjie/cangjie_docs/blob/main/docs/tools/source_en/cmd-tools/cjdb_manual.md).
 3. The `build.py install` command installs the build products to the `output` directory.
 
@@ -65,7 +65,7 @@ Target: xxxx-xxxx-xxxx
 
 ### Environment Preparation
 
-The standalone compiler build environment is largely consistent with the integrated build environment, except for the additional dependency on googletest for executing UTs. For detailed information, please refer to [Cangjie Build Guide (macOS 14 Sonoma) - Environment Preparation].  
+The standalone compiler build environment is largely consistent with the integrated build environment, except for the additional dependency on googletest for executing UTs. For detailed information, please refer to [Cangjie Build Guide (macOS 14 Sonoma) - Environment Preparation](https://gitcode.com/Cangjie/cangjie_build/blob/main/doc_en/macos.md#2-environment-preparation).  
 For googletest dependency installation, refer to [General Build Guide](https://github.com/google/googletest/blob/main/googletest/README.md). Alternatively, you can temporarily disable UT builds during compilation using the [`--no-test`](#build-options) option.
 
 ### Build Commands
@@ -92,7 +92,7 @@ python3 build.py install;
 
 1. The `build.py clean` command clears temporary files in the workspace.
 2. The `build.py build` command initiates compilation:
-   - The secondary option `-t` (i.e., `--build-type`) specifies the build product type, which can be `release`, `debug`, or `relwithdebuginfo`.
+   - The secondary option `-t` (i.e., `--build-type`) specifies the build product type, which can be `release`, `debug`, or `relwithdebinfo`.
    - The secondary option `--build-cjdb` enables cjdb (lldb) compilation. For more details about cjdb, refer to [cjdb Tool Introduction](https://gitcode.com/Cangjie/cangjie_docs/blob/main/docs/tools/source_en/cmd-tools/cjdb_manual.md).
 3. The `build.py install` command installs the build products to the `output` directory.
 
@@ -114,7 +114,7 @@ Target: xxxx-xxxx-xxxx
 
 ### Environment Preparation
 
-The standalone compiler build environment is largely consistent with the integrated build environment, except for the additional dependency on googletest for executing UTs. For detailed information, please refer to [Cangjie Build Guide (Ubuntu 22.04) - Environment Preparation].  
+The standalone compiler build environment is largely consistent with the integrated build environment, except for the additional dependency on googletest for executing UTs. For detailed information, please refer to [Cangjie Build Guide (Ubuntu 22.04) - Environment Preparation](https://gitcode.com/Cangjie/cangjie_build/blob/main/doc_en/linux_cross_windows.md#2-environment-preparation).  
 For googletest dependency installation, refer to [General Build Guide](https://github.com/google/googletest/blob/main/googletest/README.md). Alternatively, you can temporarily disable UT builds during compilation using the [`--no-test`](#build-options) option.
 
 > **Note:**
@@ -147,7 +147,7 @@ python3 build.py install --host windows-x86_64;
 1. The `CMAKE_PREFIX_PATH` environment variable specifies the folder where cmake generates products for the target platform.
 2. The `build.py clean` command clears temporary files in the workspace.
 3. The `build.py build` command initiates compilation:
-   - The secondary option `-t` (i.e., `--build-type`) specifies the build product type, which can be `release`, `debug`, or `relwithdebuginfo`.
+   - The secondary option `-t` (i.e., `--build-type`) specifies the build product type, which can be `release`, `debug`, or `relwithdebinfo`.
    - The secondary option `--product` specifies the build target products, which can be `all`, `cjc`, or `libs`.
    - The secondary option `--target` specifies the target platform description, which can be `native` (current compilation platform), `windows-x86_64`, `ohos-aarch64`, `ohos-x86_64`, `ios-simulator-aarch64`, `ios-aarch64`, `android-aarch64`, `android-x86_64`.
    - The secondary option `--target-sysroot` passes the subsequent parameter to the C/C++ compiler as its `--sysroot` parameter.
@@ -164,7 +164,7 @@ source ./output/envsetup.bat
 cjc.exe -v
 ```
 
-This step only generates the target platform cjc executable. For building peripheral dependencies, refer to [Cangjie Build Guide (Ubuntu 22.04) - Source Code Build].
+This step only generates the target platform cjc executable. For building peripheral dependencies, refer to [Cangjie Build Guide (Ubuntu 22.04) - Source Code Build](https://gitcode.com/Cangjie/cangjie_build/blob/main/doc_en/linux_cross_windows.md#4-build-process).
 
 ## Building base libraries of the Android platform on Linux (cross-compilation)
 
@@ -202,7 +202,7 @@ python3 build.py install --host android-aarch64;
 1. `ANDROID_NDK_ROOT` environment variable is used to set the path to the Android NDK.
 2. `build.py clean` command is used to clear temporary files in the workspace.
 3. `build.py build` command starts the compilation process:
-   - The secondary option `-t` (i.e., `--build-type`) specifies the build product type, which can be `release`, `debug`, or `relwithdebuginfo`.
+   - The secondary option `-t` (i.e., `--build-type`) specifies the build product type, which can be `release`, `debug`, or `relwithdebinfo`.
    - The secondary option `--product` specifies the build target products, which can be `all`, `cjc`, or `libs`.
    - The secondary option `--target` specifies the target platform description, which can be `native` (current compilation platform), `windows-x86_64`, `ohos-aarch64`, `ohos-x86_64`, `ios-simulator-aarch64`, `ios-aarch64`, `android-aarch64`, `android-x86_64`.
    - The secondary option `--android-ndk` specifies the path to the Android NDK.
@@ -246,7 +246,7 @@ python3 build.py install --host android-aarch64
 1. `ANDROID_NDK_ROOT` environment variable is used to set the path to the Android NDK.
 2. `build.py clean` command is used to clear temporary files in the workspace.
 3. `build.py build` command starts the compilation process:
-   - The secondary option `-t` (i.e., `--build-type`) specifies the build product type, which can be `release`, `debug`, or `relwithdebuginfo`.
+   - The secondary option `-t` (i.e., `--build-type`) specifies the build product type, which can be `release`, `debug`, or `relwithdebinfo`.
    - The secondary option `--product` specifies the build target products, which can be `all`, `cjc`, or `libs`.
    - The secondary option `--target` specifies the target platform description, which can be `native` (current compilation platform), `windows-x86_64`, `ohos-aarch64`, `ohos-x86_64`, `ios-simulator-aarch64`, `ios-aarch64`, `android-aarch64`, `android-x86_64`.
    - The secondary option `--android-ndk` specifies the path to the Android NDK.
@@ -310,7 +310,7 @@ python3 build.py install;
 4. `TOOLCHAIN_BIN` environment variable is used to set the path to the binaries of the Xcode toolchain.
 5. `build.py clean` command is used to clear temporary files in the workspace.
 6. `build.py build` command starts the compilation process:
-   - The secondary option `-t` (i.e., `--build-type`) specifies the build product type, which can be `release`, `debug`, or `relwithdebuginfo`.
+   - The secondary option `-t` (i.e., `--build-type`) specifies the build product type, which can be `release`, `debug`, or `relwithdebinfo`.
    - The secondary option `--product` specifies the build target products, which can be `all`, `cjc`, or `libs`.
    - The secondary option `--target` specifies the target platform description, which can be `native` (current compilation platform), `windows-x86_64`, `ohos-aarch64`, `ohos-x86_64`, `ios-simulator-aarch64`, `ios-aarch64`, `android-aarch64`, `android-x86_64`.
    - The secondary option `--target-sysroot` passes the following parameter to the C/C++ compiler as its `--sysroot` parameter.
@@ -330,7 +330,7 @@ The `clean` option clears the build/output folders.
 The `build` option builds the project files. It provides the following secondary options:
 
 - `-h, --help`: Displays help information for secondary options.
-- `-t, --build-type`: Specifies the build product type, which can be `release`, `debug`, or `relwithdebuginfo`.
+- `-t, --build-type`: Specifies the build product type, which can be `release`, `debug`, or `relwithdebinfo`.
 - `--print-cmd`: Displays the complete cmake command configured by the build script.
 - `-j, --jobs JOBS`: Specifies the number of concurrent build tasks.
 - `--link-jobs LINK_JOBS`: Specifies the number of concurrent linking tasks.
@@ -347,7 +347,7 @@ The `build` option builds the project files. It provides the following secondary
 - `--product {all,cjc,libs}`: Specifies the build target products, which can be `all` (default, includes `cjc` and `libs`), `cjc` (compiler binary), or `libs` (compiler libraries required by the standard library).
 - `--build-cjdb`: Enables building the Cangjie debugger.
 - `--enable-sanitize-option`: Make cjc option `--sanitize` visible to developer, in order to build sanitizer version cangjie code.
-- `--cjlib-sanitizer-support`： Build sanitizer version of cangjie library，you should use it along with `--product=libs` option. Valid values: `asan`, `tsan` or `hwasan`.
+- `--cjlib-sanitizer-support`： Build santizer version of cangjie library，you should use it along with `--product=libs` option. Valid values: `asan`, `tsan` or `hwasan`.
 
 ### `install` Option
 

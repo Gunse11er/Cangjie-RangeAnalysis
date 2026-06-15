@@ -52,7 +52,7 @@ bool CallGraph::Node::Empty() const
     return calledEdges.empty();
 }
 
-Func* CallGraph::Node::GetFunction() const
+Function* CallGraph::Node::GetFunction() const
 {
     return func;
 }
@@ -96,7 +96,7 @@ CallGraph::CallGraph(const Package* package, DevirtualizationInfo& devirtFuncInf
       exitNode(std::make_unique<Node>(nullptr))
 {
     // build the call graph.
-    for (auto func : package->GetGlobalFuncs()) {
+    for (auto func : package->GetGlobalFuncsWithBody()) {
         if (func->GetUsers().size() == 0) {
             AddToCallGraph(*func, true);
         } else {
@@ -105,7 +105,7 @@ CallGraph::CallGraph(const Package* package, DevirtualizationInfo& devirtFuncInf
     }
 }
 
-void CallGraph::AddToCallGraph(const Func& func, bool isCalledByEntryNode)
+void CallGraph::AddToCallGraph(const Function& func, bool isCalledByEntryNode)
 {
     CallGraph::Node* node = GetOrCreateNode(func);
 
@@ -121,14 +121,14 @@ void CallGraph::AddToCallGraph(const Func& func, bool isCalledByEntryNode)
 
 // GetOrCreateNode - This method will insert a new call graph Node for the specified function
 // if one does not already exist.
-CallGraph::Node* CallGraph::GetOrCreateNode(const Func& func)
+CallGraph::Node* CallGraph::GetOrCreateNode(const Function& func)
 {
     auto& callGraphNode = functionMap[&func];
     if (callGraphNode) {
         return callGraphNode.get();
     }
 
-    callGraphNode = std::make_unique<Node>(const_cast<Func*>(&func));
+    callGraphNode = std::make_unique<Node>(const_cast<Function*>(&func));
     return callGraphNode.get();
 }
 
@@ -175,13 +175,14 @@ void CallGraph::AddVirtualEdgeToNode(Node& node, const Expression& expression)
             paramTys.emplace_back(types[i]);
         }
         auto allPossibleCalleeOfInvoke =
-            Utils::SetToVec<FuncBase*>(GetAllPossibleCalleeOfInvoke(std::make_pair(methodName, paramTys)));
+            Utils::SetToVec<Function*>(GetAllPossibleCalleeOfInvoke(std::make_pair(methodName, paramTys)));
         std::sort(allPossibleCalleeOfInvoke.begin(), allPossibleCalleeOfInvoke.end(),
-            [](const Ptr<const FuncBase> v1, const Ptr<const FuncBase> v2) {
+            [](const Ptr<const Function> v1, const Ptr<const Function> v2) {
                 return v1->GetIdentifier() < v2->GetIdentifier();
             });
         for (auto possibleCalleeOfInvoke : allPossibleCalleeOfInvoke) {
-            if (auto callee = DynamicCast<const Func*>(possibleCalleeOfInvoke); callee) {
+            if (possibleCalleeOfInvoke->IsFuncWithBody()) {
+                auto callee = StaticCast<const Function*>(possibleCalleeOfInvoke);
                 Edge edge(GetOrCreateNode(*callee), Edge::Kind::VIRTUAL);
                 entryNode->DeleteCalledEdge(edge);
                 node.AddCalledEdge(edge);
@@ -196,12 +197,15 @@ void CallGraph::AddVirtualEdgeToNode(Node& node, const Expression& expression)
 
 void CallGraph::AddDirectEdgeToNode(Node& node, const Expression& expression)
 {
-    const Func* calledFunc;
+    const Function* calledFunc = nullptr;
     if (expression.GetExprKind() == ExprKind::APPLY) {
-        calledFunc = DynamicCast<const Func*>(StaticCast<const Apply*>(&expression)->GetCallee());
+        if (auto callee = StaticCast<const Apply*>(&expression)->GetCallee(); callee->IsFuncWithBody()) {
+            calledFunc = StaticCast<const Function*>(callee);
+        }
     } else {
-        auto apply = StaticCast<const ApplyWithException*>(&expression);
-        calledFunc = DynamicCast<const Func*>(apply->GetCallee());
+        if (auto callee = StaticCast<const ApplyWithException*>(&expression)->GetCallee(); callee->IsFuncWithBody()) {
+            calledFunc = StaticCast<const Function*>(callee);
+        }
     }
     if (calledFunc) {
         Edge edge(GetOrCreateNode(*calledFunc), Edge::Kind::DIRECT);
@@ -214,12 +218,12 @@ void CallGraph::AddDirectEdgeToNode(Node& node, const Expression& expression)
 
 // Get all the possible callee function of a virtual function from Devirtualization info collection.
 // Only care about the method name and type, ignore the classType of invoker.
-std::unordered_set<FuncBase*> CallGraph::GetAllPossibleCalleeOfInvoke(
+std::unordered_set<Function*> CallGraph::GetAllPossibleCalleeOfInvoke(
     const std::pair<std::string, std::vector<Type*>>& method) const
 {
     (void)method;
     (void)devirtFuncInfo;
-    return std::unordered_set<FuncBase*>();
+    return std::unordered_set<Function*>();
 }
 
 void CallGraphAnalysis::DoCallGraphAnalysis(bool isDebug)

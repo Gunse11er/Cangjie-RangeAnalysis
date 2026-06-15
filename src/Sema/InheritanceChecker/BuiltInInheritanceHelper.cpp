@@ -28,8 +28,8 @@ using namespace TypeCheckUtil;
 bool StructInheritanceChecker::IsBuiltInOperatorFuncInExtend(
     const MemberSignature& member, const Decl& structDecl) const
 {
-    if (structDecl.astKind != ASTKind::EXTEND_DECL || !member.decl->IsFunc() || !Ty::IsTyCorrect(member.decl->ty) ||
-        !member.decl->TestAttr(Attribute::ABSTRACT, Attribute::OPERATOR)) {
+    if (structDecl.astKind != ASTKind::EXTEND_DECL || !member.decl->IsFunc() ||
+        !Ty::IsTyCorrect(member.decl->GetTy()) || !member.decl->TestAttr(Attribute::ABSTRACT, Attribute::OPERATOR)) {
         return false;
     }
     auto ed = RawStaticCast<const ExtendDecl*>(&structDecl);
@@ -37,7 +37,7 @@ bool StructInheritanceChecker::IsBuiltInOperatorFuncInExtend(
     auto funcTy = RawStaticCast<FuncTy*>(member.ty);
     auto iFuncRetTy = funcTy->retTy;
     const std::vector<Ptr<Ty>>& paramTys = funcTy->paramTys;
-    Ptr<Ty> thisTy = ed->extendedType->ty;
+    Ptr<Ty> thisTy = ed->extendedType->GetTy();
     if (paramTys.size() == 1 && thisTy && paramTys[0] && IsBuiltinBinaryExpr(fd->op, *thisTy, *paramTys[0])) {
         TypeKind returnTyKind = GetBuiltinBinaryExprReturnKind(fd->op, thisTy->kind);
         auto expectedRetTy = TypeManager::GetPrimitiveTy(returnTyKind);
@@ -48,7 +48,7 @@ bool StructInheritanceChecker::IsBuiltInOperatorFuncInExtend(
         }
         return true;
     } else if (paramTys.empty() && thisTy && IsBuiltinUnaryExpr(fd->op, *thisTy)) {
-        TypeKind returnTyKind = GetBuiltinUnaryOpReturnKind(fd->op, ed->ty->kind);
+        TypeKind returnTyKind = GetBuiltinUnaryOpReturnKind(fd->op, ed->TyKind());
         auto expectedRetTy = TypeManager::GetPrimitiveTy(returnTyKind);
         if (expectedRetTy == iFuncRetTy) {
             CreateBuiltInUnaryOperatorFunc(fd->op, *const_cast<ExtendDecl*>(ed));
@@ -62,7 +62,7 @@ bool StructInheritanceChecker::IsBuiltInOperatorFuncInExtend(
 
 void StructInheritanceChecker::CreateBuiltInUnaryOperatorFunc(TokenKind op, ExtendDecl& ed) const
 {
-    TypeKind returnTyKind = GetBuiltinUnaryOpReturnKind(op, ed.ty->kind);
+    TypeKind returnTyKind = GetBuiltinUnaryOpReturnKind(op, ed.TyKind());
     auto returnTy = TypeManager::GetPrimitiveTy(returnTyKind);
     auto nothingTy = TypeManager::GetNothingTy();
 
@@ -74,34 +74,34 @@ void StructInheritanceChecker::CreateBuiltInUnaryOperatorFunc(TokenKind op, Exte
     fd->fullPackageName = ed.fullPackageName;
     fd->op = op;
     fd->identifier = SrcIdentifier{TOKENS[static_cast<int>(op)]};
-    fd->ty = typeManager.GetFunctionTy({}, returnTy);
+    fd->SetTy(typeManager.GetFunctionTy({}, returnTy));
     fd->outerDecl = &ed;
 
     auto funcBody = MakeOwnedNode<FuncBody>();
     funcBody->paramLists.emplace_back(MakeOwnedNode<FuncParamList>());
     funcBody->funcDecl = fd.get();
-    funcBody->ty = fd->ty;
+    funcBody->SetTy(fd->GetTy());
     auto retType = MakeOwnedNode<PrimitiveType>();
     retType->kind = returnTyKind;
-    retType->ty = returnTy;
+    retType->SetTy(returnTy);
     funcBody->retType = std::move(retType);
 
     auto block = MakeOwnedNode<Block>();
-    block->ty = nothingTy;
+    block->SetTy(nothingTy);
 
     auto thisExpr = MakeOwnedNode<RefExpr>();
     thisExpr->isThis = true;
     thisExpr->ref.identifier = "this";
-    thisExpr->ty = ed.ty;
+    thisExpr->SetTy(ed.GetTy());
 
     auto ue = MakeOwnedNode<UnaryExpr>();
     ue->op = op;
     ue->expr = std::move(thisExpr);
-    ue->ty = returnTy;
+    ue->SetTy(returnTy);
 
     auto returnExpr = MakeOwnedNode<ReturnExpr>();
     returnExpr->expr = std::move(ue);
-    returnExpr->ty = nothingTy;
+    returnExpr->SetTy(nothingTy);
     returnExpr->refFuncBody = funcBody.get();
 
     block->body.emplace_back(std::move(returnExpr));
@@ -125,43 +125,43 @@ void StructInheritanceChecker::CreateBuiltInBinaryOperatorFunc(
     fd->fullPackageName = ed.fullPackageName;
     fd->op = op;
     fd->identifier = SrcIdentifier{TOKENS[static_cast<int>(op)]};
-    fd->ty = typeManager.GetFunctionTy({rightTy}, retTy);
+    fd->SetTy(typeManager.GetFunctionTy({rightTy}, retTy));
     fd->outerDecl = &ed;
 
     auto funcBody = MakeOwnedNode<FuncBody>();
-    funcBody->ty = fd->ty;
+    funcBody->SetTy(fd->GetTy());
     funcBody->funcDecl = fd.get();
     auto retType = MakeOwnedNode<PrimitiveType>();
     retType->kind = returnTyKind;
-    retType->ty = retTy;
+    retType->SetTy(retTy);
     funcBody->retType = std::move(retType);
 
     auto rightParam = MakeOwnedNode<FuncParam>();
-    rightParam->ty = rightTy;
+    rightParam->SetTy(rightTy);
     rightParam->identifier = "right";
 
     auto block = MakeOwnedNode<Block>();
-    block->ty = nothingTy;
+    block->SetTy(nothingTy);
 
     auto leftExpr = MakeOwnedNode<RefExpr>();
     leftExpr->isThis = true;
     leftExpr->ref.identifier = "this";
-    leftExpr->ty = ed.ty;
+    leftExpr->SetTy(ed.GetTy());
 
     auto rightExpr = MakeOwnedNode<RefExpr>();
     rightExpr->ref.identifier = "right";
     rightExpr->ref.target = rightParam.get();
-    rightExpr->ty = rightTy;
+    rightExpr->SetTy(rightTy);
 
     auto be = MakeOwnedNode<BinaryExpr>();
     be->op = op;
     be->leftExpr = std::move(leftExpr);
     be->rightExpr = std::move(rightExpr);
-    be->ty = retTy;
+    be->SetTy(retTy);
 
     auto returnExpr = MakeOwnedNode<ReturnExpr>();
     returnExpr->expr = std::move(be);
-    returnExpr->ty = nothingTy;
+    returnExpr->SetTy(nothingTy);
     returnExpr->refFuncBody = funcBody.get();
 
     auto paramList = MakeOwnedNode<FuncParamList>();

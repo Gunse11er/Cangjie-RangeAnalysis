@@ -84,7 +84,7 @@ std::string ToPosInfo(const DebugLocation& loc, bool isPrintFileName)
     return " at [" + fileName + std::to_string(line) + "," + std::to_string(column) + "]";
 }
 
-std::optional<size_t> IsInitialisingMemberVar(const Func& func, const StoreElementRef& store)
+std::optional<size_t> IsInitialisingMemberVar(const Function& func, const StoreElementRef& store)
 {
     auto location = store.GetLocation();
     if ((func.IsConstructor() || func.GetFuncKind() == FuncKind::INSTANCEVAR_INIT) && location->IsParameter()) {
@@ -127,7 +127,7 @@ bool IsGetOrThrowFunction(const Expression& expr)
     if (!callee->IsFunc()) {
         return false;
     }
-    return IsExpectedFunction(*VirtualCast<FuncBase*>(callee), GETORTHROWFUNCINFO);
+    return IsExpectedFunction(*StaticCast<Function*>(callee), GETORTHROWFUNCINFO);
 }
 
 ClassType* LeastCommonSuperClass(ClassType* ty1, ClassType* ty2, CHIRBuilder* builder)
@@ -163,13 +163,13 @@ bool IsRefEnum(const Ptr<Type>& type)
     return false;
 }
 
-Func* TryGetInstanceVarInitFromApply(const Expression& expr)
+Function* TryGetInstanceVarInitFromApply(const Expression& expr)
 {
     if (expr.GetExprKind() == ExprKind::APPLY) {
         auto applyExpr = StaticCast<Apply>(&expr);
         auto callee = applyExpr->GetCallee();
         if (callee->IsFuncWithBody()) {
-            auto func = VirtualCast<Func*>(callee);
+            auto func = StaticCast<Function*>(callee);
             if (func->IsInstanceVarInit()) {
                 return func;
             }

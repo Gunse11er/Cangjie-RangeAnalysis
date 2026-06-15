@@ -49,12 +49,12 @@ OwnedPtr<TypeConvExpr> CreateConvInt64(VarDecl& vd, Ty& ty)
 {
     auto convType = MakeOwnedNode<PrimitiveType>();
     convType->kind = TypeKind::TYPE_INT64;
-    convType->ty = &ty;
+    convType->SetTy(&ty);
     auto numConv = MakeOwnedNode<TypeConvExpr>();
     numConv->type = std::move(convType);
     numConv->expr = CreateRefExpr(vd);
-    numConv->expr->ty = &ty;
-    numConv->ty = &ty;
+    numConv->expr->SetTy(&ty);
+    numConv->SetTy(&ty);
     return numConv;
 }
 
@@ -63,7 +63,7 @@ OwnedPtr<FuncDecl> CreateMainInvokeDecl(OwnedPtr<FuncBody>&& funcBody, const Fun
     auto mainInvokeFunc = MakeOwnedNode<FuncDecl>();
     funcBody->funcDecl = mainInvokeFunc.get();
     mainInvokeFunc->toBeCompiled = mainFunc.toBeCompiled;
-    mainInvokeFunc->ty = &funcTy;
+    mainInvokeFunc->SetTy(&funcTy);
     mainInvokeFunc->identifier = MAIN_INVOKE;
     mainInvokeFunc->funcBody = std::move(funcBody);
     mainInvokeFunc->moduleName = mainFunc.moduleName;
@@ -136,7 +136,7 @@ std::vector<OwnedPtr<FuncArg>> GetFuncArgsForDesugaredPropDecl(
     auto leftBaseExpr = mapExpr ? CreateMemberAccess(ASTCloner::Clone(mapExpr), getFunc)
                                 : OwnedPtr<Expr>(CreateRefExpr(getFunc).release());
     // 'getFunc' may be generic type, which need to be update to real used type.
-    leftBaseExpr->ty = tyMgr.GetFunctionTy({}, &propTy);
+    leftBaseExpr->SetTy(tyMgr.GetFunctionTy({}, &propTy));
     auto isMemberAccessSuperCall = false;
     if (auto ma = DynamicCast<MemberAccess*>(leftBaseExpr.get()); ma) {
         CJC_NULLPTR_CHECK(ma->baseExpr);
@@ -151,7 +151,7 @@ std::vector<OwnedPtr<FuncArg>> GetFuncArgsForDesugaredPropDecl(
     auto leftExpr = CreateCallExpr(std::move(leftBaseExpr), {});
     leftExpr->callKind = isMemberAccessSuperCall ? CallKind::CALL_SUPER_FUNCTION : CallKind::CALL_DECLARED_FUNCTION;
     leftExpr->resolvedFunction = &getFunc;
-    leftExpr->ty = &propTy;
+    leftExpr->SetTy(&propTy);
     auto binaryExpr = CreateBinaryExpr(std::move(leftExpr), std::move(rightExpr), op);
     CopyBasicInfo(&expr, binaryExpr.get());
     args.emplace_back(CreateFuncArg(std::move(binaryExpr)));
@@ -167,7 +167,7 @@ void DesugarGetForPropDecl(TypeManager& tyMgr, Expr& expr)
     // 2. Do not desugar as property get for left value.
     // 3. Do not desugar for unreadchable node.
     // 4. Do not desugar for non-reference node.
-    bool ignored = expr.desugarExpr || !Ty::IsTyCorrect(expr.ty) || expr.TestAttr(Attribute::LEFT_VALUE) ||
+    bool ignored = expr.desugarExpr || !Ty::IsTyCorrect(expr.GetTy()) || expr.TestAttr(Attribute::LEFT_VALUE) ||
         expr.TestAttr(Attribute::UNREACHABLE) || !expr.IsReferenceExpr();
     if (ignored) {
         return;
@@ -195,12 +195,12 @@ void DesugarGetForPropDecl(TypeManager& tyMgr, Expr& expr)
         baseExpr = CreateRefExpr(*getFunc);
     }
     // 'getFunc' may be generic type, which need to be update to real used type.
-    baseExpr->ty = tyMgr.GetFunctionTy({}, expr.ty);
+    baseExpr->SetTy(tyMgr.GetFunctionTy({}, expr.GetTy()));
     CopyBasicInfo(&expr, baseExpr.get());
     auto lastCallExpr = CreateCallExpr(std::move(baseExpr), {});
     lastCallExpr->callKind = isMemberAccessSuperCall ? CallKind::CALL_SUPER_FUNCTION : CallKind::CALL_DECLARED_FUNCTION;
     lastCallExpr->resolvedFunction = StaticCast<FuncDecl*>(getFunc);
-    lastCallExpr->ty = expr.ty;
+    lastCallExpr->SetTy(expr.GetTy());
     CopyBasicInfo(&expr, lastCallExpr.get());
     AddCurFile(*lastCallExpr, expr.curFile);
     expr.desugarExpr = std::move(lastCallExpr);
@@ -211,7 +211,7 @@ void DesugarGetForPropDecl(TypeManager& tyMgr, Expr& expr)
  */
 void DesugarSetForPropDecl(TypeManager& tyMgr, Expr& expr)
 {
-    if (expr.desugarExpr || !Ty::IsTyCorrect(expr.ty)) {
+    if (expr.desugarExpr || !Ty::IsTyCorrect(expr.GetTy())) {
         return;
     }
     Ptr<Expr> subExpr = nullptr;
@@ -227,7 +227,7 @@ void DesugarSetForPropDecl(TypeManager& tyMgr, Expr& expr)
         isCompound = static_cast<const AssignExpr&>(expr).isCompound || expr.TestAttr(Attribute::SIDE_EFFECT);
         expr.DisableAttr(Attribute::SIDE_EFFECT);
     }
-    if (!subExpr || !Ty::IsTyCorrect(subExpr->ty)) {
+    if (!subExpr || !Ty::IsTyCorrect(subExpr->GetTy())) {
         return;
     }
     auto propDecl = DynamicCast<PropDecl*>(subExpr->GetTarget());
@@ -246,7 +246,7 @@ void DesugarSetForPropDecl(TypeManager& tyMgr, Expr& expr)
         ? CreateMemberAccess(ASTCloner::Clone(RawStaticCast<MemberAccess*>(subExpr)->baseExpr.get()), *setFunc)
         : OwnedPtr<Expr>(CreateRefExpr(*setFunc).release());
     // 'setFunc' may be generic type, which need to be update to real used type.
-    baseExpr->ty = tyMgr.GetFunctionTy({subExpr->ty}, TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT));
+    baseExpr->SetTy(tyMgr.GetFunctionTy({subExpr->GetTy()}, TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT)));
     CopyBasicInfo(subExpr, baseExpr.get());
     Ptr<Expr> basePtr = nullptr;
     // For refExpr case, 'a += b' is desugared to aSet(aGet() + b), there is no side effect to be handle.
@@ -265,18 +265,34 @@ void DesugarSetForPropDecl(TypeManager& tyMgr, Expr& expr)
             ma->baseExpr->mapExpr = basePtr;
         }
     }
-    auto args = GetFuncArgsForDesugaredPropDecl(tyMgr, expr, *subExpr->ty, basePtr, *getFunc);
+    auto args = GetFuncArgsForDesugaredPropDecl(tyMgr, expr, *subExpr->GetTy(), basePtr, *getFunc);
     auto lastCallExpr = CreateCallExpr(std::move(baseExpr), std::move(args));
     CopyBasicInfo(subExpr, lastCallExpr.get());
     lastCallExpr->callKind = isMemberAccessSuperCall ? CallKind::CALL_SUPER_FUNCTION : CallKind::CALL_DECLARED_FUNCTION;
     lastCallExpr->resolvedFunction = setFunc;
     // Setter of propDecl must be unit type.
-    lastCallExpr->ty = TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT);
+    lastCallExpr->SetTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT));
     AddCurFile(*lastCallExpr, expr.curFile);
     if (isCompound) {
         lastCallExpr->EnableAttr(Attribute::SIDE_EFFECT);
     }
     expr.desugarExpr = std::move(lastCallExpr);
+}
+
+void UpdatePosForMacroExpandedNodes(const std::vector<Ptr<AST::Package>>& pkgs)
+{
+    auto visit = [](Ptr<AST::Node> curNode) -> AST::VisitAction {
+        if (!curNode->curMacroCall) {
+            return AST::VisitAction::WALK_CHILDREN;
+        }
+        curNode->begin = curNode->GetDebugPos(curNode->begin);
+        curNode->end = curNode->GetDebugPos(curNode->end);
+        return AST::VisitAction::WALK_CHILDREN;
+    };
+    for (auto pkg : pkgs) {
+        AST::Walker walker(pkg, visit);
+        walker.Walk();
+    }
 }
 } // namespace
 
@@ -327,14 +343,14 @@ void TypeChecker::TypeCheckerImpl::ParsePackageConfigFile(
                             }
                             if (decl->symbol->isNeedExposedToInterop ||
                                 element == (decl->symbol->name + "." + member->symbol->name)) {
-                                    member->symbol->isNeedExposedToInterop = true;
-                                    isMemberExposed = true;
+                                member->symbol->isNeedExposedToInterop = true;
+                                isMemberExposed = true;
                             }
                             // For default constructor function exposed because of part of
                             // memberfunction need exposed.
                             if (isMemberExposed && member->TestAttr(Attribute::CONSTRUCTOR) &&
                                 !member->symbol->isNeedExposedToInterop) {
-                                    member->symbol->isNeedExposedToInterop = true;
+                                member->symbol->isNeedExposedToInterop = true;
                             }
                         }
                     }
@@ -357,7 +373,7 @@ void TypeChecker::TypeCheckerImpl::ParsePackageConfigFile(
                             }
                             if (!decl->symbol->isNeedExposedToInterop &&
                                 (element == (decl->symbol->name + "." + member->symbol->name))) {
-                                    member->symbol->isNeedExposedToInterop = false;
+                                member->symbol->isNeedExposedToInterop = false;
                             }
                         }
                     }
@@ -458,6 +474,11 @@ void TypeChecker::TypeCheckerImpl::PerformDesugarAfterSema(std::vector<Ptr<AST::
             : saveFileWithAbsPath;
         importManager.ExportDeclsWithContent(saveAbsPath, *pkg);
     }
+    // Update positions of macro-expanded nodes for user-facing locations.
+    // Affects exception stack line numbers, coverage hit lines, and cjdb jump/source locations.
+    if (ci->invocation.globalOptions.enableCompileDebug || ci->invocation.globalOptions.displayLineInfo) {
+        UpdatePosForMacroExpandedNodes(pkgs);
+    }
 }
 
 void TypeChecker::TypeCheckerImpl::GenerateMainInvoke()
@@ -470,7 +491,7 @@ void TypeChecker::TypeCheckerImpl::GenerateMainInvoke()
     auto mainFunc = RawStaticCast<FuncDecl*>(*mainFunctionMap.begin()->second.begin());
     CJC_ASSERT(mainFunc && mainFunc->curFile && mainFunc->curFile->curPackage);
     auto packageHasMain = mainFunc->curFile->curPackage;
-    auto funcTy = DynamicCast<FuncTy*>(mainFunc->ty);
+    auto funcTy = DynamicCast<FuncTy*>(mainFunc->GetTy());
     // Do not generate mainInvoke if any of the following condition satisfies:
     // 1. target is a library, not an executable (-c or --output-type=staticlib or --output-type=dylib)
     // 2. main function is in imported package. (can be remove when strategy of main importation is updated).
@@ -491,22 +512,23 @@ void TypeChecker::TypeCheckerImpl::GenerateMainInvoke()
 
     // Creat mainInvoke function: "func $mainInvoke(v:Array<String>)" or "func $mainInvoke()".
     OwnedPtr<FuncBody> funcBody = MakeOwnedNode<FuncBody>();
-    funcBody->ty = mainInvokeTy;
+    funcBody->SetTy(mainInvokeTy);
     funcBody->body = MakeOwnedNode<Block>();
-    funcBody->body->ty = mainInvokeTy;
+    funcBody->body->SetTy(mainInvokeTy);
     auto funcParamList = MakeOwnedNode<FuncParamList>();
     Ptr<VarDecl> argPtr = nullptr;
     if (!mainFunc->funcBody->paramLists[0]->params.empty()) {
-        auto param = CreateFuncParam("v", ASTCloner::Clone(mainFunc->funcBody->paramLists[0]->params[0]->type.get()));
-        argPtr = param.get();
-        funcParamList->params.emplace_back(std::move(param));
+        const auto& param = mainFunc->funcBody->paramLists[0]->params[0];
+        auto newParam = CreateFuncParam("v", ASTCloner::Clone(param->type.get()), nullptr, param->GetTy());
+        argPtr = newParam.get();
+        funcParamList->params.emplace_back(std::move(newParam));
     }
     funcBody->paramLists.push_back(std::move(funcParamList));
 
     // Creat "retVal = main(v) or main()"
     std::vector<OwnedPtr<FuncArg>> args;
     if (argPtr) {
-        args.emplace_back(CreateFuncArg(CreateRefExpr(*argPtr), "", argPtr->ty));
+        args.emplace_back(CreateFuncArg(CreateRefExpr(*argPtr), "", argPtr->GetTy()));
     }
     auto callMain = CreateCallExpr(CreateRefExpr(*mainFunc), std::move(args), mainFunc, mainTy);
     auto retVal = CreateVarDecl("retVal", std::move(callMain));
@@ -514,7 +536,7 @@ void TypeChecker::TypeCheckerImpl::GenerateMainInvoke()
     OwnedPtr<ReturnExpr> retExpr = mainTy->IsInteger()
         ? CreateReturnExpr(CreateConvInt64(*retVal, *int64Ty), funcBody.get())
         : CreateReturnExpr(CreateLitConstExpr(LitConstKind::INTEGER, "0", int64Ty), funcBody.get());
-    retExpr->ty = TypeManager::GetNothingTy();
+    retExpr->SetTy(TypeManager::GetNothingTy());
     funcBody->body->body.emplace_back(std::move(retVal));
     funcBody->body->body.emplace_back(std::move(retExpr));
     mainFunc->curFile->decls.emplace_back(CreateMainInvokeDecl(std::move(funcBody), *mainFunc, *mainInvokeTy));
@@ -556,9 +578,13 @@ void TypeChecker::TypeCheckerImpl::PerformDesugarAfterTypeCheck(ASTContext& ctx,
         jim.CheckTypes(*file);
     }
 
-    jim.DesugarPackage(pkg, structMemberMap);
+    jim.DesugarPackage(pkg, structMemberMap, [this](auto& node) {
+        DesugarForPropDecl(node);
+    });
     Interop::ObjC::Desugar(Interop::ObjC::InteropContext(
-        pkg, typeManager, importManager, diag, *ci->mangler, ci->invocation.globalOptions.output, structMemberMap));
+        pkg, typeManager, importManager, diag, *ci->mangler,
+        ci->invocation.globalOptions.output, ci->invocation.globalOptions.outputObjCGenDir,
+        structMemberMap, ci->invocation.globalOptions.target.os));
 
     DesugarDeclsForPackage(pkg, ci->invocation.globalOptions.enableCoverage);
     std::function<VisitAction(Ptr<Node>)> preVisit = [this, &ctx](Ptr<Node> node) -> VisitAction {
@@ -574,7 +600,7 @@ void TypeChecker::TypeCheckerImpl::PerformDesugarAfterTypeCheck(ASTContext& ctx,
             }
             case ASTKind::LIT_CONST_EXPR: {
                 auto lce = StaticAs<ASTKind::LIT_CONST_EXPR>(node);
-                if (lce->siExpr && Ty::IsTyCorrect(lce->ty)) {
+                if (lce->siExpr && Ty::IsTyCorrect(lce->GetTy())) {
                     DesugarStrInterpolationExpr(ctx, *lce);
                 }
                 break;
@@ -625,11 +651,12 @@ void TypeChecker::TypeCheckerImpl::PerformDesugarAfterTypeCheck(ASTContext& ctx,
     Walker(&pkg, preVisit).Walk();
 }
 
-Ptr<AST::Ty> TypeChecker::TypeCheckerImpl::SynthesizeWithoutRecover(ASTContext& ctx, Ptr<AST::Node> node)
+Ptr<AST::Ty> TypeChecker::TypeCheckerImpl::SynthesizeWithoutRecover(
+    const CheckerContext& ctx, Ptr<AST::Node> node)
 {
     CJC_NULLPTR_CHECK(node);
-    ctx.ClearTypeCheckCache(*node);    // ensure newly created nodes have no related cache
-    ctx.SkipSynForCorrectTyRec(*node); // avoid possible recovery during synthesize for already checked node
+    ctx.Ctx().ClearTypeCheckCache(*node);    // ensure newly created nodes have no related cache
+    ctx.Ctx().SkipSynForCorrectTyRec(*node); // avoid possible recovery during synthesize for already checked node
     auto ret = Synthesize(ctx, node);
     DesugarForPropDecl(*node); // seems that the above still aren't enough...
     return ret;
@@ -641,23 +668,23 @@ OwnedPtr<AST::FuncDecl> TypeChecker::TypeCheckerImpl::CreateToAny(AST::Decl& out
 {
     OwnedPtr<FuncBody> funcBody = MakeOwned<FuncBody>();
     funcBody->body = MakeOwned<Block>();
-    funcBody->body->ty = typeManager.GetAnyTy();
+    funcBody->body->SetTy(typeManager.GetAnyTy());
 
     auto anyDecl = Ty::GetDeclPtrOfTy<InheritableDecl>(typeManager.GetAnyTy());
     CJC_NULLPTR_CHECK(anyDecl);
     funcBody->retType = CreateRefType(*anyDecl);
 
-    funcBody->ty = typeManager.GetFunctionTy({}, typeManager.GetAnyTy());
+    funcBody->SetTy(typeManager.GetFunctionTy({}, typeManager.GetAnyTy()));
 
-    auto fromTy = outerDecl.ty;
+    auto fromTy = outerDecl.GetTy();
     auto funcParamList = MakeOwned<FuncParamList>();
     funcBody->paramLists.push_back(std::move(funcParamList));
     auto xRef = CreateRefExpr("this");
     xRef->ref.target = &outerDecl;
-    xRef->ty = fromTy;
+    xRef->SetTy(fromTy);
     xRef->EnableAttr(Attribute::NO_REFLECT_INFO);
     auto returnExpr = CreateReturnExpr(std::move(xRef), funcBody.get());
-    returnExpr->ty = TypeManager::GetNothingTy();
+    returnExpr->SetTy(TypeManager::GetNothingTy());
     funcBody->body->body.push_back(std::move(returnExpr));
 
     auto toAnyFunc = CreateFuncDecl(std::string(TO_ANY), std::move(funcBody));
@@ -674,25 +701,5 @@ OwnedPtr<AST::FuncDecl> TypeChecker::TypeCheckerImpl::CreateToAny(AST::Decl& out
     AddCurFile(*toAnyFunc, outerDecl.curFile);
 
     return toAnyFunc;
-}
-
-void TypeChecker::TypeCheckerImpl::PerformToAnyInsertion(AST::Package& pkg)
-{
-    if (ci->invocation.globalOptions.disableInstantiation) {
-        return;
-    }
-    auto addToAny = [this](const OwnedPtr<Decl>& decl) {
-        if (decl->astKind == ASTKind::STRUCT_DECL && !decl->TestAttr(Attribute::GENERIC)) {
-            auto sd = RawStaticCast<AST::StructDecl*>(decl.get());
-            auto fd = CreateToAny(*sd);
-            fd->EnableAttr(Attribute::IN_STRUCT);
-            fd->funcBody->parentStruct = sd;
-            fd->toBeCompiled = sd->toBeCompiled;
-            (void)sd->body->decls.emplace_back(std::move(fd));
-        }
-    };
-    IterateToplevelDecls(pkg, addToAny);
-    (void)std::for_each(pkg.genericInstantiatedDecls.begin(), pkg.genericInstantiatedDecls.end(),
-        [&addToAny](auto& it) { addToAny(it); });
 }
 #endif

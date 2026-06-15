@@ -31,7 +31,7 @@ target_link_libraries(
     GTest::gtest_main)
 add_test(NAME ParseTypeAliasTest COMMAND ParseTypeAliasTest)
 
-add_executable(ParseCommentTest ParseCommentTest.cpp)
+add_executable(ParseCommentTest ParseCommentTest.cpp ParseCommentTest2.cpp)
 target_link_libraries(
     ParseCommentTest
     cangjie-lsp
@@ -40,8 +40,17 @@ target_link_libraries(
     GTest::gtest
     GTest::gtest_main
     TestCompilerInstanceObject)
-
 add_test(NAME ParseCommentTest COMMAND ParseCommentTest)
+
+add_executable(CheckCjdTest CheckCjdTest.cpp)
+target_link_libraries(
+    CheckCjdTest
+    cangjie-lsp
+    ${CMAKE_DL_LIBS}
+    GTest::gtest
+    GTest::gtest_main)
+add_test(NAME CheckCjdTest COMMAND CheckCjdTest)
+
 add_executable(ParseIncrTest ParseIncrTest.cpp)
 target_link_libraries(
     ParseIncrTest

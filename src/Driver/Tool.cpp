@@ -27,6 +27,9 @@
 #include "cangjie/Utils/Semaphore.h"
 #include "cangjie/Driver/TempFileManager.h"
 #include "cangjie/Driver/Utils.h"
+#ifdef _WIN32
+#include "cangjie/Basic/StringConvertor.h"
+#endif
 
 using namespace Cangjie;
 namespace {
@@ -36,7 +39,9 @@ std::string GetSystemErrorMessage(DWORD errCode)
     if (errCode == 0) {
         return "";
     }
+
     LPWSTR wMsgBuf = nullptr;
+
     DWORD size =
         FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
             NULL, errCode, MAKELANGID(LANG_ENGLISH, SUBLANG_DEFAULT), (LPWSTR)&wMsgBuf, 0, NULL);
@@ -68,6 +73,7 @@ std::string GetSystemErrorMessage(int error)
     char buf[buffSize] = {0};
     auto handleError = [&buf](auto res) -> std::string {
         using T = decltype(res);
+
         if constexpr (std::is_integral_v<T>) {
             // POSIX
             return res != 0 ? "" : std::string(buf);

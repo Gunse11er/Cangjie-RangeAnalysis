@@ -16,6 +16,7 @@
 #include "cangjie/Mangle/CHIRManglingUtils.h"
 #include "cangjie/Mangle/CHIRTypeManglingUtils.h"
 #include "cangjie/Option/Option.h"
+#include "cangjie/Utils/ProfileRecorder.h"
 
 using namespace Cangjie;
 using namespace Cangjie::CHIR;
@@ -25,7 +26,7 @@ const std::string GENERIC_THIS_SRC_NAME = "This";
 
 // Check if the srcFunc is a lambda with signature (JSContext, JSCallInfo) -> JSValue
 // Only such lambdas need debug location info for cross-lang debugging
-bool IsArkInteropLambdaSignature(const FuncBase& srcFunc)
+bool IsArkInteropLambdaSignature(const Function& srcFunc)
 {
     auto* originalType = srcFunc.GetOriginalLambdaType();
     if (originalType == nullptr) {
@@ -119,7 +120,7 @@ void SetAutoEnvBaseDefAttr(ClassDef& def)
     def.EnableAttr(Attribute::ABSTRACT);
 }
 
-void SetLiftedLambdaAttr(Func& func, Lambda& lambda)
+void SetLiftedLambdaAttr(Function& func, Lambda& lambda)
 {
     func.EnableAttr(Attribute::COMPILER_ADD);
     func.EnableAttr(Attribute::NO_REFLECT_INFO);
@@ -137,7 +138,7 @@ void SetLiftedLambdaAttr(Func& func, Lambda& lambda)
     }
 }
 
-void SetMemberMethodAttr(Func& func, bool isConst)
+void SetMemberMethodAttr(Function& func, bool isConst)
 {
     func.EnableAttr(Attribute::COMPILER_ADD);
     func.EnableAttr(Attribute::NO_REFLECT_INFO);
@@ -150,7 +151,7 @@ void SetMemberMethodAttr(Func& func, bool isConst)
     }
 }
 
-bool FuncTypeHasGenericT(const FuncBase& func)
+bool FuncTypeHasGenericT(const Function& func)
 {
     if (func.GetFuncKind() == FuncKind::LAMBDA) {
         auto funcType = func.GetFuncType();
@@ -213,7 +214,7 @@ bool NeedAddThisType(const Value& srcFunc)
 size_t GetFuncGenericTypeParamNum(const Value& srcFunc)
 {
     size_t num = 0;
-    if (auto funcBase = DynamicCast<const FuncBase*>(&srcFunc)) {
+    if (auto funcBase = DynamicCast<const Function*>(&srcFunc)) {
         num = funcBase->GetGenericTypeParams().size();
     } else {
         auto lambda = StaticCast<Lambda*>(StaticCast<const LocalVar&>(srcFunc).GetExpr());
@@ -243,7 +244,7 @@ size_t GetFuncGenericTypeParamNum(const Value& srcFunc)
 std::vector<Type*> GetInstTypeParamsForCustomTypeDef(
     const std::vector<Type*>& givInstTypes, const Value& srcFunc)
 {
-    auto memberFunc = DynamicCast<const FuncBase*>(&srcFunc);
+    auto memberFunc = DynamicCast<const Function*>(&srcFunc);
     if (memberFunc == nullptr) {
         memberFunc = GetTopLevelFunc(srcFunc);
     }
@@ -332,7 +333,7 @@ void LiftCustomDefType(CustomTypeDef& def, TypeConverterForCC& converter)
         return VisitResult::CONTINUE;
     };
     for (auto method : def.GetMethods()) {
-        Visitor::Visit(*StaticCast<Func*>(method), preVisit);
+        Visitor::Visit(*method, preVisit);
         converter.VisitValue(*method);
     }
     converter.VisitDef(def);
@@ -341,36 +342,36 @@ void LiftCustomDefType(CustomTypeDef& def, TypeConverterForCC& converter)
 void CreateVirtualFuncInAutoEnvBaseDef(ClassDef& autoEnvBaseDef,
     const std::string& funcName, const std::vector<Type*>& paramsAndRetType, CHIRBuilder& builder)
 {
-    std::vector<AbstractMethodParam> params;
     std::vector<Type*> paramTypes{builder.GetType<RefType>(autoEnvBaseDef.GetType())};
     CJC_ASSERT(!paramsAndRetType.empty());
     for (size_t i = 0; i < paramsAndRetType.size() - 1; ++i) {
-        params.emplace_back(AbstractMethodParam{"p" + std::to_string(i), paramsAndRetType[i]});
         paramTypes.emplace_back(paramsAndRetType[i]);
     }
     auto methodTy = builder.GetType<FuncType>(paramTypes, paramsAndRetType.back());
-    AttributeInfo attr;
-    attr.SetAttr(Attribute::ABSTRACT, true);
-    attr.SetAttr(Attribute::PUBLIC, true);
-    attr.SetAttr(Attribute::NO_DEBUG_INFO, true);
-
     std::string mangleName;
     if (funcName == GENERIC_VIRTUAL_FUNC) {
         mangleName = CHIRMangling::ClosureConversion::GenerateGenericAbstractFuncMangleName(autoEnvBaseDef);
     } else if (funcName == INST_VIRTUAL_FUNC) {
         mangleName = CHIRMangling::ClosureConversion::GenerateInstantiatedAbstractFuncMangleName(autoEnvBaseDef);
     }
-    autoEnvBaseDef.AddAbstractMethod(
-        AbstractMethodInfo{funcName, autoEnvBaseDef.GetIdentifier() + funcName,
-        methodTy, params, attr, AnnoInfo{}, std::vector<GenericType*>{}, false, &autoEnvBaseDef});
+    auto abstractMethod = builder.CreateFunction(methodTy, mangleName, funcName, "", autoEnvBaseDef.GetPackageName());
+    abstractMethod->EnableAttr(Attribute::ABSTRACT);
+    abstractMethod->EnableAttr(Attribute::PUBLIC);
+    abstractMethod->EnableAttr(Attribute::NO_DEBUG_INFO);
+
+    for (size_t i = 0; i < paramsAndRetType.size() - 1; ++i) {
+        builder.CreateParameter(paramTypes[i], INVALID_LOCATION, *abstractMethod);
+    }
+
+    autoEnvBaseDef.AddMethod(abstractMethod);
 }
 
 FuncType* GetMethodTypeInAutoEnvGenericDef(const ClassDef& def)
 {
     if (def.GetType()->IsAutoEnvGenericBase()) {
-        auto abstractMethods = def.GetAbstractMethods();
-        CJC_ASSERT(abstractMethods.size() == 1);
-        return Cangjie::StaticCast<FuncType*>(abstractMethods[0].methodTy);
+        auto methods = def.GetMethods();
+        CJC_ASSERT(methods.size() == 1);
+        return methods[0]->GetFuncType();
     }
     auto superDef = def.GetSuperClassDef();
     CJC_NULLPTR_CHECK(superDef);
@@ -430,7 +431,7 @@ std::string GenerateSrcCodeIdentifier(Value& memberVar)
 }
 
 void ReplaceEnvVarWithMemberVar(const std::vector<Value*>& capturedValues,
-    Expression* firstExpr, Func& globalFunc, Value& curCalss, CHIRBuilder& builder)
+    Expression* firstExpr, Function& globalFunc, Value& curCalss, CHIRBuilder& builder)
 {
     uint64_t capturedValueIndex = 0;
     Expression* lastExpr = firstExpr;
@@ -500,8 +501,7 @@ Value* CastTypeFromAutoEnvRefToFuncType(FuncType& srcFuncType, Value& autoEnvObj
      * }
      * class B <: A<Bool> {
      * }
-     * In B, we will generate a func B::foo with type (Box<Bool>&) -> Unit to meet consistent function signatures
-     * in vtable.
+     * In B, we will generate a func B::foo with type (Box<Bool>&) -> Unit to meet consistent function signatures in vtable
      * However when we got a function call B::foo(true), we should get its real function type (Bool) -> Unit,
      *   and type info is stored in orphan flag in generic type.
      */
@@ -555,13 +555,6 @@ void PrintGlobalFuncInfo(const CHIR::Position& pos)
 {
     std::string posMsg = " in the line:" + std::to_string(pos.line) + " and the column:" + std::to_string(pos.column);
     auto msg = "The top level func" + posMsg + " was closure converted";
-    std::cout << msg << std::endl;
-}
-
-void PrintImportedFuncInfo(const ImportedFunc& func)
-{
-    std::string msg = "The imported func " + func.GetSrcCodeIdentifier() + " from package " +
-        func.GetSourcePackageName() + " was closure converted";
     std::cout << msg << std::endl;
 }
 
@@ -706,7 +699,27 @@ bool IsAutoEnvGenericType(const Type& type)
     if (type.IsAutoEnvGenericBase()) {
         return true;
     }
-    return StaticCast<const ClassType&>(type).GetClassDef()->GetMethods().size() == 1;
+    /**
+     *  if `type` is sub type of Auto_Env_GenericBase, and `type` is not Auto_Env_InstBase,
+     *  it must only have one method with suffix `$g`, such as:
+     *  func foo<T>(a: T): Unit {
+     *      println("foo")
+     *  }
+     *  func goo(a: Int32): Unit {
+     *      println("goo")
+     *  }
+     *  var x = goo
+     *  x = foo<Int32>  // there is a TypeCast, from `AutoEnvFoo` to `AutoEnvInstBase`
+     *  the `AutoEnvFoo` is like the following class:
+     *  class AutoEnvFoo<T> <: AutoEnvGenericBase<T, Unit> {
+     *      public func foo_$g(a: T): Unit {
+     *          return foo(a)
+     *      }
+     *  }
+     *  only have one method with suffix `$g`, so we need to use AutoEnvWrapper to wrap the `AutoEnvFoo`
+     */
+    auto parentType = StaticCast<const ClassType&>(type).GetClassDef()->GetSuperClassTy();
+    return parentType && parentType->IsAutoEnvGenericBase() && !type.IsAutoEnvInstBase();
 }
 
 std::pair<bool, std::vector<size_t>> EnumConstructorNeedTypeCast(const Expression& e)
@@ -796,10 +809,117 @@ void ReplaceOperandWithAutoEnvWrapperClass(
         user->ReplaceOperand(&op, &autoEnvWrapperClass);
     }
 }
+
+ClassType* GetAutoEnvGenericBase(ClassType& closureType, CHIRBuilder& builder)
+{
+    if (closureType.IsAutoEnvGenericBase()) {
+        return &closureType;
+    }
+    auto superType = closureType.GetSuperClassTy(&builder);
+    return GetAutoEnvGenericBase(*superType, builder);
+}
+
+ClassType* InstantiateAutoEnvGenericBaseType(ClassType& closureType, const Expression& e, CHIRBuilder& builder)
+{
+    /** there are some scenario we need to discuss:
+     *  1. lambda recursively call itself directly
+     *  func foo(): Unit {
+     *      func goo<T>(a: T): Unit {
+     *          goo<Int64>(1)
+     *          goo<Bool>(true)
+     *      }
+     *  }
+     *  after closure conversion:
+     *  abstract class AutoEnvGenericBase<T1, T2> {
+     *      open public func $GenericVirtualFunc(p: T1): T2
+     *  }
+     *  class AutoEnvGoo<T> <: AutoEnvGenericBase<T, Unit> {
+     *      override public func goo_&g(a: T): Unit {
+     *          goo<T>(this, a)
+     *      }
+     *  }
+     *  func goo<T>(env: AutoEnvGoo<T>&, a: T): Unit {
+     *      ...
+     *      %1: Unit = Apply(AutoEnvGoo<Int64>& -> goo_&g, env, a) // goo<Int64>(1)
+     *      %2: Unit = Apply(AutoEnvGoo<Bool>& -> goo_&g, env, a)  // goo<Bool>(true)
+     *  }
+     *  env's type is always `AutoEnvGoo<T>&`, but in different `Apply`, ThisType should be different,
+     *  otherwise, we will lost instantiated type info and some APIs might get wrong result
+     *
+     *  2. lambda recursively call itself indirectly
+     *  func foo(): Unit {
+     *      func goo<T>(a: T): Unit {
+     *          func hoo() {
+     *              goo<Int64>(1)
+     *              goo<Bool>(true)
+     *          }
+     *      }
+     *  }
+     *  after closure conversion:
+     *  abstract class AutoEnvGenericBase1<T1> {
+     *      open public func $GenericVirtualFunc(): T1
+     *  }
+     *  abstract class AutoEnvGenericBase2<T1, T2> {
+     *      open public func $GenericVirtualFunc(p: T1): T2
+     *  }
+     *  class AutoEnvGoo<T> <: AutoEnvGenericBase2<T, Unit> {
+     *      override public func $GenericVirtualFunc(a: T): Unit {
+     *          goo<T>(this, a)
+     *      }
+     *  }
+     *  abstract class AutoEnvInstBase <: AutoEnvGenericBase1<Unit> {
+     *      open public func $InstVirtualFunc(): Unit
+     *  }
+     *  class AutoEnvHoo<T> <: AutoEnvInstBase {
+     *      var v1: AutoEnvGenericBase<T, Unit>&
+     *      override public func $GenericVirtualFunc(): Box<Unit>& {
+     *          hoo<T>(this)
+     *      }
+     *      override public func $InstVirtualFunc(): Unit {
+     *          hoo<T>(this)
+     *      }
+     *  }
+     *  func hoo<T>(env: AutoEnvHoo<T>&): Unit {
+     *      ...
+     *      %1: AutoEnvGenericBase<T, Unit>& = env.v1
+     *      %2: Int64 = Constant(1)
+     *      %3: Unit = Invoke(AutoEnvGenericBase<Int64, Unit>& -> $GenericVirtualFunc, %1, %2) // goo<Int64>(1)
+     *      %4: Bool = Constant(true)
+     *      %5: Unit = Invoke(AutoEnvGenericBase<Bool, Unit>& -> $GenericVirtualFunc, %1, %4)  // goo<Bool>(true)
+     *  }
+     *  the same reason with scenario 1
+     */
+    if (!closureType.IsGenericRelated()) {
+        return &closureType;
+    }
+    std::vector<Type*> funcTypeArgs;
+    if (auto apply = Cangjie::DynamicCast<const Apply*>(&e)) {
+        for (auto arg : apply->GetArgs()) {
+            funcTypeArgs.emplace_back(arg->GetType());
+        }
+    } else if (auto applyE = Cangjie::DynamicCast<const ApplyWithException*>(&e)) {
+        for (auto arg : applyE->GetArgs()) {
+            funcTypeArgs.emplace_back(arg->GetType());
+        }
+    } else {
+        return &closureType;
+    }
+    funcTypeArgs.emplace_back(e.GetResultType());
+    auto autoEnvGenericBase = GetAutoEnvGenericBase(closureType, builder);
+    auto autoEnvTypeArgs = autoEnvGenericBase->GetGenericArgs();
+    std::unordered_map<const GenericType*, Type*> replaceTable;
+    CJC_ASSERT(autoEnvTypeArgs.size() == funcTypeArgs.size());
+    for (size_t i = 0; i < funcTypeArgs.size(); ++i) {
+        if (autoEnvTypeArgs[i]->IsGeneric() && !funcTypeArgs[i]->IsGeneric()) {
+            replaceTable.emplace(Cangjie::StaticCast<GenericType*>(autoEnvTypeArgs[i]), funcTypeArgs[i]);
+        }
+    }
+    return StaticCast<ClassType*>(ReplaceRawGenericArgType(closureType, replaceTable, builder));
+}
 } // namespace
 
 ClosureConversion::ClosureConversion(Package& package, CHIRBuilder& builder, const GlobalOptions& opts,
-    const std::unordered_set<Func*>& srcCodeImportedFuncs)
+    const std::unordered_set<Function*>& srcCodeImportedFuncs)
     : package(package),
       builder(builder),
       objClass(*builder.GetObjectTy()->GetClassDef()),
@@ -818,15 +938,16 @@ std::unordered_set<ClassDef*> ClosureConversion::GetUselessClassDef() const
     return uselessClasses;
 }
 
-std::unordered_set<Func*> ClosureConversion::GetUselessLambda() const
+std::unordered_set<Function*> ClosureConversion::GetUselessLambda() const
 {
     return uselessLambda;
 }
 
 std::vector<Lambda*> ClosureConversion::CollectNestedFunctions()
 {
+    Utils::ProfileRecorder recorder("ClosureConversion", "CollectNestedFunctions");
     std::vector<Lambda*> nestedFuncs;
-    Func* curOutFunc = nullptr;
+    Function* curOutFunc = nullptr;
     auto preVisit = [&nestedFuncs, &curOutFunc, this](Expression& e) {
         if (auto lambdaExpr = DynamicCast<Lambda*>(&e); lambdaExpr) {
             // we must collect inner lambda first, and then outer lambda,
@@ -842,7 +963,7 @@ std::vector<Lambda*> ClosureConversion::CollectNestedFunctions()
         }
         return VisitResult::CONTINUE;
     };
-    for (auto func : package.GetGlobalFuncs()) {
+    for (auto func : package.GetGlobalFuncsWithBody()) {
         if (func->TestAttr(Attribute::SKIP_ANALYSIS)) {
             continue;
         }
@@ -1012,10 +1133,12 @@ void ClosureConversion::ReplaceEnvWithBoxObjMemberVar(LocalVar& env, LocalVar& b
     env.GetExpr()->RemoveSelfFromBlock();
 }
 
-std::pair<LocalVar*, LocalVar*> ClosureConversion::SetBoxClassAsMutableVar(LocalVar& rValue)
+std::pair<LocalVar*, LocalVar*> ClosureConversion::SetBoxClassAsMutableVar(
+    LocalVar& rValue, const std::string& srcCodeIdentifier)
 {
     auto retTy = builder.GetType<RefType>(rValue.GetType());
     auto lValue = builder.CreateExpression<Allocate>(retTy, rValue.GetType(), rValue.GetExpr()->GetParentBlock());
+    lValue->GetResult()->SetSrcCodeIdentifier(srcCodeIdentifier);
     lValue->MoveAfter(rValue.GetExpr());
     auto asg =
         builder.CreateExpression<Store>(builder.GetUnitTy(), &rValue, lValue->GetResult(), lValue->GetParentBlock());
@@ -1034,7 +1157,7 @@ Value* ClosureConversion::BoxMutableVar(LocalVar& env)
     // if not use `-g`, we generate less expressions to improve runtime performance
     if (opts.enableCompileDebug) {
         // var a: Class-$BOX_xxx = $BOX_xxx()
-        auto [lValue, rValue] = SetBoxClassAsMutableVar(*boxObj);
+        auto [lValue, rValue] = SetBoxClassAsMutableVar(*boxObj, env.GetSrcCodeIdentifier());
         allocRes = lValue;
         boxObj = rValue;
     }
@@ -1065,8 +1188,9 @@ void ClosureConversion::LiftNestedFunctionWithCFuncType(Lambda& nestedFunc)
     // move lambda to global function
     auto globalFuncId = GenerateGlobalFuncIdentifier(nestedFunc);
     auto genericParamTypes = nestedFunc.GetGenericTypeParams();
-    auto globalFunc = builder.CreateFunc(loc, StaticCast<FuncType*>(nestedFunc.GetResult()->GetType()), globalFuncId,
-        nestedFunc.GetSrcCodeIdentifier(), "", package.GetName(), genericParamTypes);
+    auto globalFunc = builder.CreateFunction(StaticCast<FuncType*>(nestedFunc.GetResult()->GetType()),
+    globalFuncId, nestedFunc.GetSrcCodeIdentifier(), "", package.GetName(), genericParamTypes);
+    globalFunc->SetDebugLocation(loc);
     // After globalFunc is used, new localId needs to be generated based on the ID in oldFunc during subsequent
     // optimization. Otherwise, duplicate IDs may exist. Therefore, the ID in oldFunc is transferred to globalFunc.
     CJC_NULLPTR_CHECK(nestedFunc.GetBody()->GetTopLevelFunc());
@@ -1103,7 +1227,7 @@ void ClosureConversion::RecordDuplicateLambdaName(const Lambda& func)
     }
 }
 
-bool ClosureConversion::LambdaCanBeInlined(const Expression& user, const FuncBase& lambda)
+bool ClosureConversion::LambdaCanBeInlined(const Expression& user, const Function& lambda)
 {
     if (user.GetExprKind() != CHIR::ExprKind::APPLY) {
         return false;
@@ -1126,7 +1250,7 @@ bool ClosureConversion::LambdaCanBeInlined(const Expression& user, const FuncBas
         }
         return VisitResult::CONTINUE;
     };
-    Visitor::Visit(*VirtualCast<Func*>(callee), preVisit);
+    Visitor::Visit(*StaticCast<Function*>(callee), preVisit);
 
     // recursive function doesn't need to be inlined
     return !isRecursive;
@@ -1139,7 +1263,6 @@ void ClosureConversion::DoFunctionInlineForLambda()
     }
     auto funcInline = FunctionInline(builder, GlobalOptions::OptimizationLevel::O2, opts.chirDebugOptimizer);
     for (auto& it : autoEnvImplDefs) {
-        auto methods = it.second->GetMethods();
         for (auto lambda : it.second->GetMethods()) {
             // after inlining generic virtual func, we should remvoe Box and Unbox expr, we will do it later
             if (lambda->GetSrcCodeIdentifier() == GENERIC_VIRTUAL_FUNC) {
@@ -1165,11 +1288,13 @@ ClassDef* ClosureConversion::GetOrCreateAutoEnvBaseDef(const FuncType& funcType)
 
 void ClosureConversion::InlineLambda(const std::vector<Lambda*>& funcs)
 {
+    Utils::ProfileRecorder recorder("ClosureConversion", "InlineLambda");
     LambdaInline(builder, opts).InlineLambda(funcs);
 }
 
 void ClosureConversion::ConvertNestedFunctions(const std::vector<Lambda*>& funcs)
 {
+    Utils::ProfileRecorder recorder("ClosureConversion", "ConvertNestedFunctions");
     for (auto func : funcs) {
         RecordDuplicateLambdaName(*func);
         if (func->GetFuncType()->IsCFunc()) {
@@ -1350,6 +1475,7 @@ void ClosureConversion::LiftGenericTypes()
 
 void ClosureConversion::LiftType()
 {
+    Utils::ProfileRecorder recorder("ClosureConversion", "LiftType");
     ConvertTypeFunc convertTypeToClosure = [this](Type& type) {
         return ConvertTypeToClosureType(type);
     };
@@ -1366,19 +1492,14 @@ void ClosureConversion::LiftType()
         converter.VisitExpr(e);
         return VisitResult::CONTINUE;
     };
-    for (auto func : package.GetGlobalFuncs()) {
-        if (func->TestAttr(Attribute::SKIP_ANALYSIS)) {
-            continue;
+    for (auto func : package.GetGlobalFunctions(true)) {
+        if (func->GetBody()) {
+            Visitor::Visit(*func, preVisit);
         }
-        Visitor::Visit(*func, preVisit);
         converter.VisitValue(*func);
     }
-
-    for (auto& importedValue : package.GetImportedVarAndFuncs()) {
-        converter.VisitValue(*importedValue);
-    }
-    for (auto& globalVar : package.GetGlobalVars()) {
-        converter.VisitValue(*globalVar);
+    for (auto var : package.GetGlobalVars()) {
+        converter.VisitValue(*var);
     }
 
     for (auto def : package.GetAllCustomTypeDef()) {
@@ -1435,7 +1556,7 @@ ClassDef* ClosureConversion::GetOrCreateGenericAutoEnvBaseDef(size_t paramNum)
     return classDef;
 }
 
-void ClosureConversion::CreateGenericOverrideMethodInAutoEnvImplDef(ClassDef& autoEnvImplDef, FuncBase& srcFunc,
+void ClosureConversion::CreateGenericOverrideMethodInAutoEnvImplDef(ClassDef& autoEnvImplDef, Function& srcFunc,
     const std::unordered_map<const GenericType*, Type*>& originalTypeToNewType)
 {
     // create new func type
@@ -1453,8 +1574,8 @@ void ClosureConversion::CreateGenericOverrideMethodInAutoEnvImplDef(ClassDef& au
     // create override func
     auto mangledName = CHIRMangling::ClosureConversion::GenerateGenericOverrideFuncMangleName(srcFunc);
     auto debugLoc = IsArkInteropLambdaSignature(srcFunc) ? srcFunc.GetDebugLocation() : INVALID_LOCATION;
-    auto newFunc = builder.CreateFunc(
-        debugLoc, newFuncTy, mangledName, GENERIC_VIRTUAL_FUNC, "", package.GetName());
+    auto newFunc = builder.CreateFunction(newFuncTy, mangledName, GENERIC_VIRTUAL_FUNC, "", package.GetName());
+    newFunc->SetDebugLocation(debugLoc);
     autoEnvImplDef.AddMethod(newFunc);
 
     // set attribute
@@ -1588,7 +1709,7 @@ void ClosureConversion::CreateGenericOverrideMethodInAutoEnvImplDef(ClassDef& au
 }
 
 void ClosureConversion::CreateInstOverrideMethodInAutoEnvImplDef(ClassDef& autoEnvImplDef,
-    FuncBase& srcFunc, const std::unordered_map<const GenericType*, Type*>& originalTypeToNewType)
+    Function& srcFunc, const std::unordered_map<const GenericType*, Type*>& originalTypeToNewType)
 {
     if (FuncTypeHasGenericT(srcFunc)) {
         return;
@@ -1605,8 +1726,8 @@ void ClosureConversion::CreateInstOverrideMethodInAutoEnvImplDef(ClassDef& autoE
     // create override func
     auto mangledName = CHIRMangling::ClosureConversion::GenerateInstOverrideFuncMangleName(srcFunc);
     auto debugLoc = IsArkInteropLambdaSignature(srcFunc) ? srcFunc.GetDebugLocation() : INVALID_LOCATION;
-    auto newFunc = builder.CreateFunc(
-        debugLoc, newFuncTy, mangledName, INST_VIRTUAL_FUNC, "", package.GetName());
+    auto newFunc = builder.CreateFunction(newFuncTy, mangledName, INST_VIRTUAL_FUNC, "", package.GetName());
+    newFunc->SetDebugLocation(debugLoc);
     autoEnvImplDef.AddMethod(newFunc);
 
     // set attribute
@@ -1760,7 +1881,7 @@ ClassDef* ClosureConversion::CreateAutoEnvImplDef(const std::string& className,
     return classDef;
 }
 
-ClassDef* ClosureConversion::GetOrCreateAutoEnvImplDef(FuncBase& func, ClassDef& superClassDef)
+ClassDef* ClosureConversion::GetOrCreateAutoEnvImplDef(Function& func, ClassDef& superClassDef)
 {
     auto className = CHIRMangling::ClosureConversion::GenerateGlobalImplClassMangleName(func);
     auto it = autoEnvImplDefs.find(className);
@@ -1808,7 +1929,7 @@ ClassDef* ClosureConversion::GetOrCreateAutoEnvImplDef(FuncBase& func, ClassDef&
     return classDef;
 }
 
-Func* ClosureConversion::LiftLambdaToGlobalFunc(
+Function* ClosureConversion::LiftLambdaToGlobalFunc(
     ClassDef& autoEnvImplDef, Lambda& nestedFunc, const std::vector<GenericType*>& genericTypeParams,
     const std::unordered_map<const GenericType*, Type*>& instMap, const std::vector<Value*>& capturedValues)
 {
@@ -1834,8 +1955,9 @@ Func* ClosureConversion::LiftLambdaToGlobalFunc(
     }
 
     // 4. create global function declare
-    auto globalFunc = builder.CreateFunc(loc, newFuncTy, globalFuncIdentifier, srcCodeIdentifier, "",
+    auto globalFunc = builder.CreateFunction(newFuncTy, globalFuncIdentifier, srcCodeIdentifier, "",
         nestedFunc.GetTopLevelFunc()->GetPackageName(), convertedGenericTypeParams);
+    globalFunc->SetDebugLocation(loc);
     SetLiftedLambdaAttr(*globalFunc, nestedFunc);
     auto sigInfo = FuncSigInfo{
         .funcName = nestedFunc.GetSrcCodeIdentifier(),
@@ -1847,7 +1969,8 @@ Func* ClosureConversion::LiftLambdaToGlobalFunc(
     // Specially, the lifted lambda should inherit local var ID
     globalFunc->InheritIDFromFunc(*nestedFunc.GetBody()->GetTopLevelFunc());
     // Specially, record the `env` value
-    Value* thisPtr = builder.CreateParameter(classRefTy, INVALID_LOCATION, *globalFunc);
+    auto thisPtr = builder.CreateParameter(classRefTy, INVALID_LOCATION, *globalFunc);
+    thisPtr->SetSrcCodeIdentifier("$env");
     for (auto param : nestedFunc.GetParams()) {
         globalFunc->AddParam(*param);
     }
@@ -1963,7 +2086,7 @@ ClassDef* ClosureConversion::GetOrCreateAutoEnvImplDef(
     return classDef;
 }
 
-void ClosureConversion::ReplaceUserPoint(FuncBase& srcFunc, Expression& user, ClassDef& autoEnvImplDef)
+void ClosureConversion::ReplaceUserPoint(Function& srcFunc, Expression& user, ClassDef& autoEnvImplDef)
 {
     auto curBlock = user.GetParentBlock();
     auto autoEnvImplType = StaticCast<ClassType*>(autoEnvImplDef.GetType());
@@ -1992,12 +2115,16 @@ void ClosureConversion::ReplaceUserPoint(
     auto it = convertedCache.find(&srcFunc);
     CJC_ASSERT(it != convertedCache.end());
     auto globalFunc = it->second;
+    Type* thisTy = nullptr;
     if (user.GetTopLevelFunc() == globalFunc) {
+        // maybe we should call itself, not method in AutoEnvObj
         autoEnvObj = user.GetTopLevelFunc()->GetParam(0);
+        thisTy = builder.GetType<RefType>(InstantiateAutoEnvGenericBaseType(
+            *StaticCast<ClassType*>(autoEnvObj->GetType()->StripAllRefs()), user, builder));
     } else {
         autoEnvObj = CreateAutoEnvImplObject(*curBlock, *autoEnvImplType, envs, user, *srcFunc.GetResult());
+        thisTy = autoEnvObj->GetType();
     }
-
     if (auto apply = DynamicCast<Apply*>(&user); apply && apply->GetCallee() == srcFunc.GetResult()) {
         auto methods = autoEnvImplDef.GetMethods();
         auto newCallee = methods.back();
@@ -2005,7 +2132,6 @@ void ClosureConversion::ReplaceUserPoint(
         newArgs.insert(newArgs.begin(), autoEnvObj);
         auto retType = apply->GetResult()->GetType();
         auto loc = apply->GetDebugLocation();
-        auto thisTy = autoEnvObj->GetType();
 
         auto newApply = builder.CreateExpression<Apply>(loc, retType, newCallee, FuncCallContext{
             .args = newArgs,
@@ -2018,7 +2144,6 @@ void ClosureConversion::ReplaceUserPoint(
         newArgs.insert(newArgs.begin(), autoEnvObj);
         auto retType = awe->GetResult()->GetType();
         auto loc = awe->GetDebugLocation();
-        auto thisTy = autoEnvObj->GetType();
 
         auto newApply = builder.CreateExpression<ApplyWithException>(loc, retType, newCallee, FuncCallContext{
             .args = newArgs,
@@ -2063,7 +2188,8 @@ ClassDef* ClosureConversion::GetOrCreateInstAutoEnvBaseDef(const FuncType& funcT
 
 void ClosureConversion::ConvertGlobalFunctions()
 {
-    for (auto func : package.GetGlobalFuncs()) {
+    Utils::ProfileRecorder recorder("ClosureConversion", "ConvertGlobalFunctions");
+    for (auto func : package.GetGlobalFunctions()) {
         if (func->IsCFunc()) {
             continue; // never lift CFunc
         }
@@ -2090,36 +2216,6 @@ void ClosureConversion::ConvertGlobalFunctions()
     }
 }
 
-void ClosureConversion::ConvertImportedFunctions()
-{
-    for (auto ele : package.GetImportedVarAndFuncs()) {
-        if (ele->IsImportedVar() || ele->GetType()->IsCFunc()) {
-            continue;
-        }
-        auto users = ele->GetUsers();
-        auto func = StaticCast<ImportedFunc*>(ele);
-        bool convertFlag{false};
-        for (auto user : users) {
-            if (IsCalleeOfApply(*user, *func)) {
-                continue;
-            }
-            auto autoEnvBaseDef = GetOrCreateAutoEnvBaseDef(*func->GetFuncType());
-            auto autoEnvImplDef = GetOrCreateAutoEnvImplDef(*func, *autoEnvBaseDef);
-            ReplaceUserPoint(*func, *user, *autoEnvImplDef);
-            convertFlag = true;
-            if (opts.chirDebugOptimizer) {
-                PrintImportedFuncInfo(*func);
-            }
-        }
-        if (opts.enIncrementalCompilation && convertFlag) {
-            if (!func->GetRawMangledName().empty()) {
-                ccOutFuncsRawMangle.emplace(func->GetRawMangledName());
-            }
-        }
-        RemoveGetInstantiateValue(users);
-    }
-}
-
 void ClosureConversion::ConvertApplyToInvoke(Apply& apply)
 {
     auto callee = apply.GetCallee();
@@ -2129,22 +2225,22 @@ void ClosureConversion::ConvertApplyToInvoke(Apply& apply)
         // callee is still func type
         autoEnvBaseDef = GetOrCreateAutoEnvBaseDef(*funcType);
         instParentType = InstantiateAutoEnvBaseType(*autoEnvBaseDef, *funcType, builder);
+        instParentType = InstantiateAutoEnvGenericBaseType(*instParentType, apply, builder);
     } else {
         // callee has been replaced in closure conversion, then apply must be converted to invoke
         instParentType = StaticCast<ClassType*>(StaticCast<RefType*>(callee->GetType())->GetBaseType());
         autoEnvBaseDef = instParentType->GetClassDef();
     }
     auto [methodName, originalFuncType] = GetFuncTypeFromAutoEnvBaseDef(*autoEnvBaseDef);
-
     auto invokeInfo = InvokeCallContext {
         .caller = callee,
         .funcCallCtx = FuncCallContext {
             .args = apply.GetArgs(),
             .thisType = instParentType
         },
-        .virMethodCtx = VirMethodContext {
-            .srcCodeIdentifier = methodName,
-            .originalFuncType = originalFuncType
+        .virMethodCtx = FuncSigInfo {
+            .funcName = methodName,
+            .funcType = originalFuncType
         }
     };
     auto invoke = builder.CreateExpression<Invoke>(
@@ -2162,22 +2258,22 @@ void ClosureConversion::ConvertApplyWithExceptionToInvokeWithException(ApplyWith
         // callee is still func type
         autoEnvBaseDef = GetOrCreateAutoEnvBaseDef(*funcType);
         instParentType = InstantiateAutoEnvBaseType(*autoEnvBaseDef, *funcType, builder);
+        instParentType = InstantiateAutoEnvGenericBaseType(*instParentType, apply, builder);
     } else {
         // callee has been replaced in closure conversion, then apply must be converted to invoke
         instParentType = StaticCast<ClassType*>(StaticCast<RefType*>(callee->GetType())->GetBaseType());
         autoEnvBaseDef = instParentType->GetClassDef();
     }
     auto [methodName, originalFuncType] = GetFuncTypeFromAutoEnvBaseDef(*autoEnvBaseDef);
-
     auto invokeInfo = InvokeCallContext {
         .caller = callee,
         .funcCallCtx = FuncCallContext {
             .args = apply.GetArgs(),
             .thisType = instParentType
         },
-        .virMethodCtx = VirMethodContext {
-            .srcCodeIdentifier = methodName,
-            .originalFuncType = originalFuncType
+        .virMethodCtx = FuncSigInfo {
+            .funcName = methodName,
+            .funcType = originalFuncType
         }
     };
     auto invoke = builder.CreateExpression<InvokeWithException>(
@@ -2189,6 +2285,7 @@ void ClosureConversion::ConvertApplyWithExceptionToInvokeWithException(ApplyWith
 
 void ClosureConversion::ConvertExpressions()
 {
+    Utils::ProfileRecorder recorder("ClosureConversion", "ConvertExpressions");
     auto preVisit = [this](Expression& e) {
         if (ApplyNeedConvertToInvoke(e)) {
             ConvertApplyToInvoke(StaticCast<Apply&>(e));
@@ -2217,7 +2314,7 @@ void ClosureConversion::ConvertExpressions()
         }
         return VisitResult::CONTINUE;
     };
-    for (auto func : package.GetGlobalFuncs()) {
+    for (auto func : package.GetGlobalFuncsWithBody()) {
         if (func->TestAttr(Attribute::SKIP_ANALYSIS)) {
             continue;
         }
@@ -2227,6 +2324,7 @@ void ClosureConversion::ConvertExpressions()
 
 void ClosureConversion::CreateVTableForAutoEnvDef()
 {
+    Utils::ProfileRecorder recorder("ClosureConversion", "CreateVTableForAutoEnvDef");
     auto insertDef =
         [](const std::unordered_map<std::string, ClassDef*>& candidateDefs, std::vector<CustomTypeDef*>& targetDefs) {
             for (const auto& it : candidateDefs) {
@@ -2239,7 +2337,7 @@ void ClosureConversion::CreateVTableForAutoEnvDef()
     insertDef(instAutoEnvWrapperDefs, defs);
     insertDef(autoEnvImplDefs, defs);
 
-    auto generator = GenerateVTable(package, defs, builder, opts);
+    auto generator = GenerateVTable(package, defs, builder, opts, "CreateVTableForAutoEnvDef");
     generator.CreateVTable();
     generator.SetSrcFuncType();
 }
@@ -2276,7 +2374,7 @@ void ClosureConversion::CreateMemberVarInAutoEnvWrapper(ClassDef& autoEnvWrapper
     autoEnvWrapperDef.AddInstanceVar(memberVar);
 }
 
-Func* ClosureConversion::CreateGenericMethodInAutoEnvWrapper(ClassDef& autoEnvWrapperDef)
+Function* ClosureConversion::CreateGenericMethodInAutoEnvWrapper(ClassDef& autoEnvWrapperDef)
 {
     // 1. create function type
     auto memberVars = autoEnvWrapperDef.GetDirectInstanceVars();
@@ -2292,8 +2390,7 @@ Func* ClosureConversion::CreateGenericMethodInAutoEnvWrapper(ClassDef& autoEnvWr
     // 2. create function
     auto funcMangledName =
         CHIRMangling::ClosureConversion::GenerateWrapperClassGenericOverrideFuncMangleName(autoEnvWrapperDef);
-    auto func = builder.CreateFunc(
-        INVALID_LOCATION, funcType, funcMangledName, GENERIC_VIRTUAL_FUNC, "", package.GetName());
+    auto func = builder.CreateFunction(funcType, funcMangledName, GENERIC_VIRTUAL_FUNC, "", package.GetName());
     autoEnvWrapperDef.AddMethod(func);
 
     // 3. set attribute
@@ -2336,9 +2433,9 @@ Func* ClosureConversion::CreateGenericMethodInAutoEnvWrapper(ClassDef& autoEnvWr
             .args = invokeArgs,
             .thisType = instCustomType
         },
-        .virMethodCtx = VirMethodContext {
-            .srcCodeIdentifier = methodName,
-            .originalFuncType = originalFuncType
+        .virMethodCtx = FuncSigInfo {
+            .funcName = methodName,
+            .funcType = originalFuncType
         }
     };
     auto invokeRes = CreateAndAppendExpression<Invoke>(builder, retType, invokeInfo, entry)->GetResult();
@@ -2351,14 +2448,14 @@ Func* ClosureConversion::CreateGenericMethodInAutoEnvWrapper(ClassDef& autoEnvWr
     return func;
 }
 
-void ClosureConversion::CreateInstMethodInAutoEnvWrapper(ClassDef& autoEnvWrapperDef, Func& genericFunc)
+void ClosureConversion::CreateInstMethodInAutoEnvWrapper(ClassDef& autoEnvWrapperDef, Function& genericFunc)
 {
     // 1. create function type
     auto superDef = autoEnvWrapperDef.GetSuperClassDef();
     CJC_ASSERT(superDef->GetType()->IsAutoEnvInstBase());
-    auto abstractMethods = superDef->GetAbstractMethods();
-    CJC_ASSERT(abstractMethods.size() == 1);
-    auto parentFuncType = StaticCast<FuncType*>(abstractMethods[0].methodTy);
+    auto methods = superDef->GetMethods();
+    CJC_ASSERT(methods.size() == 1);
+    auto parentFuncType = methods[0]->GetFuncType();
     auto paramTypes = parentFuncType->GetParamTypes();
     CJC_ASSERT(!paramTypes.empty());
     auto autoEnvWrapperRefType = builder.GetType<RefType>(autoEnvWrapperDef.GetType());
@@ -2370,8 +2467,7 @@ void ClosureConversion::CreateInstMethodInAutoEnvWrapper(ClassDef& autoEnvWrappe
     auto funcNamePrefix = autoEnvWrapperDef.GetIdentifierWithoutPrefix();
     auto funcMangledName =
         CHIRMangling::ClosureConversion::GenerateWrapperClassInstOverrideFuncMangleName(autoEnvWrapperDef);
-    auto func = builder.CreateFunc(
-        INVALID_LOCATION, funcType, funcMangledName, INST_VIRTUAL_FUNC, "", package.GetName());
+    auto func = builder.CreateFunction(funcType, funcMangledName, INST_VIRTUAL_FUNC, "", package.GetName());
     autoEnvWrapperDef.AddMethod(func);
 
     // 3. set attribute
@@ -2972,6 +3068,7 @@ void ClosureConversion::CastSpawnArgIfNeed(Spawn& e)
 
 void ClosureConversion::ModifyTypeMismatchInExpr()
 {
+    Utils::ProfileRecorder recorder("ClosureConversion", "ModifyTypeMismatchInExpr");
     auto preVisit = [this](Expression& e) {
         if (Is<Apply>(e)) {
             CastApplyArgAndRetIfNeed(StaticCast<Apply&>(e));
@@ -3000,7 +3097,7 @@ void ClosureConversion::ModifyTypeMismatchInExpr()
         }
         return VisitResult::CONTINUE;
     };
-    for (auto func : package.GetGlobalFuncs()) {
+    for (auto func : package.GetGlobalFuncsWithBody()) {
         if (func->TestAttr(Attribute::SKIP_ANALYSIS)) {
             continue;
         }
@@ -3008,7 +3105,7 @@ void ClosureConversion::ModifyTypeMismatchInExpr()
     }
 }
 
-void ClosureConversion::ModifyTypeMismatchInFunc(Func& func, size_t paramIndex)
+void ClosureConversion::ModifyTypeMismatchInFunc(Function& func, size_t paramIndex)
 {
     // 1. create $Auto_Env_wrapper def
     auto param = func.GetParam(paramIndex);
@@ -3038,7 +3135,7 @@ void ClosureConversion::ModifyTypeMismatchInFunc(Func& func, size_t paramIndex)
 
 void ClosureConversion::ModifyTypeMismatchInVTable()
 {
-    for (auto func : package.GetGlobalFuncs()) {
+    for (auto func : package.GetGlobalFuncsWithBody()) {
         if (func->TestAttr(Attribute::SKIP_ANALYSIS)) {
             continue;
         }
@@ -3065,7 +3162,6 @@ void ClosureConversion::Convert()
     InlineLambda(nestedFuncs);
     nestedFuncs = CollectNestedFunctions();
     ConvertNestedFunctions(nestedFuncs);
-    ConvertImportedFunctions();
     ConvertExpressions();
     LiftType();
     ModifyTypeMismatchInVTable();

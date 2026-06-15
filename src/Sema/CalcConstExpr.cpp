@@ -29,23 +29,23 @@ using namespace Sema;
 
 bool TypeChecker::TypeCheckerImpl::ChkFloatTypeOverflow(const LitConstExpr& lce)
 {
-    auto info = GetFloatTypeInfoByKind(lce.ty->kind);
+    auto info = GetFloatTypeInfoByKind(lce.TyKind());
     switch (lce.constNumValue.asFloat.flowStatus) {
         case Expr::FlowStatus::OVER: {
             (void)diag.DiagnoseRefactor(
-                DiagKindRefactor::sema_float_literal_too_large, lce, lce.ty->String(), info.max);
+                DiagKindRefactor::sema_float_literal_too_large, lce, lce.GetTy()->String(), info.max);
             return false;
         }
         case Expr::FlowStatus::UNDER: {
             (void)diag.DiagnoseRefactor(
-                DiagKindRefactor::sema_float_literal_too_small, lce, lce.ty->String(), info.min);
+                DiagKindRefactor::sema_float_literal_too_small, lce, lce.GetTy()->String(), info.min);
             return false;
         }
         default:
             break;
     }
     uint64_t value = 0;
-    switch (lce.ty->kind) {
+    switch (lce.TyKind()) {
         case TypeKind::TYPE_FLOAT16: {
             float f32 = static_cast<float>(lce.constNumValue.asFloat.value);
             value = static_cast<uint64_t>(FloatFormat::Float32ToFloat16(f32) << 1); // 1: remove the sign bit
@@ -76,10 +76,12 @@ bool TypeChecker::TypeCheckerImpl::ChkFloatTypeOverflow(const LitConstExpr& lce)
 #if defined(__clang__)
 #pragma clang diagnostic pop
 #endif
-        (void)diag.DiagnoseRefactor(DiagKindRefactor::sema_float_literal_too_small, lce, lce.ty->String(), info.min);
+        (void)diag.DiagnoseRefactor(
+            DiagKindRefactor::sema_float_literal_too_small, lce, lce.GetTy()->String(), info.min);
         return false;
     } else if (value == info.inf) { // match the infinity bits
-        (void)diag.DiagnoseRefactor(DiagKindRefactor::sema_float_literal_too_large, lce, lce.ty->String(), info.max);
+        (void)diag.DiagnoseRefactor(
+            DiagKindRefactor::sema_float_literal_too_large, lce, lce.GetTy()->String(), info.max);
         return false;
     }
     return true;
@@ -87,24 +89,24 @@ bool TypeChecker::TypeCheckerImpl::ChkFloatTypeOverflow(const LitConstExpr& lce)
 
 bool TypeChecker::TypeCheckerImpl::ChkLitConstExprRange(LitConstExpr& lce)
 {
-    if (!Ty::IsTyCorrect(lce.ty)) {
+    if (!Ty::IsTyCorrect(lce.GetTy())) {
         return false;
     }
     InitializeLitConstValue(lce);
-    // Ty::IsTyCorrect(lce.ty) is checked by the caller.
-    if (lce.ty->IsInteger()) {
-        lce.constNumValue.asInt.SetOutOfRange(lce.ty);
+    // Ty::IsTyCorrect(lce.GetTy()) is checked by the caller.
+    if (lce.GetTy()->IsInteger()) {
+        lce.constNumValue.asInt.SetOutOfRange(lce.GetTy());
         if (lce.constNumValue.asInt.IsOutOfRange()) {
-            std::string typeName = lce.ty->String();
-            if (lce.ty->IsIdeal()) {
+            std::string typeName = lce.GetTy()->String();
+            if (lce.GetTy()->IsIdeal()) {
                 typeName += "64";
             }
             (void)diag.DiagnoseRefactor(DiagKindRefactor::sema_exceed_num_value_range,
                 lce, lce.stringValue, typeName);
-            lce.ty = TypeManager::GetInvalidTy();
+            lce.SetTy(TypeManager::GetInvalidTy());
             return false;
         }
-    } else if (lce.ty->IsFloating()) {
+    } else if (lce.GetTy()->IsFloating()) {
         // Check whether floating-point literal exceeds the value range of target float type.
         (void)ChkFloatTypeOverflow(lce);
     }
@@ -113,10 +115,11 @@ bool TypeChecker::TypeCheckerImpl::ChkLitConstExprRange(LitConstExpr& lce)
 
 bool TypeChecker::TypeCheckerImpl::ReplaceIdealTy(Node& node)
 {
-    if (!Ty::IsTyCorrect(node.ty)) {
+    if (!Ty::IsTyCorrect(node.GetTy())) {
         return false;
     }
-    typeManager.ReplaceIdealTy(&node.ty);
+    Ptr<Ty> idealTy = typeManager.ReplaceIdealTy(node.GetTy());
+    node.SetTy(idealTy);
     if (node.astKind == ASTKind::LIT_CONST_EXPR) {
         return ChkLitConstExprRange(*StaticAs<ASTKind::LIT_CONST_EXPR>(&node));
     }

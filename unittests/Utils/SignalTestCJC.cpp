@@ -28,7 +28,7 @@ SIGCBF(SIGFPE)
 SIGCBF(SIGSEGV)
 SIGCBF(SIGILL)
 
-#ifdef __unix__
+#ifndef _WIN32
 SIGCBF(SIGTRAP)
 SIGCBF(SIGBUS)
 #endif
@@ -58,12 +58,12 @@ void StackOverflowCallback()
     RecursiveFunction(a, arraySize);
 }
 
-#ifdef __unix__
+#ifndef _WIN32
 const std::unordered_map<std::string, Cangjie::SignalTest::SignalTestCallbackFuncType> signalStringCallbackFuncMap = {
     {"SIGABRT", SIGABRTCallback}, {"SIGFPE", SIGFPECallback}, {"SIGSEGV", SIGSEGVCallback}, {"SIGILL", SIGILLCallback},
     {"SIGTRAP", SIGTRAPCallback}, {"SIGBUS", SIGBUSCallback}, {"StackOverflow", StackOverflowCallback},
     {"SIGINT", SIGINTCallback}};
-#elif _WIN32
+#else
 const std::unordered_map<std::string, Cangjie::SignalTest::SignalTestCallbackFuncType> signalStringCallbackFuncMap = {
     {"SIGABRT", SIGABRTCallback}, {"SIGFPE", SIGFPECallback}, {"SIGSEGV", SIGSEGVCallback}, {"SIGILL", SIGILLCallback},
     {"StackOverflow", StackOverflowCallback}, {"SIGINT", SIGINTCallback}};

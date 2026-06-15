@@ -181,7 +181,7 @@ public:
     // But in Java FFI scenario, the exportId of declarations with generics is different with the mangledName,
     // so we add the member as a flag to indicate which use the mangler is using for.
     bool exportIdMode = false;
-    std::unordered_map<std::string, Ptr<ManglerContext>> manglerCtxTable;
+    std::unordered_map<std::string, Ptr<ManglerContext>> manglerCtxTable {};
 
     /**
      * @brief The constructor of class BaseMangler.
@@ -276,10 +276,9 @@ public:
      * @brief Obtain local function mangled index.
      *
      * @param decl The local function decl.
-     * @param prefix Path of the node.
      * @return std::string The mangled index.
      */
-    std::string GetMangledLocalFuncIndex(const AST::FuncDecl& decl, const std::vector<Ptr<AST::Node>>& prefix) const;
+    std::string GetMangledLocalFuncIndex(const AST::FuncDecl& decl) const;
 
     /**
      * @brief Find outer container of lambda.
@@ -302,7 +301,7 @@ public:
     /**
      * @brief Check whether the function decl is local function decl.
      *
-     * @param decl The decl to be judged.
+     * @param funcDecl The decl to be judged.
      * @return bool If yes, true is returned. Otherwise, false is returned.
      */
     bool IsLocalFunc(const AST::FuncDecl& funcDecl) const;
@@ -576,8 +575,8 @@ inline bool IsAutoBoxedBaseDecl(const AST::Decl& decl)
 inline std::string MangleEnumElement(const std::string& enumDeclMangledName, const AST::Decl& decl)
 {
     auto elementClassName = enumDeclMangledName + MANGLE_DOLLAR_PREFIX + decl.identifier;
-    if (decl.ty && decl.ty->kind == AST::TypeKind::TYPE_FUNC) {
-        auto funcTy = static_cast<AST::FuncTy*>(decl.ty.get());
+    if (decl.GetTy() && decl.TyKind() == AST::TypeKind::TYPE_FUNC) {
+        auto funcTy = static_cast<AST::FuncTy*>(decl.GetTy().get());
         // Do temp mangle of enum element to ensure not duplicate.
         elementClassName += MANGLE_DOLLAR_PREFIX + std::to_string(funcTy->paramTys.size());
     }

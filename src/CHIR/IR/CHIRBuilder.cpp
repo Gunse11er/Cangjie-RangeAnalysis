@@ -22,6 +22,7 @@
 #include "cangjie/CHIR/Utils/Utils.h"
 #include "cangjie/CHIR/IR/Value/Value.h"
 #include "cangjie/Mangle/CHIRMangler.h"
+#include "cangjie/Utils/CheckUtils.h"
 
 using namespace Cangjie::CHIR;
 
@@ -37,10 +38,10 @@ CHIRBuilder::~CHIRBuilder()
 // ===--------------------------------------------------------------------=== //
 // BlockGroup API
 // ===--------------------------------------------------------------------=== //
-BlockGroup* CHIRBuilder::CreateBlockGroup(Func& func)
+BlockGroup* CHIRBuilder::CreateBlockGroup(Function& func)
 {
     auto blockGroup = new BlockGroup(std::to_string(func.GenerateBlockGroupId()));
-    this->allocatedBlockGroups.push_back(blockGroup);
+    StoreAllocatedPtrInFuncOrLambda(*blockGroup);
     return blockGroup;
 }
 
@@ -53,9 +54,9 @@ Block* CHIRBuilder::CreateBlock(BlockGroup* parentGroup)
     auto func = parentGroup->GetTopLevelFunc();
     CJC_NULLPTR_CHECK(func);
     std::string idstr = "#" + std::to_string(func->GenerateBlockId());
-
     auto basicBlock = new Block(idstr, parentGroup);
-    this->allocatedBlocks.push_back(basicBlock);
+    auto bg = basicBlock->GetFuncOrLambdaBody();
+    StoreAllocatedPtrInFuncOrLambda(*bg, basicBlock);
     if (markAsCompileTimeValue) {
         basicBlock->EnableAttr(Attribute::CONST);
     }
@@ -87,7 +88,7 @@ std::pair<Block*, Block*> CHIRBuilder::SplitBlock(const Expression& separator)
 // Value API
 // ===--------------------------------------------------------------------===//
 
-Parameter* CHIRBuilder::CreateParameter(Type* ty, const DebugLocation& loc, Func& parentFunc)
+Parameter* CHIRBuilder::CreateParameter(Type* ty, const DebugLocation& loc, Function& parentFunc)
 {
     auto id = parentFunc.GenerateLocalId();
     auto param = new Parameter(ty, "%" + std::to_string(id), &parentFunc);
@@ -99,8 +100,9 @@ Parameter* CHIRBuilder::CreateParameter(Type* ty, const DebugLocation& loc, Func
 
 Parameter* CHIRBuilder::CreateParameter(Type* ty, const DebugLocation& loc, Lambda& parentLambda)
 {
-    CJC_NULLPTR_CHECK(parentLambda.GetTopLevelFunc());
-    auto id = parentLambda.GetTopLevelFunc()->GenerateLocalId();
+    auto topFunc = parentLambda.GetTopLevelFunc();
+    CJC_NULLPTR_CHECK(topFunc);
+    auto id = topFunc->GenerateLocalId();
     auto param = new Parameter(ty, "%" + std::to_string(id), parentLambda);
     param->EnableAttr(Attribute::READONLY);
     param->SetDebugLocation(loc);
@@ -108,35 +110,28 @@ Parameter* CHIRBuilder::CreateParameter(Type* ty, const DebugLocation& loc, Lamb
     return param;
 }
 
-GlobalVar* CHIRBuilder::CreateGlobalVar(const DebugLocation& loc, RefType* ty, const std::string& mangledName,
-    const std::string& srcCodeIdentifier, const std::string& rawMangledName, const std::string& packageName)
+GlobalVar* CHIRBuilder::CreateGlobalVar(
+    Type* ty, const std::string& mangledName, const std::string& srcCodeIdentifier,
+    const std::string& rawMangledName, const std::string& packageName)
 {
-    GlobalVar* globalVar = new GlobalVar(ty, "@" + mangledName, srcCodeIdentifier, rawMangledName, packageName);
-    globalVar->SetDebugLocation(loc);
-    this->allocatedValues.push_back(globalVar);
-    if (context.GetCurPackage() != nullptr) {
-        context.GetCurPackage()->AddGlobalVar(globalVar);
-    }
-    return globalVar;
+    auto identifier = GLOBAL_VALUE_PREFIX + mangledName;
+    auto var = new GlobalVar(ty, identifier, srcCodeIdentifier, rawMangledName, packageName);
+    this->allocatedValues.push_back(var);
+    context.GetCurPackage()->AddGlobalVar(var);
+    return var;
 }
 
-// ===--------------------------------------------------------------------===//
-// Expression API
-// ===--------------------------------------------------------------------===//
-
-Func* CHIRBuilder::CreateFunc(const DebugLocation& loc, FuncType* funcTy, const std::string& mangledName,
+Function* CHIRBuilder::CreateFunction(FuncType* funcTy, const std::string& mangledName,
     const std::string& srcCodeIdentifier, const std::string& rawMangledName, const std::string& packageName,
     const std::vector<GenericType*>& genericTypeParams)
 {
-    Func* func = new Func(funcTy, "@" + mangledName, srcCodeIdentifier, rawMangledName, packageName, genericTypeParams);
+    auto identifier = GLOBAL_VALUE_PREFIX + mangledName;
+    auto func = new Function(
+        funcTy, identifier, srcCodeIdentifier, rawMangledName, packageName, genericTypeParams);
     this->allocatedValues.push_back(func);
-    if (context.GetCurPackage() != nullptr) {
-        context.GetCurPackage()->AddGlobalFunc(func);
-    }
-    func->SetDebugLocation(loc);
+    context.GetCurPackage()->AddGlobalFunc(func);
     return func;
 }
-
 // ===--------------------------------------------------------------------===//
 // StructDef API
 // ===--------------------------------------------------------------------===//
@@ -159,9 +154,8 @@ StructDef* CHIRBuilder::CreateStruct(const DebugLocation& loc, const std::string
 // ===--------------------------------------------------------------------===//
 // ClassDef API
 // ===--------------------------------------------------------------------===//
-ClassDef* CHIRBuilder::CreateClass(const DebugLocation& loc,
-    const std::string& srcCodeIdentifier, const std::string& mangledName, const std::string& pkgName, bool isClass,
-    bool isImported)
+ClassDef* CHIRBuilder::CreateClass(const DebugLocation& loc, const std::string& srcCodeIdentifier,
+    const std::string& mangledName, const std::string& pkgName, bool isClass, bool isImported)
 {
     ClassDef* ret = new ClassDef(srcCodeIdentifier, "@" + mangledName, pkgName, isClass);
     this->allocatedClasses.push_back(ret);
@@ -261,17 +255,16 @@ std::unordered_set<GenericType*> CHIRBuilder::GetAllGenericTypes() const
     return result;
 }
 
-void CHIRBuilder::EnableIRCheckerAfterPlugin()
+void CHIRBuilder::StoreAllocatedPtrInFuncOrLambda(BlockGroup& bg, Base* ptr)
 {
-    enableIRCheckerAfterPlugin = true;
-}
-
-void CHIRBuilder::DisableIRCheckerAfterPlugin()
-{
-    enableIRCheckerAfterPlugin = false;
-}
-
-bool CHIRBuilder::IsEnableIRCheckerAfterPlugin() const
-{
-    return enableIRCheckerAfterPlugin;
+    auto it = allocatedPtrInFuncOrLambda.find(&bg);
+    if (it == allocatedPtrInFuncOrLambda.end()) {
+        if (ptr == nullptr) {
+            allocatedPtrInFuncOrLambda.emplace(&bg, std::vector<Base*>{});
+        } else {
+            allocatedPtrInFuncOrLambda.emplace(&bg, std::vector<Base*>{ptr});
+        }
+    } else {
+        it->second.emplace_back(ptr);
+    }
 }

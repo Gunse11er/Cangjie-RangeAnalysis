@@ -9,8 +9,14 @@
  * This file implements the AST Loader related classes.
  */
 
+#include "ASTLoaderCJMP.h"
 #include "ASTLoaderImpl.h"
 
+#include "cangjie/AST/Node.h"
+#include "cangjie/AST/Walker.h"
+#include "cangjie/Basic/DiagnosticEngine.h"
+#include "cangjie/Option/Option.h"
+#include "cangjie/Utils/ICEUtil.h"
 #include "flatbuffers/ModuleFormat_generated.h"
 
 #include "cangjie/AST/ASTCasting.h"
@@ -26,62 +32,62 @@ using namespace AST;
 namespace Cangjie {
 const std::unordered_map<PackageFormat::AccessLevel, AST::AccessLevel> ACCESS_LEVEL_RMAP = {
 #define ACCESS_LEVEL(AST_KIND, FBS_KIND) {PackageFormat::AccessLevel_##FBS_KIND, AST::AccessLevel::AST_KIND},
-#include "Mapping.inc"
+#include "Mapping.h"
 #undef ACCESS_LEVEL
 };
 
 const std::unordered_map<PackageFormat::AccessModifier, std::pair<TokenKind, AST::Attribute>> ACCESS_MODIFIER_RMAP = {
 #define ACCESS_MODIFIER(AST_KIND, FBS_KIND)                                                                            \
     {PackageFormat::AccessModifier_##FBS_KIND, {TokenKind::AST_KIND, AST::Attribute::AST_KIND}},
-#include "Mapping.inc"
+#include "Mapping.h"
 #undef ACCESS_MODIFIER
 };
 
 const std::unordered_map<PackageFormat::BuiltInType, AST::BuiltInType> BUILTIN_TYPE_RMAP = {
 #define BUILTIN_TYPE(AST_KIND, FBS_KIND) {PackageFormat::BuiltInType_##FBS_KIND, AST::BuiltInType::AST_KIND},
-#include "Mapping.inc"
+#include "Mapping.h"
 #undef BUILTIN_TYPE
 };
 
 const std::unordered_map<PackageFormat::OverflowPolicy, OverflowStrategy> STRATEGY_RMAP = {
 #define OVERFLOW_STRATEGY(AST_KIND, FBS_KIND) {PackageFormat::OverflowPolicy_##FBS_KIND, OverflowStrategy::AST_KIND},
-#include "Mapping.inc"
+#include "Mapping.h"
 #undef OVERFLOW_STRATEGY
 };
 
 const std::unordered_map<PackageFormat::TypeKind, AST::TypeKind> TYPE_KIND_RMAP = {
 #define TYPE_KIND(AST_KIND, FBS_KIND) {PackageFormat::TypeKind_##FBS_KIND, AST::TypeKind::AST_KIND},
-#include "Mapping.inc"
+#include "Mapping.h"
 #undef TYPE_KIND
 };
 
 const std::unordered_map<PackageFormat::OperatorKind, TokenKind> OP_KIND_RMAP = {
 #define OPERATOR_KIND(AST_KIND, FBS_KIND) {PackageFormat::OperatorKind_##FBS_KIND, TokenKind::AST_KIND},
-#include "Mapping.inc"
+#include "Mapping.h"
 #undef OPERATOR_KIND
 };
 
 const std::unordered_map<PackageFormat::CallKind, AST::CallKind> CALL_KIND_RMAP = {
 #define CALL_KIND(AST_KIND, FBS_KIND) {PackageFormat::CallKind_##FBS_KIND, AST::CallKind::AST_KIND},
-#include "Mapping.inc"
+#include "Mapping.h"
 #undef CALL_KIND
 };
 
 const std::unordered_map<PackageFormat::LitConstKind, AST::LitConstKind> LIT_CONST_KIND_RMAP = {
 #define LIT_CONST_KIND(AST_KIND, FBS_KIND) {PackageFormat::LitConstKind_##FBS_KIND, AST::LitConstKind::AST_KIND},
-#include "Mapping.inc"
+#include "Mapping.h"
 #undef LIT_CONST_KIND
 };
 
 const std::unordered_map<PackageFormat::StringKind, AST::StringKind> STRING_KIND_RMAP = {
 #define STRING_KIND(AST_KIND, FBS_KIND) {PackageFormat::StringKind_##FBS_KIND, AST::StringKind::AST_KIND},
-#include "Mapping.inc"
+#include "Mapping.h"
 #undef STRING_KIND
 };
 
 const std::unordered_map<PackageFormat::ForInKind, AST::ForInKind> FOR_IN_KIND_RMAP = {
 #define FOR_IN_KIND(AST_KIND, FBS_KIND) {PackageFormat::ForInKind_##FBS_KIND, AST::ForInKind::AST_KIND},
-#include "Mapping.inc"
+#include "Mapping.h"
 #undef FOR_IN_KIND
 };
 } // namespace Cangjie
@@ -146,6 +152,11 @@ void SetOuterDeclForMemberDecl(Decl& member, Decl& parentDecl)
         SetOuterDeclForParamDecl(*func, parentDecl);
     }
 }
+
+inline bool DeclaredInDifferentFiles(const Decl& d1, const Decl& d2)
+{
+    return d1.curFile && d2.curFile && d1.curFile != d2.curFile;
+}
 } // namespace
 
 ASTLoader::ASTLoader(std::vector<uint8_t>&& data, const std::string& fullPackageName, TypeManager& typeManager,
@@ -167,23 +178,6 @@ std::string ASTLoader::GetImportedPackageName() const
 {
     CJC_NULLPTR_CHECK(pImpl);
     return pImpl->importedPackageName;
-}
-
-std::string ASTLoader::PreReadAndSetPackageName()
-{
-    return pImpl->PreReadAndSetPackageName();
-}
-
-std::string ASTLoader::ASTLoaderImpl::PreReadAndSetPackageName()
-{
-    if (!package) {
-        package = PackageFormat::GetPackage(data.data());
-    }
-    CJC_NULLPTR_CHECK(package);
-    CJC_NULLPTR_CHECK(package->fullPkgName());
-    importedPackageName = package->fullPkgName()->str();
-
-    return importedPackageName;
 }
 
 std::vector<std::string> ASTLoader::ReadFileNames() const
@@ -253,7 +247,7 @@ OwnedPtr<Package> ASTLoader::ASTLoaderImpl::LoadPackageDependencies()
 }
 
 // Deserialize common part of package into already existing Package node
-void ASTLoader::PreloadCommonPartOfPackage(AST::Package& pkg) const
+bool ASTLoader::PreloadCommonPartOfPackage(AST::Package& pkg) const
 {
     CJC_NULLPTR_CHECK(pImpl);
     pImpl->deserializingCommon = true;
@@ -295,45 +289,6 @@ std::vector<OwnedPtr<ImportSpec>> ASTLoader::ASTLoaderImpl::LoadImportSpecs(cons
     return importSpecsVec;
 }
 
-void ASTLoader::ASTLoaderImpl::PreloadCommonPartOfPackage(AST::Package& pkg)
-{
-    if (!VerifyForData("ast")) {
-        CJC_ABORT();
-    }
-
-    package = PackageFormat::GetPackage(data.data());
-    CJC_NULLPTR_CHECK(package);
-
-    curPackage = &pkg; // Deserialize common part AST into current specific package AST
-
-    allTypes.resize(package->allTypes()->size(), nullptr);
-    auto fileSize = package->allFiles()->size();
-    allFileIds.resize(fileSize);
-    for (uoffset_t i = 0; i < fileSize; i++) {
-        CJC_NULLPTR_CHECK(package->allFileImports());
-        auto&& importInfos = LoadImportSpecs(package->allFileImports()->Get(i));
-        CJC_NULLPTR_CHECK(package->allFileInfo());
-        // Load file info for CJMP
-        auto fileInfo = package->allFileInfo()->Get(i);
-        allFileIds[i] = fileInfo->fileID();
-        auto file = CreateFileNode(*curPackage, fileInfo->fileID(), std::move(importInfos));
-        file->EnableAttr(Attribute::FROM_COMMON_PART);
-        file->EnableAttr(Attribute::COMMON);
-        file->isCommon = true;
-        file->begin = LoadPos(fileInfo->begin());
-        file->end = LoadPos(fileInfo->end());
-        pkg.files.emplace_back(std::move(file));
-    }
-    AddCurFile(pkg);
-    auto imports = package->imports();
-    CJC_NULLPTR_CHECK(imports);
-    uoffset_t nImports = imports->size();
-    for (uoffset_t i = 0; i < nImports; i++) {
-        std::string importItem = imports->Get(i)->str();
-        importedFullPackageNames.emplace_back(importItem);
-    }
-}
-
 void ASTLoader::LoadPackageDecls() const
 {
     pImpl->LoadPackageDecls();
@@ -353,8 +308,9 @@ void ASTLoader::ASTLoaderImpl::LoadPackageDecls()
             }
             // NOTE: FormattedIndex is vector offset plus 1.
             auto tmpDecl = LoadDecl(i + 1);
-            if (!tmpDecl) {
-                continue;
+            if (!tmpDecl || tmpDecl->TestAttr(Attribute::ALREADY_LOADED)) {
+                tmpDecl->doNotExport = true;
+                // continue;
             }
             auto fileID = tmpDecl->begin.fileID;
             if (auto found = idToFileMap.find(fileID); found != idToFileMap.end()) {
@@ -392,7 +348,7 @@ OwnedPtr<AST::File> ASTLoader::ASTLoaderImpl::CreateFileNode(
     auto file = MakeOwned<File>();
     file->curFile = file.get();
     file->curPackage = &pkg;
-    Source& source = sourceManager.GetSource(fileId);
+    auto& source = sourceManager.GetSource(fileId);
     file->fileName = FileUtil::GetFileName(source.path);
     file->filePath = source.path;
     file->fileHash = source.fileHash;
@@ -513,20 +469,71 @@ void ASTLoader::ASTLoaderImpl::AddDeclToImportedPackage(Decl& decl)
     CJC_NULLPTR_CHECK(exportIdDeclMap);
     if (exportId.empty()) {
         exportIdDeclMap->emplace(decl.identifier, &decl);
-    } else {
-        auto it1 = exportIdDeclMap->find(exportId);
-        if (it1 == exportIdDeclMap->end()) {
-            exportIdDeclMap->emplace(exportId, &decl);
-        } else {
-            // NOTE: when 'importSrcCode' is disabled, the imported ast cannot to be used for code generation,
-            //       this kind of situation is for LSP usage now, so the duplication error can be ignored.
-            bool reportError = (it1->second != &decl) && importSrcCode;
-            reportError = reportError && !isChirNow;
-            if (reportError) {
-                InternalError("Found same exportID when import a package.");
+        return;
+    }
+    auto it1 = exportIdDeclMap->find(exportId);
+    // will be added if declaration appears first time
+    bool needAdd = it1 == exportIdDeclMap->end();
+    if (!needAdd) {
+        // NOTE: when 'importSrcCode' is disabled, the imported ast cannot to be used for code generation,
+        //       this kind of situation is for LSP usage now, so the duplication error can be ignored.
+        bool reportError = (it1->second != &decl) && importSrcCode;
+        reportError = reportError && !isChirNow;
+        if (decl.TestAttr(Attribute::FROM_COMMON_PART)) {
+            reportError = false;
+            //       A
+            //     /  \
+            //    B    C
+            //    \   /
+            //      D
+            // Declaration defined in A source set was added in B.cjo and C.cjo,
+            // so when compiling child source set D it can be duplicated, it's not an error.
+
+            if (DeclaredInDifferentFiles(decl, *it1->second)) {
+                // If declaration `foo` was added in B and in C source sets,
+                // then it can be not an error at all if `foo` is common/specific,
+                // Or an error if it's non-CJMP declaration, but it's not an export error,
+                // It need to be checked later when semantic checking.
+                needAdd = true;
+            } else {
+                decl.EnableAttr(Attribute::ALREADY_LOADED);
             }
         }
+        if (reportError) {
+            InternalError("Found same exportID when import a package.");
+        }
     }
+
+    if (needAdd) {
+        exportIdDeclMap->emplace(exportId, &decl);
+    }
+}
+
+/**
+ * @brief Convert fb optimization level enum to the GlobalOptions' enum
+ */
+GlobalOptions::OptimizationLevel ASTLoader::ASTLoaderImpl::LoadOptimizationLevel(
+    const PackageFormat::CompilationOptions& options)
+{
+    using L = GlobalOptions::OptimizationLevel;
+    using CJO = PackageFormat::OptimizationLevel;
+    switch (options.optimization_level()) {
+        case CJO::OptimizationLevel_O0:
+            return L::O0;
+        case CJO::OptimizationLevel_O1:
+            return L::O1;
+        case CJO::OptimizationLevel_O2:
+            return L::O2;
+        case CJO::OptimizationLevel_O3:
+            return L::O3;
+        case CJO::OptimizationLevel_Os:
+            return L::Os;
+        case CJO::OptimizationLevel_Oz:
+            return L::Oz;
+        default:
+            InternalError("Unexpected optimization level");
+    }
+    return L::O0;
 }
 
 /**

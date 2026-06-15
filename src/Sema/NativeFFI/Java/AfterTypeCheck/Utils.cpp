@@ -1,4 +1,4 @@
-// Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+// Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 // This source file is part of the Cangjie project, licensed under Apache-2.0
 // with Runtime Library Exception.
 //
@@ -6,16 +6,25 @@
 
 #include "Utils.h"
 #include "NativeFFI/Utils.h"
+#include "NativeFFI/Java/Utils.h"
 #include "TypeCheckUtil.h"
 
 #include "Desugar/AfterTypeCheck.h"
 #include "JavaDesugarManager.h"
+#include "cangjie/AST/Create.h"
 #include "cangjie/AST/Match.h"
+#include "cangjie/AST/Node.h"
 #include "cangjie/AST/Utils.h"
 #include "cangjie/Mangle/BaseMangler.h"
 #include "cangjie/Modules/ImportManager.h"
+#include "cangjie/Utils/CheckUtils.h"
 #include "cangjie/Utils/ConstantsUtils.h"
+#include <string_view>
 
+namespace Cangjie::Interop::Java {
+using namespace TypeCheckUtil;
+using namespace Cangjie::Native::FFI;
+using namespace Cangjie::Native::FFI::Java;
 
 namespace {
 using namespace Cangjie;
@@ -56,11 +65,6 @@ void GenerateSyntheticClassPropStub(ClassDecl& synthetic, PropDecl& fd)
 }
 } // namespace
 
-namespace Cangjie::Interop::Java {
-
-using namespace TypeCheckUtil;
-using namespace Cangjie::Native::FFI;
-
 Utils::Utils(ImportManager& importManager, TypeManager& typeManager, Package& pkg)
     : importManager(importManager), typeManager(typeManager), pkg(pkg)
 {
@@ -93,7 +97,7 @@ OwnedPtr<Expr> Utils::CreateOptionSomeRef(Ptr<Ty> ty)
 {
     auto someDeclRef = CreateRefExpr(*GetOptionSomeDecl());
     auto optionActualTy = GetOptionTy(ty);
-    someDeclRef->ty = typeManager.GetFunctionTy({ty}, optionActualTy);
+    someDeclRef->SetTy(typeManager.GetFunctionTy({ty}, optionActualTy));
     return someDeclRef;
 }
 
@@ -101,7 +105,7 @@ OwnedPtr<Expr> Utils::CreateOptionNoneRef(Ptr<Ty> ty)
 {
     auto noneDeclRef = CreateRefExpr(*GetOptionNoneDecl());
     auto optionActualTy = GetOptionTy(ty);
-    noneDeclRef->ty = optionActualTy;
+    noneDeclRef->SetTy(optionActualTy);
     return noneDeclRef;
 }
 
@@ -110,7 +114,7 @@ OwnedPtr<Expr> Utils::CreateOptionSomeCall(OwnedPtr<Expr> expr, Ptr<Ty> ty)
     std::vector<OwnedPtr<FuncArg>> someDeclCallArgs{};
     someDeclCallArgs.emplace_back(CreateFuncArg(std::move(expr)));
     auto someDeclCall = CreateCallExpr(CreateOptionSomeRef(ty), std::move(someDeclCallArgs));
-    someDeclCall->ty = GetOptionTy(ty);
+    someDeclCall->SetTy(GetOptionTy(ty));
     someDeclCall->resolvedFunction = As<ASTKind::FUNC_DECL>(GetOptionSomeDecl());
     someDeclCall->callKind = CallKind::CALL_DECLARED_FUNCTION;
     return someDeclCall;
@@ -145,7 +149,7 @@ StructDecl& Utils::GetStringDecl()
 Ptr<VarDecl> GetJavaRefField(ClassDecl& mirrorLike)
 {
     if (mirrorLike.TestAttr(Attribute::JAVA_MIRROR_SUBTYPE)) {
-        if (auto superClass = mirrorLike.GetSuperClassDecl(); superClass && !superClass->ty->IsObject() &&
+        if (auto superClass = mirrorLike.GetSuperClassDecl(); superClass && !superClass->GetTy()->IsObject() &&
             superClass->TestAnyAttr(Attribute::JAVA_MIRROR, Attribute::JAVA_MIRROR_SUBTYPE)) {
             return GetJavaRefField(*superClass);
         }
@@ -214,7 +218,7 @@ OwnedPtr<Expr> CreateJavaRefCall(ClassLikeDecl& mirrorLike, FuncDecl& javaRefGet
 {
     CJC_ASSERT(mirrorLike.TestAnyAttr(
         Attribute::JAVA_MIRROR, Attribute::JAVA_MIRROR_SUBTYPE, Attribute::CJ_MIRROR_JAVA_INTERFACE_FWD));
-    auto thisRef = CreateThisRef(&mirrorLike, mirrorLike.ty, curFile);
+    auto thisRef = CreateThisRef(&mirrorLike, mirrorLike.GetTy(), curFile);
     return CreateJavaRefCall(std::move(thisRef), javaRefGetter);
 }
 
@@ -223,7 +227,7 @@ OwnedPtr<Expr> CreateJavaRefCall(ClassLikeDecl& mirrorLike, VarDecl& javaref, Pt
     CJC_ASSERT(mirrorLike.astKind == ASTKind::CLASS_DECL);
     CJC_ASSERT(mirrorLike.TestAnyAttr(
         Attribute::JAVA_MIRROR, Attribute::JAVA_MIRROR_SUBTYPE, Attribute::CJ_MIRROR_JAVA_INTERFACE_FWD));
-    auto thisRef = CreateThisRef(&mirrorLike, mirrorLike.ty, curFile);
+    auto thisRef = CreateThisRef(&mirrorLike, mirrorLike.GetTy(), curFile);
     return CreateJavaRefCall(std::move(thisRef), javaref);
 }
 
@@ -231,26 +235,22 @@ OwnedPtr<Expr> CreateJavaRefCall(OwnedPtr<Expr> expr, FuncDecl& javaRefGetter)
 {
     // expr ty decl and javaRef outerDecl must be the same
 
-    CJC_ASSERT(expr->ty->IsClassLike());
-    CJC_ASSERT(StaticCast<ClassLikeTy*>(expr->ty)->commonDecl->TestAnyAttr(
-        Attribute::JAVA_MIRROR, Attribute::JAVA_MIRROR_SUBTYPE));
+    CJC_ASSERT(expr->GetTy()->IsClassLike());
+    CJC_ASSERT(StaticCast<ClassLikeTy*>(expr->GetTy())
+        ->commonDecl->TestAnyAttr(Attribute::JAVA_MIRROR, Attribute::JAVA_MIRROR_SUBTYPE));
     auto curFile = expr->curFile;
     CJC_NULLPTR_CHECK(curFile);
 
-    return CreateCallExpr(
-        WithinFile(CreateMemberAccess(std::move(expr), javaRefGetter), curFile),
-        {},
-        &javaRefGetter,
-        StaticCast<FuncTy*>(javaRefGetter.ty)->retTy,
-        CallKind::CALL_DECLARED_FUNCTION);
+    return CreateCallExpr(WithinFile(CreateMemberAccess(std::move(expr), javaRefGetter), curFile), {}, &javaRefGetter,
+        StaticCast<FuncTy*>(javaRefGetter.GetTy())->retTy, CallKind::CALL_DECLARED_FUNCTION);
 }
 
 OwnedPtr<Expr> CreateJavaRefCall(OwnedPtr<Expr> expr, VarDecl& javaref)
 {
     // expr ty decl and javaref outerDecl must be the same
 
-    CJC_ASSERT(expr->ty->IsClassLike());
-    CJC_ASSERT(StaticCast<ClassLikeTy*>(expr->ty)->commonDecl->TestAnyAttr(
+    CJC_ASSERT(expr->GetTy()->IsClassLike());
+    CJC_ASSERT(StaticCast<ClassLikeTy*>(expr->GetTy())->commonDecl->TestAnyAttr(
         Attribute::JAVA_MIRROR, Attribute::JAVA_MIRROR_SUBTYPE, Attribute::CJ_MIRROR_JAVA_INTERFACE_FWD));
 
     auto curFile = expr->curFile;
@@ -273,14 +273,14 @@ OwnedPtr<Expr> CreateJavaRefCall(OwnedPtr<Expr> expr, ClassLikeDecl& mirrorLike)
 
 OwnedPtr<Expr> CreateJavaRefCall(ClassLikeDecl& mirrorLike, Ptr<File> curFile)
 {
-    auto thisExpr = CreateThisRef(Ptr(&mirrorLike), mirrorLike.ty, curFile);
+    auto thisExpr = CreateThisRef(Ptr(&mirrorLike), mirrorLike.GetTy(), curFile);
     return CreateJavaRefCall(std::move(thisExpr), mirrorLike);
 }
 
 OwnedPtr<Expr> CreateJavaRefCall(OwnedPtr<Expr> expr)
 {
-    CJC_ASSERT(expr->ty->IsClassLike());
-    auto classLikeTy = StaticCast<ClassLikeTy*>(expr->ty);
+    CJC_ASSERT(expr->GetTy()->IsClassLike());
+    auto classLikeTy = StaticCast<ClassLikeTy*>(expr->GetTy());
     CJC_ASSERT(classLikeTy->commonDecl);
     return CreateJavaRefCall(std::move(expr), *classLikeTy->commonDecl);
 }
@@ -311,10 +311,10 @@ Ptr<FuncDecl> GetGeneratedJavaMirrorConstructor(ClassLikeDecl& mirror)
     CJC_ASSERT(mirror.astKind == AST::ASTKind::CLASS_DECL);
     if (mirror.TestAttr(Attribute::JAVA_MIRROR_SUBTYPE) && !mirror.TestAttr(Attribute::JAVA_MIRROR)) {
         for (auto& superType : mirror.inheritedTypes) {
-            if (superType->ty->kind != TypeKind::TYPE_CLASS) {
+            if (superType->TyKind() != TypeKind::TYPE_CLASS) {
                 continue;
             }
-            auto superTy = static_cast<ClassLikeTy*>(superType->ty.get());
+            auto superTy = static_cast<ClassLikeTy*>(superType->GetTy().get());
             if (superTy->commonDecl->TestAnyAttr(Attribute::JAVA_MIRROR, Attribute::JAVA_MIRROR_SUBTYPE)) {
                 return GetGeneratedJavaMirrorConstructor(*superTy->commonDecl);
             }
@@ -499,8 +499,7 @@ DestructedJavaClassName DestructJavaClassName(const ClassLikeDecl& decl)
     if (ind == std::string::npos) {
         return {.packageName = std::nullopt,
             .topLevelClassName = parts[0],
-            .fullClassName = StringJoin(parts.begin(), parts.end(), ".")
-        };
+            .fullClassName = StringJoin(parts.begin(), parts.end(), ".")};
     }
     auto package = parts[0].substr(0, ind);
     parts[0] = parts[0].substr(ind + 1);
@@ -552,7 +551,7 @@ std::string GetJavaPackage(const Decl& decl)
         }
 
         // @JavaMirror or @JavaImpl annotations could accept optional string literal argument with fully-qualified name.
-        CJC_ASSERT(anno->args.size() < 2 && "@JavaMirror or @JavaImpl could accept maximum one argument");
+        CJC_ASSERT_WITH_MSG(anno->args.size() < 2, "@JavaMirror or @JavaImpl could accept maximum one argument");
         if (anno->args.empty()) {
             break;
         }
@@ -575,10 +574,13 @@ std::string GetJavaPackage(const Decl& decl)
 
 void MangleJNIName(std::string& name)
 {
-    size_t start_pos = 0;
-    while ((start_pos = name.find("_", start_pos)) != std::string::npos) {
-        name.replace(start_pos, 1, "_1");
-        start_pos += 2; // Continue after inserted "_1" substring (2 characters).
+    size_t startPos = 0;
+    // "_" in name should be replaced with `_1` since `_` is reserved symbol in JNI signatures
+    constexpr std::string_view underscorePattern = "_1";
+    while ((startPos = name.find("_", startPos)) != std::string::npos) {
+        name.replace(startPos, 1, underscorePattern);
+        startPos += underscorePattern.size();
+        // Continue after inserted "_1" substring (2 characters).
     }
 
     std::replace(name.begin(), name.end(), '.', '_');
@@ -748,6 +750,26 @@ std::string Utils::GetJavaTypeSignature(Ty& retTy, const std::vector<Ptr<Ty>>& p
     return GetJavaTypeSignature(*typeManager.GetFunctionTy(params, &retTy), fullPackageName);
 }
 
+OwnedPtr<CallExpr> Utils::CreateZeroValue(Ptr<Ty> ty, File& curFile) const
+{
+    static constexpr std::string_view ZERO_VALUE_INTRINSIC_NAME = "zeroValue";
+    static auto zeroValueDecl = importManager.GetCoreDecl<FuncDecl>(std::string(ZERO_VALUE_INTRINSIC_NAME));
+    auto zeroValueCall = MakeOwned<CallExpr>();
+
+    auto fdRef = WithinFile(CreateRefExpr(*zeroValueDecl), &curFile);
+    fdRef->instTys.push_back(ty);
+    auto refTy = typeManager.GetInstantiatedTy(zeroValueDecl->GetTy(),
+        GenerateTypeMapping(*zeroValueDecl, fdRef->instTys));
+    fdRef->SetTy(refTy);
+
+    zeroValueCall->baseFunc = std::move(fdRef);
+    zeroValueCall->SetTy(ty);
+    zeroValueCall->callKind = CallKind::CALL_INTRINSIC_FUNCTION;
+    zeroValueCall->resolvedFunction = zeroValueDecl;
+    zeroValueCall->curFile = &curFile;
+    return zeroValueCall;
+}
+
 std::string GetMangledJniInitCjObjectFuncName(
     const BaseMangler& mangler, const std::vector<OwnedPtr<FuncParam>>& params, bool isGeneratedCtor)
 {
@@ -760,7 +782,7 @@ std::string GetMangledJniInitCjObjectFuncName(
             toSkip--;
             continue;
         }
-        auto mangledParam = mangler.MangleType(*param->ty);
+        auto mangledParam = mangler.MangleType(*param->GetTy());
         std::replace(mangledParam.begin(), mangledParam.end(), '.', '_');
         name += mangledParam;
     }
@@ -788,12 +810,17 @@ std::string GetMangledJniInitCjObjectFuncNameForEnum(
 
     // the first parameter is added in generated constructor, it should be skipped in mangling
     for (auto& param : params) {
-        auto mangledParam = mangler.MangleType(*param->ty);
+        auto mangledParam = mangler.MangleType(*param->GetTy());
         std::replace(mangledParam.begin(), mangledParam.end(), '.', '_');
         name += mangledParam;
     }
 
     return name;
+}
+
+bool IsOptionOfString(Ptr<Ty> ty)
+{
+    return ty->IsCoreOptionType() && ty->typeArgs.size() > 0 && ty->typeArgs[0]->IsString();
 }
 
 bool IsMirror(const Ty& ty)
@@ -843,24 +870,14 @@ bool IsCJMappingTuple(const Ptr<Ty>& ty, std::unordered_set<Ptr<Ty>> tupleConfig
     return false;
 }
 
-const Ptr<ClassDecl> GetSyntheticClass(const ImportManager& importManager, const ClassLikeDecl& cld)
-{
-    ClassDecl* synthetic =
-        importManager.GetImportedDecl<ClassDecl>(cld.fullPackageName, GetSyntheticNameFromClassLike(cld));
-
-    CJC_NULLPTR_CHECK(synthetic);
-
-    return Ptr(synthetic);
-}
-
 std::string ReplaceClassName(std::string& classTypeSignature, std::string newSegment)
 {
     bool hasSemicolon = (!classTypeSignature.empty() && classTypeSignature.back() == ';');
-
+    
     std::string base = hasSemicolon
         ? classTypeSignature.substr(0, classTypeSignature.length() - 1)
         : classTypeSignature;
-
+    
     size_t lastSlash = classTypeSignature.rfind('/');
     if (lastSlash != std::string::npos) {
         base = base.substr(0, lastSlash + 1) + newSegment;
@@ -905,7 +922,7 @@ OwnedPtr<Expr> CreateMirrorConstructorCall(
         auto ctorCall = CreateCall(mirrorCtor, curFile, std::move(entity));
         if (ctorCall) {
             ctorCall->callKind = CallKind::CALL_OBJECT_CREATION;
-            ctorCall->ty = mirrorTy;
+            ctorCall->SetTy(mirrorTy);
         }
         return ctorCall;
     }
@@ -927,7 +944,7 @@ OwnedPtr<Expr> Utils::CreateOptionMatch(
     auto curFile = selector->curFile;
     CJC_NULLPTR_CHECK(curFile);
 
-    auto& optTy = *selector->ty;
+    auto& optTy = *selector->GetTy();
     CJC_ASSERT(optTy.IsCoreOptionType());
     CJC_ASSERT_WITH_MSG(!optTy.typeArgs.empty(), "Option type must be generic");
     auto optArgTy = optTy.typeArgs[0];
@@ -938,7 +955,7 @@ OwnedPtr<Expr> Utils::CreateOptionMatch(
     auto& someArgVar = *vp->varDecl;
 
     auto somePattern = MakeOwnedNode<EnumPattern>();
-    somePattern->ty = selector->ty;
+    somePattern->SetTy(selector->GetTy());
     somePattern->constructor = CreateOptionSomeRef(optArgTy);
     somePattern->patterns.emplace_back(std::move(vp));
     somePattern->curFile = curFile;
@@ -947,13 +964,52 @@ OwnedPtr<Expr> Utils::CreateOptionMatch(
     // `case None => Java_CFFI_JavaEntityJobjectNull()`
     auto nonePattern = MakeOwnedNode<EnumPattern>();
     nonePattern->constructor = CreateOptionNoneRef(optArgTy);
-    nonePattern->ty = nonePattern->constructor->ty;
+    nonePattern->SetTy(nonePattern->constructor->GetTy());
     nonePattern->curFile = curFile;
     auto caseNone = CreateMatchCase(std::move(nonePattern), noneBranch());
 
     return WithinFile(CreateMatchExpr(
         std::move(selector),
         Nodes<MatchCase>(std::move(caseSome), std::move(caseNone)), ty), curFile);
+}
+
+OwnedPtr<FuncDecl> Utils::CreateNativeFunc(std::string& name,
+    std::vector<OwnedPtr<FuncParam>>&& params, Ptr<Ty> retTy, std::vector<OwnedPtr<Node>>&& nodes,
+    File& curFile, std::string& moduleName, std::string& fullPackageName) const
+{
+    CJC_ASSERT(Ty::IsMetCType(*retTy));
+    for (auto& param : params) {
+        CJC_ASSERT(Ty::IsMetCType(*param->GetTy()));
+    }
+
+    auto block = MakeOwned<Block>();
+    block->EnableAttr(Attribute::COMPILER_ADD);
+    block->SetTy(retTy);
+    block->curFile = &curFile;
+    std::move(nodes.begin(), nodes.end(), std::back_inserter(block->body));
+
+    std::vector<Ptr<Ty>> funcTyParams;
+    for (auto& param : params) {
+        funcTyParams.push_back(param->GetTy());
+    }
+
+    auto funcBody = CreateFuncBody({}, nullptr, std::move(block), retTy);
+    funcBody->curFile = &curFile;
+    funcBody->paramLists.emplace_back(CreateFuncParamList(std::move(params)));
+
+    auto funcTy = typeManager.GetFunctionTy(funcTyParams, retTy, {.isC = true});
+    auto fdecl = CreateFuncDecl(name, std::move(funcBody), funcTy);
+    fdecl->funcBody->funcDecl = fdecl.get();
+    fdecl->EnableAttr(Attribute::C);
+    fdecl->EnableAttr(Attribute::GLOBAL);
+    fdecl->EnableAttr(Attribute::PUBLIC);
+    fdecl->EnableAttr(Attribute::NO_MANGLE);
+    fdecl->EnableAttr(Attribute::UNSAFE);
+    fdecl->curFile = &curFile;
+    fdecl->moduleName = moduleName;
+    fdecl->fullPackageName = fullPackageName;
+
+    return fdecl;
 }
 
 bool IsJArray(const Decl& decl)
@@ -1043,10 +1099,10 @@ OwnedPtr<Expr> InteropLibBridge::CreateGetTypeForTypeParameterCall(const Ptr<Gen
 
     std::vector<OwnedPtr<FuncArg>> args;
     auto refExpr = WithinFile(CreateRefExpr(*getTypeForTypeParamDecl), genericParam->curFile);
-    refExpr->instTys.push_back(genericParam->ty);
+    refExpr->instTys.push_back(genericParam->GetTy());
 
     auto callExpr = CreateCallExpr(std::move(refExpr), std::move(args), getTypeForTypeParamDecl,
-        getTypeForTypeParamDecl->funcBody->retType->ty, CallKind::CALL_INTRINSIC_FUNCTION);
+        getTypeForTypeParamDecl->funcBody->retType->GetTy(), CallKind::CALL_INTRINSIC_FUNCTION);
     callExpr->curFile = genericParam->curFile;
 
     return callExpr;
@@ -1056,7 +1112,7 @@ OwnedPtr<MatchExpr> InteropLibBridge::CreateMatchByTypeArgument(
     const Ptr<GenericParamDecl> genericParam,
     std::map<std::string, OwnedPtr<Expr>> typeToCaseMap, Ptr<Ty> retTy, OwnedPtr<Expr> defaultCase)
 {
-    static auto strTy = utils.GetStringDecl().ty;
+    static auto strTy = utils.GetStringDecl().GetTy();
     static auto cStrToStringDecl = FindCStringToStringDecl();
     static auto strEqualsDecl = FindStringEqualsDecl();
     static auto strStartsWithDecl = FindStringStartsWithDecl();
@@ -1065,12 +1121,12 @@ OwnedPtr<MatchExpr> InteropLibBridge::CreateMatchByTypeArgument(
     auto file = genericParam->curFile;
     auto cStrToStringCall = MakeOwned<CallExpr>();
     auto cStrToStringMa = CreateMemberAccess(CreateGetTypeForTypeParameterCall(genericParam), "toString");
-    cStrToStringMa->ty = cStrToStringDecl->ty;
+    cStrToStringMa->SetTy(cStrToStringDecl->GetTy());
     cStrToStringMa->target = cStrToStringDecl;
     cStrToStringMa->callOrPattern = cStrToStringCall;
 
     std::vector<OwnedPtr<FuncArg>> cStrToStringCallArgs;
-    cStrToStringCall->ty = strTy;
+    cStrToStringCall->SetTy(strTy);
     cStrToStringCall->resolvedFunction = cStrToStringDecl;
     cStrToStringCall->baseFunc = std::move(cStrToStringMa);
     cStrToStringCall->args = std::move(cStrToStringCallArgs);
@@ -1084,13 +1140,13 @@ OwnedPtr<MatchExpr> InteropLibBridge::CreateMatchByTypeArgument(
             typeDesc.rfind(std::string(CORE_PACKAGE_NAME) + ":" + OPTION_NAME, 0) == 0; // starts_with actually
         auto caseCall = MakeOwned<CallExpr>();
         auto caseMa = CreateMemberAccess(ASTCloner::Clone(cStrToStringCall.get()), isOption ? "startsWith" : "==");
-        caseMa->ty = isOption ? strStartsWithDecl->ty : strEqualsDecl->ty;
+        caseMa->SetTy(isOption ? strStartsWithDecl->GetTy() : strEqualsDecl->GetTy());
         caseMa->target = isOption ? strStartsWithDecl : strEqualsDecl;
         caseMa->callOrPattern = caseCall;
 
         std::vector<OwnedPtr<FuncArg>> caseCallArgs;
         caseCallArgs.emplace_back(CreateFuncArg(CreateLitConstExpr(LitConstKind::STRING, typeDesc, strTy)));
-        caseCall->ty = boolTy;
+        caseCall->SetTy(boolTy);
         caseCall->resolvedFunction = isOption ? strStartsWithDecl : strEqualsDecl;
         caseCall->baseFunc = std::move(caseMa);
         caseCall->args = std::move(caseCallArgs);
@@ -1098,7 +1154,7 @@ OwnedPtr<MatchExpr> InteropLibBridge::CreateMatchByTypeArgument(
         caseCall->curFile = file;
 
         OwnedPtr<ConstPattern> patternForType = MakeOwned<ConstPattern>();
-        patternForType->ty = strTy;
+        patternForType->SetTy(strTy);
         patternForType->literal = CreateLitConstExpr(LitConstKind::STRING, typeDesc, strTy);
         patternForType->operatorCallExpr = std::move(caseCall);
 
@@ -1119,6 +1175,23 @@ constexpr auto NATIVE_CONSTRUCTOR_MARKER_CLASS_NAME = "$$NativeConstructorMarker
 constexpr auto NATIVE_CONSTRUCTOR_MARKER_PACKAGE_NAME = "cangjie.lang.internal";
 
 } // namespace
+
+Ptr<FuncDecl> GetJavaImplRegistryCompanionConstructor(AST::ClassDecl& companion)
+{
+    CJC_ASSERT(IsImplRegistryCompanion(companion));
+
+    for (auto member : companion.GetMemberDeclPtrs()) {
+        if (!member->TestAttr(Attribute::CONSTRUCTOR)) {
+            continue;
+        }
+        if (auto ctor = As<ASTKind::FUNC_DECL>(member)) {
+            return ctor;
+        }
+    }
+
+    CJC_ABORT_WITH_MSG("Bad registry companion");
+    return nullptr;
+}
 
 std::string GetConstructorMarkerFQName()
 {

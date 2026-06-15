@@ -101,7 +101,7 @@ public:
      * @param isDebug flag whether print debug log.
      * @param realRetTyMap extra info to detect real type from apply expression.
      */
-    TypeAnalysis(const Func* func, CHIRBuilder& builder, bool isDebug, const DevirtualizationInfo& devirtInfo);
+    TypeAnalysis(const Function* func, CHIRBuilder& builder, bool isDebug, const DevirtualizationInfo& devirtInfo);
 
     ~TypeAnalysis() final
     {
@@ -119,7 +119,7 @@ public:
      * @param method function to detect.
      * @return flag if has invoke expression.
      */
-    static bool Filter(const Func& method);
+    static bool Filter(const Function& method);
 
     /// print type value with its expression.
     void PrintDebugMessage(const Expression* expr, const TypeValue* absVal) const;
@@ -154,7 +154,7 @@ private:
 
     std::optional<Block*> HandleTerminatorEffect(TypeDomain& state, const Terminator* terminator) override;
 
-    const std::unordered_map<Func*, Type*>& realRetTyMap;
+    const std::unordered_map<Function*, Type*>& realRetTyMap;
 
     const ConstMemberVarCollector::ConstMemberMapType& constMemberTypeMap;
 };

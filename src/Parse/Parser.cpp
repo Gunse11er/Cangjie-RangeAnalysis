@@ -86,6 +86,18 @@ void ParserImpl::CheckAndHandleUnexpectedTopLevelDeclAfterFeatures()
     }
 }
 
+void ParserImpl::CheckExpectedTopLevelDeclWhenNoPackage(
+    const PtrVector<Annotation>& annos, const std::set<Modifier>& modifiers)
+{
+    if (!annos.empty() || !modifiers.empty()) {
+        return;
+    }
+    if (!IsExpectedTokenAfterFeaturesOrPackage(false)) {
+        DiagAndSuggestKeywordForExpectedDeclaration({"macro", "package", "import", "func", "let", "var", "const",
+            "enum", "type", "struct", "class", "interface", "extend", "main"});
+    }
+}
+
 bool ParserImpl::IsExpectedTokenAfterFeaturesOrPackage(bool allowPackageKeyword)
 {
     if (Seeing(TokenKind::SEMI) || SeeingImport() || SeeingDecl() || SeeingMacroCallDecl() || SeeingInitializer() ||
@@ -116,7 +128,7 @@ OwnedPtr<File> ParserImpl::ParseTopLevel()
     Peek();
     // Set the begin of file at (fileID, 1, 1).
     ret->begin = {lexer->GetFileID(), 1, 1};
-    Source& source = sourceManager.GetSource(ret->begin.fileID);
+    auto& source = sourceManager.GetSource(ret->begin.fileID);
     ret->fileName = FileUtil::GetFileName(source.path);
     ret->filePath = source.path;
     ret->fileHash = source.fileHash;
@@ -162,6 +174,7 @@ OwnedPtr<File> ParserImpl::ParseTopLevel()
             annos.clear();
         }
     } else {
+        CheckExpectedTopLevelDeclWhenNoPackage(annos, modifiers);
         scope.ResetParserScope();
     }
     // Parse importSpec in TopLevel.

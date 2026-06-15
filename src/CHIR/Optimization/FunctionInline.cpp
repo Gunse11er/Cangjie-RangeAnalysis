@@ -88,7 +88,7 @@ void FunctionInline::InlineImpl(BlockGroup& bg)
     Visitor::Visit(bg, preVisit);
 }
 
-void FunctionInline::Run(Func& func)
+void FunctionInline::Run(Function& func)
 {
     globalFunc = &func;
     InlineImpl(*func.GetBody());
@@ -99,7 +99,7 @@ const OptEffectCHIRMap& FunctionInline::GetEffectMap() const
     return effectMap;
 }
 
-static bool InBlackList(const Func& func)
+static bool InBlackList(const Function& func)
 {
     if (func.GetFuncKind() == FuncKind::MACRO_FUNC || func.GetFuncKind() == FuncKind::GLOBALVAR_INIT ||
         func.GetFuncKind() == FuncKind::MAIN_ENTRY) {
@@ -121,7 +121,7 @@ static bool InBlackList(const Func& func)
     return false;
 }
 
-static bool InWhiteList(const Func& func)
+static bool InWhiteList(const Function& func)
 {
     for (auto element : functionInlineWhiteList) {
         if (IsExpectedFunction(func, element)) {
@@ -131,7 +131,7 @@ static bool InWhiteList(const Func& func)
     return false;
 }
 
-static bool OnlyCalledOnce(const Func& func)
+static bool OnlyCalledOnce(const Function& func)
 {
     bool alreadyHasUser = false;
     for (auto user : func.GetUsers()) {
@@ -145,7 +145,7 @@ static bool OnlyCalledOnce(const Func& func)
     return true;
 }
 
-static bool IsHotSpotCall(const Func& callee)
+static bool IsHotSpotCall(const Function& callee)
 {
     // Case A: the callee is operator overloading function like `[]`, `+`, `-`
     if (callee.TestAttr(Attribute::OPERATOR)) {
@@ -156,7 +156,7 @@ static bool IsHotSpotCall(const Func& callee)
     return false;
 }
 
-static bool FunctionWithLambdaArg(const Func& func)
+static bool FunctionWithLambdaArg(const Function& func)
 {
     for (auto arg : func.GetParams()) {
         if (arg->GetType()->IsFunc()) {
@@ -169,18 +169,17 @@ static bool FunctionWithLambdaArg(const Func& func)
 static size_t CalculateThreshold(const Value& callee, const Cangjie::GlobalOptions::OptimizationLevel& optLevel)
 {
     size_t realThreshold = INIT_INLINE_THRESHOLD;
-    auto func = Cangjie::DynamicCast<const Func*>(&callee);
-    CJC_NULLPTR_CHECK(func);
-    if (OnlyCalledOnce(*func)) {
+    const auto& func = Cangjie::StaticCast<const Function&>(callee);
+    if (OnlyCalledOnce(func)) {
         // Increase the threshold value by 20%
         realThreshold += realThreshold / INCREASE_THRESHOLD;
     }
     if (optLevel < Cangjie::GlobalOptions::OptimizationLevel::Os) {
-        if (IsHotSpotCall(*func)) {
+        if (IsHotSpotCall(func)) {
             // Increase the threshold value by 20%
             realThreshold = INIT_INLINE_THRESHOLD + INIT_INLINE_THRESHOLD / INCREASE_THRESHOLD;
         }
-        if (FunctionWithLambdaArg(*func)) {
+        if (FunctionWithLambdaArg(func)) {
             realThreshold = INIT_INLINE_THRESHOLD * INCREASE_WHEN_CALLEE_WITH_LAMBDA_ARG;
         }
     }
@@ -201,7 +200,7 @@ static size_t GetExprSize(const Expression& expr)
     return exprSize;
 }
 
-static size_t CountFuncSize(const Func& func)
+static size_t CountFuncSize(const Function& func)
 {
     size_t funcSize = 0;
     for (auto block : func.GetBody()->GetBlocks()) {
@@ -222,7 +221,7 @@ bool FunctionInline::CheckCanRewrite(const Apply& apply)
     if (!callee->IsFuncWithBody()) {
         return false;
     }
-    auto func = VirtualCast<Func*>(callee);
+    auto func = StaticCast<Function*>(callee);
     CJC_NULLPTR_CHECK(callee);
 
     // when the terminator of this block is RaiseException, do not inline this apply because it rarely happens
@@ -270,10 +269,24 @@ bool FunctionInline::CheckCanRewrite(const Apply& apply)
     return false;
 }
 
-static std::vector<Block*> GetExitBlocks(const BlockGroup& blockGroup)
+static Block* GetEntryBlock(const BlockGroup& oldBG, std::vector<Block*>& blocks)
+{
+    auto oldBlocks = oldBG.GetBlocks();
+    CJC_ASSERT(oldBlocks.size() == blocks.size());
+    CJC_ASSERT(!blocks.empty());
+    for (size_t i = 0; i < oldBlocks.size(); ++i) {
+        if (oldBlocks[i] == oldBG.GetEntryBlock()) {
+            return blocks[i];
+        }
+    }
+    CJC_ABORT();
+    return blocks.front();
+}
+
+static std::vector<Block*> GetExitBlocks(std::vector<Block*>& blocks)
 {
     std::vector<Block*> exitBlocks;
-    for (auto block : blockGroup.GetBlocks()) {
+    for (auto block : blocks) {
         auto term = block->GetTerminator();
         CJC_NULLPTR_CHECK(term);
         if (term->GetExprKind() == ExprKind::EXIT) {
@@ -285,11 +298,25 @@ static std::vector<Block*> GetExitBlocks(const BlockGroup& blockGroup)
     return exitBlocks;
 }
 
-static void ReplaceFuncArgs(std::vector<Parameter*>& src, std::vector<Value*>& dst, const BlockGroup& scope)
+static void ReplaceFuncArgs(
+    std::vector<Parameter*>& src, std::vector<Value*>& dst, const std::vector<Block*>& newBlocks)
 {
     CJC_ASSERT(src.size() == dst.size());
+    std::unordered_set<Block*> allNewBlocks;
+    auto preVisit = [&allNewBlocks](Block& block) {
+        allNewBlocks.emplace(&block);
+        return VisitResult::CONTINUE;
+    };
+    for (auto block : newBlocks) {
+        Visitor::Visit(*block, preVisit);
+    }
     for (size_t i = 0; i < src.size(); ++i) {
-        src[i]->ReplaceWith(*dst[i], &scope);
+        for (auto user : src[i]->GetUsers()) {
+            if (allNewBlocks.count(user->GetParentBlock()) == 0) {
+                continue;
+            }
+            user->ReplaceOperand(src[i], dst[i]);
+        }
     }
 }
 
@@ -321,14 +348,15 @@ void FunctionInline::ReplaceFuncResult(LocalVar* resNew, LocalVar* resOld)
     return;
 }
 
-void FunctionInline::SetGroupDebugLocation(BlockGroup& group, const DebugLocation& loc)
+void FunctionInline::SetGroupDebugLocation(const std::vector<Block*>& blocks, const DebugLocation& loc)
 {
-    group.SetDebugLocation(loc);
     auto changeLoc = [&loc](Expression& expr) {
         expr.SetDebugLocation(loc);
         return VisitResult::CONTINUE;
     };
-    Visitor::Visit(group, changeLoc);
+    for (auto block : blocks) {
+        Visitor::Visit(*block, changeLoc);
+    }
 }
 
 void FunctionInline::DoFunctionInline(const Apply& apply, const std::string& name)
@@ -339,14 +367,14 @@ void FunctionInline::DoFunctionInline(const Apply& apply, const std::string& nam
     // func foo1(param: Int64) { return param }
     // func foo2() { foo1(2) }
     // CHIR graph is like:
-    // Func foo1(%7: Int64) { // Block Group: 1
+    // Function foo1(%7: Int64) { // Block Group: 1
     // Block #7:
     //   %8: Unit = Debug(%7, param)
     //   [ret]%9: Int64& = Allocate(Int64)
     //   %10: Unit = Store(%7, %9)
     //   Exit()
     // }
-    // Func foo2 { // Block Group: 2
+    // Function foo2 { // Block Group: 2
     // Block #14:
     //   %[ret]%11: Int64& = Allocate(Int64)
     //   %12: Int64 = ConstantInt(2)
@@ -360,7 +388,7 @@ void FunctionInline::DoFunctionInline(const Apply& apply, const std::string& nam
     BlockGroup* oldFuncGroup = nullptr;
     std::vector<Parameter*> funcArgs;
     if (apply.GetCallee()->IsFuncWithBody()) {
-        auto func = VirtualCast<Func*>(apply.GetCallee());
+        auto func = StaticCast<Function*>(apply.GetCallee());
         oldFuncGroup = func->GetBody();
         funcArgs = func->GetParams();
     } else {
@@ -380,17 +408,15 @@ void FunctionInline::DoFunctionInline(const Apply& apply, const std::string& nam
     //   Exit()
     // }
     // `newFuncGroup` is `Block Group: 7`
-    CJC_NULLPTR_CHECK(apply.GetTopLevelFunc());
-    auto [newFuncGroup, returnVal] = CloneBlockGroupForInline(*oldFuncGroup, *apply.GetTopLevelFunc(), apply);
-    SetGroupDebugLocation(*newFuncGroup, apply.GetDebugLocation());
+    auto [newBlocks, returnVal] = CloneBlockGroupForInline(*oldFuncGroup, apply);
+    SetGroupDebugLocation(newBlocks, apply.GetDebugLocation());
     // `funcEntry` is `Block #27`
-    auto funcEntry = newFuncGroup->GetEntryBlock();
+    auto funcEntry = GetEntryBlock(*oldFuncGroup, newBlocks);
     // `exitBlock` is `Block #27`, `returnVal` is `%20`
-    auto exitBlocks = GetExitBlocks(*newFuncGroup);
-    CJC_NULLPTR_CHECK(newFuncGroup->GetTopLevelFunc());
+    auto exitBlocks = GetExitBlocks(newBlocks);
 
     // step 2: change connection of func args
-    // Func foo2 { // Block Group: 4
+    // Function foo2 { // Block Group: 4
     // Block #14:
     //   [ret] %11: Int64& = Allocate(Int64)
     //   %12: Int64 = Constant(2)
@@ -404,34 +430,13 @@ void FunctionInline::DoFunctionInline(const Apply& apply, const std::string& nam
     //   Exit()
     // }
     auto applyArgs = apply.GetArgs();
-    ReplaceFuncArgs(funcArgs, applyArgs, *newFuncGroup);
+    ReplaceFuncArgs(funcArgs, applyArgs, newBlocks);
 
-    FixCastProblemAfterInst(newFuncGroup, builder);
-
-    // step 3: move copied blocks
-    // Func foo2 { // Block Group: 4
-    // Block #14:
-    //   [ret] %11: Int64& = Allocate(Int64)
-    //   %12: Int64 = Constant(2)
-    //   %13: Int64 = Apply(@_CN7default4foo1El, %12)
-    //   %14: Unit = Store(%13, %11)
-    //   Exit()
-    // Block #27:
-    //   %19: Unit = Debug(%7, param)
-    //   %20: Int64& = Allocate(Int64)
-    //   %21: Unit = Store(%7, %20)
-    //   Exit()
-    // }
-    // `applyGroup` is `Block Group: 2`
-    auto applyGroup = apply.GetParentBlock()->GetParentBlockGroup();
-    CJC_NULLPTR_CHECK(applyGroup->GetTopLevelFunc());
-    for (auto block : newFuncGroup->GetBlocks()) {
-        block->MoveTo(*applyGroup);
-    }
+    FixCastProblemAfterInst(newBlocks, builder);
 
     // if callee must throw exception, then we can't get return value
     // step 4 : Insert a load for return value of inlined function and replace the use
-    // Func foo2 { // Block Group: 4
+    // Function foo2 { // Block Group: 4
     // Block #14:
     //   [ret] %11: Int64& = Allocate(Int64)
     //   %12: Int64 = Constant(2)
@@ -447,7 +452,7 @@ void FunctionInline::DoFunctionInline(const Apply& apply, const std::string& nam
         ReplaceFuncResult(returnVal, StaticCast<LocalVar*>(apply.GetResult()));
     }
     // step 5: split block to 2 pieces and remove `apply` node
-    // Func foo2 { // Block Group: 4
+    // Function foo2 { // Block Group: 4
     // Block #14:                       // `Block #14` is split to `Block #14` and `Block #28`
     //   [ret] %11: Int64& = Allocate(Int64)
     //   %12: Int64 = Constant(2)
@@ -465,7 +470,7 @@ void FunctionInline::DoFunctionInline(const Apply& apply, const std::string& nam
     auto [block1, block2] = builder.SplitBlock(apply);
 
     // step 6: change connection in `Block Group 4`
-    // Func foo2 { // Block Group: 4
+    // Function foo2 { // Block Group: 4
     // Block #21:
     //   [ret] %11: Int64& = Allocate(Int64)
     //   %12: Int64 = Constant(2)
@@ -495,11 +500,11 @@ void FunctionInline::DoFunctionInline(const Apply& apply, const std::string& nam
 
 void FunctionInline::RecordEffectMap(const Apply& apply)
 {
-    auto callee = DynamicCast<CHIR::Func*>(apply.GetCallee());
     // `callee` may be a lambda, we only record global function
-    if (callee == nullptr) {
+    if (!apply.GetCallee()->IsFuncWithBody()) {
         return;
     }
+    auto callee = StaticCast<Function*>(apply.GetCallee());
     auto parentFunc = apply.GetTopLevelFunc();
     CJC_NULLPTR_CHECK(parentFunc);
     if (!callee->IsLambda() && !parentFunc->IsLambda()) {
@@ -509,11 +514,10 @@ void FunctionInline::RecordEffectMap(const Apply& apply)
 
 // Clone a new block group for Function Inline and return the new local variableCHIRBuilder::CloneBlock
 // for function result value.
-std::pair<BlockGroup*, LocalVar*> FunctionInline::CloneBlockGroupForInline(
-    const BlockGroup& other, Func& parentFunc, const Apply& apply)
+std::pair<std::vector<Block*>, LocalVar*> FunctionInline::CloneBlockGroupForInline(
+    const BlockGroup& oldBG, const Apply& apply)
 {
     BlockGroupCopyHelper helper(builder);
     helper.GetInstMapFromApply(apply);
-    auto [newGroup, newBlockGroupRetValue] = helper.CloneBlockGroup(other, parentFunc);
-    return {newGroup, newBlockGroupRetValue};
+    return helper.CloneBlockGroup(oldBG, *apply.GetParentBlockGroup());
 }

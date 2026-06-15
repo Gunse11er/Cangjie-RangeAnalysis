@@ -30,6 +30,7 @@
 #include "cangjie/FrontendTool/IncrementalCompilerInstance.h"
 #include "cangjie/Utils/ProfileRecorder.h"
 #include "cangjie/Utils/TaskQueue.h"
+#include "cangjie/Utils/Utils.h"
 
 namespace Cangjie::CodeGen {
 void EmitMain(CGModule& cgMod);
@@ -347,58 +348,14 @@ void EmitCJSDKVersion(const CGModule& cgMod)
     cgMod.GetCGContext().AddLLVMUsedVars(cjSdkVersion->getName().str());
 }
 
-void GenerateReflectionMetadata(CGModule& module, const SubCHIRPackage& subCHIRPkg)
-{
-    auto& globalOptions = module.GetCGContext().GetCGPkgContext().GetGlobalOptions();
-    uint8_t reflectionMode = globalOptions.disableReflection
-        ? GenReflectMode::NO_REFLECT
-        : GenReflectMode::FULL_REFLECT;
-
-    const std::array<MetadataKind, 6> allKinds = {
-        CodeGen::MetadataKind::PKG_METADATA,
-        CodeGen::MetadataKind::CLASS_METADATA,
-        CodeGen::MetadataKind::STRUCT_METADATA,
-        CodeGen::MetadataKind::ENUM_METADATA,
-        CodeGen::MetadataKind::GF_METADATA,
-        CodeGen::MetadataKind::GV_METADATA
-    };
-
-    auto runTask = [&](CodeGen::MetadataKind kind) {
-        std::unique_ptr<MetadataInfo> info = nullptr;
-        switch (kind) {
-            case CodeGen::MetadataKind::PKG_METADATA:
-                info = std::make_unique<PkgMetadataInfo>(module, subCHIRPkg, reflectionMode); break;
-            case CodeGen::MetadataKind::CLASS_METADATA:
-                info = std::make_unique<ClassMetadataInfo>(module, subCHIRPkg, reflectionMode); break;
-            case CodeGen::MetadataKind::STRUCT_METADATA:
-                info = std::make_unique<StructMetadataInfo>(module, subCHIRPkg, reflectionMode); break;
-            case CodeGen::MetadataKind::ENUM_METADATA:
-                info = std::make_unique<EnumMetadataInfo>(module, subCHIRPkg, reflectionMode); break;
-            case CodeGen::MetadataKind::GF_METADATA:
-                info = std::make_unique<GFMetadataInfo>(module, subCHIRPkg, reflectionMode); break;
-            case CodeGen::MetadataKind::GV_METADATA:
-                info = std::make_unique<GVMetadataInfo>(module, subCHIRPkg, reflectionMode); break;
-            default: break;
-        }
-
-        if (info) {
-            info->Gen();
-        }
-    };
-
-    for (auto kind : allKinds) {
-        runTask(kind);
-    }
-}
-
 void GenSubCHIRPackage(CGModule& cgMod)
 {
     auto& subCHIRPkg = cgMod.GetCGContext().GetSubCHIRPackage();
     EmitTIOrTTForCustomDefs(cgMod);
     EmitGlobalVariableIR(cgMod, std::vector<CHIR::GlobalVar*>(subCHIRPkg.chirGVs.begin(), subCHIRPkg.chirGVs.end()));
-    EmitFunctionIR(cgMod, std::vector<CHIR::Func*>(subCHIRPkg.chirFuncs.begin(), subCHIRPkg.chirFuncs.end()));
+    EmitFunctionIR(cgMod, std::vector<CHIR::Function*>(subCHIRPkg.chirFuncs.begin(), subCHIRPkg.chirFuncs.end()));
     EmitImportedCFuncIR(cgMod,
-        std::vector<CHIR::ImportedFunc*>(subCHIRPkg.chirImportedCFuncs.begin(), subCHIRPkg.chirImportedCFuncs.end()));
+        std::vector<CHIR::Function*>(subCHIRPkg.chirImportedCFuncs.begin(), subCHIRPkg.chirImportedCFuncs.end()));
     if (subCHIRPkg.mainModule) {
         EmitCJSDKVersion(cgMod);
         EmitMain(cgMod);
@@ -462,9 +419,9 @@ void GenSubCHIRPackage(CGModule& cgMod)
 
 class PackageGeneratorImpl : public IRGeneratorImpl {
 public:
-    PackageGeneratorImpl(CHIR::CHIRBuilder& chirBuilder, const CHIRData& chirData, const GlobalOptions& options,
+    PackageGeneratorImpl(CHIRData& chirData, const GlobalOptions& options,
         bool enableIncrement, const CachedMangleMap& cachedMangleMap)
-        : cgPkgCtx(chirBuilder, chirData, options, enableIncrement, cachedMangleMap)
+        : cgPkgCtx(chirData, options, enableIncrement, cachedMangleMap)
     {
     }
 
@@ -551,10 +508,10 @@ llvm::Value* SaturatingIntegerValue(IRBuilder2& irBuilder, const std::vector<llv
     auto [minBb, maxBb, checkOverBb] =
         Vec2Tuple<3>(irBuilder.CreateAndInsertBasicBlocks({"min.bb", "max.bb", "check.over"}));
 
-    const int srcIndex = 0;
-    const int minIndex = 1;
-    const int maxIndex = 2;
-    const int branchNum = 3;
+    constexpr int srcIndex = 0;
+    constexpr int minIndex = 1;
+    constexpr int maxIndex = 2;
+    constexpr int branchNum = 3;
     auto previousBB = irBuilder.GetInsertBlock();
     auto downOverflow = irBuilder.CreateICmpSLT(values[srcIndex], values[minIndex]);
     auto upOverflow = irBuilder.CreateICmpSGT(values[srcIndex], values[maxIndex]);
@@ -634,16 +591,23 @@ void PackageGeneratorImpl::EmitIR()
 #endif
 
 #ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
-std::vector<std::unique_ptr<llvm::Module>> GenPackageModules(CHIR::CHIRBuilder& chirBuilder, const CHIRData& chirData,
-    const GlobalOptions& options, DefaultCompilerInstance& compilerInstance, bool enableIncrement)
+std::vector<std::unique_ptr<llvm::Module>> GenPackageModules(
+    DefaultCompilerInstance& compilerInstance, bool enableIncrement)
 {
     CachedMangleMap cachedMangleMap;
     if (enableIncrement) {
         cachedMangleMap = StaticCast<Cangjie::IncrementalCompilerInstance&>(compilerInstance).cacheMangles;
     }
-    auto temp = PackageGeneratorImpl(chirBuilder, chirData, options, enableIncrement, cachedMangleMap);
-    temp.EmitIR();
-    return temp.ReleaseLLVMModules();
+    std::vector<std::unique_ptr<llvm::Module>> llvmModules;
+    {
+        auto temp = PackageGeneratorImpl(
+            *compilerInstance.chirData, compilerInstance.invocation.globalOptions, enableIncrement, cachedMangleMap);
+        temp.EmitIR();
+        llvmModules = temp.ReleaseLLVMModules();
+    }
+    compilerInstance.FreeCHIRData();
+    Utils::FreeIdleMemoryToOS();
+    return llvmModules;
 }
 #endif
 
@@ -666,5 +630,7 @@ void ClearPackageModules(std::vector<std::unique_ptr<llvm::Module>>& packageModu
         CJC_NULLPTR_CHECK(llvmCtx);
         delete llvmCtx;
     });
+
+    Utils::FreeIdleMemoryToOS();
 }
 } // namespace Cangjie::CodeGen

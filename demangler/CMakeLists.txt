@@ -10,6 +10,15 @@ project(cangjie-demangler)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+set(CJC_EXTRA_WARNINGS -Woverloaded-virtual -Wvla -Wconversion -Wunused -Wdelete-non-virtual-dtor -Wswitch-default -Wcast-qual -Wextra -Wformat=2 -Wno-missing-field-initializers -Wno-format-nonliteral -Wno-sign-conversion)
+if(${CMAKE_SYSTEM_NAME} EQUAL Darwin)
+    set(CJC_EXTRA_WARNINGS ${CJC_EXTRA_WARNINGS} -Wno-float-equal)
+    set(CJC_EXTRA_WARNINGS ${CJC_EXTRA_WARNINGS} -Wno-undef)
+else()
+    set(CJC_EXTRA_WARNINGS ${CJC_EXTRA_WARNINGS} -Wcast-align -Wfloat-equal)
+endif()
+set(CJC_EXTRA_WARNINGS ${CJC_EXTRA_WARNINGS} -Wshadow -Wnon-virtual-dtor -Wundef)
+
 if(BUILD_GCC_TOOLCHAIN AND (CMAKE_C_COMPILER_ID STREQUAL "Clang" OR (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")))
     add_compile_options(--gcc-toolchain=${BUILD_GCC_TOOLCHAIN})
     add_link_options(--gcc-toolchain=${BUILD_GCC_TOOLCHAIN})
@@ -20,6 +29,7 @@ if(CANGJIE_DEMANGLER_USE_CSTRING)
     add_library(cangjie-demangle STATIC
         ${CMAKE_CURRENT_SOURCE_DIR}/Demangler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/DeCompression.cpp)
+    target_compile_options(cangjie-demangle PRIVATE ${CJC_EXTRA_WARNINGS})
 else()
     # A library for demangling, which using std::string as its string implementation.
     add_library(cangjie-demangle STATIC
@@ -27,6 +37,7 @@ else()
         ${CMAKE_CURRENT_SOURCE_DIR}/Demangler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/CangjieDemangle.cpp)
     target_compile_definitions(cangjie-demangle PRIVATE BUILD_LIB_CANGJIE_DEMANGLE)
+    target_compile_options(cangjie-demangle PRIVATE ${CJC_EXTRA_WARNINGS})
 endif()
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/CangjieDemangle.h DESTINATION include)
 install(TARGETS cangjie-demangle DESTINATION lib)
@@ -37,6 +48,7 @@ if(OHOS)
         ${CMAKE_CURRENT_SOURCE_DIR}/Demangler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/CangjieDemangle.cpp)
     target_compile_definitions(cangjie-demangle-shared PRIVATE BUILD_LIB_CANGJIE_DEMANGLE)
+    target_compile_options(cangjie-demangle-shared PRIVATE ${CJC_EXTRA_WARNINGS})
     install(TARGETS cangjie-demangle-shared LIBRARY DESTINATION lib)
     set_target_properties(cangjie-demangle-shared PROPERTIES OUTPUT_NAME "cangjie-demangle")
 endif()
@@ -47,4 +59,5 @@ add_executable(cjfilt
     ${CMAKE_CURRENT_SOURCE_DIR}/DeCompression.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/Cjfilt.cpp)
 target_compile_definitions(cjfilt PRIVATE BUILD_LIB_CANGJIE_DEMANGLE)
+target_compile_options(cjfilt PRIVATE ${CJC_EXTRA_WARNINGS})
 install(TARGETS cjfilt DESTINATION bin)

@@ -40,7 +40,7 @@ std::string DecimalToManglingNumber(const std::string& decimal)
     }
     std::string base62 = num > 0 ? "" : "0";
     while (num > 0) {
-        base62 = base62CharsStr[num % n] + base62;
+        base62 = base62CharsStr[static_cast<unsigned>(num) % n] + base62;
         num /= n;
     }
     return base62 + MANGLE_WILDCARD_PREFIX;
@@ -620,7 +620,7 @@ size_t ForwardTypes(std::string& mangled, std::vector<std::unique_ptr<CJType>>& 
     return idx;
 }
 
-std::string CJMangledCompression(const std::string mangled, bool isType)
+std::string CJMangledCompression(const std::string& mangled, bool isType)
 {
     bool isCompressed = false;
     size_t preIdx = 0;

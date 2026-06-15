@@ -16,6 +16,7 @@
 #include "DesugarMacro.h"
 #include "TypeCheckUtil.h"
 
+#include "../Plugin/APILevelVersion.h"
 #include "cangjie/AST/Clone.h"
 #include "cangjie/AST/Create.h"
 #include "cangjie/AST/Match.h"
@@ -281,8 +282,7 @@ Ptr<OptionalChainExpr> GetOptionalChainExprForLeftVale(Expr& leftValue)
     return nullptr;
 }
 
-OwnedPtr<AssignExpr> CreateCompoundAssignExpr(
-    OwnedPtr<Expr> left, OwnedPtr<Expr> right, TokenKind op)
+OwnedPtr<AssignExpr> CreateCompoundAssignExpr(OwnedPtr<Expr> left, OwnedPtr<Expr> right, TokenKind op)
 {
     auto ae = CreateAssignExpr(std::move(left), std::move(right));
     ae->op = op;
@@ -310,8 +310,7 @@ void DesugarIncOrDecExpr(IncOrDecExpr& ide)
     ide.desugarExpr = std::move(ae);
 }
 
-void DesugarAssignExprRecursively(
-    const TupleLit& leftValues, Expr& rightExprs, std::vector<OwnedPtr<Node>>& nodes)
+void DesugarAssignExprRecursively(const TupleLit& leftValues, Expr& rightExprs, std::vector<OwnedPtr<Node>>& nodes)
 {
     uint64_t indexOfRightExpr = 0;
     auto varDecl = CreateTmpVarDecl(nullptr, &rightExprs);
@@ -459,6 +458,7 @@ void DesugarTrailingClosureExpr(TrailingClosureExpr& trailingClosure)
     } else {
         trailingClosure.desugarExpr = DesugarTrailClosureAsCall(trailingClosure);
     }
+    CopyBasicInfo(&trailingClosure, trailingClosure.desugarExpr.get());
 }
 
 const std::string LEVEL_IDENTGIFIER = "level";
@@ -466,37 +466,184 @@ const std::string SYSCAP_IDENTGIFIER = "syscap";
 // For level check:
 const std::string DEVICE_INFO = "DeviceInfo";
 const std::string SDK_API_VERSION = "sdkApiVersion";
+const std::string API_AVAILABLE = "apiAvailable";
 // For syscap check:
 const std::string CANIUSE_IDENTIFIER = "canIUse";
+// SDK 26 is the minimum version that introduces the apiAvailable(...) runtime check
+// (from ohos.base, per issue #824). For compatibleSDKVersion >= 26 the desugar path
+// emits apiAvailable(...); for < 26 it falls back to DeviceInfo.sdkApiVersion >= N,
+// because apiAvailable does not exist in older SDKs.
+// See DesugarIfAvailableLevelCondition for the full 5-way desugar matrix.
+constexpr uint32_t IFAVAILABLE_RUNTIME_APILEVEL_MAJOR = 26; // apiAvailable introduced at SDK 26
 
-// Before desugar: `@IfAvaliable(level: 11, {=>...}, {=>...})`
-// Desugar as: `if (DeviceInfo.sdkApiVersion >= 11) {...} else {...}`
-OwnedPtr<Expr> DesugarIfAvailableLevelCondition(IfAvailableExpr& iae)
+/*
+ * Build a `DeviceInfo.sdkApiVersion >= <levelExpr>` boolean condition node,
+ * with source-position info copied from iae and levelExprBase.
+ * Used by DesugarIfAvailableLevelCondition for the legacy integer-comparison
+ * path (compatibleSDKVersion < 26 or argument major < 26).
+ * *************** before desugar ****************
+   @IfAvailable(level: 11, {=>...}, {=>...})
+ * *************** after desugar (condition only) ***
+   DeviceInfo.sdkApiVersion >= 11
+ * **********************************************
+ */
+OwnedPtr<Expr> CreateSDKApiVersionCheck(IfAvailableExpr& iae, OwnedPtr<Expr> levelExpr, const Expr& levelExprBase)
 {
     auto me = CreateMemberAccess(CreateRefExpr(SrcIdentifier(DEVICE_INFO)), SDK_API_VERSION);
-    auto condition = CreateBinaryExpr(std::move(me), std::move(iae.GetArg()->expr), TokenKind::GE);
+    CopyBasicInfo(&iae, me->baseExpr.get());
+    auto condition = CreateBinaryExpr(std::move(me), std::move(levelExpr), TokenKind::GE);
+    CopyBasicInfo(&levelExprBase, condition->rightExpr.get());
+    CopyBasicInfo(&iae, condition->leftExpr.get());
     AddCurFile(*condition, iae.curFile);
     CopyBasicInfo(&iae, condition.get());
-    return std::move(condition);
+    return condition;
 }
 
-// Before desugar: `@IfAvaliable(syscap: "xxx", {=>...}, {=>...})`
-// Desugar as: `if (canIUse("xxx")) {...} else {...}`
+/*
+ * Build an `apiAvailable(<levelExpr>)` call expression node, with
+ * source-position info copied from iae. levelExpr may be an integer literal
+ * or a string literal depending on the @IfAvailable argument shape.
+ * Used by DesugarIfAvailableLevelCondition for the SDK-26+ path.
+ * apiAvailable is defined in ohos.base and is only available from SDK 26
+ * onwards — callers must guard with IFAVAILABLE_RUNTIME_APILEVEL_MAJOR.
+ * *************** before desugar ****************
+   @IfAvailable(level: 26, {=>...}, {=>...})
+ * *************** after desugar (condition only) ***
+   apiAvailable(26)
+ * **********************************************
+ */
+OwnedPtr<Expr> CreateApiAvailableCheck(IfAvailableExpr& iae, OwnedPtr<Expr> levelExpr)
+{
+    auto apiAvailableRef = CreateRefExpr(SrcIdentifier(API_AVAILABLE));
+    CopyBasicInfo(&iae, apiAvailableRef.get());
+    std::vector<OwnedPtr<FuncArg>> argList;
+    argList.emplace_back(CreateFuncArg(std::move(levelExpr)));
+    auto condition = CreateCallExpr(std::move(apiAvailableRef), std::move(argList));
+    AddCurFile(*condition, iae.curFile);
+    CopyBasicInfo(&iae, condition.get());
+    return condition;
+}
+
+/*
+ * Desugar the level condition of an @IfAvailable expression into a boolean
+ * check expression. Implements the 5-way matrix from issue #824; the exact
+ * output depends on the integer or string argument and compatibleSDKVersion
+ * (--cfg=APILevel_level). The surrounding if-expr is built by DesugarIfAvailableExpr.
+ *
+ * 26 is the minimum SDK major version that introduces the apiAvailable(...)
+ * runtime API (ohos.base). Older devices only expose DeviceInfo.sdkApiVersion.
+ *
+ * *************** before desugar ****************
+   @IfAvailable(level: 11, {=>...}, {=>...})          // compatibleSDKVersion < 26
+ * *************** after desugar (condition only) ***
+   DeviceInfo.sdkApiVersion >= 11
+ * **********************************************
+ * *************** before desugar ****************
+   @IfAvailable(level: 26, {=>...}, {=>...})          // compatibleSDKVersion >= 26
+ * *************** after desugar (condition only) ***
+   apiAvailable(26)
+ * **********************************************
+ * *************** before desugar ****************
+   @IfAvailable(level: "26.0.0", {=>...}, {=>...})    // compatibleSDKVersion < 26, major >= 26
+ * *************** after desugar (condition only) ***
+   DeviceInfo.sdkApiVersion >= 26 && apiAvailable("26.0.0")
+ * **********************************************
+ */
+OwnedPtr<Expr> DesugarIfAvailableLevelCondition(IfAvailableExpr& iae, const std::string& compatibleSDKVersion)
+{
+    auto compatibleLevel = Cangjie::APILevelVersion::ParseChecked(
+        compatibleSDKVersion, Cangjie::APILevelVersion::ParseRule::MAJOR_OR_TRIPLE)
+        .value_or(Cangjie::APILevelVersion());
+    auto argExpr = iae.GetArg()->expr.get();
+    if (!argExpr || argExpr->astKind != ASTKind::LIT_CONST_EXPR) {
+        return ASTCloner::Clone(iae.GetArg()->expr.get());
+    }
+    auto lce = StaticCast<LitConstExpr>(argExpr);
+    if (lce->kind == LitConstKind::INTEGER) {
+        if (compatibleLevel >= Cangjie::APILevelVersion(IFAVAILABLE_RUNTIME_APILEVEL_MAJOR)) {
+            return CreateApiAvailableCheck(iae, ASTCloner::Clone(iae.GetArg()->expr.get()));
+        }
+        return CreateSDKApiVersionCheck(iae, ASTCloner::Clone(iae.GetArg()->expr.get()), *lce);
+    }
+    if (lce->kind != LitConstKind::STRING) {
+        return ASTCloner::Clone(iae.GetArg()->expr.get());
+    }
+    // Check compatibleSDKVersion before parsing the level string:
+    // if compatibleLevel >= 26, we can directly call apiAvailable regardless of format validity
+    // (CheckIfAvailableExpr will ERROR on invalid format before codegen runs).
+    if (compatibleLevel >= Cangjie::APILevelVersion(IFAVAILABLE_RUNTIME_APILEVEL_MAJOR)) {
+        return CreateApiAvailableCheck(iae, ASTCloner::Clone(iae.GetArg()->expr.get()));
+    }
+    auto parsedLevel =
+        Cangjie::APILevelVersion::ParseChecked(lce->stringValue, Cangjie::APILevelVersion::ParseRule::TRIPLE_ONLY);
+    if (!parsedLevel.has_value()) {
+        // Invalid format: do not generate apiAvailable("bad string") — CheckIfAvailableExpr
+        // will emit a hard ERROR (sema_apilevel_invalid_version_format) for this node.
+        // Return a clone of the raw argument so the error fires on the correct AST node.
+        return ASTCloner::Clone(iae.GetArg()->expr.get());
+    }
+    if (parsedLevel->major < IFAVAILABLE_RUNTIME_APILEVEL_MAJOR) {
+        auto majorExpr =
+            CreateLitConstExpr(LitConstKind::INTEGER, std::to_string(parsedLevel->major), Ty::GetInitialTy());
+        CopyBasicInfo(lce, majorExpr.get());
+        return CreateSDKApiVersionCheck(iae, std::move(majorExpr), *lce);
+    }
+    auto majorGate = CreateLitConstExpr(
+        LitConstKind::INTEGER, std::to_string(IFAVAILABLE_RUNTIME_APILEVEL_MAJOR), Ty::GetInitialTy());
+    CopyBasicInfo(lce, majorGate.get());
+    auto majorCondition = CreateSDKApiVersionCheck(iae, std::move(majorGate), *lce);
+    auto runtimeCondition = CreateApiAvailableCheck(iae, ASTCloner::Clone(iae.GetArg()->expr.get()));
+    auto condition = CreateBinaryExpr(std::move(majorCondition), std::move(runtimeCondition), TokenKind::AND);
+    AddCurFile(*condition, iae.curFile);
+    CopyBasicInfo(&iae, condition.get());
+    return condition;
+}
+
+/*
+ * Desugar the syscap condition of an @IfAvailable expression into a
+ * canIUse(string) call expression. The syscap string literal argument is
+ * moved directly into the generated call. The surrounding if-expr is built
+ * by DesugarIfAvailableExpr.
+ * *************** before desugar ****************
+   @IfAvailable(syscap: "SystemCapability.ArkUI.ArkUI.Full", {=>...}, {=>...})
+ * *************** after desugar (condition only) ***
+   canIUse("SystemCapability.ArkUI.ArkUI.Full")
+ * **********************************************
+ */
 OwnedPtr<Expr> DesugarIfAvailableSyscapCondition(IfAvailableExpr& iae)
 {
     auto canIUseRef = CreateRefExpr(SrcIdentifier(CANIUSE_IDENTIFIER));
+    CopyBasicInfo(&iae, canIUseRef.get());
     std::vector<OwnedPtr<FuncArg>> argList;
     argList.emplace_back(CreateFuncArg(std::move(iae.GetArg()->expr)));
-    auto condition = CreateCallExpr(CreateRefExpr(SrcIdentifier(CANIUSE_IDENTIFIER)), std::move(argList));
+    auto condition = CreateCallExpr(std::move(canIUseRef), std::move(argList));
     AddCurFile(*condition, iae.curFile);
     CopyBasicInfo(&iae, condition.get());
     return std::move(condition);
 }
 
-OwnedPtr<Expr> DesugarIfAvailableCondition(IfAvailableExpr& iae)
+/*
+ * Dispatch @IfAvailable condition desugaring based on the named argument kind.
+ * Delegates to DesugarIfAvailableLevelCondition for "level" arguments and to
+ * DesugarIfAvailableSyscapCondition for "syscap" arguments. Returns an
+ * InvalidExpr for any unrecognised argument name (sema will diagnose).
+ * *************** before desugar ****************
+   @IfAvailable(level: 11, {=>body1}, {=>body2})
+ * *************** after desugar (condition only) ***
+   DesugarIfAvailableLevelCondition(iae, compatibleSDKVersion)
+   // → DeviceInfo.sdkApiVersion >= 11  (or apiAvailable(...), see that function)
+ * **********************************************
+ * *************** before desugar ****************
+   @IfAvailable(syscap: "SystemCapability.X", {=>body1}, {=>body2})
+ * *************** after desugar (condition only) ***
+   DesugarIfAvailableSyscapCondition(iae)
+   // → canIUse("SystemCapability.X")
+ * **********************************************
+ */
+OwnedPtr<Expr> DesugarIfAvailableCondition(IfAvailableExpr& iae, const std::string& compatibleSDKVersion)
 {
     if (iae.GetArg()->name == LEVEL_IDENTGIFIER) {
-        return DesugarIfAvailableLevelCondition(iae);
+        return DesugarIfAvailableLevelCondition(iae, compatibleSDKVersion);
     } else if (iae.GetArg()->name == SYSCAP_IDENTGIFIER) {
         return DesugarIfAvailableSyscapCondition(iae);
     } else {
@@ -504,17 +651,41 @@ OwnedPtr<Expr> DesugarIfAvailableCondition(IfAvailableExpr& iae)
     }
 }
 
-/// @IfAvailable(namedArg, lambda1, lambda2) is parsed as a MacroExpandExpr and desguared into an IfAvailableExpr here
-void DesugarIfAvailableExpr(IfAvailableExpr& iae)
+/*
+ * Desugar an @IfAvailable expression into an if-expr. Produces the boolean
+ * condition via DesugarIfAvailableCondition, then wraps it in an if-expr
+ * whose then-block and else-block are cloned from the first and second
+ * lambda arguments of the original macro call respectively.
+ * *************** before desugar ****************
+   @IfAvailable(level: 11, {=> dostuff() }, {=> fallback() })
+ * *************** after desugar ****************
+   if (DeviceInfo.sdkApiVersion >= 11) {
+       dostuff()
+   } else {
+       fallback()
+   }
+ * **********************************************
+ * *************** before desugar ****************
+   @IfAvailable(syscap: "SystemCapability.ArkUI.ArkUI.Full",
+                {=> dostuff() }, {=> fallback() })
+ * *************** after desugar ****************
+   if (canIUse("SystemCapability.ArkUI.ArkUI.Full")) {
+       dostuff()
+   } else {
+       fallback()
+   }
+ * **********************************************
+ */
+void DesugarIfAvailableExpr(IfAvailableExpr& iae, const std::string& compatibleSDKVersion)
 {
     if (iae.desugarExpr) {
         return;
     }
     // Create condition.
-    OwnedPtr<Expr> condition = DesugarIfAvailableCondition(iae);
+    OwnedPtr<Expr> condition = DesugarIfAvailableCondition(iae, compatibleSDKVersion);
     auto ifBlock = ASTCloner::Clone(iae.GetLambda1()->funcBody->body.get());
     auto elseBlock = ASTCloner::Clone(iae.GetLambda2()->funcBody->body.get());
-    auto ifExpr = CreateIfExpr(std::move(condition), std::move(ifBlock), std::move(elseBlock), iae.ty);
+    auto ifExpr = CreateIfExpr(std::move(condition), std::move(ifBlock), std::move(elseBlock), iae.GetTy());
     ifExpr->sourceExpr = &iae;
     CopyBasicInfo(&iae, ifExpr);
     iae.desugarExpr = std::move(ifExpr);
@@ -538,6 +709,68 @@ struct VisitContext {
     std::vector<bool> isDiscardedStack;
     std::vector<Ptr<Node>> parentStack;
 };
+
+// ----------- helpers for DesugarBrExpr ----------------------------------------
+
+bool IsUnitExpr(Node& n)
+{
+    return n.astKind == ASTKind::LIT_CONST_EXPR &&
+        StaticAs<ASTKind::LIT_CONST_EXPR>(&n)->kind == LitConstKind::UNIT;
+}
+
+bool IsNothingExpr(const Node& n)
+{
+    return std::set<ASTKind>{ASTKind::JUMP_EXPR, ASTKind::THROW_EXPR, ASTKind::RETURN_EXPR}.count(n.astKind) > 0;
+}
+
+void UnitifyBlock(Block& b)
+{
+    if (b.body.empty() ||
+        (b.body.back() && (!IsUnitExpr(*b.body.back())) && (!IsNothingExpr(*b.body.back())))) {
+        b.body.push_back(CreateUnitExpr());
+    }
+}
+
+void UnitifyIf(const IfExpr& ie)
+{
+    if (ie.thenBody && ie.elseBody) {
+        UnitifyBlock(*StaticAs<ASTKind::BLOCK>(ie.thenBody.get()));
+        if (ie.elseBody->astKind == ASTKind::BLOCK) {
+            UnitifyBlock(*StaticAs<ASTKind::BLOCK>(ie.elseBody.get()));
+        }
+    }
+}
+
+void UnitifyTry(TryExpr& te)
+{
+    if (te.tryLambda) {
+        UnitifyBlock(*(te.tryLambda->funcBody->body));
+    } else {
+        UnitifyBlock(*(te.tryBlock));
+    }
+    for (auto& cb : te.catchBlocks) {
+        UnitifyBlock(*cb);
+    }
+    for (auto& h : te.handlers) {
+        if (h.desugaredLambda) {
+            UnitifyBlock(*h.desugaredLambda->funcBody->body);
+        }
+        CJC_NULLPTR_CHECK(h.block);
+        UnitifyBlock(*h.block);
+    }
+}
+
+void UnitifyMatch(MatchExpr& me)
+{
+    for (auto& mc : me.matchCases) {
+        UnitifyBlock(*(mc->exprOrDecls));
+    }
+    for (auto& mc : me.matchCaseOthers) {
+        UnitifyBlock(*(mc->exprOrDecls));
+    }
+}
+
+// ---------------------------------------------------------------------------
 
 struct DiscardedHelper {
     void PushCtxt(bool isDiscarded, Ptr<Node> parent)
@@ -580,67 +813,12 @@ struct DiscardedHelper {
      */
     static void DesugarBrExpr(Node& node)
     {
-        auto isUnitExpr = [](Node& n) -> bool {
-            return n.astKind == ASTKind::LIT_CONST_EXPR &&
-                StaticAs<ASTKind::LIT_CONST_EXPR>(&n)->kind == LitConstKind::UNIT;
-        };
-
-        auto isNothingExpr = [](const Node& n) -> bool {
-            return std::set<ASTKind>{ASTKind::JUMP_EXPR,
-                ASTKind::THROW_EXPR, ASTKind::RETURN_EXPR}.count(n.astKind) > 0;
-        };
-
-        auto unitifyBlock = [&isUnitExpr, &isNothingExpr](Block& b) -> void {
-            if (b.body.empty() || (b.body.back() &&
-                (!isUnitExpr(*b.body.back())) &&
-                (!isNothingExpr(*b.body.back())))) {
-                b.body.push_back(CreateUnitExpr());
-            }
-        };
-
-        auto unitifyIf = [&unitifyBlock](const IfExpr& ie) -> void {
-            if (ie.thenBody && ie.elseBody) {
-                unitifyBlock(*StaticAs<ASTKind::BLOCK>(ie.thenBody.get()));
-                if (ie.elseBody->astKind == ASTKind::BLOCK) {
-                    unitifyBlock(*StaticAs<ASTKind::BLOCK>(ie.elseBody.get()));
-                }
-            }
-        };
-
-        auto unitifyTry = [&unitifyBlock](TryExpr& te) {
-            if (te.tryLambda) {
-                unitifyBlock(*(te.tryLambda->funcBody->body));
-            } else {
-                unitifyBlock(*(te.tryBlock));
-            }
-            for (auto& cb : te.catchBlocks) {
-                unitifyBlock(*cb);
-            }
-
-            for (auto& h : te.handlers) {
-                if (h.desugaredLambda) {
-                    unitifyBlock(*h.desugaredLambda->funcBody->body);
-                }
-                CJC_NULLPTR_CHECK(h.block);
-                unitifyBlock(*h.block);
-            }
-        };
-
-        auto unitifyMatch = [&unitifyBlock](MatchExpr& me) {
-            for (auto& mc : me.matchCases) {
-                unitifyBlock(*(mc->exprOrDecls));
-            }
-            for (auto& mc : me.matchCaseOthers) {
-                unitifyBlock(*(mc->exprOrDecls));
-            }
-        };
-
         if (node.astKind == ASTKind::IF_EXPR) {
-            unitifyIf(*StaticAs<ASTKind::IF_EXPR>(&node));
+            UnitifyIf(*StaticAs<ASTKind::IF_EXPR>(&node));
         } else if (node.astKind == ASTKind::TRY_EXPR) {
-            unitifyTry(*StaticAs<ASTKind::TRY_EXPR>(&node));
+            UnitifyTry(*StaticAs<ASTKind::TRY_EXPR>(&node));
         } else if (node.astKind == ASTKind::MATCH_EXPR) {
-            unitifyMatch(*StaticAs<ASTKind::MATCH_EXPR>(&node));
+            UnitifyMatch(*StaticAs<ASTKind::MATCH_EXPR>(&node));
         }
     }
 
@@ -656,7 +834,7 @@ private:
         static const std::set<ASTKind> caseKinds = {ASTKind::MATCH_CASE, ASTKind::MATCH_CASE_OTHER};
         // if expr to then blk and else blk
         bool ifBody = parent.astKind == ASTKind::IF_EXPR &&
-                (&node == StaticAs<ASTKind::IF_EXPR>(&parent)->thenBody.get() ||
+            (&node == StaticAs<ASTKind::IF_EXPR>(&parent)->thenBody.get() ||
                 &node == StaticAs<ASTKind::IF_EXPR>(&parent)->elseBody.get());
         // try expr to try blk and catch blk
         bool tryBody = parent.astKind == ASTKind::TRY_EXPR && node.astKind == ASTKind::BLOCK;
@@ -670,7 +848,7 @@ private:
         bool parentheses = parent.astKind == ASTKind::PAREN_EXPR;
         // info of FuncDecl has to pass down through FuncBody node
         bool funcBody = parent.astKind == ASTKind::FUNC_BODY;
-        return ifBody || tryBody || matchCase || matchCaseBody || syncBody || parentheses || funcBody ;
+        return ifBody || tryBody || matchCase || matchCaseBody || syncBody || parentheses || funcBody;
     };
 
     /* Some expressions will ignore a child block's return value. */
@@ -711,9 +889,59 @@ private:
         return flagTransitive || flagConst || flagBlock;
     }
 };
+
+/// Dispatch a single node to the appropriate desugar pass.
+/// Returns early from the dispatch table; @p visitor and @p visitorPost are needed
+/// for the recursive FILE macro-call walk.
+void DispatchDesugar(Node& node, bool desugarMacrocall, const std::string& compatibleSDKVersion,
+    const std::function<VisitAction(Ptr<Node>)>& visitor,
+    const std::function<VisitAction(Ptr<Node>)>& visitorPost)
+{
+    switch (node.astKind) {
+        case ASTKind::FILE: {
+            auto& file = *StaticAs<ASTKind::FILE>(&node);
+            if (desugarMacrocall) {
+                for (auto& it : file.originalMacroCallNodes) {
+                    Walker(it.get(), visitor, visitorPost).Walk();
+                }
+            }
+            DesugarMacroDecl(file);
+            break;
+        }
+        case ASTKind::MAIN_DECL:
+            DesugarMainDecl(*StaticAs<ASTKind::MAIN_DECL>(&node));
+            break;
+        case ASTKind::QUOTE_EXPR:
+            DesugarQuoteExpr(*StaticAs<ASTKind::QUOTE_EXPR>(&node));
+            break;
+        case ASTKind::OPTION_TYPE:
+            DesugarOptionType(*StaticAs<ASTKind::OPTION_TYPE>(&node));
+            break;
+        case ASTKind::TRAIL_CLOSURE_EXPR:
+            DesugarTrailingClosureExpr(*StaticAs<ASTKind::TRAIL_CLOSURE_EXPR>(&node));
+            break;
+        case ASTKind::SYNCHRONIZED_EXPR:
+            DesugarSynchronizedExpr(*StaticAs<ASTKind::SYNCHRONIZED_EXPR>(&node));
+            break;
+        case ASTKind::OPTIONAL_CHAIN_EXPR:
+            DesugarOptionalChainExpr(*StaticAs<ASTKind::OPTIONAL_CHAIN_EXPR>(&node));
+            break;
+        case ASTKind::INC_OR_DEC_EXPR:
+            DesugarIncOrDecExpr(StaticCast<IncOrDecExpr&>(node));
+            break;
+        case ASTKind::ASSIGN_EXPR:
+            DesugarAssignExpr(*StaticAs<ASTKind::ASSIGN_EXPR>(&node));
+            break;
+        case ASTKind::IF_AVAILABLE_EXPR:
+            DesugarIfAvailableExpr(*StaticAs<ASTKind::IF_AVAILABLE_EXPR>(&node), compatibleSDKVersion);
+            break;
+        default:
+            break;
+    }
+}
 } // namespace
 
-void PerformDesugarBeforeTypeCheck(Node& root, bool desugarMacrocall)
+void PerformDesugarBeforeTypeCheck(Node& root, bool desugarMacrocall, const std::string& compatibleSDKVersion)
 {
     DiscardedHelper dHelper;
     std::function<VisitAction(Ptr<Node>)> visitorPost = [&dHelper](Ptr<Node> node) -> VisitAction {
@@ -721,41 +949,13 @@ void PerformDesugarBeforeTypeCheck(Node& root, bool desugarMacrocall)
         return VisitAction::KEEP_DECISION;
     };
     std::function<VisitAction(Ptr<Node>)> visitor =
-        [&visitor, &visitorPost, &dHelper, &desugarMacrocall](Ptr<Node> node) -> VisitAction {
+        [&visitor, &visitorPost, &dHelper, &desugarMacrocall, &compatibleSDKVersion](Ptr<Node> node) -> VisitAction {
         if (node->TestAttr(Attribute::IS_BROKEN)) {
             // must push before return to pair with visitorPost
             dHelper.PushCtxt(false, node);
             return VisitAction::SKIP_CHILDREN;
         }
-        // Add all desugar branches here.
-        if (node->astKind == ASTKind::FILE) {
-            auto file = StaticAs<ASTKind::FILE>(node);
-            if (desugarMacrocall) {
-                // Walk nodes in macrocall to find references, for lsp.
-                for (auto& it : file->originalMacroCallNodes) {
-                    Walker(it.get(), visitor, visitorPost).Walk();
-                }
-            }
-            DesugarMacroDecl(*file);
-        } else if (node->astKind == ASTKind::MAIN_DECL) {
-            DesugarMainDecl(*StaticAs<ASTKind::MAIN_DECL>(node));
-        } else if (node->astKind == ASTKind::QUOTE_EXPR) {
-            DesugarQuoteExpr(*StaticAs<ASTKind::QUOTE_EXPR>(node));
-        } else if (node->astKind == ASTKind::OPTION_TYPE) {
-            DesugarOptionType(*StaticAs<ASTKind::OPTION_TYPE>(node));
-        } else if (node->astKind == ASTKind::TRAIL_CLOSURE_EXPR) {
-            DesugarTrailingClosureExpr(*StaticAs<ASTKind::TRAIL_CLOSURE_EXPR>(node));
-        } else if (node->astKind == ASTKind::SYNCHRONIZED_EXPR) {
-            DesugarSynchronizedExpr(*StaticAs<ASTKind::SYNCHRONIZED_EXPR>(node));
-        } else if (node->astKind == ASTKind::OPTIONAL_CHAIN_EXPR) {
-            DesugarOptionalChainExpr(*StaticAs<ASTKind::OPTIONAL_CHAIN_EXPR>(node));
-        } else if (node->astKind == ASTKind::INC_OR_DEC_EXPR) {
-            DesugarIncOrDecExpr(StaticCast<IncOrDecExpr&>(*node));
-        } else if (node->astKind == ASTKind::ASSIGN_EXPR) {
-            DesugarAssignExpr(*StaticAs<ASTKind::ASSIGN_EXPR>(node));
-        } else if (node->astKind == ASTKind::IF_AVAILABLE_EXPR) {
-            DesugarIfAvailableExpr(*StaticAs<ASTKind::IF_AVAILABLE_EXPR>(node));
-        }
+        DispatchDesugar(*node, desugarMacrocall, compatibleSDKVersion, visitor, visitorPost);
         if (dHelper.IsNodeDiscarded(*node)) {
             dHelper.PushCtxt(true, node);
             DiscardedHelper::DesugarBrExpr(*node);

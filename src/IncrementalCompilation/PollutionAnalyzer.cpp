@@ -25,12 +25,12 @@ void TypeMap::CollectImportedDeclExtraRelation(const AST::Decl& decl)
     }
     auto& type{StaticCast<InheritableDecl>(decl)};
     for (auto& parentType: type.inheritedTypes) {
-        auto parentDecl = Ty::GetDeclOfTy(parentType->ty);
+        auto parentDecl = Ty::GetDeclOfTy(parentType->GetTy());
         CJC_NULLPTR_CHECK(parentDecl); // all builtin types are struct or enum and cannot have child types
         AddParent(*parentDecl, decl);
     }
     if (auto extend = DynamicCast<ExtendDecl*>(&type)) {
-        AddExtend(Sema::GetTypeRawMangleName(*extend->ty), decl.rawMangleName);
+        AddExtend(Sema::GetTypeRawMangleName(*extend->GetTy()), decl.rawMangleName);
     }
 }
 
@@ -927,7 +927,7 @@ static std::optional<std::string> LookupSpecialBuiltinType(const RefType& type)
 std::optional<std::string> PollutionAnalyzer::GetExtendedTypeRawMangleNameImpl(const Type& extendedType)
 {
     // If this `type` is from imported AST, then we can get what we want directly from sema ty info
-    auto ty = extendedType.ty;
+    auto ty = extendedType.GetTy();
     if (Ty::IsTyCorrect(ty)) {
         return Sema::GetTypeRawMangleName(*ty);
     }

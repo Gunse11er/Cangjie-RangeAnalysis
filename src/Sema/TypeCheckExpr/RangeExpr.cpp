@@ -46,7 +46,7 @@ bool TypeChecker::TypeCheckerImpl::CheckRangeElements(ASTContext& ctx, Ptr<Ty> e
 
 bool TypeChecker::TypeCheckerImpl::ChkRangeExpr(ASTContext& ctx, Ty& target, RangeExpr& re)
 {
-    re.ty = TypeManager::GetInvalidTy(); // Set type invalid first, will be updated if check passed.
+    re.SetTy(TypeManager::GetInvalidTy()); // Set type invalid first, will be updated if check passed.
     re.decl = importManager.GetCoreDecl<StructDecl>("Range");
     if (!re.decl) {
         diag.Diagnose(re, DiagKind::sema_no_core_object);
@@ -57,9 +57,9 @@ bool TypeChecker::TypeCheckerImpl::ChkRangeExpr(ASTContext& ctx, Ty& target, Ran
     }
 
     auto synAndCheckRangeTy = [this, &ctx, &re, &target]() {
-        re.ty = SynRangeExpr(ctx, re);
-        bool isWellTyped = typeManager.IsSubtype(re.ty, &target);
-        if (!isWellTyped && Ty::IsTyCorrect(re.ty)) {
+        re.SetTy(SynRangeExpr(ctx, re));
+        bool isWellTyped = typeManager.IsSubtype(re.GetTy(), &target);
+        if (!isWellTyped && Ty::IsTyCorrect(re.GetTy())) {
             DiagMismatchedTypes(diag, re, target);
         }
         return isWellTyped;
@@ -69,13 +69,13 @@ bool TypeChecker::TypeCheckerImpl::ChkRangeExpr(ASTContext& ctx, Ty& target, Ran
     bool isWellTyped = Ty::IsTyCorrect(targetTy) && (targetTy->IsStruct() || targetTy->IsInterface());
     if (!isWellTyped) {
         (void)synAndCheckRangeTy();
-        re.ty = TypeManager::GetInvalidTy();
+        re.SetTy(TypeManager::GetInvalidTy());
         return false;
     }
 
     auto rangeTy = targetTy;
     if (targetTy->IsInterface()) {
-        auto candiTys = promotion.Downgrade(*re.decl->ty, target);
+        auto candiTys = promotion.Downgrade(*re.decl->GetTy(), target);
         if (candiTys.empty()) {
             // If range type cannot be inferred from target type, syn range expr.
             if (synAndCheckRangeTy()) {
@@ -91,8 +91,8 @@ bool TypeChecker::TypeCheckerImpl::ChkRangeExpr(ASTContext& ctx, Ty& target, Ran
     if (!CheckRangeElements(ctx, rangeTy->typeArgs[0], re)) {
         return false;
     }
-    re.ty = rangeTy;
-    isWellTyped = typeManager.IsSubtype(re.ty, &target);
+    re.SetTy(rangeTy);
+    isWellTyped = typeManager.IsSubtype(re.GetTy(), &target);
     if (!isWellTyped) {
         DiagMismatchedTypes(diag, re, target);
     }
@@ -101,10 +101,10 @@ bool TypeChecker::TypeCheckerImpl::ChkRangeExpr(ASTContext& ctx, Ty& target, Ran
 
 Ptr<Ty> TypeChecker::TypeCheckerImpl::SynRangeExpr(ASTContext& ctx, RangeExpr& re)
 {
-    re.ty = TypeManager::GetInvalidTy(); // Set type invalid first, will be updated if check passed.
+    re.SetTy(TypeManager::GetInvalidTy()); // Set type invalid first, will be updated if check passed.
     re.decl = importManager.GetCoreDecl<StructDecl>("Range");
     if (!re.decl) {
-        return re.ty;
+        return re.GetTy();
     }
     Ptr<Ty> elemTy = SynRangeExprInferElemTy(re, ctx);
 
@@ -113,22 +113,24 @@ Ptr<Ty> TypeChecker::TypeCheckerImpl::SynRangeExpr(ASTContext& ctx, RangeExpr& r
     }
 
     if (!CheckRangeElements(ctx, elemTy, re)) {
-        return re.ty;
+        return re.GetTy();
     }
-    re.ty = typeManager.GetStructTy(*re.decl, {elemTy});
-    return re.ty;
+    re.SetTy(typeManager.GetStructTy(*re.decl, {elemTy}));
+    return re.GetTy();
 }
 
 Ptr<Ty> TypeChecker::TypeCheckerImpl::SynRangeExprInferElemTy(const RangeExpr& re, ASTContext& ctx)
 {
     // If type of startExpr is Nothing or startExpr is litconst when only one of start/stop is litconst,
     // using type of stopExpr or default Int64 type.
-    Ptr<Ty> startTy = re.startExpr ? Synthesize(ctx, re.startExpr.get()) : TypeManager::GetInvalidTy();
+    Ptr<Ty> startTy =
+        re.startExpr ? Synthesize({ctx, SynPos::EXPR_ARG}, re.startExpr.get()) : TypeManager::GetInvalidTy();
     bool useStartLit = !Is<LitConstExpr>(re.startExpr.get()) || Is<LitConstExpr>(re.stopExpr.get());
     if (Ty::IsTyCorrect(startTy) && !startTy->IsNothing() && useStartLit) {
         return startTy;
     }
-    Ptr<Ty> stopTy = re.stopExpr ? Synthesize(ctx, re.stopExpr.get()) : TypeManager::GetInvalidTy();
+    Ptr<Ty> stopTy =
+        re.stopExpr ? Synthesize({ctx, SynPos::EXPR_ARG}, re.stopExpr.get()) : TypeManager::GetInvalidTy();
     if (Ty::IsTyCorrect(stopTy) && !stopTy->IsNothing()) {
         return stopTy;
     } else if (Ty::IsTyCorrect(startTy)) {

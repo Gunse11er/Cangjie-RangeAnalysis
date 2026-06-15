@@ -1,4 +1,4 @@
-// Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+// Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 // This source file is part of the Cangjie project, licensed under Apache-2.0
 // with Runtime Library Exception.
 //
@@ -12,32 +12,40 @@
 #ifndef CANGJIE_SEMA_NATIVE_FFI_JAVA_DESUGAR_MANAGER
 #define CANGJIE_SEMA_NATIVE_FFI_JAVA_DESUGAR_MANAGER
 
+#include "Context.h"
 #include "InteropLibBridge.h"
 #include "Utils.h"
 
+#include "cangjie/AST/Node.h"
 #include "cangjie/Mangle/BaseMangler.h"
 #include "cangjie/Modules/ImportManager.h"
 #include "cangjie/Sema/TypeManager.h"
 #include "InheritanceChecker/MemberSignature.h"
+#include "cangjie/Utils/SafePointer.h"
+#include <unordered_map>
+
+namespace Cangjie::Native::FFI::Java {
+class GenerateInJavaImplRegistryCompanion;
+class GenerateNativeBridgeForJavaImpl;
+class GenerateJavaImplWrappingConstructorStub;
+class GenerateInJavaImplReferenceWrapper;
+class GenerateJavaImplRegistryCompanionReferenceField;
+class RewriteJavaImplReferenceWrapperFields;
+class DesugarTypeCheckingAndCasting;
+class DesugarSuperConstructorCallInJavaImplReferenceWrapper;
+class DesugarSuperMethodCallInJavaImplReferenceWrapper;
+class DesugarJArray;
+class DesugarJavaImplSuperConstructorCall;
+}
 
 namespace Cangjie::Interop::Java {
 using namespace AST;
 using namespace std;
+using namespace Native::FFI::Java;
 
 const std::string JAVA_ARRAY_GET_FOR_REF_TYPES = "$javaarrayget";
 const std::string JAVA_ARRAY_SET_FOR_REF_TYPES = "$javaarrayset";
 const std::string JAVA_IMPL_ENTITY_ARG_NAME_IN_GENERATED_CTOR = "$obj";
-
-enum class DesugarJavaMirrorImplStage : uint8_t {
-    BEGIN,
-    MIRROR_GENERATE_STUB,
-    MIRROR_GENERATE,
-    IMPL_GENERATE,
-    MIRROR_DESUGAR,
-    IMPL_DESUGAR,
-    TYPECHECKS,
-    END
-};
 
 enum class DesugarCJImplStage : uint8_t {
     BEGIN,
@@ -45,11 +53,22 @@ enum class DesugarCJImplStage : uint8_t {
     FWD_GENERATE,
     IMPL_GENERATE,
     IMPL_DESUGAR,
-    TYPECHECKS,
     END
 };
 
 class JavaDesugarManager {
+// TODO: remove JavaDesugarManager completely and avoid friendship.
+friend class Cangjie::Native::FFI::Java::GenerateInJavaImplRegistryCompanion;
+friend class Cangjie::Native::FFI::Java::GenerateNativeBridgeForJavaImpl;
+friend class Cangjie::Native::FFI::Java::GenerateJavaImplWrappingConstructorStub;
+friend class Cangjie::Native::FFI::Java::GenerateInJavaImplReferenceWrapper;
+friend class Cangjie::Native::FFI::Java::GenerateJavaImplRegistryCompanionReferenceField;
+friend class Cangjie::Native::FFI::Java::RewriteJavaImplReferenceWrapperFields;
+friend class Cangjie::Native::FFI::Java::DesugarTypeCheckingAndCasting;
+friend class Cangjie::Native::FFI::Java::DesugarSuperConstructorCallInJavaImplReferenceWrapper;
+friend class Cangjie::Native::FFI::Java::DesugarSuperMethodCallInJavaImplReferenceWrapper;
+friend class Cangjie::Native::FFI::Java::DesugarJArray;
+friend class Cangjie::Native::FFI::Java::DesugarJavaImplSuperConstructorCall;
 public:
     JavaDesugarManager(ImportManager& importManager, TypeManager& typeManager, DiagnosticEngine& diag,
         const BaseMangler& mangler, const std::optional<std::string>& javaCodeGenPath, const std::string& outputLibPath,
@@ -68,7 +87,7 @@ public:
     }
 
     /**
-     * Stage 1-2: constructors generation and javaref field insertion.
+     * Constructors generation and javaref field insertion.
      * The first step: generate members in `JObject` and insert empty constructor in other mirrors. ([doStub] = `false`)
      * The second step: fill pregenerated bodies ([doStub] = `false`)
      */
@@ -79,34 +98,16 @@ public:
     void GenerateInSynthetic(ClassDecl& cd);
 
     /**
-     * Stage 3: desugar constructors, methods, etc
+     * Desugar constructors, methods, etc
      */
     void DesugarMirrors(File& file);
 
-    /**
-     * Stage 4: generate constructors and native init/deinit/method call functions (callable from java) for @JavaImpl
-     */
-    void GenerateInJavaImpls(File& file);
-
-    /**
-     * Stage 5: desugar in @JavaImpl
-     */
-    void DesugarInJavaImpls(File& file);
-
-    /**
-     * Stage 6: desugar `as`, `is` where type operand is Java class
-     */
-    void DesugarTypechecks(File& file);
+    void GenerateJavaSourceCode(AfterTypeCheckContext& ctx);
 
     void DesugarJavaMirror(ClassDecl& mirror);
     void DesugarJavaMirror(InterfaceDecl& mirror);
-    void DesugarJavaImpl(ClassDecl& jimpl);
-    void ProcessJavaMirrorImplStage(DesugarJavaMirrorImplStage stage, File& file);
+    void ProcessJavaMirrorImplStage(AfterTypeCheckContext& ctx, std::function<void(AST::Node&)> desugarPropRef);
     void ProcessCJImplStage(DesugarCJImplStage stage, File& file);
-
-    /**
-     * Stage 1: generate configued CJMapping-type glue code
-     */
 
     /**
      * Generates glue code for CJMapping tuples:
@@ -132,22 +133,33 @@ public:
     void GenerateTuplesGlueCode(Package& pkg);
 
     /**
-     * Stage 2: generate forward class for CJMapping data structure
+     * Generate forward class for CJMapping data structure
      */
     void GenerateFwdClassInCJMapping(File& file);
 
     /**
-     * Stage 3: generate constructors and native init/deinit/method call functions (callable from java) for CJMapping
+     * Generate constructors and native init/deinit/method call functions (callable from java) for CJMapping
      * data structure
      */
     void GenerateInCJMapping(File& file);
 
     /**
-     * Stage 4: desugar in CJMapping data structure
+     * Desugar in CJMapping data structure
      */
     void DesugarInCJMapping(File& file);
 
 private:
+    /**
+     * Processes logically isolated interop stage.
+     */
+    template <typename S, class... StageArgs>
+    std::enable_if_t<std::is_base_of_v<AfterTypeCheckStage, S>, void>
+    Process(AfterTypeCheckContext& ctx, StageArgs&&... args) const
+    {
+        S stage(std::forward<StageArgs>(args)...);
+        stage(ctx);
+    }
+
     /**
      * Inserts javaref decl to the class decl:
      *
@@ -175,7 +187,7 @@ private:
 
     /**
      * ~init() {
-     *     Java_CFFI_deleteGlobalReference(this.javaref)
+     *     Java_CFFI_deleteGlobalReference($jnienv, this.javaref)
      * }
      */
     void InsertJavaMirrorFinalizer(ClassDecl& mirror);
@@ -215,108 +227,17 @@ private:
      */
     void DesugarJavaMirrorConstructor(FuncDecl& ctor, FuncDecl& generatedCtor);
 
-    /**
-     * This constructor could be called from cangjie
-     * before [ctor]:
-     *   init(a1: A, a2: B, ..., an: N) {
-     *       <super(...)> // optional
-     *       ...body...
-     *   }
-     * --------------------------------
-     * after:
-     *   init(a1: A, a2: B, ..., an: N) {
-     *       super({
-     *           let jniEnv = Java_CFFI_get_env()
-     *           Java_CFFI_newGlobalReference(
-     *               jniEnv,
-     *               Java_CFFI_newJavaObject(jniEnv, typeSignature, "(<argsSignature>)V", [
-     *                   Java_CFFI_JavaEntity(a1),
-     *                   Java_CFFI_JavaEntity(a2),
-     *                   ...,
-     *                   Java_CFFI_JavaEntity(an),
-     *                   Java_CFFI_JavaEntity(null) // mark argument for generated java constructor
-     *                                              // of Type $$NativeConstructorMarker
-     *                   ]),
-     *               true // isWeak
-     *           )
-     *       }) // @JavaMirror constructor call
-     *       <super(...)> // optional <- will be removed after java code generation
-     *       ...body...
-     *   }
-     */
-    void DesugarJavaImplConstructor(FuncDecl& ctor, FuncDecl& parentCtor);
+    FuncParam& PushEnvParams(std::vector<OwnedPtr<FuncParam>>& params, const std::string& name = "env");
 
-    /**
-     * Create native func
-     * public @C func ${funcName} (${params}): retTy {
-     *     ${nodes}
-     * }
-     */
-    OwnedPtr<FuncDecl> CreateNativeFunc(const std::string& funcName,
-        std::vector<OwnedPtr<FuncParam>> params, Ptr<Ty> retTy, std::vector<OwnedPtr<Node>> nodes);
-    /**
-     * Unwrap a refExpr of native func param into Cangjie type.
-     * ref: jobject -> @JavaMirror/@JavaImpl
-     */
-    OwnedPtr<Expr> UnwrapRefExpr(OwnedPtr<RefExpr> ref, Ptr<Ty> targetTy, const ClassLikeDecl& decl);
-    /**
-     * Wrap the cangjie expr into native type.
-     * expr: @JavaMirror/@JavaImpl -> jobject
-     */
-    OwnedPtr<Expr> WrapExprWithExceptionHandling(
-        std::vector<OwnedPtr<Node>>&& nodes, OwnedPtr<Expr> expr, FuncParam& env, const ClassLikeDecl& decl);
-    /**
-     * Generate native for arg:
-     * public @C func Java_xxx_superC${ctorId}A${argId}P${paramIds} (${usingParams}) {
-     *     return withExceptionHandling(env, { =>
-     *         let tmp0 = wrap($usingParams)
-     *         let tmp1 = ${clonedExpr($arg)}
-     *         return unwrap(tmp)
-     *     })
-     * }
-     */
-    OwnedPtr<FuncDecl> GenerateNativeFunc4Argument(const FuncArg& arg,
-        const std::vector<OwnedPtr<FuncParam>>& params, ClassLikeDecl& decl, size_t ctorId, size_t argId);
-    // Desugar super call in constructor
-    OwnedPtr<CallExpr> DesugarJavaImplSuperCall(const FuncDecl& ctor, Decl& jniEnvVar);
+    FuncParam& PushObjParams(std::vector<OwnedPtr<FuncParam>>& params, const std::string& name = "obj");
 
-    /**
-     * This contructor could be called from java
-     * for constructor [sampleCtor]:
-     *   init(a1: A, a2: B, ..., an: N) { // or primary constructor
-     *       <super(...)> // optional
-     *       ...body...
-     *   }
-     *
-     * the following will be generated:
-     *     init(obj: Java_CFFI_JavaEntity, a1: A, a2: B, ..., an: N) {
-     *         super(obj)
-     *         ...body...
-     *     }
-     */
-    OwnedPtr<FuncDecl> GenerateJavaImplConstructor(FuncDecl& sampleCtor, ClassLikeDecl& parent);
+    OwnedPtr<AST::FuncParam> CreateJniEnvParam(const std::string& name = "$jnienv");
 
-    /**
-     * This generated method could be called from java
-     * for method [sampleMethod] of class package.I:
-     *
-     * func foo(a1: A, a2: B, ..., an: N): Ret {
-     *     ...body...
-     * }
-     *
-     * the following native function will be generated:
-     *
-     * @C
-     * func java_package_I_fooImpl{mangling}(env: JNIEnv_ptr, _: jobject, self: jlong, a1: A, a2: B, ..., an: N): Ret {
-     *     *WrapJavaEntity*(Java_CFFI_getFromRegistry<I>(env, self).foo(a1, a2, ..., an))
-     * }
-     */
+    OwnedPtr<AST::FuncParam> CreateJniJobjectOrJclassParam(const std::string& name = "$obj");
 
-    void PushEnvParams(std::vector<OwnedPtr<FuncParam>>& params, std::string name = "env");
+    OwnedPtr<AST::FuncParam> CreateRegistryIdParam(const std::string& name = "$regId");
 
-    void PushObjParams(std::vector<OwnedPtr<FuncParam>>& params, std::string name = "obj");
-
-    void PushSelfParams(std::vector<OwnedPtr<FuncParam>>& params, std::string name = "self");
+    FuncParam& PushSelfParams(std::vector<OwnedPtr<FuncParam>>& params, std::string name = "self");
 
     OwnedPtr<CallExpr> GetFwdClassInstance(OwnedPtr<RefExpr> paramRef, Decl& fwdClassDecl);
 
@@ -344,8 +265,6 @@ private:
     std::string GetJniMethodNameForProp(const PropDecl& propDecl, bool isSet,
         const std::string* genericActualName = nullptr) const;
 
-    std::string GetJniSuperArgFuncName(const ClassLikeDecl& outer, const std::string& id) const;
-
     std::string GetJniInitCjObjectFuncName(const FuncDecl& ctor, bool isGeneratedCtor,
         const std::string* genericActualName = nullptr);
     std::string GetJniInitCjObjectFuncName(const Ptr<TupleTy>& tupleTy, Package& pkg);
@@ -356,21 +275,19 @@ private:
 
     std::string GetJniDetachCjObjectFuncName(const Decl& decl) const;
 
-    /**
-     * @C public func Java_<type_signature>_deleteCJObject(env: JNIEnv_ptr, obj: jobject, self: jlong): Unit {
-     *     Java_CFFI_deleteCJObject<type>(env, self, { objToDelete: <type> => objToDelete.javaref })
-     * }
-     */
-    OwnedPtr<Decl> GenerateNativeDeleteCjObjectFunc(ClassLikeDecl& javaImpl, VarDecl& javaWeakRefField);
+    OwnedPtr<FuncDecl> CreateNativeFunc(const std::string& funcName,
+        std::vector<OwnedPtr<FuncParam>> params, Ptr<Ty> retTy, std::vector<OwnedPtr<Node>> nodes);
 
     /**
-     * @C public func Java_Vector_deleteCJObject(env: JNIEnv_ptr, clazz: jclass, self: jlong): Unit {
+     * ```cangjie
+     * @C public func Java_<Type>_deleteCJObject(env: JNIEnv_ptr, clazz: jclass, regId: jlong): Unit {
      *      withExceptionHandling(env) {
-     *          Java_CFFI_removeFromRegistry(self)
+     *          Java_CFFI_removeFromRegistry(regId)
      *     }
      *   }
+     * ```
      */
-    OwnedPtr<Decl> GenerateCJMappingNativeDeleteCjObjectFunc(Decl& decl);
+    OwnedPtr<Decl> GenerateNativeDeleteCjObjectFunc(Decl& decl);
 
     OwnedPtr<Decl> GenerateCJMappingNativeDetachCjObjectFunc(ClassDecl& fwdDecl, ClassDecl& classDecl);
 
@@ -402,8 +319,11 @@ private:
      *     )
      * }
      */
-    OwnedPtr<Decl> GenerateNativeInitCjObjectFunc(FuncDecl& ctor, bool isClassLikeDecl, bool isOpenClass = false,
-        Ptr<FuncDecl> fwdCtor = nullptr, const GenericConfigInfo* genericConfig = nullptr);
+    OwnedPtr<Decl> GenerateNativeInitCjObjectFunc(FuncDecl& ctor,
+        bool isClassLikeDecl,
+        bool isOpenClass = false,
+        Ptr<FuncDecl> fwdCtor = nullptr,
+        const GenericConfigInfo* genericConfig = nullptr);
 
     OwnedPtr<Decl> GenerateNativeInitCjObjectFunc(const Ptr<TupleTy>& tuple, Package& pkg);
 
@@ -430,7 +350,9 @@ private:
      * used in DesugarJavaMirrorMethod for method's body generation
      *
      */
-    void AddJavaMirrorMethodBody(ClassLikeDecl& mirror, FuncDecl& fun, OwnedPtr<Expr> javaRefCall,
+    void AddJavaMirrorMethodBody(ClassLikeDecl& mirror,
+        FuncDecl& fun,
+        OwnedPtr<Expr> javaRefCall,
         GenericConfigInfo *config = nullptr);
 
     /**
@@ -463,66 +385,6 @@ private:
      */
     Ptr<Ty> GetJNITy(Ptr<Ty> ty);
 
-    OwnedPtr<Expr> CreateIsInstanceCall(Ptr<VarDecl> jObjectVar, Ptr<Ty> classTy, Ptr<File> curFile);
-
-    /**
-     * Transforms `x is T` expressions, where T is Java class into and x is class or interface:
-     *
-     * match (x) {
-     *   case x : JObject =>
-     *     Java_CFFI_isInstanceOf(Java_CFFI_get_env(), x.javaref, [Name of T Java class])
-     *   case _ => false
-     * }
-     */
-    void DesugarIsExpression(IsExpr& ie);
-
-    OwnedPtr<Expr> CreateJObjectCast(Ptr<VarDecl> jObjectVar, Ptr<ClassLikeDecl> castDecl, Ptr<File> curFile);
-
-    /**
-     * Transforms `x as T` expressions, similarly to `is` above:
-     *
-     * In case of T is JavaMirror:
-     * match (x) {
-     *   case x : JObject =>
-     *     match (Java_CFFI_isInstanceOf(Java_CFFI_get_env(), x.javaref, [Name of T Java class])) {
-     *       case true =>
-     *         (When T is JavaMirror) Some(T(x.javaref))
-     *         (When T is JavaImpl) Java_CFFI_getFromRegistryByObj<T>(Java_CFFI_get_env(), x.javaref)
-     *       case flase => None
-     *     }
-     *   case _ => None
-     * }
-     * }
-     */
-    void DesugarAsExpression(AsExpr& ae);
-
-    /**
-     * Transforms case arm where Java class is used in type patterns
-     *
-     * `case (.. (xi : Ti) ..) where guard => ...`
-     * where Ti is Java class. Gets replaced with:
-     * case (.. (xi : JObject) ..) where IsInstanceOf(xi.javaref, Ti) && .. && guard => {
-     *  (.. let xi$Casted = T(x.javaref) ..)
-     *  // All references to xi are replaces with references to xi$Casted
-     *  ...
-     * }
-     *
-     * Guard also might use xi variables, so casted variables are added to guard too and
-     * all references are replaced
-     */
-    void DesugarMatchCase(MatchCase& matchCase);
-    OwnedPtr<Block> CastAndSubstituteVars(
-        Expr& expr, const std::vector<std::tuple<Ptr<VarDecl>, Ptr<Ty>>>& patternVars);
-
-    /**
-     * Transforms let pattern (let Some(a) = b), where type pattern with Java class is used
-     *
-     * let (... (xi : Ti) ...) = ...
-     * where Ti is Java class. Gets replaced with:
-     * let ( ... (xi : JObject) ... ) = ... && IsInstanceOf(xi, Ti) && ...
-     */
-    void DesugarLetPattern(LetPatternDestructor& letPat);
-
     /**
      * Inserts constructor of form `JString(String)`.
      * The operation consists of two steps:
@@ -535,23 +397,19 @@ private:
      */
     void InsertJStringOfStringCtor(ClassDecl& decl, bool doStub);
 
-    void ReplaceCallsWithArrayJavaEntityGet(File& file);
-    void ReplaceCallsWithArrayJavaEntitySet(File& file);
-
-    void DesugarSuperMethodCall(CallExpr& call, ClassDecl& impl);
-
-    void GenerateInJavaImpl(AST::ClassDecl* classDecl);
     void GenerateForCJStructOrClassTypeMapping(const File &file, AST::Decl* decl);
     void GenerateForCJEnumMapping(AST::EnumDecl& enumDecl);
     void GenerateForCJExtendMapping(AST::ExtendDecl& extendDecl);
 
     /**
      * for a cj-mapping interface:
+     *
      * public interface CJMappingInterface {
      *   public func foo() : Unit {...}
      * }
      *
      * the following forward class and native method will be generated:
+     *
      * class CJMappingInterface_fwd <: CJMappingInterface { // Attribute::CJ_MIRROR_JAVA_INTERFACE_FWD
      *     public let javaref: Java_CFFI_JavaEntity
      *
@@ -571,22 +429,28 @@ private:
      */
     void GenerateForCJInterfaceMapping(File& file, AST::InterfaceDecl& interfaceDecl);
     void GenerateNativeForCJInterfaceMapping(AST::ClassDecl& classDecl);
-    void GenerateInterfaceFwdclassBody(AST::ClassDecl& fwdclassDecl, AST::InterfaceDecl& interfaceDecl,
+    void GenerateInterfaceFwdclassBody(AST::ClassDecl& fwdclassDecl,
+        AST::InterfaceDecl& interfaceDecl,
+        GenericConfigInfo* config = nullptr);
+    OwnedPtr<FuncDecl> GenerateInterfaceFwdclassMethod(AST::ClassDecl& fwdclassDecl,
+        FuncDecl& interfaceFuncDecl,
         GenericConfigInfo *config = nullptr);
-    OwnedPtr<FuncDecl> GenerateInterfaceFwdclassMethod(AST::ClassDecl& fwdclassDecl, FuncDecl& interfaceFuncDecl,
+    OwnedPtr<FuncDecl> GenerateInterfaceFwdclassDefaultMethod(AST::ClassDecl& fwdclassDecl,
+        FuncDecl& interfaceFuncDecl,
         GenericConfigInfo *config = nullptr);
-    OwnedPtr<FuncDecl> GenerateInterfaceFwdclassDefaultMethod(
-        AST::ClassDecl& fwdclassDecl, FuncDecl& interfaceFuncDecl, GenericConfigInfo *config = nullptr);
 
-    OwnedPtr<PrimitiveType> CreateUnitType();
     void GenerateForCJOpenClassMapping(AST::ClassDecl& classDecl);
-    void GenerateClassFwdclassBody(AST::ClassDecl& fwdclassDecl, AST::ClassDecl& classDecl,
-        std::vector<std::pair<Ptr<FuncDecl>, Ptr<FuncDecl>>>& pairCtors);
+    void GenerateClassFwdclassBody(AST::ClassDecl& fwdclassDecl,
+        AST::ClassDecl& classDecl,
+        std::vector<std::pair<Ptr<FuncDecl>,
+        Ptr<FuncDecl>>>& pairCtors);
     void InsertJavaObjectControllerVarDecl(ClassDecl& fwdClassDecl, ClassDecl& classDecl);
     void InsertOverrideMaskVar(AST::ClassDecl& fwdclassDecl);
     OwnedPtr<FuncDecl> GenerateFwdClassCtor(ClassDecl& fwdDecl, ClassDecl& classDecl, FuncDecl& oriCtorDecl);
     void InsertAttachCJObject(ClassDecl& fwdDecl, ClassDecl& classDecl);
-    OwnedPtr<FuncDecl> GenerateFwdClassMethod(ClassDecl& fwdDecl, ClassDecl& classDecl, FuncDecl& oriMethodDecl,
+    OwnedPtr<FuncDecl> GenerateFwdClassMethod(ClassDecl& fwdDecl,
+        ClassDecl& classDecl,
+        FuncDecl& oriMethodDecl,
         int index);
     OwnedPtr<ClassDecl> InitInterfaceFwdClassDecl(AST::InterfaceDecl& interfaceDecl);
     OwnedPtr<StructDecl> CreateHelperStructDecl(const Ptr<TupleTy>& tupleTy, Package& pkg);
@@ -606,7 +470,8 @@ private:
      * func test2(){}
      * }
      */
-    OwnedPtr<AST::MemberAccess> GenThisMemAcessForSelfMethod(Ptr<FuncDecl> fd, Ptr<InterfaceDecl> interfaceDecl,
+    OwnedPtr<AST::MemberAccess> GenThisMemAcessForSelfMethod(Ptr<FuncDecl> fd,
+        Ptr<InterfaceDecl> interfaceDecl,
         GenericConfigInfo* genericConfig);
     void PreGenerateInCJMapping(File& file);
 
@@ -665,6 +530,7 @@ private:
      * generate callexpr for getInt32ToInt32CjLambda() if param ty is (Int32)->Int32.
      */
     OwnedPtr<CallExpr> CreateGetCJLambdaCallExpr(OwnedPtr<RefExpr> callResRef, Ptr<Ty> ty, const Decl& outerDecl);
+
 
     /**
      * generate java interface functional call() method's native function decl.

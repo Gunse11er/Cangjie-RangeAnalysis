@@ -181,6 +181,8 @@ private:
         TokenVector& inputTokens, size_t& startIndex, size_t& curIndex, MacroCall& macCall, bool reEval = false);
     void CheckDeprecatedMacrosUsage(MacroCall& macCall) const;
     bool NeedCreateMacroCallTree(MacroCall& macCall, bool reEval);
+    bool NeedCreateMacroCallTreeForReEval(MacroCall& macCall, AST::MacroInvocation* pInvocation);
+    bool NeedCreateMacroCallTreeForFirstEval(MacroCall& macCall, AST::MacroInvocation* pInvocation);
     void CreateMacroCallTree(MacroCall& macCall, bool reEval = false);
     void CreateMacroCallsTree(bool reEval = false);
     void EvalOneMacroCall(MacroCall& macCall);

@@ -18,12 +18,12 @@ RedundantGetOrThrowElimination::RedundantGetOrThrowElimination()
 
 void RedundantGetOrThrowElimination::RunOnPackage(const Ptr<const Package>& package, bool isDebug) const
 {
-    for (auto func : package->GetGlobalFuncs()) {
+    for (auto func : package->GetGlobalFuncsWithBody()) {
         RunOnFunc(func, isDebug);
     }
 }
 
-void RedundantGetOrThrowElimination::RunOnFunc(const Ptr<const Func>& func, bool isDebug) const
+void RedundantGetOrThrowElimination::RunOnFunc(const Ptr<const Function>& func, bool isDebug) const
 {
     auto analysis = std::make_unique<GetOrThrowResultAnalysis>(func, isDebug);
     auto engine = Engine<GetOrThrowResultDomain>(func, std::move(analysis));

@@ -4,7 +4,7 @@
 //
 // See https://cangjie-lang.cn/pages/LICENSE for license information.
 
-macro package define
+macro package define_report
 
 import std.ast.*
 

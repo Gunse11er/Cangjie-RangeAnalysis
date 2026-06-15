@@ -187,6 +187,48 @@ if [ "$hw_arch" = "" ]; then
 fi
 hw_arch="${sys_name}_${hw_arch}"
 
+# Remove Cangjie-related paths from an environment variable
+_remove_cangjie_paths() {
+    env_var_name="$1"
+    env_var_value=""
+
+    # Read environment variable by name in a way that works in both bash and zsh.
+    eval "env_var_value=\${$env_var_name}"
+
+    if [ -n "${env_var_value}" ]; then
+        # IMPORTANT: use explicit ':' splitting with parameter expansion.
+        # Do not rely on shell word-splitting behavior, which differs across sh/bash/zsh
+        item=""
+        new_env_var_value=""
+        remaining="${env_var_value}"
+        while :; do
+            case "${remaining}" in
+                *:*)
+                    item="${remaining%%:*}"
+                    remaining="${remaining#*:}"
+                    ;;
+                *)
+                    item="${remaining}"
+                    remaining=""
+                    ;;
+            esac
+            case "${item}" in
+                "${CANGJIE_HOME}/"*) ;;
+                "${HOME}/.cjpm/bin") ;;
+                *)
+                    new_env_var_value="${new_env_var_value}${new_env_var_value:+:}${item}"
+                    ;;
+            esac
+            [ -n "${remaining}" ] || break
+        done
+        eval "export ${env_var_name}=\"\${new_env_var_value}\""
+    fi
+}
+if [ -n "${CANGJIE_HOME-}" ]; then
+    _remove_cangjie_paths "PATH"
+    _remove_cangjie_paths "LD_LIBRARY_PATH"
+fi
+
 # Set Cangjie related environment variables
 export CANGJIE_HOME="${script_dir}"
 export PATH="${CANGJIE_HOME}/bin:${CANGJIE_HOME}/tools/bin${PATH:+:${PATH}}:${HOME}/.cjpm/bin"
@@ -194,3 +236,4 @@ export LD_LIBRARY_PATH="${CANGJIE_HOME}/runtime/lib/linux${hw_arch}_cjnative:${C
 
 # Clean up temporary variables
 unset hw_arch
+unset sys_name

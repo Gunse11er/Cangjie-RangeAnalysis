@@ -15,19 +15,20 @@
 #include <fstream>
 
 #include "PrintSymbolTable.h"
-
 #include "cangjie/Basic/DiagnosticEngine.h"
 #include "cangjie/Basic/Match.h"
 #include "cangjie/Basic/Print.h"
 #include "cangjie/Basic/Version.h"
 #include "cangjie/CHIR/CHIR.h"
 #include "cangjie/CHIR/Serializer/CHIRDeserializer.h"
+#include "cangjie/CHIR/Transformation/MetaTransform.h"
 #include "cangjie/CHIR/Utils/CHIRPrinter.h"
 #include "cangjie/CHIR/Utils/UserDefinedType.h"
 #include "cangjie/Driver/TempFileManager.h"
 #include "cangjie/Frontend/CompileStrategy.h"
 #include "cangjie/IncrementalCompilation/ASTCacheCalculator.h"
 #include "cangjie/IncrementalCompilation/IncrementalCompilationLogger.h"
+#include "cangjie/Macro/MacroExpansion.h"
 #include "cangjie/Mangle/BaseMangler.h"
 #include "cangjie/Modules/ImportManager.h"
 #include "cangjie/Modules/PackageManager.h"
@@ -43,8 +44,8 @@
 #include "cangjie/Utils/Utils.h"
 
 #ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
-#include "cangjie/CHIR/Checker/ComputeAnnotations.h"
 #include "cangjie/Mangle/CHIRMangler.h"
+#include "cangjie/CHIR/Checker/ComputeAnnotations.h"
 #endif
 #ifdef RELEASE
 #include "cangjie/Utils/Signal.h"
@@ -54,18 +55,16 @@ using namespace Cangjie;
 using namespace AST;
 
 CompilerInstance::CompilerInstance(CompilerInvocation& invocation, DiagnosticEngine& diag)
-    : invocation(invocation),
-      diag(diag),
-      packageManager(new PackageManager(importManager)),
-      typeManager(new TypeManager()),
-      importManager(diag, *typeManager, invocation.globalOptions),
-      testManager(new TestManager(importManager, *typeManager, diag, invocation.globalOptions)),
-      mangler(std::make_unique<BaseMangler>())
+    : invocation(invocation), diag(diag), mangler(std::make_unique<BaseMangler>())
 {
-    CJC_NULLPTR_CHECK(typeManager);
-    CJC_NULLPTR_CHECK(packageManager);
+    // allocate managers in safe order
+    typeManager = new TypeManager();
+    importManager = new ImportManager(diag, *typeManager, invocation.globalOptions);
+    packageManager = new PackageManager(*importManager);
+    testManager = new TestManager(*importManager, *typeManager, diag, invocation.globalOptions);
 #ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
-    chirData.InitData(&fileNameMap, invocation.globalOptions.GetJobs());
+    chirData = std::make_unique<CHIRData>();
+    chirData->InitData(&fileNameMap, invocation.globalOptions.GetJobs());
 #endif
     if (invocation.globalOptions.compilePackage) {
         std::copy(invocation.globalOptions.packagePaths.begin(), invocation.globalOptions.packagePaths.end(),
@@ -84,28 +83,111 @@ CompilerInstance::CompilerInstance(CompilerInvocation& invocation, DiagnosticEng
 
 CompilerInstance::~CompilerInstance()
 {
+    delete compileStrategy;
+    if (astResourcesDestroyed) {
+#ifndef CANGJIE_ENABLE_GCOV
+        try {
+#endif
+            destroyFut.get();
+#ifndef CANGJIE_ENABLE_GCOV
+        } catch (...) {
+            // Ignore for delete exception.
+        }
+#endif
+        return;
+    }
+    delete typeChecker;
+    delete testManager;
+    delete packageManager;
+    delete importManager;
+    delete typeManager;
+    delete gim;
     // AST must be released before ASTContext for correct symbol detaching.
     srcPkgs.clear();
     pkgCtxMap.clear();
-    delete compileStrategy;
-    compileStrategy = nullptr;
-    delete typeChecker;
+}
+
+void CompilerInstance::DestroyASTResources()
+{
+    // The following situations do not allow for the destruction or partial destruction of ast:
+    // 1. In the incremental mode, after the compilation is completed, the AST information needs to be cached in the
+    // cache file and cannot be deleted.
+    // 2. When used as a library, the ast resources will be released by the library user.
+    // 3. In cjdb mode, the ast resources will be released by the cjdb client expression in cjdb cannot destroy the ast.
+    if (astResourcesDestroyed || invocation.globalOptions.enIncrementalCompilation ||
+        invocation.globalOptions.cjdbMode) {
+        return;
+    }
+    astResourcesDestroyed = true;
+    Utils::ProfileRecorder recorder("ClearASTResources", "DestroyASTResources");
+
+    // Note: callers must ensure no background tasks are accessing these resources.
+    struct ToBeDestroyInfo {
+        TypeChecker* typeChecker{nullptr};
+        TestManager* testManager{nullptr};
+        PackageManager* packageManager{nullptr};
+        ImportManager* importManager{nullptr};
+        TypeManager* typeManager{nullptr};
+        GenericInstantiationManager* gim{nullptr};
+        std::vector<OwnedPtr<Package>> srcPkgs;
+        std::unordered_set<std::unique_ptr<ASTContext>> pkgCtxMap;
+    };
+    ToBeDestroyInfo info;
+
+    // 2) Delete TypeChecker as it may hold references to AST and TypeManager.
+    info.typeChecker = typeChecker;
     typeChecker = nullptr;
-    delete typeManager;
-    typeManager = nullptr;
-    delete testManager;
+
+    // 3) Delete TestManager which may depend on TypeManager and GenericInstantiationManager.
+    info.testManager = testManager;
     testManager = nullptr;
-    delete gim;
+
+    // 4) Delete GenericInstantiationManager if exists.
+    info.gim = gim;
     gim = nullptr;
-    delete packageManager;
+
+    // 5) Delete PackageManager which holds reference to ImportManager->
+    info.packageManager = packageManager;
     packageManager = nullptr;
+
+    // 5.1) Delete ImportManager after PackageManager
+    info.importManager = importManager;
+    importManager = nullptr;
+
+    // 6) Release AST nodes before ASTContext for correct symbol detaching.
+    for (auto& pkg : srcPkgs) {
+        info.srcPkgs.emplace_back(std::move(pkg));
+    }
+    srcPkgs.clear();
+
+    // 7) Clear ASTContext map.
+    for (auto& [_, ctx] : pkgCtxMap) {
+        info.pkgCtxMap.emplace(std::move(ctx));
+    }
+    pkgCtxMap.clear();
+
+    // 8) Delete TypeManager last among managers that are heap-allocated here.
+    info.typeManager = typeManager;
+    typeManager = nullptr;
+
+    std::function<void(ToBeDestroyInfo info)> destroyFunc = [](ToBeDestroyInfo info) {
+        // Explicitly reset unique_ptr members to trigger their destruction before the function returns.
+        delete info.typeChecker;
+        delete info.testManager;
+        delete info.packageManager;
+        delete info.importManager;
+        delete info.typeManager;
+        delete info.gim;
+        info.srcPkgs.clear();
+        info.pkgCtxMap.clear();
+        Utils::FreeIdleMemoryToOS();
+    };
+    destroyFut = std::async(std::launch::async, destroyFunc, std::move(info));
 }
 
 bool CompilerInstance::InitCompilerInstance()
 {
-#ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
     performMap.insert_or_assign(CompileStage::LOAD_PLUGINS, &CompilerInstance::PerformPluginLoad);
-#endif
     performMap.insert_or_assign(CompileStage::PARSE, &CompilerInstance::PerformParse);
     performMap.insert_or_assign(CompileStage::CONDITION_COMPILE, &CompilerInstance::PerformConditionCompile);
     performMap.insert_or_assign(CompileStage::IMPORT_PACKAGE, &CompilerInstance::PerformImportPackage);
@@ -221,12 +303,11 @@ static bool IsNeedSaveIncrCompilationLogFile(const GlobalOptions& globalOpts, co
     return true;
 }
 
-#ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
 namespace {
 class MetaTransformPlugin {
 public:
     static MetaTransformPlugin Get(const std::string& path);
-    void RegisterCallbackTo(MetaTransformPluginBuilder& mtm) const;
+    void RegisterCallbackTo(Cangjie::CHIR::MetaTransformPluginBuilder& mtm) const;
 
     bool IsValid() const
     {
@@ -241,71 +322,124 @@ public:
 
 private:
     MetaTransformPlugin() = default;
-    MetaTransformPlugin(const std::string& pluginPath, const MetaTransformPluginInfo& info, HANDLE handle);
+    MetaTransformPlugin(
+        const std::string& pluginPath, const Cangjie::CHIR::MetaTransformPluginInfo& info, HANDLE handle);
 
 private:
     std::string pluginPath;
-    MetaTransformPluginInfo metaTransformPluginInfo;
+    Cangjie::CHIR::MetaTransformPluginInfo metaTransformPluginInfo;
     HANDLE handle;
 };
 
 MetaTransformPlugin::MetaTransformPlugin(
-    const std::string& pluginPath, const MetaTransformPluginInfo& info, HANDLE handle)
+    const std::string& pluginPath, const Cangjie::CHIR::MetaTransformPluginInfo& info, HANDLE handle)
     : pluginPath(pluginPath), metaTransformPluginInfo(info), handle(handle)
 {
 }
 
 MetaTransformPlugin MetaTransformPlugin::Get(const std::string& path)
 {
-    HANDLE handle = nullptr;
-#ifdef _WIN32
-    handle = InvokeRuntime::OpenSymbolTable(path);
-#elif defined(__linux__) || defined(__APPLE__)
-    handle = InvokeRuntime::OpenSymbolTable(path, RTLD_NOW | RTLD_LOCAL);
-#endif
+    HANDLE handle = InvokeRuntime::OpenSymbolTable(path);
     if (!handle) {
-#ifndef CANGJIE_ENABLE_GCOV
-        throw NullPointerException();
-#else
-        CJC_ABORT();
-#endif
+        Utils::ThrowNullPointerException();
     }
     void* fPtr = InvokeRuntime::GetMethod(handle, "getMetaTransformPluginInfo");
     if (!fPtr) {
-#ifndef CANGJIE_ENABLE_GCOV
-        throw NullPointerException();
-#else
-        CJC_ABORT();
-#endif
+        Utils::ThrowNullPointerException();
     }
-    auto pluginInfo = reinterpret_cast<MetaTransformPluginInfo (*)()>(fPtr)();
+    auto pluginInfo = reinterpret_cast<Cangjie::CHIR::MetaTransformPluginInfo (*)()>(fPtr)();
     return MetaTransformPlugin(path, pluginInfo, handle);
 }
 
-void MetaTransformPlugin::RegisterCallbackTo(MetaTransformPluginBuilder& mtm) const
+void MetaTransformPlugin::RegisterCallbackTo(Cangjie::CHIR::MetaTransformPluginBuilder& mtm) const
 {
     metaTransformPluginInfo.registerTo(mtm);
 }
 } // namespace
 
-bool CompilerInstance::PerformPluginLoad()
+bool CompilerInstance::RegisterCppPlugin()
 {
     for (auto pluginPath : invocation.globalOptions.pluginPaths) { // loop for all plugins
+#ifndef CANGJIE_ENABLE_GCOV
         try {
+#endif
             auto metaTransformPlugin = MetaTransformPlugin::Get(pluginPath);
             if (!metaTransformPlugin.IsValid()) {
                 diag.DiagnoseRefactor(DiagKindRefactor::not_a_valid_plugin, DEFAULT_POSITION, pluginPath);
+                return false;
             }
-            AddPluginHandle(metaTransformPlugin.GetHandle());
+            pluginHandles.emplace_back(metaTransformPlugin.GetHandle());
             metaTransformPlugin.RegisterCallbackTo(metaTransformPluginBuilder); // register MetaTransform into builder
+#ifndef CANGJIE_ENABLE_GCOV
         } catch (...) {
+            diag.DiagnoseRefactor(DiagKindRefactor::not_a_valid_plugin, DEFAULT_POSITION, pluginPath);
+            return false;
+        }
+#endif
+    }
+    return true;
+}
+
+bool CompilerInstance::RegisterCjPlugin()
+{
+    // check it's cpp plugin or cj plugin
+    auto p = invocation.globalOptions.pluginPaths[0];
+    void* tempHandle = InvokeRuntime::OpenSymbolTable(p);
+    if (tempHandle == nullptr) {
+        return false;
+    }
+    void* fPtr = InvokeRuntime::GetMethod(tempHandle, "executeCHIRPlugins");
+    if (fPtr == nullptr) {
+        return false;
+    }
+    RuntimeInit::GetInstance().InitRuntime(
+        invocation.GetRuntimeLibPath(), invocation.globalOptions.environment.allVariables);
+    auto rtHandle = InvokeRuntime::OpenSymbolTableSafely(invocation.GetRuntimeLibPath());
+    if (rtHandle == nullptr) {
+        return false;
+    }
+    auto initLibFunc = reinterpret_cast<int (*)(const char*)>(InvokeRuntime::GetMethod(rtHandle, "InitCJLibrary"));
+    if (initLibFunc == nullptr) {
+        return false;
+    }
+    for (auto pluginPath : invocation.globalOptions.pluginPaths) {
+        void* handle = InvokeRuntime::OpenSymbolTableSafely(pluginPath);
+        if (handle == nullptr) {
+            diag.DiagnoseRefactor(DiagKindRefactor::not_a_valid_plugin, DEFAULT_POSITION, pluginPath);
+            return false;
+        }
+        bool res = initLibFunc(pluginPath.c_str());
+        if (res != 0) {
             diag.DiagnoseRefactor(DiagKindRefactor::not_a_valid_plugin, DEFAULT_POSITION, pluginPath);
             return false;
         }
     }
     return true;
 }
+
+bool CompilerInstance::PerformPluginLoad()
+{
+    if (invocation.globalOptions.pluginPaths.empty()) {
+        return true;
+    }
+#ifndef CANGJIE_ENABLE_GCOV
+    try {
 #endif
+        if (RegisterCjPlugin()) {
+            metaTransformPluginBuilder.SetIsCppPlugin(false);
+            return true;
+        }
+        if (RegisterCppPlugin()) {
+            metaTransformPluginBuilder.SetIsCppPlugin(true);
+            return true;
+        }
+#ifndef CANGJIE_ENABLE_GCOV
+    } catch (...) {
+        return false;
+    }
+#endif
+    return false;
+}
 
 bool CompilerInstance::PerformParse()
 {
@@ -316,8 +450,8 @@ bool CompilerInstance::PerformParse()
         Utils::ProfileRecorder::SetPackageName(srcPkgs[0]->fullPackageName);
         Utils::ProfileRecorder::SetOutputDir(globalOpts.output);
         if (IsNeedSaveIncrCompilationLogFile(globalOpts, invocation.frontendOptions)) {
-            std::string incrLogPath =
-                invocation.globalOptions.GenerateCachedPathName(srcPkgs[0]->fullPackageName, CACHED_LOG_EXTENSION);
+            std::string incrLogPath = invocation.globalOptions.GenerateCachedPathName(
+                srcPkgs[0]->fullPackageName, std::string(CACHED_LOG_EXTENSION));
             IncrementalCompilationLogger::GetInstance().InitLogFile(incrLogPath);
             IncrementalCompilationLogger::GetInstance().WriteBuffToFile();
         }
@@ -343,9 +477,9 @@ bool CompilerInstance::PerformMacroExpand()
 
     // Constant evaluation and the interpreter needs to load bchir, which requires an AST loader.
     if (!invocation.globalOptions.IsConstEvalEnabled() && !invocation.globalOptions.interpreter) {
-        importManager.DeleteASTLoaders();
+        importManager->DeleteASTLoaders();
     }
-    importManager.ClearPackageBCHIRCache();
+    importManager->ClearPackageBCHIRCache();
 
     if (invocation.globalOptions.compileTestsOnly && invocation.globalOptions.enableVerbose) {
         Print("Source files to compile for the test-only mode: {");
@@ -360,6 +494,12 @@ bool CompilerInstance::PerformMacroExpand()
         DumpAST(GetSourcePackages(), invocation.globalOptions.output, "macroexp");
     }
     return ret;
+}
+
+std::vector<OwnedPtr<AST::Decl>> CompilerInstance::ExpandDecl(OwnedPtr<AST::Decl> decl)
+{
+    MacroExpansion me(this);
+    return me.ExpandDecl(std::move(decl));
 }
 
 void CompilerInstance::CacheCompileArgs()
@@ -431,7 +571,7 @@ void UpdateMemberDeclMangleNameForCachedInfo(const RawMangled2DeclMap& rawMangle
     } else {
         CJC_ABORT();
     }
-    for (auto& m : memCache.members) {
+    for (auto &m : memCache.members) {
         UpdateMemberDeclMangleNameForCachedInfo(rawMangleName2DeclMap, m);
     }
 }
@@ -444,19 +584,19 @@ void UpdateTopLevelDeclMangleNameForCachedInfo(
     } else {
         CJC_ABORT();
     }
-    for (auto& m : topCache.members) {
+    for (auto &m : topCache.members) {
         UpdateMemberDeclMangleNameForCachedInfo(rawMangleName2DeclMap, m);
     }
 }
-} // namespace
+}
 
 void CompilerInstance::UpdateMangleNameForCachedInfo()
 {
-    for (auto& it : cachedInfo.curPkgASTCache) {
+    for (auto &it : cachedInfo.curPkgASTCache) {
         auto rawMangle = it.first;
         UpdateTopLevelDeclMangleNameForCachedInfo(rawMangleName2DeclMap, rawMangle, it.second);
     }
-    for (auto& it : cachedInfo.importedASTCache) {
+    for (auto &it : cachedInfo.importedASTCache) {
         auto rawMangle = it.first;
         UpdateTopLevelDeclMangleNameForCachedInfo(rawMangleName2DeclMap, rawMangle, it.second);
     }
@@ -472,7 +612,8 @@ bool CompilerInstance::WriteCachedInfo()
 {
 #ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
     auto& pkg{*srcPkgs[0]};
-    std::string path{invocation.globalOptions.GenerateCachedPathName(pkg.fullPackageName, CACHED_AST_EXTENSION)};
+    std::string path{
+        invocation.globalOptions.GenerateCachedPathName(pkg.fullPackageName, std::string(CACHED_AST_EXTENSION))};
     WriteCache(pkg, std::move(cachedInfo), std::move(order), path);
 #endif
     return true;
@@ -581,14 +722,13 @@ bool CompilerInstance::PerformDesugarAfterSema()
 #ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
 bool CompilerInstance::PerformGenericInstantiation()
 {
-    if (!importManager.IsSourceCodeImported()) {
+    if (!importManager->IsSourceCodeImported()) {
         InternalError("Generic instantiation should not be performed when imported source code is not reparsed.");
         return false;
     }
     if (gim == nullptr) {
         gim = new GenericInstantiationManager(*this);
         CJC_NULLPTR_CHECK(gim);
-        testManager->Init(gim);
     }
     if (!invocation.globalOptions.enIncrementalCompilation) {
         Utils::ProfileRecorder::Start("Generic Instantiation", "ResetGenericInstantiationStage");
@@ -623,6 +763,12 @@ bool CompilerInstance::PerformGenericInstantiation()
 namespace {
 using DeclAndPackageName = std::pair<AST::Decl*, std::string>;
 using LambdaAndPackageName = std::pair<AST::LambdaExpr*, std::string>;
+struct DeclAndPackageNameHasher {
+    size_t operator()(const DeclAndPackageName& elem) const noexcept
+    {
+        return std::hash<Ptr<const AST::Decl>>()(elem.first);
+    }
+};
 
 #ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
 void DoNewMangling(
@@ -648,17 +794,18 @@ void DoNewMangling(
                     desugar.mangledName = baseMangler.Mangle(desugar);
                     return VisitAction::WALK_CHILDREN;
                 }
-                if (!Ty::IsTyCorrect(decl.ty)) {
+                if (!Ty::IsTyCorrect(decl.GetTy())) {
                     return VisitAction::SKIP_CHILDREN;
                 }
                 decl.mangledName = baseMangler.Mangle(decl, filteredPrefix);
                 return VisitAction::WALK_CHILDREN;
             },
             [&baseMangler, &filteredPrefix](LambdaExpr& lambda) {
-                if (lambda.TestAttr(Attribute::GENERIC) || !Ty::IsTyCorrect(lambda.ty)) {
+                if (lambda.TestAttr(Attribute::GENERIC) || !Ty::IsTyCorrect(lambda.GetTy())) {
                     return VisitAction::SKIP_CHILDREN;
                 }
-                lambda.mangledName = baseMangler.MangleLambda(lambda, filteredPrefix);
+                lambda.mangledName = baseMangler.MangleLambda(lambda,
+                    filteredPrefix);
                 return VisitAction::WALK_CHILDREN;
             },
             []([[maybe_unused]] const Annotation& anno) {
@@ -704,7 +851,6 @@ void DoMangling(const BaseMangler& baseMangler, size_t parallelNum, const std::v
         auto tasksNum = topDecls.size() / batchSize;
         size_t start = 0;
         size_t end = batchSize;
-        std::unordered_map<int, std::vector<LambdaAndPackageName>> lambdasCollectedByTask;
         // Creating a Concurrent Task Queue
         Utils::TaskQueue taskQueue(parallelNum);
         for (size_t i = 0; i < tasksNum; ++i) {
@@ -720,30 +866,6 @@ void DoMangling(const BaseMangler& baseMangler, size_t parallelNum, const std::v
         DoNewMangling(baseMangler, topDecls, start, topDecls.size());
     }
 }
-
-void SortForBep(Package& pkg)
-{
-    std::unordered_map<Ptr<Decl>, std::string> declMangleMap;
-    auto compare = [&declMangleMap](const Ptr<Decl> d1, const Ptr<Decl> d2) {
-        const std::string& mangle1 = declMangleMap[d1];
-        const std::string& mangle2 = declMangleMap[d2];
-        if (mangle1 == mangle2) {
-            return CompNodeByPos(d1, d2);
-        }
-        return mangle1 < mangle2;
-    };
-    // Reorder genericInstantiatedDecls for bep.
-    std::set<Ptr<Decl>, decltype(compare)> orderedDecls(compare);
-    std::for_each(pkg.genericInstantiatedDecls.begin(), pkg.genericInstantiatedDecls.end(),
-        [&orderedDecls, &declMangleMap](auto& it) {
-            BaseMangler mangler;
-            declMangleMap.emplace(it.get(), mangler.Mangle(*it));
-            orderedDecls.emplace(it.release());
-        });
-    pkg.genericInstantiatedDecls.clear();
-    std::for_each(orderedDecls.cbegin(), orderedDecls.cend(),
-        [&pkg](auto it) { pkg.genericInstantiatedDecls.emplace_back(OwnedPtr<Decl>(it)); });
-}
 #endif
 } // namespace
 
@@ -752,10 +874,14 @@ void CompilerInstance::ManglingHelpFunction(const BaseMangler& baseMangler)
 #endif
 {
     // Collect all top-level decls
-    std::vector<DeclAndPackageName> topDecls;
-    auto deduplicatedEmplace = [&topDecls](AST::Decl* decl, std::string pkgName) {
-        if (std::find(topDecls.begin(), topDecls.end(), std::make_pair(decl, pkgName)) == topDecls.end()) {
-            topDecls.emplace_back(decl, pkgName);
+    std::unordered_set<DeclAndPackageName, DeclAndPackageNameHasher> topDeclsSet;
+    auto deduplicatedEmplace = [&topDeclsSet](AST::Decl* decl, std::string pkgName) {
+        if (!decl->TestAttr(AST::Attribute::IMPORTED)) {
+            topDeclsSet.insert(std::make_pair(decl, pkgName));
+            return;
+        }
+        if (decl->isUsedImports) {
+            topDeclsSet.insert(std::make_pair(decl, pkgName));
         }
     };
 
@@ -777,29 +903,28 @@ void CompilerInstance::ManglingHelpFunction(const BaseMangler& baseMangler)
             deduplicatedEmplace(decl.get(), package->fullPackageName);
         }
     }
-    if (invocation.globalOptions.disableInstantiation) {
-        for (auto& importPkg : importManager.GetAllImportedPackages()) {
-            CJC_NULLPTR_CHECK(importPkg->srcPackage.get());
-            // exclude current package
-            if (!importPkg->srcPackage->TestAttr(AST::Attribute::IMPORTED)) {
-                continue;
+    for (auto& importPkg : importManager->GetAllImportedPackages()) {
+        CJC_NULLPTR_CHECK(importPkg->srcPackage.get());
+        // exclude current package
+        if (!importPkg->srcPackage->TestAttr(AST::Attribute::IMPORTED)) {
+            continue;
+        }
+        for (auto& file : importPkg->srcPackage->files) {
+            for (auto& decl : file->decls) {
+                deduplicatedEmplace(decl.get(), importPkg->fullPackageName);
             }
-            for (auto& file : importPkg->srcPackage->files) {
-                for (auto& decl : file->decls) {
-                    deduplicatedEmplace(decl.get(), importPkg->fullPackageName);
-                }
-                for (auto& decl : file->exportedInternalDecls) {
-                    deduplicatedEmplace(decl.get(), importPkg->fullPackageName);
-                }
+            for (auto& decl : file->exportedInternalDecls) {
+                deduplicatedEmplace(decl.get(), importPkg->fullPackageName);
             }
-            for (auto& decl : importPkg->srcPackage->genericInstantiatedDecls) {
-                if (decl->IsNominalDecl()) {
-                    deduplicatedEmplace(decl.get(), importPkg->fullPackageName);
-                }
+        }
+        for (auto& decl : importPkg->srcPackage->genericInstantiatedDecls) {
+            if (decl->IsNominalDecl()) {
+                deduplicatedEmplace(decl.get(), importPkg->fullPackageName);
             }
         }
     }
 
+    std::vector<DeclAndPackageName> topDecls(topDeclsSet.begin(), topDeclsSet.end());
     DoMangling(baseMangler, invocation.globalOptions.GetJobs(), topDecls);
 }
 
@@ -813,7 +938,7 @@ bool CompilerInstance::PerformMangling()
     std::vector<std::unique_ptr<ManglerContext>> manglerCtxVec;
 
     // Get all imported packages and source packages.
-    for (auto& package : importManager.GetAllImportedPackages()) {
+    for (auto& package : importManager->GetAllImportedPackages()) {
         std::string pkgName = ManglerContext::ReduceUnitTestPackageName(package->fullPackageName);
         if (mangler->manglerCtxTable.find(pkgName) == mangler->manglerCtxTable.end()) {
             auto manglerCtx = std::make_unique<ManglerContext>();
@@ -826,13 +951,6 @@ bool CompilerInstance::PerformMangling()
     mangler->lambdaCounter = cachedInfo.lambdaCounter;
     ManglingHelpFunction(*mangler);
     cachedInfo.lambdaCounter = mangler->lambdaCounter;
-#ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
-    if (!invocation.globalOptions.disableInstantiation) {
-        for (auto& package : GetSourcePackages()) {
-            SortForBep(*package);
-        }
-    }
-#endif
     // when dump to screen, only dump once and dump the ast immediately after mangling
     if (!srcPkgs.empty() && invocation.globalOptions.NeedDumpAST()) {
         DumpAST(GetSourcePackages(), invocation.globalOptions.output, "mangle", invocation.globalOptions.dumpToScreen);
@@ -840,16 +958,33 @@ bool CompilerInstance::PerformMangling()
     return true;
 }
 
+namespace {
+void RegisterMacroCallDiagInfos(DiagnosticEngine& diag, AST::Package& pkg)
+{
+    for (auto& file : pkg.files) {
+        for (auto& macrocall : file->originalMacroCallNodes) {
+            auto pInvocation = macrocall->GetInvocation();
+            if (!pInvocation) {
+                continue;
+            }
+            auto uniqueInfo = std::make_unique<MacroCallDiagInfo>(pInvocation->macroCallDiagInfo);
+            diag.RegisterMacroCallDiagInfo(std::move(uniqueInfo));
+        }
+    }
+}
+} // namespace
+
 bool CompilerInstance::GenerateCHIRForPkg(AST::Package& pkg)
 {
     if (pkg.files.empty()) {
         return true;
     }
 
+    RegisterMacroCallDiagInfos(diag, pkg);
 #ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
     // use this result when APILevel check supports arbitrary const expressions
     (void)CHIR::ComputeAnnotations(pkg, *this);
-    auto& constAnalysisWrapper = chirData.GetConstAnalysisResultRef();
+    auto& constAnalysisWrapper = chirData->GetConstAnalysisResultRef();
 #endif
     CHIR::CHIRBuilder builder1(GetCHIRContext(), invocation.globalOptions.GetJobs());
     CHIR::ToCHIR convertor(*this, pkg, constAnalysisWrapper, builder1);
@@ -865,9 +1000,9 @@ bool CompilerInstance::GenerateCHIRForPkg(AST::Package& pkg)
     astPkg2chirPkgMap.emplace(&pkg, chirPkg);
     chirInfo.optEffectMap = convertor.GetOptEffectMap();
 #ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
-    chirData.AppendNewPackage(chirPkg);
-    chirData.SetImplicitFuncs(convertor.GetImplicitFuncs());
-    chirData.SetConstVarInitFuncs(convertor.GetConstVarInitFuncs());
+    chirData->AppendNewPackage(chirPkg);
+    chirData->SetImplicitFuncs(convertor.GetImplicitFuncs());
+    chirData->SetConstVarInitFuncs(convertor.GetConstVarInitFuncs());
     chirInfo.curVirtFuncWrapDep = convertor.GetCurVirtualFuncWrapperDepForIncr();
     chirInfo.delVirtFuncWrapForIncr = convertor.GetDeleteVirtualFuncWrapperForIncr();
     chirInfo.ccOutFuncsRawMangle = convertor.GetCCOutFuncsRawMangle();
@@ -998,16 +1133,16 @@ bool CompilerInstance::ImportPackages()
     AddSourceToMember();
 
     if (invocation.globalOptions.scanDepPkg) {
-        importManager.UpdateSearchPath(cangjieModules);
+        importManager->UpdateSearchPath(cangjieModules);
         if (!invocation.globalOptions.inputCjoFile.empty()) {
-            depPackageInfo = importManager.GeneratePkgDepInfoByCjo(invocation.globalOptions.inputCjoFile);
+            depPackageInfo = importManager->GeneratePkgDepInfoByCjo(invocation.globalOptions.inputCjoFile);
         } else {
-            depPackageInfo = importManager.GeneratePkgDepInfo(pkgs);
+            depPackageInfo = importManager->GeneratePkgDepInfo(pkgs);
         }
         return true;
     }
 
-    if (!importManager.BuildIndex(cangjieModules, invocation.globalOptions, pkgs)) {
+    if (!importManager->BuildIndex(cangjieModules, invocation.globalOptions, pkgs)) {
         return false;
     }
     MergePackages();
@@ -1051,13 +1186,13 @@ std::vector<Ptr<Decl>> CompilerInstance::GetAllVisibleExtendMembers(
     if (type.index() == 0) {
         exprTy = std::get<Ptr<Ty>>(type);
     } else if (type.index() == 1) {
-        exprTy = std::get<Ptr<InheritableDecl>>(type)->ty;
+        exprTy = std::get<Ptr<InheritableDecl>>(type)->GetTy();
     }
     if (!Ty::IsTyCorrect(exprTy)) {
         return {};
     }
     for (auto& e : extends) {
-        if (!importManager.IsExtendAccessible(curFile, *e)) {
+        if (!importManager->IsExtendAccessible(curFile, *e)) {
             continue;
         }
         auto& extendMember = e->GetMemberDecls();
@@ -1065,7 +1200,7 @@ std::vector<Ptr<Decl>> CompilerInstance::GetAllVisibleExtendMembers(
             members.insert(members.end(), extendMember.begin(), extendMember.end());
         } else {
             for (auto& m : extendMember) {
-                if (importManager.IsExtendMemberAccessible(curFile, *m, *exprTy)) {
+                if (importManager->IsExtendMemberAccessible(curFile, *m, *exprTy)) {
                     members.emplace_back(m.get());
                 }
             }
@@ -1112,8 +1247,8 @@ bool CompilerInstance::DetectCangjieHome()
     }
     // Detect from exepath.
     if (invocation.globalOptions.executablePath.empty()) {
-        diag.DiagnoseRefactor(DiagKindRefactor::frontend_failed_to_detect_cangjie_home, DEFAULT_POSITION,
-            "can not resolve executable path");
+        diag.DiagnoseRefactor(DiagKindRefactor::frontend_failed_to_detect_cangjie_home,
+            DEFAULT_POSITION, "can not resolve executable path");
         return false;
     } else {
         cangjieHome =
@@ -1155,10 +1290,18 @@ bool CompilerInstance::DetectCangjieModules()
 bool CompilerInstance::ModularizeCompilation()
 {
     Utils::ProfileRecorder recorder("ImportPackages", "ModularizeCompilation");
-    for (auto& objFile : importManager.GetUsedSTDLibFiles(DepType::DIRECT)) {
+
+    // process stdlib deps of .bc inputs
+    for (const auto& bcpkg : invocation.globalOptions.bcPackageNames) {
+        if (!importManager->AnalyzeDepStdPkgsOfBC(bcpkg)) {
+            return false;
+        }
+    }
+
+    for (auto& objFile : importManager->GetUsedSTDLibFiles(DepType::DIRECT)) {
         invocation.globalOptions.directBuiltinDependencies.insert(objFile);
     }
-    for (auto& objFile : importManager.GetUsedSTDLibFiles(DepType::INDIRECT)) {
+    for (auto& objFile : importManager->GetUsedSTDLibFiles(DepType::INDIRECT)) {
         invocation.globalOptions.indirectBuiltinDependencies.insert(objFile);
     }
     return packageManager->ResolveDependence(pkgs);
@@ -1178,24 +1321,32 @@ bool CompilerInstance::DeserializeCHIR()
 #ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
 CHIR::CHIRContext& CompilerInstance::GetCHIRContext()
 {
-    return chirData.GetCHIRContext();
+    return chirData->GetCHIRContext();
 }
 
 // used only by cjlint
 const CHIR::ConstAnalysisWrapper& CompilerInstance::GetConstAnalysisWrapper() const
 {
-    return chirData.GetConstAnalysisResult();
+    return chirData->GetConstAnalysisResult();
 }
 
 std::vector<CHIR::Package*> CompilerInstance::GetAllCHIRPackages() const
 {
-    return chirData.GetAllCHIRPackages();
+    return chirData->GetAllCHIRPackages();
+}
+
+void CompilerInstance::FreeCHIRData()
+{
+    if (chirData) {
+        chirData.reset();
+    }
 }
 
 void CHIRData::InitData(std::unordered_map<unsigned int, std::string>* fileNameMap, size_t threadNum)
 {
     cctx.SetFileNameMap(fileNameMap);
     cctx.SetThreadNum(threadNum);
+    constAnalysisWrapper = std::make_unique<CHIR::ConstAnalysisWrapper>(builder);
 }
 
 CHIR::CHIRContext& CHIRData::GetCHIRContext()
@@ -1221,33 +1372,40 @@ CHIR::Package* CHIRData::GetCurrentCHIRPackage() const
     return chirPkgs[0];
 }
 
-void CHIRData::SetImplicitFuncs(const std::unordered_map<std::string, CHIR::FuncBase*>& funcs)
+void CHIRData::SetImplicitFuncs(const std::unordered_map<std::string, CHIR::Function*>& funcs)
 {
     implicitFuncs = funcs;
 }
 
-std::unordered_map<std::string, CHIR::FuncBase*> CHIRData::GetImplicitFuncs() const
+std::unordered_map<std::string, CHIR::Function*> CHIRData::GetImplicitFuncs() const
 {
     return implicitFuncs;
 }
 
-void CHIRData::SetConstVarInitFuncs(const std::vector<CHIR::FuncBase*>& funcs)
+void CHIRData::SetConstVarInitFuncs(const std::vector<CHIR::Function*>& funcs)
 {
     initFuncsForConstVar = funcs;
 }
 
-std::vector<CHIR::FuncBase*> CHIRData::GetConstVarInitFuncs() const
+std::vector<CHIR::Function*> CHIRData::GetConstVarInitFuncs() const
 {
     return initFuncsForConstVar;
 }
 
 CHIR::ConstAnalysisWrapper& CHIRData::GetConstAnalysisResultRef()
 {
-    return constAnalysisWrapper;
+    CJC_ASSERT(constAnalysisWrapper != nullptr);
+    return *constAnalysisWrapper;
 }
 
 const CHIR::ConstAnalysisWrapper& CHIRData::GetConstAnalysisResult() const
 {
-    return constAnalysisWrapper;
+    CJC_ASSERT(constAnalysisWrapper != nullptr);
+    return *constAnalysisWrapper;
+}
+
+void CHIRData::FreeConstAnalysisWrapper()
+{
+    constAnalysisWrapper.reset();
 }
 #endif

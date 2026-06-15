@@ -22,9 +22,7 @@ class StructDef;
 class ExtendDef;
 class GlobalVar;
 class Value;
-class FuncBase;
-class Func;
-class ImportedFunc;
+class Function;
 }
 namespace CodeGen {
 class CGPkgContext;
@@ -44,9 +42,9 @@ struct SubCHIRPackage {
     std::size_t splitNum;
     std::set<CHIR::CustomTypeDef*, ChirTypeDefCmp> chirCustomDefs;
     std::set<CHIR::GlobalVar*, ChirValueCmp> chirGVs;
-    std::set<CHIR::Func*, ChirValueCmp> chirFuncs;
-    std::set<CHIR::ImportedFunc*, ChirValueCmp> chirForeigns;
-    std::set<CHIR::ImportedFunc*, ChirValueCmp> chirImportedCFuncs;
+    std::set<CHIR::Function*, ChirValueCmp> chirFuncs;
+    std::set<CHIR::Function*, ChirValueCmp> chirForeigns;
+    std::set<CHIR::Function*, ChirValueCmp> chirImportedCFuncs;
 
     explicit SubCHIRPackage(std::size_t splitNum);
     void Clear();

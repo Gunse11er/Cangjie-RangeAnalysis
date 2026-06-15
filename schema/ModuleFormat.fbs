@@ -322,7 +322,7 @@ table Anno { // Short name "Anno" because of the clash with "Annotation" from "P
   kind:AnnoKind;
   identifier:string;
   args:[AnnoArg];
-  target:FullId;
+  target:FullId; // Target is const constructor of custom annotaiton class.
 }
 
 table AnnoArg {
@@ -654,10 +654,33 @@ struct CjoVersion {
   patch_num:uint8;
 }
 
+// Keep feature name, e.g `os.linux`
+table FeatureId {
+  identifiers: [string]; // ["os", "linux"]
+}
+
+table FeaturesSet {
+  features: [FeatureId];
+}
+
+table FeaturesDirective {
+  featuresSet: FeaturesSet;
+}
+
 table FileInfo {
   fileID:  uint32;
   begin:   Position;
   end:     Position;
+  feature: FeaturesDirective;
+}
+
+enum OptimizationLevel : uint8 {
+  O0, O1, O2, O3, Os, Oz
+}
+
+table CompilationOptions {
+  optimization_level: OptimizationLevel;
+  debug: bool;
 }
 
 // all SemaTys, decls are saved here, and indexed by other nodes.
@@ -680,6 +703,7 @@ table Package {
   allFileInfo: [FileInfo];
   // record all std full package name dependencies.
   allDependentStdPkgs:[string];
+  options: CompilationOptions;
 }
 
 root_type Package;

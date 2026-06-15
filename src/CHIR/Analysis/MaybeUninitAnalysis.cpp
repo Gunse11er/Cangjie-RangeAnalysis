@@ -102,7 +102,7 @@ void SaveAllocateMap(
     }
 }
 
-MaybeUninitAnalysis::MaybeUninitAnalysis(const Func* func, const ConstructorInitInfo* ctorInitInfo)
+MaybeUninitAnalysis::MaybeUninitAnalysis(const Function* func, const ConstructorInitInfo* ctorInitInfo)
     : GenKillAnalysis(func), ctorInitInfo(ctorInitInfo)
 {
     size_t allocateIdx = ctorInitInfo->localMemberNums;
@@ -200,7 +200,7 @@ void MaybeUninitAnalysis::HandleApplyExpr(MaybeUninitDomain& state, const Apply*
     // Check if it is a call to another init function of this class/struct
     auto callee = apply->GetCallee();
     if (callee->IsFuncWithBody()) {
-        auto calleeFunc = VirtualCast<Func*>(callee);
+        auto calleeFunc = StaticCast<Function*>(callee);
         if (calleeFunc->IsConstructor() &&
             calleeFunc->GetOuterDeclaredOrExtendedDef() == ctorInitInfo->thisCustomDef &&
             apply->GetArgs()[0] == func->GetParam(0)) {

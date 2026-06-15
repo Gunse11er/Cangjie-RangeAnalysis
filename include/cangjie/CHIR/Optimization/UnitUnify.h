@@ -43,7 +43,7 @@ public:
     void RunOnPackage(const Ptr<const Package>& package, bool isDebug);
 
 private:
-    void RunOnFunc(const Ptr<Func>& func, bool isDebug);
+    void RunOnFunc(const Ptr<Function>& func, bool isDebug);
 
     void LoadOrCreateUnit(Ptr<Constant>& constant, const Ptr<BlockGroup>& group);
 

@@ -13,25 +13,6 @@
 using namespace Cangjie::CHIR;
 
 namespace {
-std::vector<FuncBase*> GetAllGlobalFuncs(const Package& package)
-{
-    std::vector<FuncBase*> result;
-    for (auto val : package.GetImportedVarAndFuncs()) {
-        auto func = Cangjie::DynamicCast<ImportedFunc*>(val);
-        if (func == nullptr || !ReturnTypeShouldBeVoid(*func)) {
-            continue;
-        }
-        result.emplace_back(func);
-    }
-    for (auto func : package.GetGlobalFuncs()) {
-        if (!ReturnTypeShouldBeVoid(*func)) {
-            continue;
-        }
-        result.emplace_back(func);
-    }
-    return result;
-}
-
 void RemoveOldRetValue(LocalVar& oldRet)
 {
     /*  remove this kind of code:
@@ -82,13 +63,15 @@ OptFuncRetType::OptFuncRetType(Package& package, CHIRBuilder& builder) : package
 void OptFuncRetType::Unit2Void()
 {
     // 1. collect all global functions that should return Void
-    auto allFuncs = GetAllGlobalFuncs(package);
-    for (auto func : allFuncs) {
+    for (auto func : package.GetGlobalFunctions()) {
+        if (!ReturnTypeShouldBeVoid(*func)) {
+            continue;
+        }
         CJC_ASSERT(func->GetReturnType()->IsUnit());
         LocalVar* oldRet = nullptr;
         // 2. change the return type to Void
-        if (auto f = DynamicCast<Func>(func)) {
-            oldRet = f->GetReturnValue();
+        if (func->IsFuncWithBody()) {
+            oldRet = func->GetReturnValue();
             CJC_NULLPTR_CHECK(oldRet);
         }
         func->ReplaceReturnValue(nullptr, builder);
@@ -105,8 +88,8 @@ void OptFuncRetType::Unit2Void()
                     .instTypeArgs = apply->GetInstantiatedTypeArgs(),
                     .thisType = apply->GetThisType()
                 };
-                auto newApply = builder.CreateExpression<Apply>(apply->GetDebugLocation(),
-                    func->GetReturnType(), apply->GetCallee(), funcCallContext, apply->GetParentBlock());
+                auto newApply = builder.CreateExpression<Apply>(
+                    apply->GetDebugLocation(), func->GetReturnType(), apply->GetCallee(), funcCallContext, apply->GetParentBlock());
                 if (apply->IsSuperCall()) {
                     newApply->SetSuperCall();
                 }

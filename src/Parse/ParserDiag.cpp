@@ -10,6 +10,7 @@
  * This file implements the Parser.
  */
 
+#include <cstddef>
 #include <utility>
 
 #include "ParserImpl.h"
@@ -240,8 +241,8 @@ void ParserImpl::DiagExpectedIdentifierPackageSpec(Ptr<Node> node)
             "a package name", "after keyword 'package'");
     } else {
         DiagExpectedIdentifier(
-            MakeRange(ps->prefixDotPoses.back(), ps->prefixDotPoses.back() + std::string(".").size()), "a package name",
-            "after '.' in qualified name");
+            MakeRange(ps->prefixDotPoses.back(), ps->prefixDotPoses.back() + lastToken.Value().size()), "a package name",
+            "after '" + lastToken.Value() + "' in qualified name");
     }
 }
 
@@ -252,9 +253,10 @@ void ParserImpl::DiagExpectedIdentifierImportContent(Ptr<Node> node)
         DiagExpectedIdentifier(
             MakeRange(lastToken.Begin(), lastToken.End()), "a package name", "after keyword 'import'");
     } else if (!ic->prefixDotPoses.empty()) {
+        auto expectedName = lastToken.Value() == "." ? "a '*' or identifier" : "an identifier";
         DiagExpectedIdentifier(
-            MakeRange(ic->prefixDotPoses.back(), ic->prefixDotPoses.back() + std::string(".").size()),
-            "a '*' or identifier", "after '.' in qualified name");
+            MakeRange(ic->prefixDotPoses.back(), ic->prefixDotPoses.back() + lastToken.Value().size()),
+            expectedName, "after '" + lastToken.Value() + "' in qualified name");
     } else {
         DiagExpectedIdentifier(MakeRange(lastToken.Begin(), lastToken.End()));
     }
@@ -269,7 +271,7 @@ void ParserImpl::DiagExpectedIdentifierImportSpec(Ptr<Node> node)
 
 void ParserImpl::DiagRawIdentifierNotAllowed(std::string& str)
 {
-    ParseDiagnoseRefactor(DiagKindRefactor::parse_not_allowed_raw_identifier, lastToken, str);
+    auto builder = ParseDiagnoseRefactor(DiagKindRefactor::parse_not_allowed_raw_identifier, lastToken, str);
 }
 
 void ParserImpl::DiagExpectedIdentifierGenericConstraint(Ptr<Node> node)

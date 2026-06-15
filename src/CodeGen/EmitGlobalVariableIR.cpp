@@ -43,7 +43,7 @@ void GlobalVariableGeneratorImpl::EmitIR()
 {
     IRBuilder2 irBuilder(cgMod);
     std::set<CHIR::GlobalVar*> quickGVs(chirGVs.begin(), chirGVs.end());
-    for (auto chirGV : cgMod.GetCGContext().GetCHIRPackage().GetGlobalVars()) {
+    for (auto chirGV : cgMod.GetCGContext().GetCHIRPackage().GetGlobalVarsWithInit()) {
         auto rawGV = llvm::cast<llvm::GlobalVariable>(cgMod.GetOrInsertGlobalVariable(chirGV)->GetRawValue());
         cgMod.diBuilder->CreateGlobalVar(*chirGV);
         if (quickGVs.find(chirGV) == quickGVs.end()) {

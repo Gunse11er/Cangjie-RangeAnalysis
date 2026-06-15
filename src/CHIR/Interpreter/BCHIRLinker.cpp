@@ -14,7 +14,6 @@
 
 #include "cangjie/CHIR/Interpreter/BCHIRPrinter.h"
 #include "cangjie/CHIR/Interpreter/Utils.h"
-#include "cangjie/Mangle/BaseMangler.h"
 #include "cangjie/CHIR/Interpreter/BCHIRLinker.h"
 
 using namespace Cangjie::CHIR::Interpreter;

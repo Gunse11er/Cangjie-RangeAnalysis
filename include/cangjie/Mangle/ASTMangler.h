@@ -7,7 +7,9 @@
 #ifndef CANGJIE_MANGLE_ASTMANGLER_H
 #define CANGJIE_MANGLE_ASTMANGLER_H
 
-#include "cangjie/Mangle/BaseMangler.h"
+#include <string>
+#include <optional>
+#include "cangjie/AST/Node.h"
 
 namespace Cangjie {
 inline const std::string MANGLE_PAREN_PREFIX = "P";

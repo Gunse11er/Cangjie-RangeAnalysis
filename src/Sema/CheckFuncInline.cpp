@@ -95,7 +95,7 @@ VisitAction CountNodeNumber(const Expr& expr, bool& result, size_t& nodeNum)
     if (expr.desugarExpr != nullptr) {
         return VisitAction::WALK_CHILDREN;
     }
-    if (ContainsInternalType(expr.ty)) {
+    if (ContainsInternalType(expr.GetTy())) {
         result = false;
         return VisitAction::STOP_NOW;
     }

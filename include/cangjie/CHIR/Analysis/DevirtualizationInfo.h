@@ -87,17 +87,17 @@ public:
     const ConstMemberVarCollector::ConstMemberMapType& GetConstMemberMap() const;
 
     /// return real runtime return type map.
-    const std::unordered_map<Func*, Type*>& GetReturnTypeMap() const;
+    const std::unordered_map<Function*, Type*>& GetReturnTypeMap() const;
 
     /// map from type to its custom type definition.
     std::unordered_map<const Type*, std::vector<CustomTypeDef*>> defsMap;
 
 private:
-    void CollectReturnTypeMap(Func& func);
+    void CollectReturnTypeMap(Function& func);
 
     SubTypeMap subtypeMap;
 
-    std::unordered_map<Func*, Type*> realRuntimeRetTyMap;
+    std::unordered_map<Function*, Type*> realRuntimeRetTyMap;
 
     ConstMemberVarCollector::ConstMemberMapType constMemberTypeMap;
 

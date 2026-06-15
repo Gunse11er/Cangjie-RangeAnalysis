@@ -14,8 +14,10 @@
 #define CANGJIE_BASIC_DIAGNOSTICENGINE_H
 
 #include <list>
+#include <vector>
 
 #include "cangjie/AST/Node.h"
+#include "cangjie/Basic/MacroCallDiagInfo.h"
 #include "cangjie/Basic/Position.h"
 #include "cangjie/Basic/SourceManager.h"
 #include "cangjie/Option/Option.h"
@@ -69,6 +71,9 @@ public:
  */
 enum class DiagKind {
 #define NOTE(Kind, Info) Kind,
+#ifdef ERROR
+#undef ERROR
+#endif
 #define ERROR(Kind, Info) Kind,
 #define WARNING(Kind, Group, Info) Kind,
 #include "cangjie/Basic/DiagnosticsAll.def"
@@ -77,17 +82,11 @@ enum class DiagKind {
 #undef NOTE
 };
 
-constexpr const char* const DIAG_KIND_STR[]{
-#define NOTE(Kind, Info) #Kind,
-#define ERROR(Kind, Info) #Kind,
-#define WARNING(Kind, Group, Info) #Kind,
-#include "cangjie/Basic/DiagnosticsAll.def"
-#undef ERROR
-#undef WARNING
-#undef NOTE
-};
+// Diagnostic kind strings, defined in DiagnosticEngine.cpp.
+extern const std::vector<std::string_view> DIAG_KIND_STR;
 
-constexpr size_t DIAG_KIND_STR_SIZE = sizeof(DIAG_KIND_STR) / sizeof(*DIAG_KIND_STR);
+// Diagnostic kind strings size, defined in DiagnosticEngine.cpp.
+extern const size_t DIAG_KIND_STR_SIZE;
 
 enum class DiagSeverity : uint8_t { DS_ERROR, DS_WARNING, DS_NOTE, DS_HINT };
 
@@ -104,35 +103,14 @@ enum class DiagCategory : uint8_t {
     OTHER
 };
 
-constexpr const DiagSeverity DiagSeveritys[]{
-#define ERROR(Kind, Info) DiagSeverity::DS_ERROR,
-#define NOTE(Kind, Info) DiagSeverity::DS_NOTE,
-#define WARNING(Kind, Group, Info) DiagSeverity::DS_WARNING,
-#include "cangjie/Basic/DiagnosticsAll.def"
-#undef ERROR
-#undef WARNING
-#undef NOTE
-};
+// Diagnostic severitys, defined in DiagnosticEngine.cpp.
+extern const std::vector<DiagSeverity> DiagSeveritys;
 
-constexpr const char* const DiagMessages[] = {
-#define ERROR(Kind, Info) Info,
-#define WARNING(Kind, Group, Info) Info,
-#define NOTE(Kind, Info) Info,
-#include "cangjie/Basic/DiagnosticsAll.def"
-#undef ERROR
-#undef WARNING
-#undef NOTE
-};
+// Diagnostic messages, defined in DiagnosticEngine.cpp.
+extern const std::vector<std::string_view> DiagMessages;
 
-constexpr const WarnGroup warnGroups[] = {
-#define ERROR(Kind, ...) WarnGroup::NONE,
-#define WARNING(Kind, Group, ...) WarnGroup::Group,
-#define NOTE(Kind, Info) WarnGroup::NONE,
-#include "cangjie/Basic/DiagnosticsAll.def"
-#undef WARNING
-#undef ERROR
-#undef NOTE
-};
+// Diagnostic warnGroups, defined in DiagnosticEngine.cpp.
+extern const std::vector<WarnGroup> warnGroups;
 
 /**
  * This is class to keep diagnostic data for single error.
@@ -161,13 +139,7 @@ struct ErrorData {
 /**
  *  This is new diagKind for refactoring, will replace previous DiagKind if all diag have been modified.
  */
-const ErrorData errorData[] = {
-#define ERROR(Kind, ...) {__VA_ARGS__},
-#define WARNING(Kind, Group, ...) {__VA_ARGS__},
-#include "cangjie/Basic/DiagRefactor/DiagnosticAll.def"
-#undef WARNING
-#undef ERROR
-};
+extern const std::vector<ErrorData> errorData;
 
 const std::map<DiagSeverity, DiagColor> SEVE_TO_COLOR{
     {DiagSeverity::DS_ERROR, DiagColor::RED}, {DiagSeverity::DS_WARNING, DiagColor::YELLOW},
@@ -177,28 +149,13 @@ const DiagKind DEFAULT_KIND = DiagKind::sema_diag_begin;
 /**
  *  This is new diagKind for refactoring, will replace previous DiagKind if all diag have been modified.
  */
-constexpr const DiagSeverity rDiagSeveritys[] = {
-#define ERROR(Kind, ...) DiagSeverity::DS_ERROR,
-#define WARNING(Kind, ...) DiagSeverity::DS_WARNING,
-#include "cangjie/Basic/DiagRefactor/DiagnosticAll.def"
-#undef WARNING
-#undef ERROR
-};
+extern const std::vector<DiagSeverity> rDiagSeveritys;
 
-constexpr const WarnGroup rWarnGroups[] = {
-#define ERROR(Kind, ...) WarnGroup::NONE,
-#define WARNING(Kind, Group, ...) WarnGroup::Group,
-#include "cangjie/Basic/DiagRefactor/DiagnosticAll.def"
-#undef WARNING
-#undef ERROR
-};
+extern const std::vector<WarnGroup> rWarnGroups;
 
-constexpr const char* warnGroupDescrs[] = {
-#define WARN_GROUP(DESCR, KIND) DESCR,
-#include "cangjie/Basic/DiagRefactor/DiagnosticWarnGroupKind.def"
-#undef WARN_GROUP
-};
-constexpr size_t WARN_GROUP_DESCRS_SIZE = sizeof(warnGroupDescrs) / sizeof(*warnGroupDescrs);
+extern const std::vector<std::string_view> warnGroupDescrs;
+
+extern const size_t WARN_GROUP_DESCRS_SIZE;
 
 /**
  *  This is new diagKind for refactoring, will replace previous DiagKind if all diag have been modified.
@@ -211,15 +168,12 @@ enum class DiagKindRefactor : unsigned {
 #undef ERROR
 };
 
-constexpr const char* const RE_DIAG_KIND_STR[]{
-#define ERROR(Kind, ...) #Kind,
-#define WARNING(Kind, ...) #Kind,
-#include "cangjie/Basic/DiagRefactor/DiagnosticAll.def"
-#undef WARNING
-#undef ERROR
-};
+// Diagnostic kind strings, defined in DiagnosticEngine.cpp.
+extern const std::vector<std::string_view> RE_DIAG_KIND_STR;
 
-constexpr size_t RE_DIAG_KIND_STR_SIZE = sizeof(RE_DIAG_KIND_STR) / sizeof(*RE_DIAG_KIND_STR);
+// Diagnostic kind strings size, defined in DiagnosticEngine.cpp.
+extern const size_t RE_DIAG_KIND_STR_SIZE;
+
 struct Range {
     Position begin;
     Position end;
@@ -227,12 +181,7 @@ struct Range {
     {
         return begin == right.begin && end == right.end;
     }
-    size_t Hash() const
-    {
-        return (static_cast<size_t>(begin.fileID)) ^ (static_cast<size_t>(begin.line) << 8u) ^
-            (static_cast<size_t>(begin.column) << 16u) ^ (static_cast<size_t>(begin.fileID) << 24u) ^
-            (static_cast<size_t>(begin.line) << 32u) ^ (static_cast<size_t>(begin.column) << 40u);
-    }
+    size_t Hash() const;
     bool EqualForHash(const Range& right) const
     {
         return begin.fileID == right.begin.fileID && begin == right.begin && end == right.end;
@@ -346,6 +295,22 @@ struct SubDiagnostic {
     {
         return !(mainHint.IsDefault() && otherHints.empty());
     }
+    /**
+     * @brief Get the Node Sub Diag At object
+     * @return Ptr<const AST::Node> The node where the diagnostic is located, nullptr by default.
+     */
+    Ptr<const AST::Node> GetNodeSubDiagAt()
+    {
+        return node;
+    }
+    /**
+     * @brief Set the Node Of Sub Diag At object
+     * @param n The node where the diagnostic is located.
+     */
+    void SetNodeSubDiagAt(Ptr<const AST::Node> n)
+    {
+        node = n;
+    }
 
 private:
     void AddMainHint(const Position& pos, const std::string& str)
@@ -358,11 +323,15 @@ private:
         Range range = MakeRange(tok.Begin(), tok.End());
         AddMainHint(range, str);
     }
-    void AddMainHint(const AST::Node& node, const std::string& str)
+    void AddMainHint(const AST::Node& n, const std::string& str)
     {
-        Range range = MakeRange(node.begin, node.end);
+        Range range = MakeRange(n.begin, n.end);
         AddMainHint(range, str);
     }
+
+    /// The node where the diagnostic is located.
+    /// For LSP, enhance automatic error correction functionality.
+    Ptr<const AST::Node> node{nullptr};
 };
 
 /**
@@ -375,7 +344,7 @@ public:
     Diagnostic(const Position s, const Position e, const DiagKind kind, const Args... args) : start(s), end(e),
         kind(kind), args{args...}
     {
-        diagSeverity = DiagSeveritys[static_cast<int>(kind)];
+        diagSeverity = DiagSeveritys[static_cast<size_t>(kind)];
         diagCategory = GetDiagnoseCategory(kind);
         warnGroup = warnGroups[static_cast<unsigned>(kind)];
         // Refactor kind is set by default.
@@ -403,17 +372,39 @@ public:
         diagCategory = GetDiagnoseCategory(kind);
     }
 
+    Diagnostic(bool refactor, const Range& range, DiagKindRefactor kind, std::vector<std::string> arguments)
+        : isRefactor(refactor), rKind(kind)
+    {
+        auto errData = errorData[static_cast<unsigned>(kind)];
+        diagSeverity = rDiagSeveritys[static_cast<unsigned>(kind)];
+        warnGroup = rWarnGroups[static_cast<unsigned>(kind)];
+
+        errorMessage = InsertArguments(errData.message, arguments);
+        if (SEVE_TO_COLOR.find(diagSeverity) != SEVE_TO_COLOR.end()) {
+            mainHint = IntegratedString(range, errData.mainHint, SEVE_TO_COLOR.at(diagSeverity));
+        } else {
+            mainHint = IntegratedString(range, errData.mainHint, DiagColor::RED);
+        }
+
+        diagCategory = GetDiagnoseCategory(kind);
+    }
+
     Diagnostic()
     {
-        diagSeverity = DiagSeveritys[static_cast<int>(kind)];
+        diagSeverity = DiagSeveritys[static_cast<size_t>(kind)];
         diagCategory = GetDiagnoseCategory(kind);
         warnGroup = warnGroups[static_cast<unsigned>(kind)];
     };
 
     Position start;                            /**< Diagnostic start position */
     Position end;                              /**< Diagnostic end position */
+    /// The node where the diagnostic is located.
+    /// For LSP, enhance automatic error correction functionality.
+    Ptr<const AST::Node> node{nullptr};
     DiagKind kind{DEFAULT_KIND}; /**< Diagnostic kind */
     bool printSourceCode{true};                /**< Whether to print the related source code. */
+
+    ///-------------------- use for refactor diagnostic --------------------//
     /// Whether this Diagnostic is created from \ref DiagnoseRefactor
     bool isRefactor{false};
     bool isConvertedToRefactor{false};
@@ -431,6 +422,8 @@ public:
     // Stands for refactor notes to differ with notes, need modify after refactor.
     std::vector<SubDiagnostic> subDiags;
     std::vector<DiagHelp> helps;
+    ///---------------------------------------------------------------------//
+
     std::vector<DiagArgument> args;
     DiagSeverity diagSeverity;
     std::string diagMessage;
@@ -443,7 +436,7 @@ public:
     /// 6 |     public open func foo(): This {
     ///   |                      ^^^
     std::vector<Diagnostic> notes;
-    Ptr<AST::Node> curMacroCall{nullptr};
+    const MacroCallDiagInfo* macroDiagInfo{nullptr};
     bool isInMacroCall{false};
 
     // This is API supported to lsp. Will delete after refactoring.
@@ -457,6 +450,13 @@ public:
     static DiagCategory GetDiagnoseCategory(DiagKind diagKind);
     static DiagCategory GetDiagnoseCategory(DiagKindRefactor diagKind);
     static std::string InsertArguments(std::string& rawString, std::vector<std::string>& arguments);
+};
+
+struct DiagnosticInfo {
+    DiagSeverity severity;
+    Range range = MakeRange(DEFAULT_POSITION, DEFAULT_POSITION);
+    std::string msg; // main diagnostic message
+    std::string hint;
 };
 
 enum class DiagHandlerKind : uint8_t {
@@ -508,13 +508,14 @@ public:
     {
         return kind;
     }
-    
+
     friend class DiagnosticEngine;
-    
+
     DiagnosticHandler(DiagnosticEngine& d, DiagHandlerKind k) : diag(d), kind(k)
     {
     }
     virtual ~DiagnosticHandler() = default;
+
 protected:
     std::mutex mtx;
     DiagnosticEngine& diag;
@@ -533,10 +534,10 @@ public:
     {
     }
     void EmitCategoryDiagnostics(DiagCategory cate);
+    void EmitCategoryDiagnosticInfos(DiagCategory cate, std::vector<DiagnosticInfo>& diagOut);
     void EmitDiagnoseGroup();
     void EmitDiagnosesInJson() noexcept;
-    std::vector<Diagnostic> GetCategoryDiagnostic(
-        DiagCategory cate) const
+    std::vector<Diagnostic> GetCategoryDiagnostic(DiagCategory cate) const
     {
         auto set = diagnostics[cate];
         return std::vector<Diagnostic>{set.begin(), set.end()};
@@ -574,7 +575,8 @@ public:
         return success;
     }
     void EmitDiagnose(Diagnostic d);
-    
+    DiagnosticInfo GetDiagnosticInfo(Diagnostic d);
+
     /**
      * Save all diagnostic to a structure. For deduplication or some tools may need read from it.
      */
@@ -629,10 +631,13 @@ private:
 class DiagnosticBuilder {
 public:
     DiagnosticBuilder(DiagnosticEngine& diag, Diagnostic diagnostic);
+    DiagnosticBuilder(DiagnosticEngine& diag, Diagnostic diagObj, const MacroCallDiagInfo* info);
     Diagnostic diagnostic;
     DiagnosticEngine& diag;
     DiagnosticBuilder(const DiagnosticBuilder& p) = delete;
     DiagnosticBuilder& operator=(const DiagnosticBuilder& p) = delete;
+
+    /// @brief Use for old diagnostic to add note.
     template <typename... Args> void AddNote(const Position& pos, DiagKind kind, Args... args)
     {
         auto end = pos == DEFAULT_POSITION ? pos : pos + 1;
@@ -640,6 +645,7 @@ public:
         diagnostic.notes.push_back(myDiag);
     }
 
+    /// @brief Use for old diagnostic to add note.
     template <typename... Args> void AddNote(const AST::Node& node, const Position& pos, DiagKind kind, Args... args)
     {
         auto begin = node.GetMacroCallPos(pos);
@@ -648,6 +654,7 @@ public:
         diagnostic.notes.push_back(myDiag);
     }
 
+    /// @brief Use for old diagnostic to add note.
     template <typename... Args> void AddNote(const AST::Node& node, DiagKind kind, Args... args)
     {
         AddNote(node.GetBegin(), kind, args...);
@@ -658,8 +665,8 @@ public:
         static_assert(IsAllString<Args...>, "args of AddHint in diagnostic builder should all be string.");
         std::vector<std::string> arguments{args...};
         auto finalPos = pos;
-        if (diagnostic.curMacroCall) {
-            finalPos = diagnostic.curMacroCall->GetMacroCallPos(pos, true);
+        if (diagnostic.macroDiagInfo) {
+            finalPos = diagnostic.macroDiagInfo->MapPos(pos, true);
         }
         Range range = MakeRange(finalPos, finalPos + 1);
         AddHint(range, arguments);
@@ -669,9 +676,9 @@ public:
     {
         static_assert(IsAllString<Args...>, "args of AddHint in diagnostic builder should all be string.");
         std::vector<std::string> arguments{args...};
-        if (diagnostic.curMacroCall) {
-            return AddHint(MakeRange(diagnostic.curMacroCall->GetMacroCallPos(range.begin),
-                                     diagnostic.curMacroCall->GetMacroCallPos(range.end, true)),
+        if (diagnostic.macroDiagInfo) {
+            return AddHint(MakeRange(diagnostic.macroDiagInfo->MapPos(range.begin),
+                                     diagnostic.macroDiagInfo->MapPos(range.end, true)),
                 arguments);
         }
         AddHint(range, arguments);
@@ -691,7 +698,7 @@ public:
         std::vector<std::string> arguments{args...};
         AddHint(MakeRange(node.GetBegin(), node.GetEnd()), arguments);
     }
-    
+
     /**
      * AddHint will insert the mark and hint message both into error. Like:
      * '''
@@ -734,7 +741,9 @@ public:
 class DiagnosticCache {
 public:
     using DiagCacheKey = int32_t;
-    DiagnosticCache() {}
+    DiagnosticCache()
+    {
+    }
     /* Remember the diags already in the diags before type check and exclude them later */
     void ToExclude(const DiagnosticEngine& diagBefore);
     void BackUp(const DiagnosticEngine& diagAfter);
@@ -753,6 +762,7 @@ class DiagnosticEngine {
     friend class DiagSuppressor;
     friend class DiagnosticBuilder;
     friend class DiagnosticCache;
+
 public:
     bool ignoreScopeCheck{false}; /**< If true, scope related error would be ignored. */
     // For each compilation, we only print errors of the first stage that produced errors.
@@ -785,8 +795,14 @@ public:
     std::vector<Diagnostic> ConsumeStoredDiags();
 
     bool DiagFilter(Diagnostic& diagnostic) noexcept;
-    
+
     void AddMacroCallNote(Diagnostic& diagnostic, const AST::Node& node, const Position& pos);
+
+    void AddMacroCallNote(Diagnostic& diagnostic, const MacroCallDiagInfo& info, const Position& pos);
+
+    MacroCallDiagInfo* FindMacroCallInfo(Position pos) const;
+
+    void RegisterMacroCallDiagInfo(std::unique_ptr<MacroCallDiagInfo> info);
 
     // ability of transaction
     void Prepare();
@@ -809,7 +825,7 @@ public:
      * @return DiagnosticBuilder A temporary local instance which contains Diagnostic.
      */
     template <typename... Args>
-        DiagnosticBuilder Diagnose(const Position start, const Position end, DiagKind kind, Args... args)
+    DiagnosticBuilder Diagnose(const Position start, const Position end, DiagKind kind, Args... args)
     {
         if (HardDisable()) {
             return DiagnosticBuilder(*this, Diagnostic{});
@@ -886,6 +902,11 @@ public:
     {
         static_assert(IsAllString<Args...>, "the diagnose only support string type argument");
         // The span of 'range' is left off and right on, like: [begin, end).
+        auto info = FindMacroCallInfo(pos);
+        if (info) {
+            std::vector<std::string> formatArgs{std::string(args)...};
+            return DiagnoseRefactor(kind, *info, pos, std::move(formatArgs));
+        }
         Range range = MakeRange(pos, pos + 1);
         Diagnostic diagnostic(true, range, kind, args...);
         return DiagnosticBuilder(*this, diagnostic);
@@ -895,7 +916,11 @@ public:
     DiagnosticBuilder DiagnoseRefactor(DiagKindRefactor kind, const Range range, Args... args)
     {
         static_assert(IsAllString<Args...>, "the diagnose only support string type argument");
-
+        auto info = FindMacroCallInfo(range.begin);
+        if (info) {
+            std::vector<std::string> formatArgs{std::string(args)...};
+            return DiagnoseRefactor(kind, *info, range, std::move(formatArgs));
+        }
         CheckRange(Diagnostic::GetDiagnoseCategory(kind), range);
         Diagnostic diagnostic(true, range, kind, args...);
         return DiagnosticBuilder(*this, diagnostic);
@@ -916,6 +941,7 @@ public:
         static_assert(IsAllString<Args...>, "the diagnose only support string type argument");
         auto range = MakeRange(node.GetBegin(), node.GetEnd());
         Diagnostic diagnostic(true, range, kind, args...);
+        diagnostic.node = &node;
         diagnostic.isInMacroCall = node.isInMacroCall;
         AddMacroCallNote(diagnostic, node, node.begin);
         return DiagnosticBuilder(*this, diagnostic);
@@ -929,6 +955,7 @@ public:
         auto begin = node.GetMacroCallPos(pos, true);
         Range range = MakeRange(begin, begin + 1);
         Diagnostic diagnostic(true, range, kind, args...);
+        diagnostic.node = &node;
         diagnostic.isInMacroCall = node.isInMacroCall;
         AddMacroCallNote(diagnostic, node, pos);
         return DiagnosticBuilder(*this, diagnostic);
@@ -941,6 +968,7 @@ public:
         CheckRange(Diagnostic::GetDiagnoseCategory(kind), range);
         auto newRange = MakeRealRange(node, range.begin, range.end);
         Diagnostic diagnostic(true, newRange, kind, args...);
+        diagnostic.node = &node;
         diagnostic.isInMacroCall = node.isInMacroCall;
         AddMacroCallNote(diagnostic, node, range.begin);
         return DiagnosticBuilder(*this, diagnostic);
@@ -952,11 +980,17 @@ public:
         static_assert(IsAllString<Args...>, "the diagnose only support string type argument");
         auto range = MakeRealRange(node, token.Begin(), token.End(), token.kind == TokenKind::END);
         Diagnostic diagnostic(true, range, kind, args...);
+        diagnostic.node = &node;
         diagnostic.isInMacroCall = node.isInMacroCall;
         AddMacroCallNote(diagnostic, node, token.Begin());
-        diagnostic.curMacroCall = node.curMacroCall;
         return DiagnosticBuilder(*this, diagnostic);
     }
+
+    DiagnosticBuilder DiagnoseRefactor(DiagKindRefactor kind, const MacroCallDiagInfo& info, const Range& range,
+        std::vector<std::string> formatArgs = {});
+
+    DiagnosticBuilder DiagnoseRefactor(DiagKindRefactor kind, const MacroCallDiagInfo& info, const Position pos,
+        std::vector<std::string> formatArgs = {});
     ///@}
 
     /**
@@ -971,13 +1005,13 @@ public:
     void RegisterHandler(DiagFormat format);
 
     void IncreaseErrorCount(DiagCategory category);
-    
+
     void IncreaseWarningCount(DiagCategory category);
 
     void IncreaseErrorCount();
 
     uint64_t GetWarningCount();
-    
+
     uint64_t GetErrorCount();
 
     void IncreaseWarningPrintCount();
@@ -987,20 +1021,21 @@ public:
     std::optional<unsigned int> GetMaxNumOfDiags() const;
     bool IsSupressedUnusedMain(const Diagnostic& diagnostic) noexcept;
     void HandleDiagnostic(Diagnostic& diagnostic) noexcept;
-    
+
     void EmitCategoryDiagnostics(DiagCategory cate);
 
     DiagEngineErrorCode GetCategoryDiagnosticsString(DiagCategory cate, std::string& diagOut);
+    DiagEngineErrorCode GetCategoryDiagnosticInfos(DiagCategory cate, std::vector<DiagnosticInfo>& diagOut);
     void EmitCategoryGroup();
-    
+
     void SetErrorCountLimit(std::optional<unsigned int> errorCountLimit);
-    
+
     std::vector<Diagnostic> GetCategoryDiagnostic(DiagCategory cate);
-    
+
     void ClearError();
-    
+
     void Reset();
-    
+
     /**
      * Set the status of diagnostic engine.
      * @param enable

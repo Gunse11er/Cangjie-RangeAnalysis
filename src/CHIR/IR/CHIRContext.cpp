@@ -21,24 +21,19 @@
 #include "cangjie/CHIR/IR/Type/ExtendDef.h"
 #include "cangjie/CHIR/IR/Type/StructDef.h"
 #include "cangjie/CHIR/IR/Value/Value.h"
+#include "cangjie/CHIR/Utils/Utils.h"
 
 using namespace Cangjie::CHIR;
 
 namespace {
 const int ALLOCATED_VALUES_START_IDX = 0;
 const int ALLOCATED_VALUES_END_IDX = 1;
-const int ALLOCATED_EXPRS_START_IDX = 2;
-const int ALLOCATED_EXPRS_END_IDX = 3;
-const int ALLOCATED_BLOCKGROUPS_START_IDX = 4;
-const int ALLOCATED_BLOCKGROUPS_END_IDX = 5;
-const int ALLOCATED_BLOCKS_START_IDX = 6;
-const int ALLOCATED_BLOCKS_END_IDX = 7;
-const int ALLOCATED_STRUCTS_START_IDX = 8;
-const int ALLOCATED_STRUCTS_END_IDX = 9;
-const int ALLOCATED_CLASSES_START_IDX = 10;
-const int ALLOCATED_CLASSES_END_IDX = 11;
-const int ALLOCATED_ENUMS_START_IDX = 12;
-const int ALLOCATED_ENUMS_END_IDX = 13;
+const int ALLOCATED_STRUCTS_START_IDX = 2;
+const int ALLOCATED_STRUCTS_END_IDX = 3;
+const int ALLOCATED_CLASSES_START_IDX = 4;
+const int ALLOCATED_CLASSES_END_IDX = 5;
+const int ALLOCATED_ENUMS_START_IDX = 6;
+const int ALLOCATED_ENUMS_END_IDX = 7;
 }
 
 std::mutex CHIRContext::dynamicAllocatedTysMtx;
@@ -59,47 +54,46 @@ void CHIRContext::DeleteAllocatedInstance(std::vector<size_t>& idxs)
 {
     // Delete the allocated instances.
     for (size_t i = idxs[ALLOCATED_VALUES_START_IDX]; i < idxs[ALLOCATED_VALUES_END_IDX]; i++) {
-        delete allocatedValues[i];
-    }
-    for (size_t i = idxs[ALLOCATED_EXPRS_START_IDX]; i < idxs[ALLOCATED_EXPRS_END_IDX]; i++) {
-        delete allocatedExprs[i];
-    }
-    for (size_t i = idxs[ALLOCATED_BLOCKGROUPS_START_IDX]; i < idxs[ALLOCATED_BLOCKGROUPS_END_IDX]; i++) {
-        delete allocatedBlockGroups[i];
-    }
-    for (size_t i = idxs[ALLOCATED_BLOCKS_START_IDX]; i < idxs[ALLOCATED_BLOCKS_END_IDX]; i++) {
-        delete allocatedBlocks[i];
+        SafeDelete(allocatedValues[i]);
     }
     for (size_t i = idxs[ALLOCATED_STRUCTS_START_IDX]; i < idxs[ALLOCATED_STRUCTS_END_IDX]; i++) {
-        delete allocatedStructs[i];
+        SafeDelete(allocatedStructs[i]);
     }
     for (size_t i = idxs[ALLOCATED_CLASSES_START_IDX]; i < idxs[ALLOCATED_CLASSES_END_IDX]; i++) {
-        delete allocatedClasses[i];
+        SafeDelete(allocatedClasses[i]);
     }
     for (size_t i = idxs[ALLOCATED_ENUMS_START_IDX]; i < idxs[ALLOCATED_ENUMS_END_IDX]; i++) {
-        delete allocatedEnums[i];
+        SafeDelete(allocatedEnums[i]);
     }
 }
 
 void CHIRContext::DeleteAllocatedTys()
 {
     for (auto inst : std::as_const(this->dynamicAllocatedTys)) {
-        delete inst;
+        SafeDelete(inst);
     }
     this->dynamicAllocatedTys.clear();
 
     for (auto inst : std::as_const(this->constAllocatedTys)) {
-        delete inst;
+        SafeDelete(inst);
     }
     this->constAllocatedTys.clear();
 
     for (auto inst : std::as_const(this->allocatedExtends)) {
-        delete inst;
+        SafeDelete(inst);
     }
     this->allocatedExtends.clear();
 
+    for (auto [bg, ptrs] : std::as_const(this->allocatedPtrInFuncOrLambda)) {
+        for (auto ptr : ptrs) {
+            SafeDelete(ptr);
+        }
+        SafeDelete(bg);
+    }
+    this->allocatedPtrInFuncOrLambda.clear();
+
     if (this->curPackage != nullptr) {
-        delete this->curPackage;
+        SafeDelete(this->curPackage);
         this->curPackage = nullptr;
     }
 }
@@ -137,6 +131,41 @@ static void DivideArray(size_t len, size_t threadNum, std::vector<std::vector<si
 CHIRContext::CHIRContext(std::unordered_map<unsigned int, std::string>* fnMap, size_t threadsNum)
     : curPackage(nullptr), fileNameMap(fnMap), threadsNum(threadsNum)
 {
+    Init();
+}
+
+ClassType* CHIRContext::SearchObjectTyInPackage() const
+{
+    for (auto classDef : this->curPackage->GetImportedClasses()) {
+        if (IsCoreObject(*classDef)) {
+            return classDef->GetType();
+        }
+    }
+    for (auto classDef : this->curPackage->GetClasses()) {
+        if (IsCoreObject(*classDef)) {
+            return classDef->GetType();
+        }
+    }
+    return nullptr;
+}
+
+ClassType* CHIRContext::SearchAnyTyInPackage() const
+{
+    for (auto classDef : this->curPackage->GetImportedClasses()) {
+        if (IsCoreAny(*classDef)) {
+            return classDef->GetType();
+        }
+    }
+    for (auto classDef : this->curPackage->GetClasses()) {
+        if (IsCoreAny(*classDef)) {
+            return classDef->GetType();
+        }
+    }
+    return nullptr;
+}
+
+void CHIRContext::Init()
+{
     unitTy = GetType<UnitType>();
     boolTy = GetType<BooleanType>();
     runeTy = GetType<RuneType>();
@@ -157,45 +186,19 @@ CHIRContext::CHIRContext(std::unordered_map<unsigned int, std::string>* fnMap, s
     cstringTy = GetType<CStringType>();
     voidTy = GetType<VoidType>();
 }
- 
+
 CHIRContext::~CHIRContext()
 {
-    if (threadsNum == 1) {
-        std::vector<size_t> indexs{0, allocatedValues.size(), 0, allocatedExprs.size(), 0, allocatedBlockGroups.size(),
-            0, allocatedBlocks.size(), 0, allocatedStructs.size(), 0, allocatedClasses.size(), 0,
-            allocatedEnums.size()};
-        DeleteAllocatedInstance(indexs);
-        DeleteAllocatedTys();
-    } else {
-        // Delete the allocated instances.
-        std::vector<std::thread> threads;
-        threads.reserve(threadsNum);
-        std::vector<std::vector<size_t>> indexs(threadsNum, std::vector<size_t>());
-        DivideArray(allocatedValues.size(), threadsNum - 1, indexs);
-        DivideArray(allocatedExprs.size(), threadsNum - 1, indexs);
-        DivideArray(allocatedBlockGroups.size(), threadsNum - 1, indexs);
-        DivideArray(allocatedBlocks.size(), threadsNum - 1, indexs);
-        DivideArray(allocatedStructs.size(), threadsNum - 1, indexs);
-        DivideArray(allocatedClasses.size(), threadsNum - 1, indexs);
-        DivideArray(allocatedEnums.size(), threadsNum - 1, indexs);
-        for (size_t i = 0; i < threadsNum - 1; i++) {
-            std::vector<size_t>& idxs = indexs[i];
-            threads.emplace_back([&idxs, this]() { DeleteAllocatedInstance(idxs); });
-        }
-        threads.emplace_back([this]() { DeleteAllocatedTys(); });
-        for (auto& thread : threads) {
-            if (thread.joinable()) {
-                thread.join();
-            }
-        }
+#ifndef CANGJIE_ENABLE_GCOV
+    try {
+#endif
+        FreeWholePackage();
+#ifndef CANGJIE_ENABLE_GCOV
+    } catch (...) {
+        // Never propagate from destructor (would call std::terminate). Per-pointer cleanup uses SafeDelete to limit
+        // leaks when a member destructor throws; this catches any other failure (e.g. resource exhaustion).
     }
-    allocatedExprs.clear();
-    allocatedValues.clear();
-    allocatedBlockGroups.clear();
-    allocatedBlocks.clear();
-    allocatedStructs.clear();
-    allocatedClasses.clear();
-    allocatedEnums.clear();
+#endif
 }
 
 // FileName API
@@ -261,4 +264,80 @@ Type* CHIRContext::ToSelectorType(Type::TypeKind kind) const
         default:
             return GetBoolTy();
     }
+}
+
+void CHIRContext::MergeAllocatedPtrInFuncOrLambda(std::unordered_map<BlockGroup*, std::vector<Base*>>& input)
+{
+    for (auto& [bg, ptrs] : input) {
+        auto it = allocatedPtrInFuncOrLambda.find(bg);
+        if (it == allocatedPtrInFuncOrLambda.end()) {
+            allocatedPtrInFuncOrLambda.emplace(bg, ptrs);
+        } else {
+            it->second.insert(it->second.end(), ptrs.begin(), ptrs.end());
+        }
+    }
+}
+
+void CHIRContext::FreeMemoryInFunc(BlockGroup& funcBody)
+{
+    // don't erase block group ptr from allocatedPtrInFuncOrLambda, because this api supports multi-threaded operation.
+    auto it = allocatedPtrInFuncOrLambda.find(&funcBody);
+    if (it != allocatedPtrInFuncOrLambda.end()) {
+        for (auto ptr : it->second) {
+            SafeDelete(ptr);
+        }
+        it->second.clear();
+    }
+}
+
+void CHIRContext::FreeWholePackage()
+{
+    if (threadsNum == 1) {
+        std::vector<size_t> indexs{0, allocatedValues.size(), 0, allocatedStructs.size(), 0, allocatedClasses.size(), 0,
+            allocatedEnums.size()};
+        DeleteAllocatedInstance(indexs);
+        DeleteAllocatedTys();
+    } else {
+        // Delete the allocated instances.
+        std::vector<std::thread> threads;
+        threads.reserve(threadsNum);
+        std::vector<std::vector<size_t>> indexs(threadsNum, std::vector<size_t>());
+        DivideArray(allocatedValues.size(), threadsNum - 1, indexs);
+        DivideArray(allocatedStructs.size(), threadsNum - 1, indexs);
+        DivideArray(allocatedClasses.size(), threadsNum - 1, indexs);
+        DivideArray(allocatedEnums.size(), threadsNum - 1, indexs);
+        for (size_t i = 0; i < threadsNum - 1; i++) {
+            threads.emplace_back([i, &indexs, this]() {
+#ifndef CANGJIE_ENABLE_GCOV
+                try {
+#endif
+                    DeleteAllocatedInstance(indexs[i]);
+#ifndef CANGJIE_ENABLE_GCOV
+                } catch (...) {
+                    // Avoid std::terminate if an unexpected exception escapes the worker.
+                }
+#endif
+            });
+        }
+        threads.emplace_back([this]() {
+#ifndef CANGJIE_ENABLE_GCOV
+            try {
+#endif
+                DeleteAllocatedTys();
+#ifndef CANGJIE_ENABLE_GCOV
+            } catch (...) {
+                // Avoid std::terminate if an unexpected exception escapes the worker.
+            }
+#endif
+        });
+        for (auto& thread : threads) {
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+    }
+    allocatedValues.clear();
+    allocatedStructs.clear();
+    allocatedClasses.clear();
+    allocatedEnums.clear();
 }

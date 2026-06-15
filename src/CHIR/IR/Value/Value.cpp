@@ -38,7 +38,7 @@ bool Value::IsLocalVar() const
 
 bool Value::IsFunc() const
 {
-    return kind == ValueKind::KIND_FUNC || kind == ValueKind::KIND_IMP_FUNC;
+    return kind == ValueKind::KIND_FUNC;
 }
 
 bool Value::IsBlock() const
@@ -63,32 +63,32 @@ bool Value::IsLiteral() const
 
 bool Value::IsGlobalVar() const
 {
-    return kind == ValueKind::KIND_GLOBALVAR || kind == ValueKind::KIND_IMP_VAR;
+    return kind == ValueKind::KIND_GLOBALVAR;
 }
 
 bool Value::IsImportedFunc() const
 {
-    return kind == ValueKind::KIND_IMP_FUNC;
+    return kind == ValueKind::KIND_FUNC && TestAttr(Attribute::IMPORTED);
 }
 
 bool Value::IsImportedVar() const
 {
-    return kind == ValueKind::KIND_IMP_VAR;
+    return kind == ValueKind::KIND_GLOBALVAR && TestAttr(Attribute::IMPORTED);
 }
 
 bool Value::IsImportedSymbol() const
 {
-    return kind == ValueKind::KIND_IMP_FUNC || kind == ValueKind::KIND_IMP_VAR;
+    return IsImportedFunc() || IsImportedVar();
 }
 
-bool Value::IsGlobalVarInCurPackage() const
+bool Value::IsGlobalVarWithInitializer() const
 {
-    return kind == ValueKind::KIND_GLOBALVAR;
+    return kind == ValueKind::KIND_GLOBALVAR && StaticCast<const GlobalVar*>(this)->GetInitializerValue() != nullptr;
 }
 
 bool Value::IsFuncWithBody() const
 {
-    return kind == ValueKind::KIND_FUNC;
+    return kind == ValueKind::KIND_FUNC && StaticCast<const Function*>(this)->GetBody() != nullptr;
 }
 
 Type* Value::GetType() const
@@ -144,8 +144,7 @@ bool Value::IsCompileTimeValue() const
 
 bool Value::IsGlobal() const
 {
-    return kind == ValueKind::KIND_GLOBALVAR || kind == ValueKind::KIND_FUNC ||
-        kind == ValueKind::KIND_IMP_VAR || kind == ValueKind::KIND_IMP_FUNC;
+    return kind == ValueKind::KIND_GLOBALVAR || kind == ValueKind::KIND_FUNC;
 }
 
 void Value::AddUserOnly(Expression* expr)
@@ -171,7 +170,7 @@ void Value::RemoveUserOnly(Expression* expr)
 
 void Value::Dump() const
 {
-    std::cout << ToString() << std::endl;
+    std::cout << ToString(0) << std::endl;
 }
 
 void Value::ReplaceWith(Value& newValue, const BlockGroup* scope)
@@ -187,76 +186,41 @@ void Value::ReplaceWith(Value& newValue, const BlockGroup* scope)
     }
 }
 
-AttributeInfo Value::GetAttributeInfo() const
-{
-    return attributes;
-}
-
-bool Value::TestAttr(Attribute attr) const
-{
-    return attributes.TestAttr(attr);
-}
-
-void Value::AppendAttributeInfo(const AttributeInfo& info)
-{
-    attributes.AppendAttrs(info);
-}
-
-void Value::EnableAttr(Attribute attr)
-{
-    attributes.SetAttr(attr, true);
-}
-
-void Value::DisableAttr(Attribute attr)
-{
-    attributes.SetAttr(attr, false);
-}
-
-const AnnoInfo& Value::GetAnnoInfo() const
-{
-    return annoInfo;
-}
-
-void Value::SetAnnoInfo(AnnoInfo&& info)
-{
-    annoInfo = std::move(info);
-}
-
 void Value::ClearUsersOnly()
 {
     users.clear();
 }
 
-Parameter::Parameter(Type* ty, const std::string& indexStr, Func* ownerFunc)
-    : Value(ty, indexStr, ValueKind::KIND_PARAMETER), ownerFunc(ownerFunc)
+Parameter::Parameter(Type* ty, const std::string& id, Function* ownerFunc)
+    : Value(ty, id, ValueKind::KIND_PARAMETER), ownerFunc(ownerFunc)
 {
-    if (ownerFunc) {
+    if (ownerFunc && !ownerFunc->TestAttr(Attribute::PREVIOUSLY_DESERIALIZED)) {
         ownerFunc->AddParam(*this);
     }
 }
 
-Parameter::Parameter(Type* ty, const std::string& indexStr, Lambda& ownerLambda)
-    : Value(ty, indexStr, ValueKind::KIND_PARAMETER), ownerLambda(&ownerLambda)
+Parameter::Parameter(Type* ty, const std::string& id, Lambda& ownerLambda)
+    : Value(ty, id, ValueKind::KIND_PARAMETER), ownerLambda(&ownerLambda)
 {
     ownerLambda.AddParam(*this);
 }
 
 std::string Parameter::GetSrcCodeIdentifier() const
 {
-    std::string ident;
-    auto debugExpr = GetDebugExpr();
-    if (debugExpr != nullptr) {
-        ident = debugExpr->GetSrcCodeIdentifier();
-    }
-    return ident;
+    return srcCodeIdentifier;
 }
 
-Func* Parameter::GetOwnerFunc() const
+void Parameter::SetSrcCodeIdentifier(const std::string& newName)
+{
+    srcCodeIdentifier = newName;
+}
+
+Function* Parameter::GetOwnerFunc() const
 {
     return ownerFunc;
 }
 
-Func* Parameter::GetTopLevelFunc() const
+Function* Parameter::GetTopLevelFunc() const
 {
     if (ownerFunc != nullptr) {
         return ownerFunc;
@@ -276,7 +240,7 @@ void Parameter::SetOwnerLambda(Lambda* newParent)
     ownerFunc = nullptr;
 }
 
-void Parameter::SetOwnerFunc(Func* owner)
+void Parameter::SetOwnerFunc(Function* owner)
 {
     ownerFunc = owner;
     ownerLambda = nullptr;
@@ -292,11 +256,30 @@ Debug* Parameter::GetDebugExpr() const
     return nullptr;
 }
 
-std::string Parameter::ToString() const
+const AnnoInfo& Parameter::GetAnnoInfo() const
 {
+    return annoInfo;
+}
+
+void Parameter::SetAnnoInfo(AnnoInfo&& info)
+{
+    annoInfo = std::move(info);
+}
+
+std::string Parameter::ToString(size_t indent) const
+{
+    /** @CustomAnnotation
+     *  [attr1] [attr2] [...] %x[name]: type // comment
+     */
     std::stringstream ss;
+    ss << AddNewLineOrNot(annoInfo.ToString(indent));
+    ss << IndentToString(indent) << attributes.ToString();
     ss << identifier;
+    if (!srcCodeIdentifier.empty()) {
+        ss << "[" << srcCodeIdentifier << "]";
+    }
     ss << ": " << ty->ToString();
+    ss << CommentToString(BaseCommentToString());
     return ss.str();
 }
 
@@ -311,12 +294,12 @@ LocalVar::LocalVar(Type* ty, std::string indexStr, Expression* expr)
 
 std::string LocalVar::GetSrcCodeIdentifier() const
 {
-    std::string ident;
-    auto debugExpr = GetDebugExpr();
-    if (debugExpr != nullptr) {
-        ident = debugExpr->GetSrcCodeIdentifier();
-    }
-    return ident;
+    return srcCodeIdentifier;
+}
+
+void LocalVar::SetSrcCodeIdentifier(const std::string& newName)
+{
+    srcCodeIdentifier = newName;
 }
 
 BlockGroup* LocalVar::GetOwnerBlockGroup() const
@@ -335,7 +318,7 @@ bool LocalVar::IsRetValue() const
     return isRetValue;
 }
 
-Func* LocalVar::GetTopLevelFunc() const
+Function* LocalVar::GetTopLevelFunc() const
 {
     CJC_NULLPTR_CHECK(expr);
     return expr->GetTopLevelFunc();
@@ -361,23 +344,22 @@ void LocalVar::SetRetValue(bool flag)
     this->isRetValue = flag;
 }
 
-std::string LocalVar::ToString() const
+std::string LocalVar::ToString(size_t indent) const
 {
-    std::stringstream ss;
-    ss << identifier;
-    ss << ": " << ty->ToString();
-    if (expr) {
-        ss << " = " << expr->ToString();
-    }
-    return ss.str();
+    CJC_NULLPTR_CHECK(expr);
+    return expr->ToString(indent);
 }
 
 // GlobalVar
-GlobalVar::GlobalVar(Type* ty, std::string identifier, std::string srcCodeIdentifier, std::string rawMangledName,
-    std::string packageName)
-    : Value{ty, std::move(identifier), ValueKind::KIND_GLOBALVAR},
-    GlobalVarBase{std::move(srcCodeIdentifier), std::move(rawMangledName), std::move(packageName)}
+GlobalVar::GlobalVar(Type* ty, const std::string& identifier, const std::string& srcCodeIdentifier,
+    const std::string& rawMangledName, const std::string& packageName)
+    : GlobalValue(ValueKind::KIND_GLOBALVAR, ty, identifier, srcCodeIdentifier, rawMangledName, packageName)
 {
+}
+
+bool GlobalVar::IsSrcCodeImported() const
+{
+    return TestAttr(Attribute::IMPORTED) && initializer != nullptr;
 }
 
 bool GlobalVar::IsLocalConst() const
@@ -387,120 +369,64 @@ bool GlobalVar::IsLocalConst() const
     return TestAttr(Attribute::CONST) && TestAttr(Attribute::COMPILER_ADD);
 }
 
-std::string GlobalVar::ToString() const
-{
-    std::stringstream ss;
-    ss << attributes.ToString() << identifier << ": " << ty->ToString();
-    if (auto initVal = GetInitializer()) {
-        ss << " = " << initVal->ToString();
-    }
-    std::stringstream comment;
-    comment << ToStringAnnotationMap();
-    if (annoInfo.IsAvailable()) {
-        AddCommaOrNot(comment);
-        comment << "annoInfo: " + annoInfo.mangledName;
-    }
-    if (!srcCodeIdentifier.empty()) {
-        AddCommaOrNot(comment);
-        comment << "srcCodeIdentifier: " + srcCodeIdentifier;
-    }
-    if (!rawMangledName.empty()) {
-        AddCommaOrNot(comment);
-        comment << "rawMangledName: " << rawMangledName;
-    }
-    if (comment.str() != "") {
-        ss << " // " << comment.str();
-    }
-    return ss.str();
-}
-
-GlobalVarBase::GlobalVarBase(std::string srcCodeIdentifier, std::string rawMangledName, std::string packageName)
-    : packageName(std::move(packageName)),
-    srcCodeIdentifier(std::move(srcCodeIdentifier)),
-    rawMangledName(std::move(rawMangledName))
-{
-}
-
-Func* GlobalVar::GetInitFunc() const
-{
-    return initFunc;
-}
-
-std::string GlobalVarBase::GetSrcCodeIdentifier() const
-{
-    return srcCodeIdentifier;
-}
-
-/**
- * @brief only static member var has declaredParent, others return nullptr
- */
-CustomTypeDef* GlobalVarBase::GetParentCustomTypeDef() const
-{
-    return declaredParent;
-}
-
-const std::string& GlobalVarBase::GetPackageName() const
-{
-    return packageName;
-}
-
-void GlobalVar::SetInitializer(LiteralValue& literalValue)
-{
-    this->initializer = &literalValue;
-    this->initFunc = nullptr;
-}
-
-void GlobalVarBase::DestroySelf()
+void GlobalVar::DestroySelf()
 {
     if (declaredParent) {
         Utils::RemoveFromVec(declaredParent->staticVars, this);
     }
 }
 
+void GlobalVar::DestroyInitializer()
+{
+    if (auto initFunc = GetInitFunc()) {
+        for (auto user : initFunc->GetUsers()) {
+            user->RemoveSelfFromBlock();
+        }
+        initFunc->DestroySelf();
+    }
+    initializer = nullptr;
+}
+
+std::string GlobalVar::ToString(size_t indent) const
+{
+    /** @CustomAnnotation
+     *  [attr1] [attr2] [...] @mangledName: type = literal init value(or init function)
+     */
+    std::stringstream ss;
+    ss << AddNewLineOrNot(annoInfo.ToString(indent));
+    ss << IndentToString(indent) << attributes.ToString() << identifier << ": " << ty->ToString();
+    if (auto initVal = GetInitializer()) {
+        ss << " = " << initVal->ToString(0);
+    } else if (auto initFunc = GetInitFunc()) {
+        ss << " = " << initFunc->GetIdentifier() << "()";
+    }
+    ss << CommentToString(GlobalValueCommentToString());
+    return ss.str();
+}
+
+Value* GlobalVar::GetInitializerValue() const
+{
+    return initializer;
+}
+
+Function* GlobalVar::GetInitFunc() const
+{
+    return DynamicCast<Function*>(initializer);
+}
+
+void GlobalVar::SetInitializer(LiteralValue& literalValue)
+{
+    this->initializer = &literalValue;
+}
+
 LiteralValue* GlobalVar::GetInitializer() const
 {
-    return this->initializer;
+    return DynamicCast<LiteralValue*>(initializer);
 }
 
-void GlobalVar::SetInitFunc(Func& func)
+void GlobalVar::SetInitFunc(Function& func)
 {
-    this->initFunc = &func;
-    initializer = nullptr; // specific var need to clear
-}
-
-const std::string& GlobalVarBase::GetRawMangledName() const
-{
-    return rawMangledName;
-}
-
-ImportedValue::ImportedValue()
-{
-}
-
-std::string ImportedValue::ToString() const
-{
-    std::stringstream ss;
-    ss << identifier;
-    ss << ": " << ty->ToString();
-    return ss.str();
-}
-
-void ImportedValue::DestroySelf()
-{
-    if (auto var = DynamicCast<ImportedVar*>(this)) {
-        StaticCast<GlobalVarBase*>(var)->DestroySelf();
-    } else {
-        StaticCast<FuncBase*>(StaticCast<ImportedFunc*>(this))->DestroySelf();
-    }
-}
-
-std::string ImportedFunc::ToString() const
-{
-    std::stringstream ss;
-    ss << identifier;
-    ss << GetGenericTypeParamsStr(genericTypeParams);
-    ss << ": " << ty->ToString();
-    return ss.str();
+    this->initializer = &func;
 }
 
 Block::Block(std::string identifier, BlockGroup* parentGroup)
@@ -531,12 +457,14 @@ void Block::RemoveExprOnly(Expression& expr)
 
 void Block::AppendExprOnly(Expression& expr)
 {
+    CJC_ASSERT(expr.GetParentBlockGroup() == GetParentBlockGroup());
     exprs.emplace_back(&expr);
 }
 
 void Block::AppendNonTerminatorExpression(Expression* expression)
 {
     CJC_ASSERT(!expression->IsTerminator());
+    CJC_ASSERT(expression->GetParentBlockGroup() == GetParentBlockGroup());
     expression->GetParentBlock()->RemoveExprOnly(*expression);
     expression->SetParent(this);
     AppendExprOnly(*expression);
@@ -551,6 +479,7 @@ void Block::AppendExpressions(const std::vector<Expression*>& expressions)
 
 void Block::AppendExpression(Expression* expression)
 {
+    CJC_ASSERT(expression->GetParentBlockGroup() == GetParentBlockGroup());
     if (expression->IsTerminator()) {
         AppendTerminator(StaticCast<Terminator*>(expression));
     } else {
@@ -590,6 +519,7 @@ BlockGroup* Block::GetParentBlockGroup() const
 
 void Block::AppendTerminator(Terminator* term)
 {
+    CJC_ASSERT(term->GetParentBlockGroup() == GetParentBlockGroup());
     AppendExprOnly(*term);
     term->SetParent(this);
     // update precedessors
@@ -598,11 +528,18 @@ void Block::AppendTerminator(Terminator* term)
     }
 }
 
-Func* Block::GetTopLevelFunc() const
+Function* Block::GetTopLevelFunc() const
 {
     auto blockGroup = GetParentBlockGroup();
     CJC_NULLPTR_CHECK(blockGroup);
     return blockGroup->GetTopLevelFunc();
+}
+
+BlockGroup* Block::GetFuncOrLambdaBody() const
+{
+    auto blockGroup = GetParentBlockGroup();
+    CJC_NULLPTR_CHECK(blockGroup);
+    return blockGroup->GetFuncOrLambdaBody();
 }
 
 Terminator* Block::GetTerminator() const
@@ -664,6 +601,7 @@ bool Block::IsEntry() const
 
 void Block::InsertExprIntoHead(Expression& expr)
 {
+    CJC_ASSERT(expr.GetParentBlockGroup() == GetParentBlockGroup());
     CJC_ASSERT(!expr.IsTerminator());
     // 1. remove expr from expr's parent block
     if (expr.parent != nullptr) {
@@ -693,9 +631,31 @@ std::vector<ClassType*> Block::GetExceptions() const
     return exceptions.value();
 }
 
-std::string Block::ToString() const
+std::string Block::ToString(size_t indent) const
 {
-    return GetBlockStr(*this);
+    std::stringstream ss;
+    ss << IndentToString(indent) << attributes.ToString();
+    ss << "Block " << identifier << ": ";
+    std::vector<std::string> comments;
+    if (!predecessors.empty()) {
+        comments.emplace_back("predecessors: " + ValueIdVecToString("[", predecessors, "]"));
+    }
+    if (auto baseComment = BaseCommentToString(); !baseComment.empty()) {
+        comments.emplace_back(baseComment);
+    }
+    if (IsLandingPadBlock()) {
+        auto exceptionStr = TypeVecToString("[", GetExceptions(), "]");
+        if (exceptionStr.empty()) {
+            comments.emplace_back("exceptions: [All]");
+        } else {
+            comments.emplace_back(exceptionStr);
+        }
+    }
+    ss << CommentToString(comments);
+    for (auto expr : exprs) {
+        ss << std::endl << expr->ToString(indent + 1);
+    }
+    return ss.str();
 }
 
 void Block::RemovePredecessorOnly(Block& block)
@@ -729,7 +689,7 @@ Block* Block::Clone(CHIRBuilder& builder, BlockGroup& newGroup) const
     }
     for (auto expr : exprs) {
         auto newExpr = expr->Clone(builder, *newBlock);
-        newExpr->CopyAnnotationMapFrom(*expr);
+        newExpr->CopyBaseInfoFrom(*expr);
     }
     return newBlock;
 }
@@ -755,7 +715,7 @@ void BlockGroup::RemoveBlock(Block& block)
     blocks.erase(std::remove(blocks.begin(), blocks.end(), &block), blocks.end());
 }
 
-Func* BlockGroup::GetTopLevelFunc() const
+Function* BlockGroup::GetTopLevelFunc() const
 {
     if (ownerFunc != nullptr) {
         return ownerFunc;
@@ -764,7 +724,16 @@ Func* BlockGroup::GetTopLevelFunc() const
     return users[0]->GetTopLevelFunc();
 }
 
-void BlockGroup::SetOwnerFunc(Func* func)
+BlockGroup* BlockGroup::GetFuncOrLambdaBody() const
+{
+    if (ownerFunc != nullptr) {
+        return ownerFunc->GetBody();
+    }
+    CJC_ASSERT(users.size() == 1);
+    return users[0]->GetFuncOrLambdaBody();
+}
+
+void BlockGroup::SetOwnerFunc(Function* func)
 {
     if (ownerFunc) {
         ownerFunc->RemoveBody();
@@ -783,6 +752,20 @@ void BlockGroup::SetOwnerFunc(Func* func)
 std::vector<Block*> BlockGroup::GetBlocks() const
 {
     return blocks;
+}
+
+std::vector<Block*> BlockGroup::GetAllBlocks() const
+{
+    auto res = blocks;
+    for (auto block : blocks) {
+        for (auto e : block->GetExpressions()) {
+            if (e->GetExprKind() == ExprKind::LAMBDA) {
+                auto lambdaBlocks = StaticCast<Lambda*>(e)->GetBody()->GetAllBlocks();
+                res.insert(res.end(), lambdaBlocks.begin(), lambdaBlocks.end());
+            }
+        }
+    }
+    return res;
 }
 
 Block* BlockGroup::GetBlockByIdx(size_t idx) const
@@ -811,7 +794,7 @@ void BlockGroup::SetOwnerExpression(Expression& expr)
         CJC_ASSERT(ownerFunc == nullptr && (ownerExpression == nullptr || !ownerExpression->IsLambda()));
     }
 #endif
-    if (auto lambda = DynamicCast<Lambda*>(&expr)) {
+    if (Is<Lambda*>(&expr)) {
         if (ownerFunc) {
             ownerFunc->RemoveBody();
             ownerFunc = nullptr;
@@ -826,7 +809,7 @@ void BlockGroup::SetOwnerExpression(Expression& expr)
     AddUserOnly(&expr);
 }
 
-Func* BlockGroup::GetOwnerFunc() const
+Function* BlockGroup::GetOwnerFunc() const
 {
     return ownerFunc;
 }
@@ -841,7 +824,7 @@ void BlockGroup::ClearBlocksOnly()
     blocks.clear();
 }
 
-void BlockGroup::SetOwnedFuncOnly(Func* newFunc)
+void BlockGroup::SetOwnedFuncOnly(Function* newFunc)
 {
     ownerFunc = newFunc;
 }
@@ -871,9 +854,31 @@ void BlockGroup::AddBlocks(const std::vector<Block*>& newBlocks)
     }
 }
 
-std::string BlockGroup::ToString() const
+std::string BlockGroup::ToString(size_t indent) const
 {
-    return GetBlockGroupStr(*this);
+    std::stringstream ss;
+    ss << IndentToString(indent) << "{ Block Group: " << identifier;
+    ss << CommentToString(BaseCommentToString());
+    ss << std::endl;
+    if (!blocks.empty()) {
+        auto cmp = [](const Ptr<const Block> b1, const Ptr<const Block> b2) {
+            return b1->GetIdentifier() < b2->GetIdentifier();
+        };
+        auto blockSet = Utils::VecToSortedSet<decltype(cmp)>(blocks, cmp);
+        CJC_NULLPTR_CHECK(entryBlock);
+        auto sortedBlock = TopologicalSort(entryBlock);
+        for (auto block : sortedBlock) {
+            ss << block->ToString(indent) << std::endl;
+            blockSet.erase(block);
+        }
+
+        // print orphan block
+        for (auto block : blockSet) {
+            ss << block->ToString(indent) << std::endl;
+        }
+    }
+    ss << IndentToString(indent) << "}";
+    return ss.str();
 }
 
 void BlockGroup::CloneBlocks(CHIRBuilder& builder, BlockGroup& parent) const
@@ -901,7 +906,7 @@ void BlockGroup::CloneBlocks(CHIRBuilder& builder, BlockGroup& parent) const
     }
 }
 
-BlockGroup* BlockGroup::Clone(CHIRBuilder& builder, Func& newFunc) const
+BlockGroup* BlockGroup::Clone(CHIRBuilder& builder, Function& newFunc) const
 {
     auto newGroup = builder.CreateBlockGroup(newFunc);
     newGroup->SetOwnerFunc(&newFunc);
@@ -934,376 +939,27 @@ size_t BlockGroup::GetExpressionsNum() const
     return res;
 }
 
-FuncBody::FuncBody()
-{
-}
-
-BlockGroup* FuncBody::GetBody() const
-{
-    return body;
-}
-
-Parameter* FuncBody::GetParam(size_t index) const
-{
-    return parameters[index];
-}
-
-const std::vector<Parameter*>& FuncBody::GetParams() const
-{
-    return parameters;
-}
-
-void FuncBody::SetReturnValue(LocalVar& ret)
-{
-    retValue = &ret;
-}
-
-void FuncBody::ClearReturnValueOnly()
-{
-    retValue = nullptr;
-}
-
-/**
- * @brief get a `LocalVar` represent the returned value of this FuncBody.
- */
-LocalVar* FuncBody::GetReturnValue() const
-{
-    return retValue;
-}
-
-void FuncBody::RemoveBody()
-{
-    body = nullptr;
-}
-
-void FuncBody::RemoveParams()
-{
-    parameters.clear();
-}
-
-void FuncBody::AddParam(Parameter& param)
-{
-    parameters.emplace_back(&param);
-}
-
-FuncBase::FuncBase(const std::string& srcCodeIdentifier, const std::string& rawMangledName,
-    const std::string& packageName, const std::vector<GenericType*>& genericTypeParams)
-    : srcCodeIdentifier(srcCodeIdentifier),
-    rawMangledName(rawMangledName),
-    packageName(packageName),
+Function::Function(Type* ty, const std::string& identifier, const std::string& srcCodeIdentifier,
+    const std::string& rawMangledName, const std::string& packageName,
+    const std::vector<GenericType*>& genericTypeParams)
+    : GlobalValue(ValueKind::KIND_FUNC, ty, identifier, srcCodeIdentifier, rawMangledName, packageName),
     genericTypeParams(genericTypeParams)
 {
 }
 
-FuncKind FuncBase::GetFuncKind() const
+FuncKind Function::GetFuncKind() const
 {
     return funcKind;
 }
 
-void FuncBase::SetFuncKind(FuncKind kind)
+void Function::SetFuncKind(FuncKind kind)
 {
     funcKind = kind;
 }
 
-const std::string& FuncBase::GetPackageName() const
-{
-    return packageName;
-}
-
-FuncType* FuncBase::GetFuncType() const
+FuncType* Function::GetFuncType() const
 {
     return StaticCast<FuncType*>(GetType());
-}
-
-/**
- * @brief Replace the return value of this function and update the function type accordingly.
- *
- * This method updates the function's return type based on the new return value:
- * - If `newRet` is nullptr, the function's return type is changed to Void.
- * - If `newRet` is not nullptr, the function's return type is set to the base type
- *   extracted from `newRet`'s RefType.
- *
- * Note: This is a base class implementation that only updates the function type.
- * The derived class `Func` overrides this to also update the function body's return value.
- *
- * @param newRet The new return value LocalVar. If nullptr, the function will return Void.
- *               Must be a RefType if not nullptr.
- * @param builder The CHIRBuilder used to create or get the updated function type.
- */
-void FuncBase::ReplaceReturnValue(LocalVar* newRet, CHIRBuilder& builder)
-{
-    auto curFuncType = GetFuncType();
-    if (newRet == nullptr) {
-        // Change return type to Void
-        ty = builder.GetType<FuncType>(curFuncType->GetParamTypes(), builder.GetVoidTy());
-    } else {
-        // Extract base type from RefType and set it as the new return type
-        CJC_ASSERT(newRet->GetType()->IsRef());
-        auto retType = StaticCast<RefType*>(newRet->GetType())->GetBaseType();
-        ty = builder.GetType<FuncType>(curFuncType->GetParamTypes(), retType);
-    }
-}
-
-size_t FuncBase::GetNumOfParams() const
-{
-    return GetFuncType()->GetNumOfParams();
-}
-
-Type* FuncBase::GetReturnType() const
-{
-    return GetFuncType()->GetReturnType();
-}
-
-void FuncBase::DestroySelf()
-{
-    if (declaredParent) {
-        Utils::RemoveFromVec(declaredParent->methods, this);
-        declaredParent = nullptr;
-    }
-}
-
-Type* FuncBase::GetParentCustomTypeOrExtendedType() const
-{
-    if (declaredParent == nullptr) {
-        return nullptr;
-    }
-    return declaredParent->GetType();
-}
-
-CustomTypeDef* FuncBase::GetOuterDeclaredOrExtendedDef() const
-{
-    if (declaredParent == nullptr) {
-        return nullptr;
-    }
-    if (auto extendDef = DynamicCast<ExtendDef*>(declaredParent); extendDef) {
-        auto extendedType = extendDef->GetExtendedType();
-        if (extendedType == nullptr) {
-            return nullptr;
-        }
-        if (auto customTy = DynamicCast<const CustomType*>(extendedType); customTy) {
-            return customTy->GetCustomTypeDef();
-        }
-        return nullptr;
-    }
-    return declaredParent;
-}
-
-bool FuncBase::IsMemberFunc() const
-{
-    return declaredParent != nullptr;
-}
-
-CustomTypeDef* FuncBase::GetParentCustomTypeDef() const
-{
-    return declaredParent;
-}
-
-std::string FuncBase::GetSrcCodeIdentifier() const
-{
-    return srcCodeIdentifier;
-}
-
-const std::string& FuncBase::GetRawMangledName() const
-{
-    return rawMangledName;
-}
-
-void FuncBase::SetRawMangledName(const std::string& name)
-{
-    rawMangledName = name;
-}
-
-bool FuncBase::IsConstructor() const
-{
-    return (funcKind == FuncKind::CLASS_CONSTRUCTOR || funcKind == FuncKind::STRUCT_CONSTRUCTOR ||
-        funcKind == FuncKind::PRIMAL_CLASS_CONSTRUCTOR || funcKind == FuncKind::PRIMAL_STRUCT_CONSTRUCTOR) &&
-        !TestAttr(Attribute::STATIC);
-}
-
-bool FuncBase::IsFinalizer() const
-{
-    return funcKind == FuncKind::FINALIZER;
-}
-
-bool FuncBase::IsLambda() const
-{
-    return funcKind == FuncKind::LAMBDA;
-}
-
-bool FuncBase::IsGVInit() const
-{
-    return funcKind == FuncKind::GLOBALVAR_INIT;
-}
-
-bool FuncBase::IsStaticInit() const
-{
-    return (funcKind == FuncKind::CLASS_CONSTRUCTOR || funcKind == FuncKind::STRUCT_CONSTRUCTOR) &&
-        srcCodeIdentifier == "static.init";
-}
-
-bool FuncBase::IsPrimalConstructor() const
-{
-    return funcKind == FuncKind::PRIMAL_CLASS_CONSTRUCTOR || funcKind == FuncKind::PRIMAL_STRUCT_CONSTRUCTOR;
-}
-
-bool FuncBase::IsInstanceVarInit() const
-{
-    return funcKind == FuncKind::INSTANCEVAR_INIT;
-}
-
-bool FuncBase::IsCFunc() const
-{
-    return ty && ty->IsCFunc();
-}
-
-bool FuncBase::IsVirtualFunc() const
-{
-    return TestAttr(Attribute::VIRTUAL) || TestAttr(Attribute::FINAL);
-}
-
-FuncBase* FuncBase::GetGenericDecl() const
-{
-    return genericDecl;
-}
-
-void FuncBase::SetGenericDecl(FuncBase& decl)
-{
-    genericDecl = &decl;
-}
-
-bool FuncBase::IsFastNative() const
-{
-    return isFastNative;
-}
-
-void FuncBase::SetFastNative(bool fastNative)
-{
-    isFastNative = fastNative;
-}
-
-void FuncBase::SetCFFIWrapper(bool isWrapper)
-{
-    isCFFIWrapper = isWrapper;
-}
-
-bool FuncBase::IsCFFIWrapper() const
-{
-    return isCFFIWrapper;
-}
-
-const std::vector<GenericType*>& FuncBase::GetGenericTypeParams() const
-{
-    return genericTypeParams;
-}
-
-void FuncBase::SetParamDftValHostFunc(FuncBase& hostFunc)
-{
-    paramDftValHostFunc = &hostFunc;
-}
-
-FuncBase* FuncBase::GetParamDftValHostFunc() const
-{
-    return paramDftValHostFunc;
-}
-
-void FuncBase::ClearParamDftValHostFunc()
-{
-    paramDftValHostFunc = nullptr;
-}
-
-// Func
-bool FuncBase::IsClassMethod() const
-{
-    if (auto outerDef = GetOuterDeclaredOrExtendedDef()) {
-        return outerDef->IsClass();
-    }
-    return false;
-}
-
-bool FuncBase::IsStructMethod() const
-{
-    if (auto outerDef = GetOuterDeclaredOrExtendedDef()) {
-        return outerDef->IsStruct();
-    }
-    return false;
-}
-
-bool FuncBase::IsEnumMethod() const
-{
-    if (auto outerDef = GetOuterDeclaredOrExtendedDef()) {
-        return outerDef->IsEnum();
-    }
-    return false;
-}
-
-bool FuncBase::IsInExtend() const
-{
-    if (declaredParent == nullptr) {
-        return false;
-    }
-    return declaredParent->GetCustomKind() == CustomDefKind::TYPE_EXTEND;
-}
-
-bool FuncBase::IsInGenericContext() const
-{
-    if (TestAttr(Attribute::GENERIC)) {
-        return true;
-    }
-    return declaredParent != nullptr && declaredParent->TestAttr(Attribute::GENERIC);
-}
-
-void FuncBase::SetOriginalLambdaInfo(const FuncSigInfo& info)
-{
-    CJC_ASSERT(funcKind == FuncKind::LAMBDA);
-    originalLambdaInfo = info;
-}
-
-FuncType* FuncBase::GetOriginalLambdaType() const
-{
-    return funcKind == LAMBDA ? originalLambdaInfo.funcType : GetFuncType();
-}
-
-std::vector<GenericType*> FuncBase::GetOriginalGenericTypeParams() const
-{
-    return funcKind == LAMBDA ? originalLambdaInfo.genericTypeParams : GetGenericTypeParams();
-}
-
-Func::Func(Type* ty, const std::string& identifier, const std::string& srcCodeIdentifier,
-    const std::string& rawMangledName, const std::string& packageName,
-    const std::vector<GenericType*>& genericTypeParams)
-    : Value(ty, identifier, ValueKind::KIND_FUNC),
-      FuncBase{srcCodeIdentifier, rawMangledName, packageName, genericTypeParams}
-{
-}
-
-uint64_t Func::GenerateLocalId()
-{
-    return localId++;
-}
-
-void Func::SetLocalId(uint64_t id)
-{
-    localId = id;
-}
-
-void Func::SetBlockId(uint64_t id)
-{
-    blockId = id;
-}
-
-void Func::SetBlockGroupId(uint64_t id)
-{
-    blockGroupId = id;
-}
-
-void Func::DestroyFuncBody()
-{
-    for (auto b : body.GetBody()->GetBlocks()) {
-        for (auto e : b->GetExpressions()) {
-            e->RemoveSelfFromBlock();
-        }
-    }
-    RemoveBody();
 }
 
 /**
@@ -1323,181 +979,498 @@ void Func::DestroyFuncBody()
  *               and the body's return value will be cleared. Must be a RefType if not nullptr.
  * @param builder The CHIRBuilder used to create or get the updated function type.
  */
-void Func::ReplaceReturnValue(LocalVar* newRet, CHIRBuilder& builder)
+void Function::ReplaceReturnValue(LocalVar* newRet, CHIRBuilder& builder)
 {
-    // Update the function type's return type
-    FuncBase::ReplaceReturnValue(newRet, builder);
-    
-    // Clear the old return value's ret flag if it exists
-    auto oldRet = body.GetReturnValue();
-    if (oldRet != nullptr) {
-        oldRet->SetRetValue(false);
-    }
-    
-    // Update the function body's return value
+    auto curFuncType = GetFuncType();
     if (newRet == nullptr) {
-        // Clear return value (function returns Void)
-        body.ClearReturnValueOnly();
+        // Change return type to Void
+        ty = builder.GetType<FuncType>(curFuncType->GetParamTypes(), builder.GetVoidTy());
     } else {
-        // Set the new return value
-        SetReturnValue(*newRet);
+        // Extract base type from RefType and set it as the new return type
+        CJC_ASSERT(newRet->GetType()->IsRef());
+        auto retType = StaticCast<RefType*>(newRet->GetType())->GetBaseType();
+        ty = builder.GetType<FuncType>(curFuncType->GetParamTypes(), retType);
+    }
+    // Clear the old return value's ret flag if it exists
+    if (retValue != nullptr) {
+        retValue->SetRetValue(false);
+    }
+
+    retValue = newRet;
+    if (retValue != nullptr) {
+        CJC_NULLPTR_CHECK(body);
+        retValue->SetRetValue(true);
     }
 }
 
-BlockGroup* Func::GetBody() const
+size_t Function::GetNumOfParams() const
 {
-    return body.GetBody();
+    return parameters.size();
 }
 
-void Func::RemoveBody()
+Type* Function::GetReturnType() const
 {
-    body.RemoveBody();
+    return GetFuncType()->GetReturnType();
 }
 
-void Func::RemoveParams()
+void Function::DestroySelf()
 {
-    body.RemoveParams();
+    if (declaredParent) {
+        Utils::RemoveFromVec(declaredParent->methods, this);
+        declaredParent = nullptr;
+    }
+    DestroyFuncBody();
 }
 
-void Func::InitBody(BlockGroup& newBody)
+Type* Function::GetParentCustomTypeOrExtendedType() const
 {
-    CJC_ASSERT(body.body == nullptr);
-    body.body = &newBody;
+    if (declaredParent == nullptr) {
+        return nullptr;
+    }
+    return declaredParent->GetType();
+}
+
+CustomTypeDef* Function::GetOuterDeclaredOrExtendedDef() const
+{
+    if (declaredParent == nullptr) {
+        return nullptr;
+    }
+    if (auto extendDef = DynamicCast<ExtendDef*>(declaredParent); extendDef) {
+        auto extendedType = extendDef->GetExtendedType();
+        if (extendedType == nullptr) {
+            return nullptr;
+        }
+        if (auto customTy = DynamicCast<const CustomType*>(extendedType); customTy) {
+            return customTy->GetCustomTypeDef();
+        }
+        return nullptr;
+    }
+    return declaredParent;
+}
+
+bool Function::IsMemberFunc() const
+{
+    return declaredParent != nullptr;
+}
+
+bool Function::IsConstructor() const
+{
+    return (funcKind == FuncKind::CLASS_CONSTRUCTOR || funcKind == FuncKind::STRUCT_CONSTRUCTOR ||
+        funcKind == FuncKind::PRIMAL_CLASS_CONSTRUCTOR || funcKind == FuncKind::PRIMAL_STRUCT_CONSTRUCTOR) &&
+        !TestAttr(Attribute::STATIC);
+}
+
+bool Function::IsFinalizer() const
+{
+    return funcKind == FuncKind::FINALIZER;
+}
+
+bool Function::IsLambda() const
+{
+    return funcKind == FuncKind::LAMBDA;
+}
+
+bool Function::IsGVInit() const
+{
+    return funcKind == FuncKind::GLOBALVAR_INIT;
+}
+
+bool Function::IsStaticInit() const
+{
+    return (funcKind == FuncKind::CLASS_CONSTRUCTOR || funcKind == FuncKind::STRUCT_CONSTRUCTOR) &&
+        srcCodeIdentifier == "static.init";
+}
+
+bool Function::IsInstanceVarInit() const
+{
+    return funcKind == FuncKind::INSTANCEVAR_INIT;
+}
+
+bool Function::IsCFunc() const
+{
+    return ty && ty->IsCFunc();
+}
+
+bool Function::IsVirtualFunc() const
+{
+    return TestAttr(Attribute::VIRTUAL) || TestAttr(Attribute::FINAL);
+}
+
+bool Function::IsPureAbstract() const
+{
+    return TestAttr(Attribute::ABSTRACT) && body == nullptr;
+}
+
+bool Function::IsSrcCodeImported() const
+{
+    return TestAttr(Attribute::IMPORTED) && body != nullptr;
+}
+
+Function* Function::GetGenericDecl() const
+{
+    return genericDecl;
+}
+
+void Function::SetGenericDecl(Function& decl)
+{
+    genericDecl = &decl;
+}
+
+bool Function::IsFastNative() const
+{
+    return isFastNative;
+}
+
+void Function::SetFastNative(bool fastNative)
+{
+    isFastNative = fastNative;
+}
+
+void Function::SetCFFIWrapper(bool isWrapper)
+{
+    isCFFIWrapper = isWrapper;
+}
+
+bool Function::IsCFFIWrapper() const
+{
+    return isCFFIWrapper;
+}
+
+const std::vector<GenericType*>& Function::GetGenericTypeParams() const
+{
+    return genericTypeParams;
+}
+
+void Function::SetParamDftValHostFunc(Function& hostFunc)
+{
+    paramDftValHostFunc = &hostFunc;
+}
+
+Function* Function::GetParamDftValHostFunc() const
+{
+    return paramDftValHostFunc;
+}
+
+void Function::ClearParamDftValHostFunc()
+{
+    paramDftValHostFunc = nullptr;
+}
+
+// Function
+bool Function::IsClassMethod() const
+{
+    if (auto outerDef = GetOuterDeclaredOrExtendedDef()) {
+        return outerDef->IsClass();
+    }
+    return false;
+}
+
+bool Function::IsStructMethod() const
+{
+    if (auto outerDef = GetOuterDeclaredOrExtendedDef()) {
+        return outerDef->IsStruct();
+    }
+    return false;
+}
+
+bool Function::IsEnumMethod() const
+{
+    if (auto outerDef = GetOuterDeclaredOrExtendedDef()) {
+        return outerDef->IsEnum();
+    }
+    return false;
+}
+
+bool Function::IsInExtend() const
+{
+    if (declaredParent == nullptr) {
+        return false;
+    }
+    return declaredParent->GetCustomKind() == CustomDefKind::TYPE_EXTEND;
+}
+
+bool Function::IsInGenericContext() const
+{
+    if (TestAttr(Attribute::GENERIC)) {
+        return true;
+    }
+    return declaredParent != nullptr && declaredParent->TestAttr(Attribute::GENERIC);
+}
+
+void Function::SetOriginalLambdaInfo(const FuncSigInfo& info)
+{
+    CJC_ASSERT(funcKind == FuncKind::LAMBDA);
+    originalLambdaInfo = info;
+}
+
+FuncType* Function::GetOriginalLambdaType() const
+{
+    return funcKind == LAMBDA ? originalLambdaInfo.funcType : GetFuncType();
+}
+
+std::vector<GenericType*> Function::GetOriginalGenericTypeParams() const
+{
+    return funcKind == LAMBDA ? originalLambdaInfo.genericTypeParams : GetGenericTypeParams();
+}
+
+uint64_t Function::GenerateLocalId()
+{
+    return localId++;
+}
+
+void Function::SetLocalId(uint64_t id)
+{
+    localId = id;
+}
+
+void Function::SetBlockId(uint64_t id)
+{
+    blockId = id;
+}
+
+void Function::SetBlockGroupId(uint64_t id)
+{
+    blockGroupId = id;
+}
+
+void Function::DestroyFuncBody()
+{
+    retValue = nullptr;
+    if (body == nullptr) {
+        return;
+    }
+    for (auto b : body->GetBlocks()) {
+        for (auto e : b->GetExpressions()) {
+            e->RemoveSelfFromBlock();
+        }
+    }
+    body = nullptr;
+}
+
+BlockGroup* Function::GetBody() const
+{
+    return body;
+}
+
+void Function::RemoveBody()
+{
+    body = nullptr;
+}
+
+void Function::RemoveParams()
+{
+    parameters.clear();
+}
+
+void Function::InitBody(BlockGroup& newBody)
+{
+    CJC_ASSERT(body == nullptr);
+    body = &newBody;
     if (newBody.GetOwnerFunc() != this) {
         newBody.SetOwnerFunc(this);
     }
 }
 
-void Func::ReplaceBody(BlockGroup& newBody)
+void Function::ReplaceBody(BlockGroup& newBody)
 {
     DestroyFuncBody();
-    body.parameters.clear();
     InitBody(newBody);
 }
 
-void Func::InheritIDFromFunc(const Func& func)
+void Function::InheritIDFromFunc(const Function& func)
 {
     blockId = func.blockId;
     localId = func.localId;
     blockGroupId = func.blockGroupId;
 }
 
-void Func::AddParam(Parameter& param)
+void Function::AddParam(Parameter& param)
 {
-    body.AddParam(param);
+    parameters.emplace_back(&param);
     param.SetOwnerFunc(this);
 }
 
-Parameter* Func::GetParam(size_t index) const
+Parameter* Function::GetParam(size_t index) const
 {
-    return body.GetParam(index);
+    CJC_ASSERT(index < parameters.size());
+    return parameters[index];
 }
 
-const std::vector<Parameter*>& Func::GetParams() const
+const std::vector<Parameter*>& Function::GetParams() const
 {
-    return body.GetParams();
+    return parameters;
 }
 
-bool Func::HasReturnValue() const
+bool Function::HasReturnValue() const
 {
-    return body.GetReturnValue() != nullptr;
+    return retValue != nullptr;
 }
 
-void Func::SetReturnValue(LocalVar& ret)
+void Function::SetReturnValue(LocalVar& ret)
 {
+    CJC_NULLPTR_CHECK(body);
     ret.SetRetValue(true);
-    body.SetReturnValue(ret);
+    retValue = &ret;
 }
 
-LocalVar* Func::GetReturnValue() const
+LocalVar* Function::GetReturnValue() const
 {
-    return body.GetReturnValue();
+    return retValue;
 }
 
-uint64_t Func::GenerateBlockId()
+uint64_t Function::GenerateBlockId()
 {
     return blockId++;
 }
 
-uint64_t Func::GenerateBlockGroupId()
+uint64_t Function::GenerateBlockGroupId()
 {
     return blockGroupId++;
 }
 
-Block* Func::GetEntryBlock() const
+Block* Function::GetEntryBlock() const
 {
-    return GetBody()->GetEntryBlock();
+    return body->GetEntryBlock();
 }
 
-std::string Func::ToString() const
+std::string Function::ToString(size_t indent) const
 {
-    return GetFuncStr(*this);
+    std::stringstream ss;
+    ss << AddNewLineOrNot(annoInfo.ToString(indent));
+    ss << IndentToString(indent) << attributes.ToString();
+    if (isFastNative) {
+        ss << "[fastNative] ";
+    }
+    if (isCFFIWrapper) {
+        ss << "[CFFIWrapper] ";
+    }
+    ss << "Func " << identifier << TypeVecToString("<", genericTypeParams, ">") << "(";
+    for (auto param : parameters) {
+        ss << std::endl << param->ToString(indent + 1);
+    }
+    if (!parameters.empty()) {
+        ss << std::endl;
+        ss << IndentToString(indent);
+    }
+    ss << "): " << GetReturnType()->ToString();
+    std::vector<std::string> comments;
+    if (auto globalValComment = GlobalValueCommentToString(); !globalValComment.empty()) {
+        comments.emplace_back(globalValComment);
+    }
+    if (auto gStr = GetGenericTypeConstaintsStr(genericTypeParams); !gStr.empty()) {
+        comments.emplace_back(gStr);
+    }
+    if (funcKind != FuncKind::DEFAULT) {
+        comments.emplace_back("kind: " + FUNCKIND_TO_STRING.at(funcKind));
+    }
+    if (genericDecl != nullptr) {
+        comments.emplace_back("genericDecl: " + genericDecl->GetIdentifier());
+    }
+    if (paramDftValHostFunc != nullptr) {
+        comments.emplace_back("paramDftValHostFunc: " + paramDftValHostFunc->GetIdentifier());
+    }
+    if (funcKind == FuncKind::LAMBDA) {
+        comments.emplace_back("originalLambdaInfo: " + originalLambdaInfo.ToString());
+    }
+    if (!propLoc.IsInvalidPos()) {
+        comments.emplace_back("propLoc: " + propLoc.ToString());
+    }
+    ss << CommentToString(comments);
+    if (body != nullptr) {
+        ss << std::endl << body->ToString(indent);
+    }
+    return ss.str();
 }
 
-const DebugLocation& Func::GetPropLocation() const
+const DebugLocation& Function::GetPropLocation() const
 {
     return propLoc;
 }
 
-void Func::SetPropLocation(const DebugLocation& loc)
+void Function::SetPropLocation(const DebugLocation& loc)
 {
     propLoc = loc;
 }
 
-size_t Func::GetExpressionsNum() const
+size_t Function::GetExpressionsNum() const
 {
-    if (!GetBody()) {
+    if (body == nullptr) {
         return 0;
     }
-    return GetBody()->GetExpressionsNum();
+    return body->GetExpressionsNum();
 }
 
-void Func::DestroySelf()
-{
-    DestroyFuncBody();
-    FuncBase::DestroySelf();
-}
-
-ImportedFunc::ImportedFunc(
-    Type* ty, const std::string& identifier, const std::string& srcCodeIdentifier, const std::string& rawMangledName,
-    const std::string& packageName, const std::vector<GenericType*>& genericTypeParams)
-    : Value{ty, identifier, KIND_IMP_FUNC},
-    ImportedValue{},
-    FuncBase{srcCodeIdentifier, rawMangledName, packageName, genericTypeParams}
+GlobalValue::GlobalValue(ValueKind kind, Type* ty, const std::string& identifier,
+    const std::string& srcCodeIdentifier, const std::string& rawMangledName, const std::string& packageName)
+    : Value(ty, identifier, kind),
+    srcCodeIdentifier(srcCodeIdentifier), rawMangledName(rawMangledName), packageName(packageName)
 {
 }
 
-const std::vector<AbstractMethodParam>& ImportedFunc::GetParamInfo() const
-{
-    return paramInfo;
-}
-
-void ImportedFunc::SetParamInfo(std::vector<AbstractMethodParam>&& params)
-{
-    paramInfo = std::move(params);
-}
-
-const std::string& ImportedFunc::GetSourcePackageName() const
+const std::string& GlobalValue::GetPackageName() const
 {
     return packageName;
 }
 
-ImportedVar::ImportedVar(Type* ty, std::string identifier, std::string srcCodeIdentifier, std::string rawMangledName,
-    std::string packageName)
-    : Value{ty, std::move(identifier), ValueKind::KIND_IMP_VAR}, ImportedValue{},
-    GlobalVarBase{std::move(srcCodeIdentifier), std::move(rawMangledName), std::move(packageName)}
+std::string GlobalValue::GetSrcCodeIdentifier() const
 {
+    return srcCodeIdentifier;
 }
 
-const std::string& ImportedVar::GetSourcePackageName() const
+const std::string& GlobalValue::GetRawMangledName() const
 {
-    return packageName;
+    return rawMangledName;
 }
 
-namespace Cangjie::CHIR {
-
-std::string AbstractMethodParam::ToString()
+void GlobalValue::SetRawMangledName(const std::string& name)
 {
-    return paramName + ": " + type->ToString();
+    rawMangledName = name;
 }
-} // namespace Cangjie::CHIR
+
+const std::set<std::string>& GlobalValue::GetFeatures() const
+{
+    return features;
+}
+
+void GlobalValue::SetFeatures(const std::set<std::string>& newFeatures)
+{
+    features = newFeatures;
+}
+
+const AnnoInfo& GlobalValue::GetAnnoInfo() const
+{
+    return annoInfo;
+}
+
+void GlobalValue::SetAnnoInfo(AnnoInfo&& info)
+{
+    annoInfo = std::move(info);
+}
+
+CustomTypeDef* GlobalValue::GetParentCustomTypeDef() const
+{
+    return declaredParent;
+}
+
+std::string GlobalValue::GlobalValueCommentToString() const
+{
+    std::vector<std::string> result;
+    result.emplace_back(BaseCommentToString());
+    if (!srcCodeIdentifier.empty()) {
+        result.emplace_back("srcCodeIdentifier: " + srcCodeIdentifier);
+    }
+    if (!rawMangledName.empty()) {
+        result.emplace_back("rawMangledName: " + rawMangledName);
+    }
+    if (!packageName.empty()) {
+        result.emplace_back("packageName: " + packageName);
+    }
+    if (declaredParent != nullptr) {
+        result.emplace_back("declaredParent: " + declaredParent->GetIdentifier());
+    }
+    if (!features.empty()) {
+        std::vector<std::string> vec(features.begin(), features.end());
+        result.emplace_back("features: {" + StringJoin(vec, ", ") + "}");
+    }
+    return StringJoin(result, ", ");
+}

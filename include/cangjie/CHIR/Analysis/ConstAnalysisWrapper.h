@@ -53,7 +53,7 @@ public:
      * @return result of analysis per function
      */
     template <typename... Args>
-    std::unique_ptr<Results<ConstDomain>> RunOnFunc(const Func* func, bool isDebug, Args&&... args)
+    std::unique_ptr<Results<ConstDomain>> RunOnFunc(const Function* func, bool isDebug, Args&&... args)
     {
         auto analysis =
             std::make_unique<ConstAnalysis<ConstStatePool>>(func, builder, isDebug, std::forward<Args>(args)...);
@@ -70,7 +70,7 @@ public:
      * @return result of analysis per function
      */
     template <typename... Args>
-    std::unique_ptr<Results<ConstPoolDomain>> RunOnFuncWithPool(const Func* func, bool isDebug, Args&&... args)
+    std::unique_ptr<Results<ConstPoolDomain>> RunOnFuncWithPool(const Function* func, bool isDebug, Args&&... args)
     {
         auto analysis =
             std::make_unique<ConstAnalysis<ConstActivePool>>(func, builder, isDebug, std::forward<Args>(args)...);
@@ -83,14 +83,14 @@ public:
      * @param func function to return analysis result
      * @return analysis result
      */
-    Results<ConstDomain>* CheckFuncResult(const Func& func);
+    Results<ConstDomain>* CheckFuncResult(const Function& func);
 
     /**
      * @brief return result of analysis for certain function
      * @param func function to return analysis result
      * @return analysis result
      */
-    Results<ConstPoolDomain>* CheckFuncActiveResult(const Func& func);
+    Results<ConstPoolDomain>* CheckFuncActiveResult(const Function& func);
 
     /**
      * @brief clear analysis result
@@ -104,17 +104,17 @@ private:
         ActiveStatePool
     };
 
-    AnalysisStrategy ChooseAnalysisStrategy(const Func& func);
+    AnalysisStrategy ChooseAnalysisStrategy(const Function& func);
 
     /// Compute block size helpers
     static size_t GetBlockSize(const Expression& expr);
-    static size_t CountBlockSize(const Func& func);
+    static size_t CountBlockSize(const Function& func);
 
     template <typename... Args>
     void RunOnPackageInSerial(const Package* package, bool isDebug, Args&&... args)
     {
         SetUpGlobalVarState(*package, isDebug, std::forward<Args>(args)...);
-        for (auto func : package->GetGlobalFuncs()) {
+        for (auto func : package->GetGlobalFuncsWithBody()) {
             auto judgeRes = ChooseAnalysisStrategy(*func);
             if (judgeRes == AnalysisStrategy::ActiveStatePool) {
                 if (auto res = RunOnFuncWithPool(func, isDebug, std::forward<Args>(args)...)) {
@@ -137,20 +137,16 @@ private:
         using ResTyPool = std::unique_ptr<Results<ConstPoolDomain>>;
         std::vector<Cangjie::Utils::TaskResult<ResTy>> results;
         std::vector<Cangjie::Utils::TaskResult<ResTyPool>> resultsPool;
-        for (auto func : package->GetGlobalFuncs()) {
+        for (auto func : package->GetGlobalFuncsWithBody()) {
             auto judgeRes = ChooseAnalysisStrategy(*func);
             if (judgeRes == AnalysisStrategy::ActiveStatePool) {
                 resultsPool.emplace_back(taskQueue.AddTask<ResTyPool>(
-                    [func, isDebug, &args..., this]() {
-                            return RunOnFuncWithPool(func, isDebug, std::forward<Args>(args)...);
-                        },
+                    [func, isDebug, &args..., this]() { return RunOnFuncWithPool(func, isDebug, std::forward<Args>(args)...); },
                     // Roughly use the number of Blocks as the cost of task weight
                     func->GetBody()->GetBlocks().size()));
             } else if (judgeRes == AnalysisStrategy::FullStatePool) {
                 results.emplace_back(taskQueue.AddTask<ResTy>(
-                    [func, isDebug, &args..., this]() {
-                            return RunOnFunc(func, isDebug, std::forward<Args>(args)...);
-                        },
+                    [func, isDebug, &args..., this]() { return RunOnFunc(func, isDebug, std::forward<Args>(args)...); },
                     func->GetBody()->GetBlocks().size()));
             }
         }
@@ -172,7 +168,7 @@ private:
     template <typename... Args> void SetUpGlobalVarState(const Package& package, bool isDebug, Args&&... args)
     {
         ConstAnalysis<ConstStatePool>::InitialiseLetGVState(package, builder);
-        for (auto gv : package.GetGlobalVars()) {
+        for (auto gv : package.GetGlobalVarsWithInit()) {
             if (auto init = gv->GetInitFunc();
                 gv->TestAttr(Attribute::READONLY) && init && resultsMap.find(init) == resultsMap.end()) {
                 // Multiple global vars may be initialised in the same function.
@@ -182,8 +178,8 @@ private:
         }
     }
 
-    std::unordered_map<const Func*, std::unique_ptr<Results<ConstDomain>>> resultsMap;
-    std::unordered_map<const Func*, std::unique_ptr<Results<ConstPoolDomain>>> resultsPoolMap;
+    std::unordered_map<const Function*, std::unique_ptr<Results<ConstDomain>>> resultsMap;
+    std::unordered_map<const Function*, std::unique_ptr<Results<ConstPoolDomain>>> resultsPoolMap;
     CHIRBuilder& builder;
 };
 

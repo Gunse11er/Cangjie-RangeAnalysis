@@ -170,7 +170,7 @@ inline bool NotAssignableVariable(const VarDecl& vd, bool inInitFunction)
 {
     return !vd.isVar &&
         (vd.TestAnyAttr(Attribute::GLOBAL, Attribute::INITIALIZED, Attribute::ENUM_CONSTRUCTOR) ||
-            (vd.TestAnyAttr(Attribute::IN_STRUCT, Attribute::IN_CLASSLIKE) && !inInitFunction) ||
+            (vd.TestAnyAttr(Attribute::IN_STRUCT, Attribute::IN_CLASSLIKE, Attribute::IN_EXTEND) && !inInitFunction) ||
             IsImutFieldInCtorOfCommonClassStruct(vd, inInitFunction));
 }
 
@@ -288,14 +288,14 @@ void UpdateContextVariables(std::unordered_set<Ptr<const AST::VarDecl>>& context
 
 bool MayBeStructTy(const VarDecl& target)
 {
-    if (!Ty::IsTyCorrect(target.ty)) {
+    if (!Ty::IsTyCorrect(target.GetTy())) {
         return false;
     }
-    if (target.ty->IsStruct()) {
+    if (target.GetTy()->IsStruct()) {
         return true;
     }
-    if (target.ty->IsGeneric()) {
-        auto gTy = RawStaticCast<GenericsTy*>(target.ty);
+    if (target.GetTy()->IsGeneric()) {
+        auto gTy = RawStaticCast<GenericsTy*>(target.GetTy());
         for (auto& ub : std::as_const(gTy->upperBounds)) {
             // The upper bounds of GenericsTy can only be Classes or Interfaces.
             CJC_ASSERT(ub->IsClassLike());
@@ -591,12 +591,12 @@ void InitializationChecker::CheckInitInClassDecl(const ClassDecl& cd)
 void InitializationChecker::CheckInitInExtendDecl(const ExtendDecl& ed)
 {
     CJC_NULLPTR_CHECK(ed.extendedType);
-    if (!Ty::IsTyCorrect(ed.extendedType->ty)) {
+    if (!Ty::IsTyCorrect(ed.extendedType->GetTy())) {
         return;
     }
     // Get the not declared-initialized member variables.
     std::vector<Ptr<Decl>> unInitNonFuncDecls;
-    if (auto typeDecl = Ty::GetDeclPtrOfTy(ed.extendedType->ty); typeDecl && typeDecl->IsStructOrClassDecl()) {
+    if (auto typeDecl = Ty::GetDeclPtrOfTy(ed.extendedType->GetTy()); typeDecl && typeDecl->IsStructOrClassDecl()) {
         for (auto& decl : typeDecl->GetMemberDecls()) {
             CJC_NULLPTR_CHECK(decl);
             if (decl->astKind == ASTKind::VAR_DECL && !decl->TestAttr(Attribute::INITIALIZED)) {
@@ -695,7 +695,7 @@ void InitializationChecker::CheckLetFlag(const Expr& ae, const Expr& expr)
             break;
         case ASTKind::SUBSCRIPT_EXPR: {
             auto& se = StaticCast<SubscriptExpr>(expr);
-            if (!se.baseExpr || !Is<VArrayTy>(se.baseExpr->ty)) {
+            if (!se.baseExpr || !Is<VArrayTy>(se.baseExpr->GetTy())) {
                 return;
             }
             // Multi-level VArray nested assignment expressions cannot be modified. Because the return value of
@@ -721,7 +721,7 @@ void InitializationChecker::CheckLetFlagInMemberAccess(const Expr& ae, const Mem
         if (realBaseExpr == nullptr) {
             return;
         }
-        bool isStructBase = realBaseExpr->ty && realBaseExpr->ty->IsStruct();
+        bool isStructBase = realBaseExpr->GetTy() && realBaseExpr->GetTy()->IsStruct();
         if (NotAssignableVariable(*vd, inInitFunction)) {
             DiagCannotAssignToImmutable(diag, ae, ma);
         }

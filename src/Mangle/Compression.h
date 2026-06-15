@@ -200,7 +200,7 @@ size_t ForwardNumber(std::string& mangled, size_t idx = 0);
  * @param isType Whether the mangled name is type.
  * @return std::string The mangled name after compression.
  */
-std::string CJMangledCompression(const std::string mangled, bool isType = false);
+std::string CJMangledCompression(const std::string& mangled, bool isType = false);
 
 /**
  * @brief Try parse path of the mangled name to generate entity vector.

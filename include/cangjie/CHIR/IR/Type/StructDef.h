@@ -27,8 +27,8 @@ public:
     void SetCStruct(bool value);
 
 protected:
-    void PrintComment(std::stringstream& ss) const override;
-    
+    std::string AddExtraComment() const override;
+
 private:
     explicit StructDef(std::string srcCodeIdentifier, std::string identifier, std::string pkgName)
         : CustomTypeDef(srcCodeIdentifier, identifier, pkgName, CustomDefKind::TYPE_STRUCT)

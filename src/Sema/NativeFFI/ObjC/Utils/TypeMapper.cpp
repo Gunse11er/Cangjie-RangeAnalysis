@@ -33,6 +33,7 @@ static constexpr auto NATIVE_UINT_TYPE = "size_t";
 static constexpr auto FLOAT_TYPE = "float";
 static constexpr auto DOUBLE_TYPE = "double";
 static constexpr auto BOOL_TYPE = "BOOL";
+static constexpr auto CHAR_PTR_TYPE = "char*";
 static constexpr auto STRUCT_TYPE_PREFIX = "struct ";
 
 static constexpr auto TYPEDEF_PREFIX = "typedef ";
@@ -41,11 +42,10 @@ static constexpr auto TYPEDEF_PREFIX = "typedef ";
 namespace {
 void MangleTypedefName(std::string& name)
 {
-    static const size_t replacementLen = 2;
-    size_t startPos = 0;
-    while ((startPos = name.find("_", startPos)) != std::string::npos) {
-        name.replace(startPos, 1, "_1");
-        startPos += replacementLen;
+    size_t start_pos = 0;
+    while ((start_pos = name.find("_", start_pos)) != std::string::npos) {
+        name.replace(start_pos, 1, "_1");
+        start_pos += 2;
     }
 
     std::replace(name.begin(), name.end(), '.', '_');
@@ -75,7 +75,7 @@ MappedCType TypeMapper::BuildFunctionalCType(const FuncTy& funcType, const std::
         decl.pop_back();
     }
     decl.push_back(')');
-    return {std::move(mangledName), std::move(decl)};
+    return {mangledName, decl};
 }
 
 Ptr<Ty> TypeMapper::Cj2CType(Ptr<Ty> cjty) const
@@ -109,7 +109,7 @@ Ptr<Ty> TypeMapper::Cj2CType(Ptr<Ty> cjty) const
     if (IsObjCBlock(*cjty)) {
         return bridge.GetNativeObjCIdTy();
     }
-    CJC_ASSERT(cjty->IsBuiltin() || Ty::IsCStructType(*cjty));
+    CJC_ASSERT(cjty->IsBuiltin() || Ty::IsCStructType(*cjty) || cjty->IsCFunc());
     return cjty;
 }
 
@@ -117,76 +117,78 @@ MappedCType TypeMapper::Cj2ObjCForObjC(const Ty& from) const
 {
     switch (from.kind) {
         case TypeKind::TYPE_UNIT:
-            return MappedCType(VOID_TYPE);
+            return VOID_TYPE;
         case TypeKind::TYPE_INT8:
-            return MappedCType(INT8_TYPE);
+            return INT8_TYPE;
         case TypeKind::TYPE_INT16:
-            return MappedCType(INT16_TYPE);
+            return INT16_TYPE;
         case TypeKind::TYPE_INT32:
-            return MappedCType(INT32_TYPE);
+            return INT32_TYPE;
         case TypeKind::TYPE_INT64:
         case TypeKind::TYPE_IDEAL_INT: // alias for int64
-            return MappedCType(INT64_TYPE);
+            return INT64_TYPE;
         case TypeKind::TYPE_INT_NATIVE:
-            return MappedCType(NATIVE_INT_TYPE);
+            return NATIVE_INT_TYPE;
         case TypeKind::TYPE_UINT8:
-            return MappedCType(UINT8_TYPE);
+            return UINT8_TYPE;
         case TypeKind::TYPE_UINT16:
-            return MappedCType(UINT16_TYPE);
+            return UINT16_TYPE;
         case TypeKind::TYPE_UINT32:
-            return MappedCType(UINT32_TYPE);
+            return UINT32_TYPE;
         case TypeKind::TYPE_UINT64:
-            return MappedCType(UINT64_TYPE);
+            return UINT64_TYPE;
         case TypeKind::TYPE_UINT_NATIVE:
-            return MappedCType(NATIVE_UINT_TYPE);
+            return NATIVE_UINT_TYPE;
         case TypeKind::TYPE_FLOAT32:
-            return MappedCType(FLOAT_TYPE);
+            return FLOAT_TYPE;
         case TypeKind::TYPE_FLOAT64:
         case TypeKind::TYPE_IDEAL_FLOAT:
-            return MappedCType(DOUBLE_TYPE);
+            return DOUBLE_TYPE;
         case TypeKind::TYPE_BOOLEAN:
-            return MappedCType(BOOL_TYPE);
+            return BOOL_TYPE;
+        case TypeKind::TYPE_CSTRING:
+            return CHAR_PTR_TYPE;
         case TypeKind::TYPE_STRUCT:
             if (IsObjCPointer(from)) {
                 auto result = Cj2ObjCForObjC(*from.typeArgs[0]);
                 result.usage += "*";
                 return result;
             } else if (Ty::IsCStructType(from)) {
-                return MappedCType(STRUCT_TYPE_PREFIX + from.name);
+                return STRUCT_TYPE_PREFIX + from.name;
             } else if (IsObjCCJMapping(from)) {
-                return MappedCType(from.name + "*");
+                return from.name + "*";
             }
             if (IsObjCFunc(from)) {
                 auto actualFuncType = DynamicCast<FuncTy>(from.typeArgs[0]);
                 if (!actualFuncType) {
-                    return MappedCType(UNSUPPORTED_TYPE);
+                    return UNSUPPORTED_TYPE;
                 }
                 return BuildFunctionalCType(*actualFuncType, actualFuncType->paramTys, actualFuncType->retTy, false,
                     [this](Ptr<Ty> t) { return Cj2ObjCForObjC(*t).usage; });
             }
             CJC_ABORT();
-            return MappedCType(UNSUPPORTED_TYPE);
+            return UNSUPPORTED_TYPE;
         case TypeKind::TYPE_CLASS:
             if (IsObjCBlock(from)) {
                 auto actualFuncType = DynamicCast<FuncTy>(from.typeArgs[0]);
                 if (!actualFuncType) {
-                    return MappedCType(UNSUPPORTED_TYPE);
+                    return UNSUPPORTED_TYPE;
                 }
                 return BuildFunctionalCType(*actualFuncType, actualFuncType->paramTys, actualFuncType->retTy, true,
                     [this](Ptr<Ty> t) { return Cj2ObjCForObjC(*t).usage; });
             }
             if (IsObjCObjectType(from)) {
-                return MappedCType(from.name + "*");
+                return from.name + "*";
             }
-            return MappedCType(UNSUPPORTED_TYPE);
+            return UNSUPPORTED_TYPE;
         case TypeKind::TYPE_INTERFACE:
             if (IsObjCId(from)) {
-                return MappedCType("id");
+                return "id";
             }
             if (IsObjCMirror(from) || IsObjCCJMappingInterface(from)) {
-                return MappedCType("id<" + from.name + ">");
+                return "id<" + from.name + ">";
             }
-            return MappedCType(UNSUPPORTED_TYPE);
+            return UNSUPPORTED_TYPE;
         case TypeKind::TYPE_POINTER: {
             if (from.typeArgs[0]->kind == TypeKind::TYPE_FUNC) {
                 return Cj2ObjCForObjC(*from.typeArgs[0]);
@@ -203,18 +205,18 @@ MappedCType TypeMapper::Cj2ObjCForObjC(const Ty& from) const
         }
         case TypeKind::TYPE_ENUM:
             if (IsObjCCJMapping(from)) {
-                return MappedCType(from.name + "*");
+                return from.name + "*";
             }
             if (!from.IsCoreOptionType()) {
                 CJC_ABORT();
-                return MappedCType(UNSUPPORTED_TYPE);
+                return UNSUPPORTED_TYPE;
             };
             if (IsObjCObjectType(*from.typeArgs[0])) {
                 return Cj2ObjCForObjC(*from.typeArgs[0]);
             }
         default:
             CJC_ABORT();
-            return MappedCType(UNSUPPORTED_TYPE);
+            return UNSUPPORTED_TYPE;
     }
 }
 
@@ -282,6 +284,14 @@ bool TypeMapper::IsObjCCompatible(const Ty& ty)
             if (IsValidObjCMirror(*ty.typeArgs[0]) || IsObjCImpl(*ty.typeArgs[0])) {
                 return true;
             }
+        case TypeKind::TYPE_FUNC:
+            if (ty.IsCFunc()) {
+                return true;
+            }
+        case TypeKind::TYPE_CSTRING:
+            if (ty.IsCString()) {
+                return true;
+            }
         default:
             return false;
     }
@@ -299,7 +309,7 @@ bool TypeMapper::IsSyntheticWrapper(const Decl& decl)
 
 bool TypeMapper::IsObjCMirrorSubtype(const Decl& decl)
 {
-    return IsValidObjCMirrorSubtype(*decl.ty);
+    return IsValidObjCMirrorSubtype(*decl.GetTy());
 }
 
 bool TypeMapper::IsObjCImpl(const Decl& decl)
@@ -587,7 +597,7 @@ bool IsOpenClassTy(const Ty& ty)
 
 inline bool SupportMemberFunc(const AST::Decl& decl, std::function<bool(Ptr<Ty>)> validTy)
 {
-    auto fnTy = Cangjie::DynamicCast<FuncTy>(decl.ty);
+    auto fnTy = Cangjie::DynamicCast<FuncTy>(decl.GetTy());
     // Constructor do not check return type.
     CJC_ASSERT(fnTy && fnTy->retTy);
     bool isValid = decl.TestAttr(Attribute::CONSTRUCTOR) ? true : validTy(fnTy->retTy);
@@ -626,7 +636,7 @@ bool TypeMapper::IsObjCCJMappingMember(const AST::Decl& decl)
         }
         return SupportMemberFunc(decl, validTy);
     } else if (decl.astKind == ASTKind::PROP_DECL || decl.astKind == ASTKind::VAR_DECL) {
-        return IsValidCJMapping(*decl.ty);
+        return IsValidCJMapping(*decl.GetTy());
     }
     return false;
 }

@@ -54,11 +54,11 @@ bool CheckInferrableEnumReference(DiagnosticEngine& diag, TypeManager& tyMgr, Ex
         }
         targetTy = *candiTys.begin();
     }
-    expr.ty = targetTy;
+    expr.SetTy(targetTy);
     Ptr<Expr> ref = &expr;
     if (auto ma = DynamicCast<MemberAccess*>(&expr); ma) {
         ref = ma->baseExpr.get();
-        ref->ty = targetTy; // Type of enum base is same with the expression's ty.
+        ref->SetTy(targetTy); // Type of enum base is same with the expression's ty.
     }
     if (auto reference = DynamicCast<AST::NameReferenceExpr*>(ref)) {
         reference->instTys.clear();
@@ -78,10 +78,10 @@ bool CheckNonFunctionReference(DiagnosticEngine& diag, TypeManager& tyMgr, Ty& t
         return CheckInferrableEnumReference(diag, tyMgr, refNode, target);
     }
 
-    bool isWellTyped = tyMgr.IsSubtype(refNode.ty, &target);
+    bool isWellTyped = tyMgr.IsSubtype(refNode.GetTy(), &target);
     if (!isWellTyped) {
         DiagMismatchedTypes(diag, refNode, target);
-        refNode.ty = TypeManager::GetInvalidTy();
+        refNode.SetTy(TypeManager::GetInvalidTy());
     }
     return isWellTyped;
 }
@@ -219,7 +219,7 @@ std::vector<Ptr<Decl>> MergeFuncTargetsInUpperBounds(TypeManager& tyMgr, const M
         }
         MultiTypeSubst mts;
         tyMgr.GenerateTypeMappingForUpperBounds(mts, ma, *decl);
-        auto tys = tyMgr.GetInstantiatedTys(decl->ty, mts);
+        auto tys = tyMgr.GetInstantiatedTys(decl->GetTy(), mts);
         for (auto ty : tys) {
             auto funcTy = DynamicCast<FuncTy*>(ty);
             if (!Ty::IsTyCorrect(funcTy)) {
@@ -260,7 +260,7 @@ std::vector<Ptr<Decl>> MergeFuncTargetsInSum(TypeManager& tyMgr, const MemberAcc
         }
         MultiTypeSubst mts;
         tyMgr.GenerateTypeMappingForUpperBounds(mts, ma, *decl);
-        auto tys = tyMgr.GetInstantiatedTys(decl->ty, mts);
+        auto tys = tyMgr.GetInstantiatedTys(decl->GetTy(), mts);
         for (auto ty : tys) {
             auto funcTy = DynamicCast<FuncTy*>(ty);
             if (!Ty::IsTyCorrect(funcTy)) {
@@ -285,7 +285,8 @@ std::vector<Ptr<Decl>> MergeFuncTargetsInSum(TypeManager& tyMgr, const MemberAcc
 
 void DiagForGenericParamMemberNotFound(DiagnosticEngine& diag, const MemberAccess& ma, const GenericParamDecl& gpd)
 {
-    if (Ty::IsTyCorrect(gpd.ty) && gpd.ty->IsGeneric() && RawStaticCast<GenericsTy*>(gpd.ty)->isUpperBoundLegal) {
+    if (Ty::IsTyCorrect(gpd.GetTy()) && gpd.GetTy()->IsGeneric() &&
+        RawStaticCast<GenericsTy*>(gpd.GetTy())->isUpperBoundLegal) {
         diag.Diagnose(*ma.baseExpr, DiagKind::sema_invalid_field_expose_access, ma.field.Val(),
             "exposed generic parameter", gpd.identifier.Val());
     }
@@ -308,18 +309,18 @@ void TypeChecker::TypeCheckerImpl::DiagMemberAccessNotFound(const MemberAccess& 
     }
     Ptr<const Expr> baseExpr = ma.baseExpr.get();
     CJC_NULLPTR_CHECK(baseExpr);
-    if (!Ty::IsTyCorrect(baseExpr->ty)) {
+    if (!Ty::IsTyCorrect(baseExpr->GetTy())) {
         return; // Do not report error for baseExpr with invlaid type.
     }
     auto getMemberRange = [&ma]() { return ma.field.ZeroPos() ? MakeRange(ma.begin, ma.end) : MakeRange(ma.field); };
     if (ma.isExposedAccess) {
         (void)diag.DiagnoseRefactor(DiagKindRefactor::sema_not_found_from_generic_upper_bounds, ma, getMemberRange(),
-            ma.field.Val(), baseExpr->ty->name);
-    } else if (baseExpr->ty->IsNominal()) {
-        std::string kind = baseExpr->ty->Ty::String();
+            ma.field.Val(), baseExpr->GetTy()->name);
+    } else if (baseExpr->GetTy()->IsNominal()) {
+        std::string kind = baseExpr->GetTy()->Ty::String();
         kind[0] = static_cast<char>(std::tolower(kind[0]));
         auto builder = diag.DiagnoseRefactor(DiagKindRefactor::sema_not_member_of, ma, getMemberRange(), ma.field, kind,
-            baseExpr->ty->name + baseExpr->ty->PrintTypeArgs());
+            baseExpr->GetTy()->name + baseExpr->GetTy()->PrintTypeArgs());
         RecommendImportForMemberAccess(typeManager, importManager, ma, &builder);
     } else if (ma.ShouldDiagnose(true)) {
         auto builder =
@@ -330,7 +331,7 @@ void TypeChecker::TypeCheckerImpl::DiagMemberAccessNotFound(const MemberAccess& 
 
 bool TypeChecker::TypeCheckerImpl::ChkRefExpr(ASTContext& ctx, Ty& target, NameReferenceExpr& refNode)
 {
-    (void)Synthesize(ctx, &refNode);
+    Synthesize({ctx, SynPos::EXPR_ARG}, &refNode);
     auto targets = GetFuncTargets(refNode);
     // None function target check.
     if (targets.empty()) {
@@ -359,16 +360,18 @@ bool TypeChecker::TypeCheckerImpl::ChkRefExpr(ASTContext& ctx, Ty& target, NameR
         }
         matched++;
         ReplaceTarget(&refNode, fd);
-        std::tie(matchedFd, refNode.ty, resultMapping) = {fd, fdTy, mapping};
+        matchedFd = fd;
+        refNode.SetTy(fdTy);
+        resultMapping = mapping;
     }
-    refNode.ty = TypeManager::GetNonNullTy(refNode.ty);
-    if (refNode.ty->IsQuest()) {
-        refNode.ty = TypeManager::GetInvalidTy();
+    refNode.SetTy(TypeManager::GetNonNullTy(refNode.GetTy()));
+    if (refNode.GetTy()->IsQuest()) {
+        refNode.SetTy(TypeManager::GetInvalidTy());
     }
     if (matched > 1) {
         diag.Diagnose(refNode, DiagKind::sema_ambiguous_func_ref, targets[0]->identifier.Val());
     } else if (matched == 0) {
-        if (Ty::IsTyCorrect(refNode.ty) && refNode.ty->HasQuestTy()) {
+        if (Ty::IsTyCorrect(refNode.GetTy()) && refNode.GetTy()->HasQuestTy()) {
             CJC_ASSERT(refNode.GetTarget());
             DiagUnableToInferReturnType(diag, *targets[0], refNode);
         } else if (genericIgnored) {
@@ -385,7 +388,7 @@ bool TypeChecker::TypeCheckerImpl::ChkRefExpr(ASTContext& ctx, Ty& target, NameR
         if (IsGenericUpperBoundCall(refNode, *matchedFd)) {
             // Previous check guarantees 'refNode' is 'RefExpr' or 'MemberAccess' which must be 'NameReferenceExpr'.
             auto& ref = static_cast<NameReferenceExpr&>(refNode);
-            ref.matchedParentTy = typeManager.GetInstantiatedTy(matchedFd->outerDecl->ty, resultMapping);
+            ref.matchedParentTy = typeManager.GetInstantiatedTy(matchedFd->outerDecl->GetTy(), resultMapping);
         }
         InstantiateReferenceType(ctx, refNode, resultMapping);
     }
@@ -401,7 +404,7 @@ bool TypeChecker::TypeCheckerImpl::SynTargetOnUsed(ASTContext& ctx, const NameRe
             auto& vda = ctx.GetOuterVarDeclAbstract(*vd);
             declToSyn = vda.TestAttr(Attribute::GLOBAL) ? &vda : vd;
         }
-        auto targetTy = Synthesize(ctx, declToSyn);
+        auto targetTy = Synthesize({ctx, SynPos::EXPR_ARG}, declToSyn);
         if (auto fd = DynamicCast<FuncDecl*>(declToSyn); fd && targetTy->HasQuestTy()) {
             DiagUnableToInferReturnType(diag, *fd, nre);
             return false;
@@ -412,12 +415,12 @@ bool TypeChecker::TypeCheckerImpl::SynTargetOnUsed(ASTContext& ctx, const NameRe
 
 void TypeChecker::TypeCheckerImpl::InferRefExpr(ASTContext& ctx, RefExpr& re)
 {
-    if (re.ref.target && Ty::IsTyCorrect(re.ty) && !re.ref.target->ty->IsPlaceholder()) {
+    if (re.ref.target && Ty::IsTyCorrect(re.GetTy()) && !re.ref.target->GetTy()->IsPlaceholder()) {
         return; // If the target is already existed and type is valid, we can exit early.
     }
     bool isWellTyped = true;
     for (auto& type : re.typeArguments) {
-        isWellTyped = Ty::IsTyCorrect(Synthesize(ctx, type.get())) && isWellTyped;
+        isWellTyped = Ty::IsTyCorrect(Synthesize({ctx, SynPos::EXPR_ARG}, type.get())) && isWellTyped;
     }
     if (re.isThis || re.isSuper) {
         CheckThisOrSuper(ctx, re);
@@ -438,7 +441,7 @@ void TypeChecker::TypeCheckerImpl::InferRefExpr(ASTContext& ctx, RefExpr& re)
         auto res = enumSugarChecker->Resolve();
         if (res.first) {
             if (res.second.empty()) {
-                re.ty = TypeManager::GetInvalidTy();
+                re.SetTy(TypeManager::GetInvalidTy());
             }
             return;
         }
@@ -446,7 +449,7 @@ void TypeChecker::TypeCheckerImpl::InferRefExpr(ASTContext& ctx, RefExpr& re)
     }
 
     if (!FilterAndCheckTargetsOfRef(ctx, re, targets) || !isWellTyped) {
-        re.ty = TypeManager::GetInvalidTy();
+        re.SetTy(TypeManager::GetInvalidTy());
         return;
     }
     // 'targets' must not empty.
@@ -466,20 +469,20 @@ void TypeChecker::TypeCheckerImpl::InferRefExpr(ASTContext& ctx, RefExpr& re)
     // If refExpr is base of call, decide real target & type in function call checking.
     // If refExpr is overloaded function reference with target type, decide real target & type in 'ChkRefExpr'.
     if (IsAllFuncDecl(targets) && targets.size() > 1 && (re.callOrPattern || ctx.HasTargetTy(&re))) {
-        re.ty = TypeManager::GetQuestTy();
+        re.SetTy(TypeManager::GetQuestTy());
         return;
     }
     if (!SynTargetOnUsed(ctx, re, *re.ref.target)) {
-        re.ty = TypeManager::GetInvalidTy();
+        re.SetTy(TypeManager::GetInvalidTy());
         return;
     }
-    re.ty = typeManager.SubstituteTypeAliasInTy(*re.ref.target->ty);
+    re.SetTy(typeManager.SubstituteTypeAliasInTy(*re.ref.target->GetTy()));
     if (!decl->IsFunc() || re.isAlone) {
         // Only check non-function or non-call target. Functions will be check after function overload resolution.
         InstantiateReferenceType(ctx, re);
     }
-    if (Ty::IsInitialTy(re.ty)) {
-        re.ty = TypeManager::GetInvalidTy();
+    if (Ty::IsInitialTy(re.GetTy())) {
+        re.SetTy(TypeManager::GetInvalidTy());
     }
 }
 
@@ -490,13 +493,13 @@ void TypeChecker::TypeCheckerImpl::InferCFuncExpr(ASTContext& ctx, RefExpr& re)
     if (re.typeArguments.size() != 1) {
         diag.DiagnoseRefactor(
             DiagKindRefactor::sema_generic_argument_no_match, re, MakeRange(re.GetBegin(), re.GetEnd()));
-        re.ty = TypeManager::GetInvalidTy();
+        re.SetTy(TypeManager::GetInvalidTy());
         return;
     }
     auto funcType = DynamicCast<FuncType>(&*re.typeArguments[0]);
     if (!funcType) {
         diag.Diagnose(re.typeArguments[0]->GetBegin(), re.typeArguments[0]->GetEnd(), DiagKind::sema_cfunc_type);
-        re.ty = TypeManager::GetInvalidTy();
+        re.SetTy(TypeManager::GetInvalidTy());
         return;
     }
 
@@ -504,19 +507,21 @@ void TypeChecker::TypeCheckerImpl::InferCFuncExpr(ASTContext& ctx, RefExpr& re)
     std::vector<Ptr<Ty>> paramTys;
     for (size_t i{0}; i < funcType->paramTypes.size(); ++i) {
         auto& param = funcType->paramTypes[i];
-        paramTys.push_back(param->ty = GetTyFromASTType(ctx, &*param));
+        param->SetTy(GetTyFromASTType(ctx, &*param));
+        paramTys.push_back(param->GetTy());
     }
-    Ptr<Ty> retTy = funcType->retType->ty = GetTyFromASTType(ctx, funcType->retType.get());
+    funcType->retType->SetTy(GetTyFromASTType(ctx, funcType->retType.get()));
+    Ptr<Ty> retTy = funcType->retType->GetTy();
     auto resTy = typeManager.GetFunctionTy(std::move(paramTys), retTy, {.isC = true});
-    re.ty = resTy;
+    re.SetTy(resTy);
 }
 
 void TypeChecker::TypeCheckerImpl::TryInitializeBaseSum(ASTContext& ctx, MemberAccess& ma)
 {
-    if (!ma.baseExpr->ty->IsPlaceholder()) {
+    if (!ma.baseExpr->GetTy()->IsPlaceholder()) {
         return;
     }
-    auto tv = RawStaticCast<GenericsTy*>(ma.baseExpr->ty);
+    auto tv = RawStaticCast<GenericsTy*>(ma.baseExpr->GetTy());
     auto& sum = typeManager.constraints[tv].sum;
     if (sum.size() != 1 || !(*sum.begin())->IsAny()) {
         return;
@@ -532,16 +537,16 @@ void TypeChecker::TypeCheckerImpl::TryInitializeBaseSum(ASTContext& ctx, MemberA
 
 void TypeChecker::TypeCheckerImpl::InferMemberAccess(ASTContext& ctx, MemberAccess& ma)
 {
-    if (ma.target && Ty::IsTyCorrect(ma.ty)) {
+    if (ma.target && Ty::IsTyCorrect(ma.GetTy())) {
         return; // If the target is already existed and type is valid, we can exit early.
     }
     bool isWellTyped = true;
     for (auto& type : ma.typeArguments) {
-        isWellTyped = Ty::IsTyCorrect(Synthesize(ctx, type.get())) && isWellTyped;
+        isWellTyped = Ty::IsTyCorrect(Synthesize({ctx, SynPos::NONE}, type.get())) && isWellTyped;
     }
     Ptr<Expr> baseExpr = ma.baseExpr.get();
     if (!baseExpr || !isWellTyped) {
-        ma.ty = TypeManager::GetInvalidTy();
+        ma.SetTy(TypeManager::GetInvalidTy());
         return;
     }
     SetIsNotAlone(*ma.baseExpr);
@@ -549,13 +554,14 @@ void TypeChecker::TypeCheckerImpl::InferMemberAccess(ASTContext& ctx, MemberAcce
     TryInitializeBaseSum(ctx, ma);
     // baseExpr is Synthesized by GetBaseDeclInMemberAccess. Refactor later.
     // Whether current is access member by type alias of primitive types.
-    bool isPrimitiveTypeAlias = targetOfBase && targetOfBase->astKind == ASTKind::TYPE_ALIAS_DECL && baseExpr->ty &&
-        baseExpr->ty->IsPrimitive();
+    bool isPrimitiveTypeAlias = targetOfBase && targetOfBase->astKind == ASTKind::TYPE_ALIAS_DECL &&
+        baseExpr->GetTy() && baseExpr->GetTy()->IsPrimitive();
     // Whether current is access member by real/generic type or package name.
     bool isStaticAccessByName =
         targetOfBase && !IsThisOrSuper(*baseExpr) && (targetOfBase->IsTypeDecl() || Is<PackageDecl>(targetOfBase));
     bool isBuiltInStaticAccess = targetOfBase && targetOfBase->IsBuiltIn();
-    bool isPartialPackagePath = !targetOfBase && Ty::IsInitialTy(ma.baseExpr->ty) && (ma.isAlone || ma.callOrPattern);
+    bool isPartialPackagePath =
+        !targetOfBase && Ty::IsInitialTy(ma.baseExpr->GetTy()) && (ma.isAlone || ma.callOrPattern);
     if (isBuiltInStaticAccess) {
         InferBuiltInStaticAccess(ctx, ma, *RawStaticCast<BuiltInDecl*>(targetOfBase));
     } else if (baseExpr->astKind == ASTKind::PRIMITIVE_TYPE_EXPR || isPrimitiveTypeAlias) {
@@ -578,14 +584,14 @@ void TypeChecker::TypeCheckerImpl::InferMemberAccess(ASTContext& ctx, MemberAcce
     bool checkedLater =
         IsAllFuncDecl(ma.targets) && ma.targets.size() > 1 && (ma.callOrPattern || ctx.HasTargetTy(&ma));
     if (checkedLater) {
-        ma.ty = TypeManager::GetQuestTy();
+        ma.SetTy(TypeManager::GetQuestTy());
         return;
     }
     if (!SynTargetOnUsed(ctx, ma, *ma.target)) {
-        ma.ty = TypeManager::GetInvalidTy();
+        ma.SetTy(TypeManager::GetInvalidTy());
         return;
     }
-    ma.ty = typeManager.SubstituteTypeAliasInTy(*ma.target->ty);
+    ma.SetTy(typeManager.SubstituteTypeAliasInTy(*ma.target->GetTy()));
     // Only instantiate ty for non-function or non-call. Function's will be done after overload resolution.
     if (!ma.target->IsFunc() || ma.isAlone) {
         InstantiateReferenceType(ctx, ma);
@@ -600,7 +606,7 @@ Ptr<Decl> TypeChecker::TypeCheckerImpl::GetBaseDeclInMemberAccess(ASTContext& ct
     Ptr<Expr> baseExpr = ma.baseExpr.get();
     // Synthesize baseExpr's ty, baseExpr maybe another MemberAccess like a.b or RefExpr a.
     // Could be from desugaring a binary expr, need to avoid exponential repetitive check with cache
-    SynthesizeWithNegCache(ctx, baseExpr);
+    SynthesizeWithNegCache({ctx, SynPos::EXPR_ARG}, baseExpr);
     return GetRealTarget(baseExpr, baseExpr->GetTarget());
 }
 
@@ -622,11 +628,11 @@ void TypeChecker::TypeCheckerImpl::InferArrayStaticAccess(const ASTContext& ctx,
     auto typeArgs = ma.baseExpr->GetTypeArgs();
     if (typeArgs.empty()) {
         diag.Diagnose(ma, DiagKind::sema_generic_type_without_type_argument);
-        ma.ty = TypeManager::GetInvalidTy();
+        ma.SetTy(TypeManager::GetInvalidTy());
         return;
     }
-    ma.baseExpr->ty = typeManager.GetArrayTy(typeArgs[0]->ty, 1);
-    auto targets = ExtendFieldLookup(ctx, *ma.curFile, ma.baseExpr->ty, ma.field);
+    ma.baseExpr->SetTy(typeManager.GetArrayTy(typeArgs[0]->GetTy(), 1));
+    auto targets = ExtendFieldLookup(ctx, *ma.curFile, ma.baseExpr->GetTy(), ma.field);
     if (!FilterAndCheckTargetsOfNameAccess(ctx, ma, targets)) {
         return;
     }
@@ -637,7 +643,7 @@ void TypeChecker::TypeCheckerImpl::InferArrayStaticAccess(const ASTContext& ctx,
 
 void TypeChecker::TypeCheckerImpl::InferStaticAccess(const ASTContext& ctx, MemberAccess& ma, Decl& targetOfBaseExpr)
 {
-    ma.ty = TypeManager::GetInvalidTy(); // Ty will be set to valid if non-error happens.
+    ma.SetTy(TypeManager::GetInvalidTy()); // Ty will be set to valid if non-error happens.
     // Caller guarantees current is access member by real/generic type or package name.
     std::vector<Ptr<Decl>> targets;
     Ptr<Expr> baseExpr = ma.baseExpr.get();
@@ -647,7 +653,7 @@ void TypeChecker::TypeCheckerImpl::InferStaticAccess(const ASTContext& ctx, Memb
         // In this case, targetOfBaseExpr is ClassDecl, InterfaceDecl, StructDecl, EnumDecl or PackageDecl.
         CJC_NULLPTR_CHECK(ma.curFile);
         targets = FieldLookup(ctx, &targetOfBaseExpr, ma.field,
-            {baseExpr->ty, ma.curFile, true, true, ma.TestAttr(AST::Attribute::LEFT_VALUE)});
+            {baseExpr->GetTy(), ma.curFile, true, true, ma.TestAttr(AST::Attribute::LEFT_VALUE)});
         // remove macro decl when it is not a @ call
         bool hasRemovedMacros{!targets.empty()};
         bool isCustomAnnotation = false;
@@ -684,7 +690,7 @@ void TypeChecker::TypeCheckerImpl::InferStaticAccess(const ASTContext& ctx, Memb
         ReplaceTarget(&ma, target ? target : targets[0]);
         AddFuncTargetsForMemberAccess(ma, targets);
     } else { // Case for access member by generic type.
-        auto genericTy = DynamicCast<GenericsTy*>(baseExpr->ty);
+        auto genericTy = DynamicCast<GenericsTy*>(baseExpr->GetTy());
         if (!genericTy) {
             return; // When the target of base is generic param and 'ty' is not 'GenericsTy', errors happened before.
         }
@@ -707,11 +713,11 @@ void TypeChecker::TypeCheckerImpl::InferInstanceAccess(const ASTContext& ctx, Me
 {
     // In this case, targetOfBaseExpr is an object.
     Ptr<Expr> baseExpr = ma.baseExpr.get();
-    if (!baseExpr || Ty::IsInitialTy(baseExpr->ty)) {
+    if (!baseExpr || Ty::IsInitialTy(baseExpr->GetTy())) {
         return; // 'baseExpr' may be a part of package name such as 'pkga' in 'package pkga.pkgb.pkgc'.
     }
-    ma.ty = TypeManager::GetInvalidTy(); // Ty will be set to valid if non-error happens.
-    Ptr<Decl> target = GetObjMemberAccessTarget(ctx, ma, *baseExpr->ty);
+    ma.SetTy(TypeManager::GetInvalidTy()); // Ty will be set to valid if non-error happens.
+    Ptr<Decl> target = GetObjMemberAccessTarget(ctx, ma, *baseExpr->GetTy());
     if (!target) {
         return;
     }
@@ -723,7 +729,7 @@ Ptr<Decl> TypeChecker::TypeCheckerImpl::CheckUpperBoundTargetsCaseFuncCall(
 {
     ma.targets.clear(); // Need clear before insertion.
     ma.foundUpperBoundMap = GetUpperBoundTargetsWithGivenKind(allTargets, {ASTKind::FUNC_DECL});
-    std::vector<Ptr<Decl>> fdTargets = ma.baseExpr->ty->IsPlaceholder()
+    std::vector<Ptr<Decl>> fdTargets = ma.baseExpr->GetTy()->IsPlaceholder()
         ? MergeFuncTargetsInSum(typeManager, ma)
         : MergeFuncTargetsInUpperBounds(typeManager, ma);
     std::sort(fdTargets.begin(), fdTargets.end(), CompNodeByPos);
@@ -758,14 +764,14 @@ Ptr<Decl> TypeChecker::TypeCheckerImpl::CheckUpperBoundTargetsCaseOthers(const A
         // Decls found in upperbounds which have same type must have only one valid implementation.
         // So, classify decls by type.
         auto found = std::find_if(tempTargets.begin(), tempTargets.end(),
-            [this, &it](auto decl) { return typeManager.IsTyEqual(decl->ty, it->ty); });
+            [this, &it](auto decl) { return typeManager.IsTyEqual(decl->GetTy(), it->GetTy()); });
         if (found == tempTargets.end()) {
             tempTargets.emplace_back(it);
         } else if (IsCloserToImpl(*(*found), *it)) {
             *found = it;
         }
     }
-    if (auto genTy = DynamicCast<GenericsTy*>(ma.baseExpr->ty); genTy && genTy->isPlaceholder) {
+    if (auto genTy = DynamicCast<GenericsTy*>(ma.baseExpr->GetTy()); genTy && genTy->isPlaceholder) {
         FilterSumUpperbound(ctx, ma, *genTy, tempTargets, allTargets);
     }
     if (tempTargets.empty()) {
@@ -809,7 +815,7 @@ void TypeChecker::TypeCheckerImpl::FilterSumUpperbound(const ASTContext& ctx, AS
             }
             InstCtxScope ic(*this);
             ic.SetRefDecl(*d->outerDecl, ub);
-            auto instTy = typeManager.InstOf(d->ty);
+            auto instTy = typeManager.InstOf(d->GetTy());
             if (typeManager.IsSubtype(instTy, tgtTy)) {
                 if (validTy && instTy != validTy) {
                     return; // can't disambiguate anyway, just return
@@ -821,8 +827,8 @@ void TypeChecker::TypeCheckerImpl::FilterSumUpperbound(const ASTContext& ctx, AS
         targets = filteredTargets;
     }
     if (targets.size() == 1 && !FilterSumUpperbound(ma, tv, *targets[0])) {
-        ma.ty = TypeManager::GetInvalidTy();
-        DiagMismatchedTypesWithFoundTy(diag, ma, *tgtTy, *ma.ty);
+        ma.SetTy(TypeManager::GetInvalidTy());
+        DiagMismatchedTypesWithFoundTy(diag, ma, *tgtTy, *ma.GetTy());
     }
 }
 
@@ -831,7 +837,7 @@ bool TypeChecker::TypeCheckerImpl::FilterSumUpperbound(AST::MemberAccess& ma, AS
     CJC_ASSERT(tv.isPlaceholder);
     auto hasMemOfTargetSig = [this, &ma, &d](Ptr<Ty> ty)->bool {
         for (auto& [d2, ub] : ma.foundUpperBoundMap) {
-            if (ub.count(ty) > 0 && typeManager.IsTyEqual(d.ty, d2->ty)) {
+            if (ub.count(ty) > 0 && typeManager.IsTyEqual(d.GetTy(), d2->GetTy())) {
                 return true;
             }
         }
@@ -882,15 +888,15 @@ Ptr<Decl> TypeChecker::TypeCheckerImpl::GetIdealTypeFuncTargetFromExtend(
         Ptr<Decl> target = nullptr;
         {
             auto disDiag = DiagSuppressor(diag);
-            target = GetObjMemberAccessTarget(ctx, ma, *ma.baseExpr->ty);
+            target = GetObjMemberAccessTarget(ctx, ma, *ma.baseExpr->GetTy());
         }
-        if (Ty::IsTyCorrect(ma.baseExpr->ty) && target == nullptr) {
+        if (Ty::IsTyCorrect(ma.baseExpr->GetTy()) && target == nullptr) {
             std::string tyStr = Ty::GetTypesToStr(targetTys, " ");
             diag.DiagnoseRefactor(DiagKindRefactor::sema_ambiguous_match_primitive_extend, ma, ma.field, tyStr);
         }
         return target;
     } else if (candidates.size() == 1) {
-        ma.baseExpr->ty = targetTys.back();
+        ma.baseExpr->SetTy(targetTys.back());
         ma.target = *candidates.begin();
         if (ma.target->astKind == ASTKind::FUNC_DECL) {
             ma.targets.push_back(StaticAs<ASTKind::FUNC_DECL>(ma.target));
@@ -979,10 +985,10 @@ Ptr<Decl> TypeChecker::TypeCheckerImpl::GetObjMemberAccessTarget(
         [this, &ma](const VArrayTy& varrayTy) {
             // 'size' is the only member of VArray.
             if (ma.field == "size") {
-                ma.ty = TypeManager::GetPrimitiveTy(TypeKind::TYPE_INT64);
-                auto literalExpr = CreateLitConstExpr(LitConstKind::INTEGER, std::to_string(varrayTy.size), ma.ty);
+                ma.SetTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_INT64));
+                auto literalExpr = CreateLitConstExpr(LitConstKind::INTEGER, std::to_string(varrayTy.size), ma.GetTy());
                 ma.desugarExpr = std::move(literalExpr);
-                ma.desugarExpr->ty = ma.ty;
+                ma.desugarExpr->SetTy(ma.GetTy());
             } else {
                 DiagMemberAccessNotFound(ma);
             }
@@ -996,7 +1002,7 @@ Ptr<Decl> TypeChecker::TypeCheckerImpl::GetObjMemberAccessTarget(
             if (genericsTy.isPlaceholder) {
                 auto maybeSol = typeManager.TryGreedySubst(&genericsTy);
                 if (!maybeSol->IsPlaceholder()) {
-                    ma.baseExpr->ty = maybeSol;
+                    ma.baseExpr->SetTy(maybeSol);
                     return GetObjMemberAccessTarget(ctx, ma, *maybeSol);
                 }
                 auto& cst = typeManager.constraints[&genericsTy];
@@ -1070,9 +1076,10 @@ void TypeChecker::TypeCheckerImpl::CheckForbiddenMemberAccess(
 {
     auto funcSrc = ScopeManager::GetOutMostSymbol(ctx, SymbolKind::FUNC, ma.scopeName);
     if (auto re = DynamicCast<RefExpr*>(ma.baseExpr.get()); re && funcSrc) {
-        bool isThisOrSuper = re->ty && (re->isThis || re->isSuper);
+        bool isThisOrSuper = re->GetTy() && (re->isThis || re->isSuper);
         if (re->isThis) {
-            bool accessStructLeftValue = ma.TestAttr(AST::Attribute::LEFT_VALUE) && re->ty && re->ty->IsStruct();
+            bool accessStructLeftValue =
+                ma.TestAttr(AST::Attribute::LEFT_VALUE) && re->GetTy() && re->GetTy()->IsStruct();
             CheckImmutableFuncAccessMutableFunc(ma.begin, *funcSrc->node, target, accessStructLeftValue);
         }
         auto funcDecl = StaticCast<FuncDecl*>(funcSrc->node);

@@ -10,7 +10,6 @@
 #include "cangjie/CHIR/IR/Type/EnumDef.h"
 #include "cangjie/CHIR/IR/Type/StructDef.h"
 #include "cangjie/CHIR/Utils/Utils.h"
-#include "cangjie/Mangle/BaseMangler.h"
 
 namespace Cangjie::CHIR {
 std::recursive_mutex CHIRType::chirTypeMtx;

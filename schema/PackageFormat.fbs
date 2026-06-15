@@ -23,23 +23,23 @@ file_identifier "CHIR";
 // 8   SEALED,               Mark whether a declaration is a sealed one.
 // 9   FOREIGN,              Mark whether a declaration is a foreign one.
 // 10  MUT,                  Mark whether a declaration is a mutable one.
-// 11  FINAL,                Mark a Func override a parent class's func, and this func self does not have VIRTUAL Attribute.
+// 11  FINAL,                Mark a Function override a parent class's func, and this func self does not have VIRTUAL Attribute.
 // 12  OPERATOR,             Mark whether a declaration is a operator one.
 // 13  JAVA,                 Mark whether a node is foreign call.
 // 14  READONLY,             'let x = xxx', 'x' enable READONLY attribute
 // 15  CONST,                correspond `const` keyword in Cangjie source code.
 // 16  IMPORTED,             Mark whether variable、func、enum、struct、class is imported from other package.
-// 17  GENERIC_INSTANTIATED, Mark whether a `GlobalVar/Func/Type` is instantiated.
+// 17  GENERIC_INSTANTIATED, Mark whether a `GlobalVar/Function/Type` is instantiated.
 // 18  NO_DEBUG_INFO,        Mark a `Value` doesn't contain debug info, like line/column number.
 // 19  GENERIC,              Mark a declaration is generic
-// 20  INTERNAL,             GlobalVar/Func/Enum/Class/Struct/Interface is visible in current and sub package.
+// 20  INTERNAL,             GlobalVar/Function/Enum/Class/Struct/Interface is visible in current and sub package.
 // 21  COMPILER_ADD,         Mark a `Value` is added by compiler, like "copied default func from interface".
 // compiler attribute
 // 22  NO_REFLECT_INFO,      Mark a `Value` is't used by `reflect` feature.
-// 23  NO_INLINE,            Mark a Func can't be inlined.
+// 23  NO_INLINE,            Mark a Function can't be inlined.
 // 24  NON_RECOMPILE,        only used in `ImportedValue` in incremental compilation, indicate this ImportedValue is converted from a decl in current package that is not recompiled.
 // 25  UNREACHABLE,          Mark a Block is unreachable.
-// 26  NO_SIDE_EFFECT,       Mark a Func does't have side effect.
+// 26  NO_SIDE_EFFECT,       Mark a Function does't have side effect.
 
 enum CHIRTypeKind: uint8 {
   INVALID,
@@ -101,45 +101,7 @@ enum SourceExpr: uint8 {
 
 table Type {
   kind: CHIRTypeKind;
-  typeID: uint32; // current id in types
   argTys: [uint32]; // use types id
-}
-
-table RuneType {
-  base: Type;
-  extends: [uint32]; // use defs id
-}
-
-table BooleanType {
-  base: Type;
-  extends: [uint32]; // use defs id
-}
-
-table UnitType {
-  base: Type;
-  extends: [uint32]; // use defs id
-}
-
-table NothingType {
-  base: Type;
-  extends: [uint32]; // use defs id
-}
-
-table NumericType {
-  base: Type;
-  extends: [uint32]; // use defs id
-}
-
-table IntType {
-  base: NumericType;
-}
-
-table FloatType {
-  base: NumericType;
-}
-
-table TupleType {
-  base: Type;
 }
 
 table RawArrayType {
@@ -163,49 +125,11 @@ table CustomType {
   customTypeDef: uint32; // use defs id
 }
 
-table EnumType {
-  base: CustomType;
-}
-
-table StructType {
-  base: CustomType;
-}
-
-table ClassType {
-  base: CustomType;
-}
-
-table CStringType {
-  base: Type;
-  extends: [uint32]; // use defs id
-}
-
-table CPointerType {
-  base: Type;
-  extends: [uint32]; // use defs id
-}
-
 table GenericType {
   base: Type;
   identifier: string(shared);
   srcCodeIdentifier: string(shared);
   upperBounds: [uint32]; // use types id
-}
-
-table RefType {
-  base: Type;
-}
-
-table BoxType {
-  base: Type;
-}
-
-table VoidType {
-  base: Type;
-}
-
-table ThisType {
-  base: Type;
 }
 
 enum Linkage: int16 {
@@ -295,7 +219,6 @@ table OverrideSrcFuncType {
 union Annotation {
   needCheckArrayBound: NeedCheckArrayBound,
   needCheckCast: NeedCheckCast,
-  debugLocationInfo: DebugLocation,
   debugLocationInfoForWarning: DebugLocation,
   generatedFromForIn: GeneratedFromForIn,
   isAutoEnvClass: IsAutoEnvClass,
@@ -311,14 +234,14 @@ union Annotation {
 
 table Base {
   annos: [Annotation];
+  loc: DebugLocation;
+  attributes: uint64;
 }
 
 enum ValueKind: uint8 {
   LITERAL,
   GLOBALVAR,
   PARAMETER,
-  IMPORTED_FUNC,
-  IMPORTED_VAR,
   LOCALVAR,
   FUNC,
   BLOCK,
@@ -326,13 +249,10 @@ enum ValueKind: uint8 {
 }
 
 table Value {
-base: Base;
-type: uint32; // use types id
-identifier: string(shared);
-kind: ValueKind;
-valueID: uint32; // current id in values
-attributes: uint64;
-annoInfo: AnnoInfo;
+  base: Base;
+  type: uint32; // use types id
+  identifier: string(shared);
+  kind: ValueKind;
 }
 
 enum ConstantValueKind: uint8 {
@@ -388,22 +308,31 @@ table Parameter {
   base: Value;
   ownedFunc: uint32;  // use values id
   ownedLambda: uint32;  // use exprs id
+  srcCodeIdentifier: string(shared);
+  annoInfo: AnnoInfo;
 }
 
 table LocalVar {
   base: Value;
   associatedExpr: uint32; // use exprs id
   isRetVal: bool = false;
+  srcCodeIdentifier: string(shared);
+}
+
+table GlobalValue {
+  base: Value;
+  srcCodeIdentifier: string(shared);
+  rawMangledName: string(shared);
+  packageName: string(shared);
+  declaredParent: uint32; // use defs id
+  features: [string]; // features set to which declaration belongs
+  annoInfo: AnnoInfo;
 }
 
 table GlobalVar {
-  base: Value;
-  rawMangledName: string(shared);
-  srcCodeIdentifier: string(shared);
-  packageName: string(shared);
-  defaultInitVal: uint32; // use values id
-  associatedInitFunc: uint32; // use values id
-  declaredParent: uint32; // use defs id
+  base: GlobalValue;
+  // LiteralValue or Function (GLOBALVAR_INIT), 0 for none or imported var
+  initializer: uint32; // use values id
 }
 
 enum FuncKind: uint8 {
@@ -424,44 +353,28 @@ enum FuncKind: uint8 {
   INSTANCEVAR_INIT
 }
 
-table ImportedValue {
-  base: Value;
+table FuncSigInfo {
+  funcName: string(shared);
+  funcType: uint32; // use types id
+  genericTypeParams: [uint32]; // use types id
 }
 
-table ImportedFunc {
-  base: ImportedValue;
-
-  // func base
-  srcCodeIdentifier: string(shared);
-  rawMangledName: string(shared);
-  packageName: string(shared);
-  declaredParent: uint32; // use defs id
+table Function {
+  base: GlobalValue;
   genericDecl: uint32; // use values id
   funcKind: FuncKind;
   isFastNative: bool;
   isCFFIWrapper: bool;
-  // originalLambdaInfo : FuncSigInfo
-  // 1. when lambda is lifted to global func, its generic type params and func type may be changed,
-  //  but cjdb need original type to show
-  //  e.g. func foo<T1>() {
-  //      func goo<T2>() {} // this lambda will be lifted to global func
-  //  }
-  //  after being lifted, global func `goo` is as follow:
-  //  func goo<T1, T2>(env: class&) {}
-  originalLambdaFuncType: uint32; // use types id. declared type, including `this` type and return type, there may be generic type in it.
-  originalLambdaGenericTypeParams: [uint32]; // use types id
+  originalLambdaInfo: FuncSigInfo;
   genericTypeParams: [uint32]; // use types id
-  paramDftValHostFunc: uint32; // use values id 
-
-  paramInfo: [AbstractMethodParam];
-}
-
-table ImportedVar {
-  base: ImportedValue;
-  packageName: string(shared);
-  srcCodeIdentifier: string(shared);
-  rawMangledName: string(shared);
-  declaredParent: uint32; // use defs id
+  paramDftValHostFunc: uint32; // use values id
+  body: uint32; // use values id, 0 for imported func
+  params: [uint32]; // use values id (signature params for imported func, body params for func with body)
+  retVal: uint32; // use values id
+  propLoc: DebugLocation;
+  localId: uint64;
+  blockId: uint64;
+  blockGroupId: uint64;
 }
 
 table Block {
@@ -481,43 +394,6 @@ table BlockGroup {
   ownedExpression: uint32;  // use exprs id
 }
 
-table Func {
-  base: Value;
-
-  // func base
-  srcCodeIdentifier: string(shared);
-  rawMangledName: string(shared);
-  packageName: string(shared);
-  declaredParent: uint32; // use defs id
-  genericDecl : uint32; // use values id
-  funcKind: FuncKind;
-  isFastNative: bool;
-  isCFFIWrapper: bool;
-  // originalLambdaInfo : FuncSigInfo
-  // 1. when lambda is lifted to global func, its generic type params and func type may be changed,
-  //  but cjdb need original type to show
-  //  e.g. func foo<T1>() {
-  //      func goo<T2>() {} // this lambda will be lifted to global func
-  //  }
-  //  after being lifted, global func `goo` is as follow:
-  //  func goo<T1, T2>(env: class&) {}
-  originalLambdaFuncType: uint32; // use types id. declared type, including `this` type and return type, there may be generic type in it.
-  originalLambdaGenericTypeParams: [uint32]; // use types id
-  genericTypeParams: [uint32]; // use types id
-  paramDftValHostFunc: uint32; // use values id 
-
-  // FuncBody
-  body: uint32; // use values id
-  params: [uint32]; // use values id
-  retVal: uint32; // use values id
-
-  propLoc: DebugLocation;
-
-  localId: uint64;
-  blockId: uint64;
-  blockGroupId: uint64;
-}
-
 enum CustomDefKind: uint8 {
   STRUCT,
   ENUM,
@@ -525,8 +401,15 @@ enum CustomDefKind: uint8 {
   EXTEND,
 }
 
+table CustomAnnoInstance {
+  annoClassName: string(shared);
+  argValues: [string];
+  loc: DebugLocation;
+}
+
 table AnnoInfo {
   mangledName: string(shared);
+  annoInstances: [CustomAnnoInstance];
 }
 
 table MemberVarInfo {
@@ -573,17 +456,16 @@ table CustomTypeDef {
   implementedInterfaces: [uint32]; // use types id
   instanceMemberVars: [MemberVarInfo];
   staticMemberVars: [uint32]; // use values id
-  attributes: uint64;
   annoInfo: AnnoInfo;
   vtable: [VTableInType];
-  extends: [uint32]; // use defs id
-  varInitializationFunc: uint32;
+  instanceVarInitFunc: uint32;
 }
 
 table EnumCtorInfo {
-  identifier: string(shared);
+  srcCodeName: string(shared);
   mangledName: string(shared);
   funcType: uint32; // use types id
+  annoInfo: AnnoInfo;
 }
 
 table EnumDef {
@@ -603,122 +485,107 @@ table ExtendDef {
   genericParams: [uint32]; // use types id
 }
 
-enum ClassDefKind: int16 {
-  CLASS,
-  INTERFACE
-}
-
-table AbstractMethodParam {
-  paramName: string(shared);
-  paramType: uint32; // use types id
-  annoInfo : AnnoInfo;
-}
-
-
-table AbstractMethodInfo {
-  methodName: string(shared);
-  mangledName: string(shared);
-  methodType: uint32; // use types id
-  paramsInfo: [AbstractMethodParam];
-  attributes: uint64;
-  annoInfo : AnnoInfo;
-  methodGenericTypeParams : [uint32]; // use types id
-  hasBody : bool;
-  parent: uint32; // class def, use def id
-}
-
 table ClassDef {
   base: CustomTypeDef;
-  kind: ClassDefKind;
-  isAnnotation: bool = false;
+  isClass: bool;
+  isAnnotation: bool;
+  annotationTargets: [uint32]; // use values id (GlobalVar), absent when not an @Annotation class
   superClass: uint32; // use types id
-  abstractMethods: [AbstractMethodInfo];
-  allMethodMangledNames: [string];
 }
 
 enum CHIRExprKind: uint8 {
-  INVALID,
-  // Terminator
-  GOTO,
-  BRANCH,
-  MULTIBRANCH,
-  EXIT,
-  APPLY_WITH_EXCEPTION,
-  INVOKE_WITH_EXCEPTION,
-  INVOKESTATIC_WITH_EXCEPTION,
-  RAISE_EXCEPTION,
-  INT_OP_WITH_EXCEPTION,
-  SPAWN_WITH_EXCEPTION,
-  TYPECAST_WITH_EXCEPTION,
-  INTRINSIC_WITH_EXCEPTION,
-  ALLOCATE_WITH_EXCEPTION,
-  RAW_ARRAY_ALLOCATE_WITH_EXCEPTION,
-  // Unary
-  NEG,
-  NOT,
-  BITNOT,
-  // Binary
-  ADD,
-  SUB,
-  MUL,
-  DIV,
-  MOD,
-  EXP,
-  LSHIFT,
-  RSHIFT,
-  BITAND,
-  BITOR,
-  BITXOR,
+  Invalid,
+ 
+  // terminator
+  Goto,
+  Branch,
+  MultiBranch,
+  Exit,
+  TryApply,
+  TryInvoke,
+  TryIntrinsic,
+  RaiseException,
+  TrySpawn,
+  TryNumericCast,
+  TryAllocate,
+  TryRawArrayAllocate,
+  TryNeg,
+  TryAdd,
+  TrySub,
+  TryMul,
+  TryDiv,
+  TryMod,
+  TryExp,
+  TryLShift,
+  TryRShift,
+ 
+  // unary expr
+  Neg,
+  Not,
+  BitNot,
+ 
+  // binary expr
+  Add,
+  Sub,
+  Mul,
+  Div,
+  Mod,
+  Exp,
+  LShift,
+  RShift,
+  BitAnd,
+  BitOr,
+  BitXor,
   LT,
   GT,
   LE,
   GE,
-  EQUAL,
-  NOTEQUAL,
-  AND,
-  OR,
-  // Memory
-  ALLOCATE,
-  LOAD,
-  STORE,
-  GET_ELEMENT_REF,
-  GET_ELEMENT_BY_NAME,
-  STORE_ELEMENT_REF,
-  STORE_ELEMENT_BY_NAME,
-  // Complext
-  IF,
-  LOOP,
-  FORIN_RANGE,
-  FORIN_ITER,
-  FORIN_CLOSED_RANGE,
-  LAMBDA,
-  // Others
-  CONSTANT,
-  DEBUGEXPR,
-  TUPLE,
-  FIELD,
-  FIELD_BY_NAME,
-  APPLY,
-  INVOKE,
-  INVOKE_STATIC,
-  INSTANCEOF,
-  TYPECAST,
-  GET_EXCEPTION,
-  RAW_ARRAY_ALLOCATE,
-  RAW_ARRAY_LITERAL_INIT,
-  RAW_ARRAY_INIT_BY_VALUE,
-  VARRAY,
-  VARRAY_BUILDER,
-  INTRINSIC,
-  SPAWN,
-  GET_INSTANTIATE_VALUE,
-  BOX,
-  UNBOX,
-  TRANSFORM_TO_GENERIC,
-  TRANSFORM_TO_CONCRETE,
-  UNBOX_TO_REF,
-  GET_RTTI,
-  GET_RTTI_STATIC,
+  Equal,
+  NotEqual,
+  And,
+  Or,
+
+  // type cast
+  StaticCast,
+  Box,
+  UnboxToValue,
+  UnboxToRef,
+  NumericCast,
+  CastToConcrete,
+  CastToGeneric,
+
+  // memory expr
+  Allocate,
+  Load,
+  Store,
+  GetElementByName,
+  GetElementRef,
+  StoreElementByName,
+  StoreElementRef,
+  Field,
+  FieldByName,
+
+  // array
+  RawArrayAllocate,
+  RawArrayLiteralInit,
+  RawArrayInitByValue,
+  VArrayExpr,
+  VArrayBuilder,
+
+  // others
+  Constant,
+  Debug,
+  Tuple,
+  InstanceOf,
+  GetException,
+  Spawn,
+  Lambda,
+  GetInstantiateValue,
+  Apply,
+  Invoke,
+  Intrinsic,
+  GetRtti,
+  GetRttiStatic
 }
 
 enum IntrinsicKind: uint16 {
@@ -1163,39 +1030,62 @@ enum IntrinsicKind: uint16 {
 table Expression {
   base: Base;
   kind: CHIRExprKind;
-  expressionID: uint32; // current id in exprs
   operands: [uint32]; // use values id
   blockGroups: [uint32]; // use values id
-  parentBlock: uint32; // use values id
+  owner: uint32; // enclosing Block, use values id
   resultLocalVar: uint32; // use values id
   resultTy: uint32; // use types id
 }
 
-table UnaryExpression {
+table UnaryExpressionBase {
   base: Expression;
   overflowStrategy: OverflowStrategy;
 }
 
-table BinaryExpression {
+table BinaryExpressionBase {
   base: Expression;
   overflowStrategy: OverflowStrategy;
 }
 
-table Constant {
+table AllocateBase {
   base: Expression;
+  allocatedType: uint32; // use types id
 }
 
-table Allocate {
+table FuncCall {
   base: Expression;
-  targetType: uint32; // use types id
+  instantiatedTypeArgs: [uint32]; // use types id
+  objType: uint32; // use types id
 }
 
-table Load {
-  base: Expression;
+table ApplyBase {
+  base: FuncCall;
+  isSuperCall: bool;
 }
 
-table Store {
+table InvokeBase {
+  base: FuncCall;
+  virMethodCtx: FuncSigInfo;
+}
+
+table IntrinsicBase {
+  base: FuncCall;
+  intrinsicKind: IntrinsicKind;
+}
+
+table NumericCastBase {
   base: Expression;
+  overflowStrategy: OverflowStrategy;
+}
+
+table Branch {
+  base: Expression;
+  sourceExpr: SourceExpr;
+}
+
+table MultiBranch {
+  base: Expression;
+  caseValues: [uint64];
 }
 
 table GetElementRef {
@@ -1205,7 +1095,7 @@ table GetElementRef {
 
 table GetElementByName {
   base: Expression;
-  names: [string];
+  fieldNames: [string];
 }
 
 table StoreElementRef {
@@ -1215,135 +1105,12 @@ table StoreElementRef {
 
 table StoreElementByName {
   base: Expression;
-  names: [string];
-}
-
-table VirMethodContext {
-  srcCodeIdentifier: string(shared);
-  originalFuncType: uint32; // use types id
-  genericTypeParams: [uint32]; // use types id
-}
-
-table Apply {
-  base: Expression;
-  isSuperCall: bool = false;
-
-  // FuncCall
-  instantiatedTypeArgs: [uint32]; // use types id
-  thisType: uint32; // use types id
-}
-
-table Invoke {
-  base: Expression;
-
-  // FuncCall
-  instantiatedTypeArgs: [uint32]; // use types id
-  thisType: uint32; // use types id
-
-  // DynamicDispatch
-  virMethodCtx: VirMethodContext;
-}
-
-table TypeCast {
-  base: Expression;
-  overflowStrategy: OverflowStrategy;
+  fieldNames: [string];
 }
 
 table InstanceOf {
   base: Expression;
-  targetType: uint32; // use types id, the class type of this Instanceof operation
-}
-
-table Box {
-  base: Expression;
-}
-
-table UnBox {
-  base: Expression;
-}
-
-table Terminator {
-  base: Expression;
-  successors: [uint32]; // use values id
-}
-
-table GoTo {
-  base: Terminator;
-}
-
-table Branch {
-  base: Terminator;
-  sourceExpr: SourceExpr;
-}
-
-table MultiBranch {
-  base: Terminator;
-  caseVals: [uint64];
-}
-
-table Exit {
-  base: Terminator;
-}
-
-table RaiseException {
-  base: Terminator;
-}
-
-table ApplyWithException {
-  base: Terminator;
-  thisType: uint32; // use types id
-  instantiatedTypeArgs: [uint32]; // use types id
-}
-
-table InvokeWithException {
-  base: Terminator;
-
-  // FuncCallWithException
-  instantiatedTypeArgs: [uint32]; // use types id
-  thisType: uint32; // use types id
-
-  // DynamicDispatchWithException
-  virMethodCtx: VirMethodContext;
-}
-
-table IntOpWithException {
-  base: Terminator;
-  opKind: CHIRExprKind;
-  overflowStrategy: OverflowStrategy;
-}
-
-table TypeCastWithException {
-  base: Terminator;
-}
-
-table IntrinsicWithException {
-  base: Terminator;
-  intrinsicKind: IntrinsicKind;
-  instantiatedTypeArgs: [uint32]; // use types id
-}
-
-table AllocateWithException {
-  base: Terminator;
   targetType: uint32; // use types id
-}
-
-table RawArrayAllocateWithException {
-  base: Terminator;
-  elementType: uint32; // use types id
-}
-
-table RawArrayLiteralAllocateWithException {
-  base: Terminator;
-  elementType: uint32; // use types id
-}
-
-table SpawnWithException {
-  base: Terminator;
-  executeClosure: uint32;  // use values id
-}
-
-table Tuple {
-  base: Expression;
 }
 
 table Field {
@@ -1353,71 +1120,20 @@ table Field {
 
 table FieldByName {
   base: Expression;
-  names: [string];
+  fieldNames: [string];
 }
 
-table RawArrayAllocate {
+table RawArrayAllocateBase {
   base: Expression;
   elementType: uint32; // use types id
-}
-
-table RawArrayLiteralAllocate {
-  base: Expression;
-  elementType: uint32; // use types id
-}
-
-table RawArrayLiteralInit {
-  base: Expression;
-}
-
-table RawArrayInitByValue {
-  base: Expression;
-}
-
-table VArray {
-  base: Expression;
-}
-
-table VArrayBd {
-  base: Expression;
-}
-
-table GetException {
-  base: Expression;
-}
-
-table Intrinsic {
-  base: Expression;
-  intrinsicKind: IntrinsicKind;
-  instantiatedTypeArgs: [uint32]; // use types id
-}
-
-table If {
-  base: Expression;
-}
-
-table Loop {
-  base: Expression;
-}
-
-table ForInRange {
-  base: Expression;
-}
-
-table ForInIter {
-  base: Expression;
-}
-
-table ForInClosedRange {
-  base: Expression;
 }
 
 table Debug {
   base: Expression;
-  srcCodeIdentifier: string(shared);
+  srcCodeName: string(shared);
 }
 
-table Spawn {
+table SpawnBase {
   base: Expression;
   executeClosure: uint32;  // use values id
 }
@@ -1425,9 +1141,9 @@ table Spawn {
 table Lambda {
   base: Expression;
   funcTy: uint32; // use types id
-  isLocalFunc: bool = false;
+  isLocalFunc: bool;
   identifier: string(shared);
-  srcCodeIdentifier: string(shared);
+  srcCodeName: string(shared);
   params: [uint32];  // use values id
   genericTypeParams: [uint32]; // use types id
   body: uint32; // use values id
@@ -1435,47 +1151,9 @@ table Lambda {
   isCompileTimeValue: bool = false;
 }
 
-table InvokeStatic {
-  base: Expression;
-  
-  // FuncCall
-  instantiatedTypeArgs: [uint32]; // use types id
-  thisType: uint32; // use types id
-
-  // DynamicDispatch
-  virMethodCtx: VirMethodContext;
-}
-
 table GetInstantiateValue {
   base: Expression;
-  instantiateTys: [uint32]; // use types id
-}
-
-table InvokeStaticWithException {
-  base: Terminator;
-
-  // FuncCallWithException
-  instantiatedTypeArgs: [uint32]; // use types id
-  thisType: uint32; // use types id
-
-  // DynamicDispatchWithException
-  virMethodCtx: VirMethodContext;
-}
-
-table TransformToGeneric {
-  base: Expression;
-}
-
-table TransformToConcrete {
-  base: Expression;
-}
-
-table UnBoxToRef {
-  base: Expression;
-}
-
-table GetRTTI {
-  base: Expression;
+  instantiateTypes: [uint32]; // use types id
 }
 
 table GetRTTIStatic {
@@ -1484,27 +1162,12 @@ table GetRTTIStatic {
 }
 
 union TypeElem {
-  RuneType,
-  BooleanType,
-  UnitType,
-  NothingType,
-  IntType,
-  FloatType,
-  TupleType,
+  Type,
   RawArrayType,
   VArrayType,
   FuncType,
   CustomType,
-  EnumType,
-  StructType,
-  ClassType,
-  CStringType,
-  CPointerType,
   GenericType,
-  RefType,
-  BoxType,
-  VoidType,
-  ThisType,
 }
 
 union CustomTypeDefElem {
@@ -1515,61 +1178,29 @@ union CustomTypeDefElem {
 }
 
 union ExpressionElem {
-  UnaryExpression,
-  BinaryExpression,
-  Constant,
-  Allocate,
-  Load,
-  Store,
-  GetElementRef,
-  GetElementByName,
-  StoreElementRef,
-  StoreElementByName,
-  Apply,
-  Invoke,
-  TypeCast,
-  InstanceOf,
-  Box,
-  UnBox,
-  GoTo,
+  Expression, // not a specific expression, more like a wildcard
+  AllocateBase,
+  ApplyBase,
+  BinaryExpressionBase,
   Branch,
-  MultiBranch,
-  Exit,
-  RaiseException,
-  ApplyWithException,
-  InvokeWithException,
-  IntOpWithException,
-  TypeCastWithException,
-  IntrinsicWithException,
-  AllocateWithException,
-  RawArrayAllocateWithException,
-  SpawnWithException,
-  Tuple,
+  Debug,
   Field,
   FieldByName,
-  RawArrayAllocate,
-  RawArrayLiteralInit,
-  RawArrayInitByValue,
-  VArray,
-  VArrayBd,
-  GetException,
-  Intrinsic,
-  If,
-  Loop,
-  ForInRange,
-  ForInIter,
-  ForInClosedRange,
-  Debug,
-  Spawn,
-  Lambda,
-  InvokeStatic,
-  InvokeStaticWithException,
+  GetElementByName,
+  GetElementRef,
   GetInstantiateValue,
-  TransformToConcrete,
-  TransformToGeneric,
-  UnBoxToRef,
-  GetRTTI,
   GetRTTIStatic,
+  InstanceOf,
+  IntrinsicBase,
+  InvokeBase,
+  Lambda,
+  MultiBranch,
+  NumericCastBase,
+  RawArrayAllocateBase,
+  SpawnBase,
+  StoreElementByName,
+  StoreElementRef,
+  UnaryExpressionBase,
 }
 
 union ValueElem {
@@ -1583,9 +1214,7 @@ union ValueElem {
   Parameter,
   LocalVar,
   GlobalVar,
-  Func,
-  ImportedVar,
-  ImportedFunc,
+  Function,
   Block,
   BlockGroup,
 }
@@ -1614,12 +1243,7 @@ table CHIRPackage {
   defs: [CustomTypeDefElem];
   packageInitFunc: uint32;  // use values id
   phase: Phase;
-  packageLiteralInitFunc: uint32;  // use valueID (Func)
-  maxImportedValueId: uint32;
-  maxImportedStructId: uint32;
-  maxImportedClassId: uint32;
-  maxImportedEnumId: uint32;
-  maxImportedExtendId: uint32;
+  packageLiteralInitFunc: uint32;  // use valueID (Function)
 }
 
 root_type CHIRPackage;

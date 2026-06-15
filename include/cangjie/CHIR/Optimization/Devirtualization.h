@@ -27,7 +27,7 @@ public:
      */
     struct RewriteInfo {
         Invoke* invoke;
-        FuncBase* realCallee;
+        Function* realCallee;
         Type* thisType;
         std::vector<Type*> typeArgs;
         Apply* newApply = nullptr;
@@ -48,21 +48,21 @@ public:
      * @param builder CHIR builder for generating IR.
      * @param isDebug flag whether print debug log.
      */
-    void RunOnFuncs(const std::vector<Func*>& funcs, CHIRBuilder& builder, bool isDebug);
+    void RunOnFuncs(const std::vector<Function*>& funcs, CHIRBuilder& builder, bool isDebug);
 
     /**
      * @brief get functions containing invoke expression.
      * @param package user package to optimization.
      * @return return functions containing invoke expression.
      */
-    static std::vector<Func*> CollectContainInvokeExprFuncs(const Ptr<const Package>& package);
+    static std::vector<Function*> CollectContainInvokeExprFuncs(const Ptr<const Package>& package);
 
     /// get optimized functions which are marked frozen.
-    const std::vector<Func*>& GetFrozenInstFuns() const;
+    const std::vector<Function*>& GetFrozenInstFuns() const;
 
     /// after first devirt pass, do second devirtualization for frozen func.
     /// this function mainly get results from second type analysis.
-    void AppendFrozenFuncState(const Func* func, std::unique_ptr<Results<TypeDomain>> analysisRes);
+    void AppendFrozenFuncState(const Function* func, std::unique_ptr<Results<TypeDomain>> analysisRes);
 
     /// function signature to determine a certain function.
     struct FuncSig {
@@ -72,9 +72,9 @@ public:
     };
 
 private:
-    void RunOnFunc(const Func* func, CHIRBuilder& builder);
+    void RunOnFunc(const Function* func, CHIRBuilder& builder);
 
-    std::pair<FuncBase*, Type*> FindRealCallee(
+    std::pair<Function*, Type*> FindRealCallee(
         CHIRBuilder& builder, const TypeValue* typeState, const FuncSig& method) const;
 
     bool IsValidSubType(CHIRBuilder& builder, const Type* expected, Type* specific,
@@ -85,9 +85,9 @@ private:
     void InstantiateFuncIfPossible(CHIRBuilder& builder, std::vector<RewriteInfo>& rewriteInfoList);
 
     void CollectCandidates(
-        CHIRBuilder& builder, ClassType* specific, std::pair<FuncBase*, Type*>& res, const FuncSig& method) const;
+        CHIRBuilder& builder, ClassType* specific, std::pair<Function*, Type*>& res, const FuncSig& method) const;
 
-    FuncBase* GetCandidateFromSpecificType(
+    Function* GetCandidateFromSpecificType(
         CHIRBuilder& builder, ClassType& specific, const FuncSig& method) const;
 
     static void RewriteToApply(CHIRBuilder& builder, std::vector<RewriteInfo>& rewriteInfos, bool isDebug);
@@ -107,11 +107,11 @@ private:
     std::vector<RewriteInfo> rewriteInfos{};
 
     // frozen inst functions after devirt, these func need a devirt optimization too after first devirt opt
-    std::vector<Func*> frozenInstFuns;
+    std::vector<Function*> frozenInstFuns;
     // extra type state from outside
-    std::unordered_map<const Func*, std::unique_ptr<Results<TypeDomain>>> frozenStates;
+    std::unordered_map<const Function*, std::unique_ptr<Results<TypeDomain>>> frozenStates;
 
-    std::unordered_map<std::string, Func*> frozenInstFuncMap;
+    std::unordered_map<std::string, Function*> frozenInstFuncMap;
 };
 } // namespace Cangjie::CHIR
 

@@ -6,7 +6,20 @@
 
 #include "cangjie/Utils/StdUtils.h"
 
+#include <climits>
 namespace Cangjie {
+std::optional<unsigned int> Stoui(const std::string& s, int base)
+{
+    try {
+        unsigned long result = std::stoul(s, nullptr, base);
+        if (result > UINT_MAX) {
+            return {};
+        }
+        return static_cast<unsigned int>(result);
+    } catch (...) {
+        return {};
+    }
+}
 std::optional<int> Stoi(const std::string& s, int base)
 {
     try {

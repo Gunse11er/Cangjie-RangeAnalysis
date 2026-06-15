@@ -41,13 +41,15 @@ inline std::string CGModule::GetDataLayoutString(const Triple::Info& target)
                             : "e-m:e-i64:64-f80:128-n8:16:32:64-S128";
 }
 
-inline std::string CGModule::GetTargetTripleString(const Triple::Info& target)
+std::string CGModule::GetTargetTripleString(const Triple::Info& target)
 {
     if (target.IsMacOS()) {
         if (target.arch == Triple::ArchType::AARCH64) {
             return "arm64-apple-macosx12.0.0";
         }
         return target.ArchToString() + "-apple-macosx12.0.0";
+    } else if (target.arch == Triple::ArchType::AARCH64 && target.env == Triple::Environment::OHOS) {
+        return target.ArchToString() + "-unknown-linux-ohos";
     } else if (target.arch == Triple::ArchType::ARM32 && target.os == Triple::OSType::LINUX) {
         return "armv7a-linux-gnu";
     } else {
@@ -174,12 +176,12 @@ void CGModule::GenIncremental()
         // Save .bc for the potential incremental compilation before deeper erasure.
         auto cachePath = option.GenerateCachedPathNameForCodeGen(module->getSourceFileName(), "_cache.bc");
         CodeGen::SaveToBitcodeFile(*module, cachePath);
-        if (auto namedMD = module->getNamedMetadata("CodeGenAddedForIncr"); namedMD) {
-            namedMD->eraseFromParent();
-        }
-        if (auto namedMD = module->getNamedMetadata("StaticGenericTIsForIncr"); namedMD) {
-            namedMD->eraseFromParent();
-        }
+    }
+    if (auto namedMD = module->getNamedMetadata("CodeGenAddedForIncr"); namedMD) {
+        namedMD->eraseFromParent();
+    }
+    if (auto namedMD = module->getNamedMetadata("StaticGenericTIsForIncr"); namedMD) {
+        namedMD->eraseFromParent();
     }
 }
 
@@ -211,7 +213,7 @@ inline void SetCFFIStub(const CHIR::Value& func, llvm::Function* function)
 {
     CJC_NULLPTR_CHECK(function);
     if (func.IsFuncWithBody()) {
-        const CHIR::Func& funcNode = VirtualCast<const CHIR::Func&>(func);
+        const CHIR::Function& funcNode = StaticCast<const CHIR::Function&>(func);
         if (funcNode.IsCFunc()) {
             if (!funcNode.IsCFFIWrapper()) {
                 function->addFnAttr(C2CJ_ATTR);
@@ -226,7 +228,7 @@ inline void SetCFFIStub(const CHIR::Value& func, llvm::Function* function)
 #endif
 
 void AddToGenericParamMapUnderExtendScope(const llvm::Function* function, std::unique_ptr<CGFunction>& cgFunc,
-    const CHIR::FuncBase& f, std::optional<size_t> outerTIIdx)
+    const CHIR::Function& f, std::optional<size_t> outerTIIdx)
 {
     CJC_NULLPTR_CHECK(function);
     auto extendDef = StaticCast<CHIR::ExtendDef*>(f.GetParentCustomTypeDef());
@@ -255,7 +257,7 @@ void AddToGenericParamMapWithOuterTI(const llvm::Function* function, std::unique
     uint32_t idx = 0;
     auto outerTiArg = function->getArg(static_cast<unsigned>(outerTIIdx.value()));
     outerTiArg->setName("outerTI");
-    auto outerDef = VirtualCast<const CHIR::FuncBase&>(func).GetParentCustomTypeDef();
+    auto outerDef = StaticCast<const CHIR::Function&>(func).GetParentCustomTypeDef();
     CJC_ASSERT(outerDef);
     if (!outerDef->GetGenericTypeParams().empty()) {
         auto outerType = outerDef->IsExtend() ? dynamic_cast<const CHIR::ExtendDef*>(outerDef)->GetExtendedType()
@@ -304,7 +306,7 @@ CGFunction* CGModule::GetOrInsertCGFunction(const CHIR::Value* func, bool forWra
         AddFnAttr(function, llvm::Attribute::get(module->getContext(), THIS_PARAM_HAS_BP));
     }
 
-    auto chirFunc = VirtualCast<const CHIR::FuncBase*>(func);
+    auto chirFunc = StaticCast<const CHIR::Function*>(func);
     auto chirLinkage = chirFunc->Get<CHIR::LinkTypeInfo>();
     if (func->IsFuncWithBody()) {
         bool markByMD = cgCtx->IsCGParallelEnabled() && !IsCHIRWrapper(func->GetIdentifierWithoutPrefix());
@@ -327,7 +329,7 @@ CGFunction* CGModule::GetOrInsertCGFunction(const CHIR::Value* func, bool forWra
 
     // If this is a function defined within `Extend<T, ..., K>` scope,  we need to
     // add the `T`, ..., `K` into the genericParamsMap of this function.
-    if (auto f = DynamicCast<const CHIR::FuncBase*>(func); f && f->IsInExtend()) {
+    if (auto f = DynamicCast<const CHIR::Function*>(func); f && f->IsInExtend()) {
         CJC_ASSERT(outerTIIdx.has_value());
         AddToGenericParamMapUnderExtendScope(function, cgFunc, *f, outerTIIdx);
     }
@@ -356,7 +358,7 @@ CGFunction* CGModule::GetOrInsertCGFunction(const CHIR::Value* func, bool forWra
         }
     }
     if (func->IsFuncWithBody()) {
-        if (!VirtualCast<const CHIR::Func*>(func)->IsCFFIWrapper()) {
+        if (!StaticCast<const CHIR::Function*>(func)->IsCFFIWrapper()) {
             SetGCCangjie(function);
         }
     }
@@ -372,7 +374,7 @@ CGFunction* CGModule::GetOrInsertCGFunction(const CHIR::Value* func, bool forWra
     return ret;
 }
 
-CGValue* CGModule::GetOrInsertGlobalVariable(const CHIR::Value* chirGV)
+CGValue* CGModule::GetOrInsertGlobalVariable(const CHIR::GlobalVar* chirGV)
 {
     CJC_ASSERT_WITH_MSG(chirGV, "chirGV is null");
     if (auto it = valueMapping.find(chirGV); it != valueMapping.end()) {
@@ -382,7 +384,7 @@ CGValue* CGModule::GetOrInsertGlobalVariable(const CHIR::Value* chirGV)
     auto cgVarType = CGType::GetOrCreate(*this, chirGV->GetType());
     llvm::GlobalVariable* gv = llvm::cast<llvm::GlobalVariable>(module->getOrInsertGlobal(
         chirGV->GetIdentifierWithoutPrefix(), cgVarType->GetPointerElementType()->GetLLVMType()));
-    if (chirGV->IsGlobalVarInCurPackage()) {
+    if (!chirGV->TestAttr(CHIR::Attribute::IMPORTED) || chirGV->IsLocalConst()) {
         auto chirLinkage = chirGV->Get<CHIR::LinkTypeInfo>();
         AddLinkageTypeMetadata(*gv, CHIRLinkage2LLVMLinkage(chirLinkage), cgCtx->IsCGParallelEnabled());
     }
@@ -407,18 +409,10 @@ CGValue* CGModule::GetMappedCGValue(const CHIR::Value* chirValue)
     if (auto cgValue = GetMappedValue(chirValue); cgValue) {
         return cgValue;
     }
-    if (chirValue->IsImportedFunc()) {
-        auto importedFunc = DynamicCast<const CHIR::ImportedFunc*>(chirValue);
-        return GetOrInsertCGFunction(importedFunc);
-    } else if (chirValue->IsFuncWithBody()) {
-        auto func = DynamicCast<const CHIR::FuncBase*>(chirValue);
+    if (auto func = DynamicCast<const CHIR::Function*>(chirValue)) {
         return GetOrInsertCGFunction(func);
-    } else if (chirValue->IsImportedVar()) {
-        auto importedVar = DynamicCast<const CHIR::ImportedVar*>(chirValue);
-        return GetOrInsertGlobalVariable(importedVar);
-    } else if (chirValue->IsGlobalVarInCurPackage()) {
-        auto chirGV = DynamicCast<const CHIR::GlobalVarBase*>(chirValue);
-        return GetOrInsertGlobalVariable(chirGV);
+    } else if (auto gv = DynamicCast<const CHIR::GlobalVar*>(chirValue)) {
+        return GetOrInsertGlobalVariable(gv);
     } else {
         CJC_ASSERT_WITH_MSG(false, "Should not reach here: value not dominate all uses in CHIR.");
         return nullptr;
@@ -593,6 +587,8 @@ std::vector<llvm::Constant*> CGModule::InitRawArrayUInt8Constants() const
         auto gvUInt8Ti = llvm::cast<llvm::GlobalVariable>(module->getOrInsertGlobal(memberTiName, typeInfoType));
         auto metaUInt8Ti = llvm::MDTuple::get(ctx, {llvm::MDString::get(ctx, "UInt8.Type")});
         gvUInt8Ti->setMetadata(GC_TYPE_META_NAME, metaUInt8Ti);
+        gvUInt8Ti->addAttribute(GC_KLASS_ATTR);
+        gvUInt8Ti->addAttribute(NOT_MODIFIABLE_CLASS_ATTR);
     }
 
     auto constantInt8Zero = llvm::ConstantInt::get(int8Ty, 0);

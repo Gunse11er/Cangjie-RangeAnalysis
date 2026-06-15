@@ -85,7 +85,7 @@ void ExtendBoxMarker::CheckBlockNeedBox(const Block& block, Ty& ty, Node& nodeTo
     auto lastExpr = block.GetLastExprOrDecl();
     Ptr<Ty> lastTy = TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT);
     if (auto expr = DynamicCast<Expr*>(lastExpr); expr) {
-        lastTy = expr->ty;
+        lastTy = expr->GetTy();
     }
     if (NeedAutoBox(lastTy, &ty)) {
         nodeToCheck.EnableAttr(Attribute::NEED_AUTO_BOX);
@@ -95,30 +95,30 @@ void ExtendBoxMarker::CheckBlockNeedBox(const Block& block, Ty& ty, Node& nodeTo
 VisitAction ExtendBoxMarker::MarkBoxPointHandleArrayExpr(ArrayExpr& ae)
 {
     CJC_ASSERT(typeManager);
-    bool ignored = !Ty::IsTyCorrect(ae.ty) || ae.args.empty() ||
+    bool ignored = !Ty::IsTyCorrect(ae.GetTy()) || ae.args.empty() ||
         (ae.initFunc && ae.initFunc->identifier != "arrayInitByCollection");
     if (ignored) {
         return VisitAction::WALK_CHILDREN;
     }
     // For 'VArray<...>(repeat: T)' constructor may need auto box.
     if (ae.isValueArray) {
-        if (NeedAutoBox(ae.args[0]->ty, typeManager->GetTypeArgs(*ae.ty)[0])) {
+        if (NeedAutoBox(ae.args[0]->GetTy(), typeManager->GetTypeArgs(*ae.GetTy())[0])) {
             ae.EnableAttr(Attribute::NEED_AUTO_BOX);
         }
         return VisitAction::WALK_CHILDREN;
     }
     // For 'RawArray(size, item: T)' constructor may need auto box.
     if (!ae.initFunc) {
-        if (NeedAutoBox(ae.args[1]->ty, typeManager->GetTypeArgs(*ae.ty)[0])) {
+        if (NeedAutoBox(ae.args[1]->GetTy(), typeManager->GetTypeArgs(*ae.GetTy())[0])) {
             ae.EnableAttr(Attribute::NEED_AUTO_BOX);
         }
         return VisitAction::WALK_CHILDREN;
     }
     // For 'RawArray(Collection)' constructor may need auto box.
     // 'initFunc' may be generic, we need to instantiated it's type before boxing check.
-    auto initFuncTy = DynamicCast<FuncTy*>(ae.initFunc->ty);
+    auto initFuncTy = DynamicCast<FuncTy*>(ae.initFunc->GetTy());
     auto generic = ae.initFunc->GetGeneric();
-    auto instTys = typeManager->GetTypeArgs(*ae.ty);
+    auto instTys = typeManager->GetTypeArgs(*ae.GetTy());
     bool invalid = !initFuncTy || initFuncTy->paramTys.size() != 2 || // 'arrayInitByCollection' has 2 parameters.
         !generic || generic->typeParameters.size() != instTys.size();
     if (invalid) {
@@ -126,7 +126,7 @@ VisitAction ExtendBoxMarker::MarkBoxPointHandleArrayExpr(ArrayExpr& ae)
     }
     TypeSubst typeMapping = TypeCheckUtil::GenerateTypeMapping(*ae.initFunc, instTys);
     initFuncTy = RawStaticCast<FuncTy*>(typeManager->GetInstantiatedTy(initFuncTy, typeMapping));
-    if (NeedAutoBox(ae.args[0]->ty, initFuncTy->paramTys[1])) {
+    if (NeedAutoBox(ae.args[0]->GetTy(), initFuncTy->paramTys[1])) {
         ae.EnableAttr(Attribute::NEED_AUTO_BOX);
     }
     return VisitAction::WALK_CHILDREN;
@@ -144,16 +144,16 @@ VisitAction ExtendBoxMarker::MarkBoxPointHandleArrayExpr(ArrayExpr& ae)
  * */
 VisitAction ExtendBoxMarker::MarkBoxPointHandleTryExpr(TryExpr& te)
 {
-    if (!Ty::IsTyCorrect(te.ty)) {
+    if (!Ty::IsTyCorrect(te.GetTy())) {
         return VisitAction::WALK_CHILDREN;
     }
     if (te.tryBlock) {
-        CheckBlockNeedBox(*te.tryBlock, *te.ty, te);
+        CheckBlockNeedBox(*te.tryBlock, *te.GetTy(), te);
     }
 
     for (auto& cb : te.catchBlocks) {
         CJC_NULLPTR_CHECK(cb);
-        CheckBlockNeedBox(*cb, *te.ty, te);
+        CheckBlockNeedBox(*cb, *te.GetTy(), te);
     }
     return VisitAction::WALK_CHILDREN;
 }
@@ -168,10 +168,11 @@ bool ExtendBoxMarker::IsTypePatternNeedBox(Ptr<Pattern> pattern, Ty& selectorTy)
     switch (pattern->astKind) {
         case ASTKind::TYPE_PATTERN: {
             auto typePattern = RawStaticCast<TypePattern*>(pattern);
-            CJC_ASSERT(typePattern->type && typePattern->ty && typePattern->type->ty == typePattern->ty);
+            CJC_ASSERT(typePattern->type && typePattern->GetTy() && typePattern->type->GetTy() == typePattern->GetTy());
             // Downcast or Upcast.
-            bool cond = NeedAutoBox(typePattern->ty, &selectorTy, false) || NeedAutoBox(&selectorTy, typePattern->ty);
-            boxOrUnbox = cond || MustUnboxDownCast(selectorTy, *typePattern->ty);
+            bool cond =
+                NeedAutoBox(typePattern->GetTy(), &selectorTy, false) || NeedAutoBox(&selectorTy, typePattern->GetTy());
+            boxOrUnbox = cond || MustUnboxDownCast(selectorTy, *typePattern->GetTy());
             break;
         }
         case ASTKind::TUPLE_PATTERN: {
@@ -186,8 +187,8 @@ bool ExtendBoxMarker::IsTypePatternNeedBox(Ptr<Pattern> pattern, Ty& selectorTy)
         }
         case ASTKind::ENUM_PATTERN: {
             auto enumPattern = StaticCast<EnumPattern*>(pattern);
-            CJC_ASSERT(enumPattern->constructor && enumPattern->constructor->ty);
-            auto constructorTy = DynamicCast<FuncTy*>(enumPattern->constructor->ty);
+            CJC_ASSERT(enumPattern->constructor && enumPattern->constructor->GetTy());
+            auto constructorTy = DynamicCast<FuncTy*>(enumPattern->constructor->GetTy());
             if (!constructorTy) { // Enum pattern may without param.
                 break;
             }
@@ -214,15 +215,15 @@ void ExtendBoxMarker::MarkBoxPointHandleCondition(Expr& e)
     while (!st.empty()) {
         auto expr = st.top();
         st.pop();
-        if (!expr || !Ty::IsTyCorrect(expr->ty)) {
+        if (!expr || !Ty::IsTyCorrect(expr->GetTy())) {
             continue;
         }
         if (auto let = DynamicCast<LetPatternDestructor>(expr)) {
-            if (!let->initializer || !Ty::IsTyCorrect(let->initializer->ty)) {
+            if (!let->initializer || !Ty::IsTyCorrect(let->initializer->GetTy())) {
                 continue;
             }
             for (auto& pat : std::as_const(let->patterns)) {
-                if (IsTypePatternNeedBox(pat.get(), *let->initializer->ty)) {
+                if (IsTypePatternNeedBox(pat.get(), *let->initializer->GetTy())) {
                     target.EnableAttr(Attribute::NEED_AUTO_BOX);
                     pat->EnableAttr(Attribute::NEED_AUTO_BOX);
                 }
@@ -240,18 +241,18 @@ void ExtendBoxMarker::MarkBoxPointHandleCondition(Expr& e)
 
 VisitAction ExtendBoxMarker::MarkBoxPointHandleMatchExpr(MatchExpr& me)
 {
-    if (!Ty::IsTyCorrect(me.ty)) {
+    if (!Ty::IsTyCorrect(me.GetTy())) {
         return VisitAction::SKIP_CHILDREN;
     }
     // NOTE: we also need to collect all boxed types, so do not interrupt loop early.
     for (auto& matchCase : me.matchCases) {
         // Primary constructors and their desugared components (such as default params) are not type checked and do
         // not have a correct semantic type field.
-        if (!me.selector || !Ty::IsTyCorrect(me.selector->ty)) {
+        if (!me.selector || !Ty::IsTyCorrect(me.selector->GetTy())) {
             continue;
         }
         for (auto& pattern : matchCase->patterns) {
-            if (IsTypePatternNeedBox(pattern.get(), *me.selector->ty)) {
+            if (IsTypePatternNeedBox(pattern.get(), *me.selector->GetTy())) {
                 // It's possible that childs have different box type, so does not break after match.
                 // auto box or unbox.
                 me.EnableAttr(Attribute::NEED_AUTO_BOX);
@@ -259,12 +260,12 @@ VisitAction ExtendBoxMarker::MarkBoxPointHandleMatchExpr(MatchExpr& me)
         }
 
         if (matchCase->exprOrDecls) {
-            CheckBlockNeedBox(*matchCase->exprOrDecls, *me.ty, me);
+            CheckBlockNeedBox(*matchCase->exprOrDecls, *me.GetTy(), me);
         }
     }
     for (auto& matchCase : me.matchCaseOthers) {
         if (matchCase->exprOrDecls) {
-            CheckBlockNeedBox(*matchCase->exprOrDecls, *me.ty, me);
+            CheckBlockNeedBox(*matchCase->exprOrDecls, *me.GetTy(), me);
         }
     }
     return VisitAction::WALK_CHILDREN;
@@ -272,10 +273,10 @@ VisitAction ExtendBoxMarker::MarkBoxPointHandleMatchExpr(MatchExpr& me)
 
 VisitAction ExtendBoxMarker::MarkBoxPointHandleArrayLit(ArrayLit& lit)
 {
-    if (Ty::IsTyCorrect(lit.ty) && lit.ty->typeArgs.size() == 1) {
+    if (Ty::IsTyCorrect(lit.GetTy()) && lit.GetTy()->typeArgs.size() == 1) {
         for (auto& child : lit.children) {
             // It's possible that child 0 and child 1 needs different box type, so does not break after match.
-            if (child->ty && NeedAutoBox(child->ty, lit.ty->typeArgs[0])) {
+            if (child->GetTy() && NeedAutoBox(child->GetTy(), lit.GetTy()->typeArgs[0])) {
                 lit.EnableAttr(Attribute::NEED_AUTO_BOX);
             }
         }
@@ -285,9 +286,9 @@ VisitAction ExtendBoxMarker::MarkBoxPointHandleArrayLit(ArrayLit& lit)
 
 VisitAction ExtendBoxMarker::MarkBoxPointHandleReturnExpr(ReturnExpr& re)
 {
-    if (re.expr && re.refFuncBody && re.refFuncBody->ty && re.refFuncBody->ty->kind == TypeKind::TYPE_FUNC) {
-        auto funcTy = RawStaticCast<FuncTy*>(re.refFuncBody->ty);
-        if (NeedAutoBox(re.expr->ty, funcTy->retTy)) {
+    if (re.expr && re.refFuncBody && re.refFuncBody->GetTy() && re.refFuncBody->TyKind() == TypeKind::TYPE_FUNC) {
+        auto funcTy = RawStaticCast<FuncTy*>(re.refFuncBody->GetTy());
+        if (NeedAutoBox(re.expr->GetTy(), funcTy->retTy)) {
             re.EnableAttr(Attribute::NEED_AUTO_BOX);
         }
     }
@@ -296,18 +297,18 @@ VisitAction ExtendBoxMarker::MarkBoxPointHandleReturnExpr(ReturnExpr& re)
 
 VisitAction ExtendBoxMarker::MarkBoxPointHandleIfExpr(IfExpr& ie)
 {
-    if (Ty::IsTyCorrect(ie.ty) && (ie.condExpr && Ty::IsTyCorrect(ie.condExpr->ty))) {
+    if (Ty::IsTyCorrect(ie.GetTy()) && (ie.condExpr && Ty::IsTyCorrect(ie.condExpr->GetTy()))) {
         MarkBoxPointHandleCondition(*ie.condExpr);
     }
-    if (Ty::IsTyCorrect(ie.ty) && !ie.ty->IsUnitOrNothing()) {
+    if (Ty::IsTyCorrect(ie.GetTy()) && !ie.GetTy()->IsUnitOrNothing()) {
         if (ie.thenBody) {
-            CheckBlockNeedBox(*ie.thenBody, *ie.ty, ie);
+            CheckBlockNeedBox(*ie.thenBody, *ie.GetTy(), ie);
         }
         if (!ie.hasElse || !ie.elseBody) {
             return VisitAction::WALK_CHILDREN;
         }
         if (auto block = DynamicCast<Block*>(ie.elseBody.get()); block) {
-            CheckBlockNeedBox(*block, *ie.ty, ie);
+            CheckBlockNeedBox(*block, *ie.GetTy(), ie);
         }
     }
     return VisitAction::WALK_CHILDREN;
@@ -315,7 +316,7 @@ VisitAction ExtendBoxMarker::MarkBoxPointHandleIfExpr(IfExpr& ie)
 
 VisitAction ExtendBoxMarker::MarkBoxPointHandleWhileExpr(const AST::WhileExpr& we)
 {
-    if (Ty::IsTyCorrect(we.ty) && we.condExpr && Ty::IsTyCorrect(we.condExpr->ty)) {
+    if (Ty::IsTyCorrect(we.GetTy()) && we.condExpr && Ty::IsTyCorrect(we.condExpr->GetTy())) {
         MarkBoxPointHandleCondition(*we.condExpr);
     }
     return VisitAction::WALK_CHILDREN;
@@ -323,10 +324,10 @@ VisitAction ExtendBoxMarker::MarkBoxPointHandleWhileExpr(const AST::WhileExpr& w
 
 VisitAction ExtendBoxMarker::MarkBoxPointHandleCallExpr(CallExpr& ce)
 {
-    if (!ce.baseFunc || !ce.baseFunc->ty || ce.baseFunc->ty->kind != TypeKind::TYPE_FUNC) {
+    if (!ce.baseFunc || !ce.baseFunc->GetTy() || ce.baseFunc->TyKind() != TypeKind::TYPE_FUNC) {
         return VisitAction::WALK_CHILDREN;
     }
-    auto funcTy = RawStaticCast<FuncTy*>(ce.baseFunc->ty);
+    auto funcTy = RawStaticCast<FuncTy*>(ce.baseFunc->GetTy());
     unsigned count = 0;
     auto callCheck = [&count, &funcTy, &ce](auto begin, auto end) {
         for (auto it = begin; it != end; ++it) {
@@ -335,7 +336,7 @@ VisitAction ExtendBoxMarker::MarkBoxPointHandleCallExpr(CallExpr& ce)
             }
             auto& paramTy = funcTy->paramTys[count];
             // It's possible that childs have different box type, so does not break after match.
-            if ((*it)->expr && NeedAutoBox((*it)->expr->ty, paramTy)) {
+            if ((*it)->expr && NeedAutoBox((*it)->expr->GetTy(), paramTy)) {
                 ce.EnableAttr(Attribute::NEED_AUTO_BOX);
             }
             count = count + 1;
@@ -352,7 +353,7 @@ VisitAction ExtendBoxMarker::MarkBoxPointHandleCallExpr(CallExpr& ce)
 VisitAction ExtendBoxMarker::MarkBoxPointHandleAssignExpr(AssignExpr& ae)
 {
     // Desugared assign expression will be skipped.
-    if (!ae.desugarExpr && ae.rightExpr && ae.leftValue && NeedAutoBox(ae.rightExpr->ty, ae.leftValue->ty)) {
+    if (!ae.desugarExpr && ae.rightExpr && ae.leftValue && NeedAutoBox(ae.rightExpr->GetTy(), ae.leftValue->GetTy())) {
         ae.EnableAttr(Attribute::NEED_AUTO_BOX);
     }
     return VisitAction::WALK_CHILDREN;
@@ -360,7 +361,7 @@ VisitAction ExtendBoxMarker::MarkBoxPointHandleAssignExpr(AssignExpr& ae)
 
 VisitAction ExtendBoxMarker::MarkBoxPointHandleVarDecl(VarDecl& vd)
 {
-    if (vd.initializer && NeedAutoBox(vd.initializer->ty, vd.ty)) {
+    if (vd.initializer && NeedAutoBox(vd.initializer->GetTy(), vd.GetTy())) {
         vd.EnableAttr(Attribute::NEED_AUTO_BOX);
     }
     return VisitAction::WALK_CHILDREN;
@@ -368,13 +369,13 @@ VisitAction ExtendBoxMarker::MarkBoxPointHandleVarDecl(VarDecl& vd)
 
 VisitAction ExtendBoxMarker::MarkBoxPointHandleTupleLit(TupleLit& tl)
 { // Tuple literal allows element been boxed.
-    auto tupleTy = DynamicCast<TupleTy*>(tl.ty);
+    auto tupleTy = DynamicCast<TupleTy*>(tl.GetTy());
     if (tupleTy == nullptr) {
         return VisitAction::WALK_CHILDREN;
     }
     auto typeArgs = tupleTy->typeArgs;
     for (size_t i = 0; i < typeArgs.size(); ++i) {
-        if (NeedAutoBox(tl.children[i]->ty, typeArgs[i])) {
+        if (NeedAutoBox(tl.children[i]->GetTy(), typeArgs[i])) {
             tl.EnableAttr(Attribute::NEED_AUTO_BOX);
         }
     }

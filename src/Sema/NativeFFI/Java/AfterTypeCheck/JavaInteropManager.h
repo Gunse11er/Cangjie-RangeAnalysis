@@ -1,4 +1,4 @@
-// Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+// Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 // This source file is part of the Cangjie project, licensed under Apache-2.0
 // with Runtime Library Exception.
 //
@@ -54,10 +54,8 @@ public:
      *        used for generating method stubs in synthetic classes.
      *        This collection contains method signatures of all structs.
      */
-    void DesugarPackage(Package& pkg, const std::unordered_map<Ptr<const InheritableDecl>, MemberMap>& memberMap);
-
-private:
-    void CheckUsageOfJavaTypes(Decl& decl);
+    void DesugarPackage(Package& pkg, const std::unordered_map<Ptr<const InheritableDecl>, MemberMap>& memberMap,
+        std::function<void(AST::Node&)> desugarPropRef);
 
 private:
     void CheckNonJavaSuperType(ClassLikeDecl& decl) const;

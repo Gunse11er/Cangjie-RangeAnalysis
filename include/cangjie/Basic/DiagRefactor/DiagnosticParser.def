@@ -21,9 +21,6 @@ ERROR(parse_varray_with_paren, "expected '(' or '{' after 'VArray' for 'VArray' 
 ERROR(parse_expected_import, "expected 'import' after module name, found %s", "expected 'import' here", {
     "after module name"
 })
-ERROR(parse_expected_module_name, "expected module name after keyword 'from', found %s", "expected module name here", {
-    "after keyword 'from'"
-})
 ERROR(parse_expected_right_delimiter, "unclosed delimiter: '%s'", "expected '%s' here", {
     "to match this opening '%s'",
 })
@@ -266,7 +263,6 @@ ERROR(parse_fail_expected_annotation, "expected annotation '%s'", {
 })
 
 // common/specific
-ERROR(parse_common_and_specific_in_the_same_file, "'common' and 'specific' declarations can not be in the same file")
 ERROR(parse_common_function_must_have_return_type, "'common' function return type must be specified")
 ERROR(parse_specific_function_must_have_return_type, "'specific' function return type must be specified")
 ERROR(parse_specific_function_parameter_cannot_have_default_value, "'specific' %s parameter can not have default value")
@@ -274,8 +270,7 @@ ERROR(parse_specific_member_must_have_implementation, "the member %s must have b
 ERROR(parse_expected_type_with_cjmp_var, "'%s' %s type must be specified")
 ERROR(parse_cjmp_outdecl_miss_match, "%s is %s, but %s is not %s")
 ERROR(parse_cjmp_static_init, "static init can not be '%s'")
-ERROR(parse_common_in_non_common_file, "common declaration must be defined in common package part")
-ERROR(parse_specific_in_non_specific_file, "specific declaration must be defined in specific package part")
+ERROR(parse_unexpected_cjmp_decl, "to compile with common/specific declarations, correct compiler options must be specified")
 ERROR(parse_cjmp_generic_decl, "generic declaration can not be '%s'")
 ERROR(parse_cjmp_pattern_decl, "%s pattern can not be '%s'")
 ERROR(parse_cjmp_in_common_ctor_required, "at least one constructor is required in common %s '%s'")
@@ -329,9 +324,7 @@ ERROR(parse_foreign_name_on_ffi_decl_member, "@ForeignName could only be used on
 // java mirror
 ERROR(parse_java_mirror_function_cannot_have_body, "java-mirrored function '%s' cannot have body", "java-mirrored function cannot have body")
 ERROR(parse_java_mirror_function_must_have_return_type, "java-mirrored function must have return type", "java-mirrored function must have return type")
-ERROR(parse_java_mirror_prop_cannot_have_setter, "java-mirrored property cannot have setter", "java-mirrored property cannot have setter")
-ERROR(parse_java_mirror_prop_cannot_have_getter, "java-mirrored property cannot have getter", "java-mirrored property cannot have getter")
-WARNING(parse_java_mirror_prop_is_deprecated, PARSER, "java-mirrored property is deprecated, use field instead")
+ERROR(parse_java_mirror_prop_is_forbidden, "java-mirrored property is forbidden, use field instead")
 ERROR(parse_java_mirror_decl_cannot_have_primary_ctor, "java-mirrored declaration cannot have primary constructor", "java-mirrored declaration cannot have primary constructor")
 ERROR(parse_java_mirror_constructor_cannot_have_body, "java-mirrored constructor cannot have body", "java-mirrored constructor cannot have body")
 ERROR(parse_java_mirror_cannot_have_private_member, "java-mirrored declaration cannot have private member")
@@ -343,7 +336,6 @@ ERROR(parse_java_impl_cannot_be_generic, "@JavaImpl declaration cannot be generi
 ERROR(parse_java_impl_cannot_be_abstract, "@JavaImpl declaration cannot be abstract")
 ERROR(parse_java_impl_cannot_be_sealed, "@JavaImpl declaration cannot be sealed")
 ERROR(parse_java_impl_cannot_have_static_init, "@JavaImpl declaration cannot have static initializer")
-ERROR(parse_java_mirror_cannot_have_open_prop, "java-mirrored declaration cannot have open property")
 
 // java impl
 ERROR(parse_java_impl_cannot_be_open, "@JavaImpl class cannot be open")

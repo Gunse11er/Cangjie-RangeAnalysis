@@ -15,12 +15,13 @@
 #include "cangjie/CHIR/Utils/Visitor/Visitor.h"
 #include "cangjie/Mangle/CHIRManglingUtils.h"
 #include "cangjie/Utils/ProfileRecorder.h"
+#include "cangjie/Utils/TaskQueue.h"
 
 using namespace Cangjie;
 using namespace Cangjie::CHIR;
 
 namespace {
-bool CalleeIsMutFuncFromParent(Type* thisType, FuncBase* callee, const Func& topLevelFunc)
+bool CalleeIsMutFuncFromParent(Type* thisType, Function* callee, const Function& topLevelFunc)
 {
     // thisType must be Struct
     if (thisType == nullptr || !thisType->StripAllRefs()->IsStruct()) {
@@ -39,33 +40,49 @@ bool CalleeIsMutFuncFromParent(Type* thisType, FuncBase* callee, const Func& top
 }
 } // namespace
 
-GenerateVTable::GenerateVTable(
-    Package& pkg, const std::vector<CustomTypeDef*>& defs, CHIRBuilder& b, const Cangjie::GlobalOptions& opts)
-    : package(pkg), candidateDefs(defs), builder(b), opts(opts)
+GenerateVTable::GenerateVTable(Package& pkg, const std::vector<CustomTypeDef*>& defs,
+    CHIRBuilder& b, const Cangjie::GlobalOptions& opts, const std::string& passName)
+    : package(pkg), candidateDefs(defs), builder(b), opts(opts), passName(passName)
 {
 }
 
 void GenerateVTable::CreateVTable()
 {
-    Utils::ProfileRecorder recorder("GenerateVTable", "CreateVTable");
-    auto vtableGenerator = VTableGenerator(builder);
-    for (auto customDef : candidateDefs) {
-        if (customDef->TestAttr(Attribute::SKIP_ANALYSIS)) {
-            continue;
+    Utils::ProfileRecorder recorder(passName, "CreateVTable");
+    size_t threadNum = opts.GetJobs();
+    if (threadNum == 1) {
+        auto vtableGenerator = VTableGenerator(builder);
+        for (auto customDef : candidateDefs) {
+            vtableGenerator.GenerateVTable(*customDef);
         }
-        vtableGenerator.GenerateVTable(*customDef);
+    } else {
+        Utils::TaskQueue taskQueue(threadNum);
+        std::vector<std::unique_ptr<VTableGenerator>> vtableGeneratorList;
+        
+        for (auto customDef : candidateDefs) {
+            auto vtableGenerator = std::make_unique<VTableGenerator>(builder);
+            VTableGenerator* generatorPtr = vtableGenerator.get();
+            vtableGeneratorList.emplace_back(std::move(vtableGenerator));
+            
+            taskQueue.AddTask<void>([generatorPtr, customDef]() {
+                generatorPtr->GenerateVTable(*customDef);
+            });
+        }
+
+        taskQueue.RunAndWaitForAllTasksCompleted();
     }
 }
 
 void GenerateVTable::UpdateOperatorVirFunc()
 {
+    Utils::ProfileRecorder recorder(passName, "UpdateOperatorVirFunc");
     UpdateOperatorVTable(package, builder).Update();
 }
 
 void GenerateVTable::CreateVirtualFuncWrapper(const IncreKind& kind, const CompilationCache& increCachedInfo,
     VirtualWrapperDepMap& curVirtFuncWrapDep, VirtualWrapperDepMap& delVirtFuncWrapForIncr)
 {
-    Utils::ProfileRecorder recorder("GenerateVTable", "CreateVirtualFuncWrapper");
+    Utils::ProfileRecorder recorder(passName, "CreateVirtualFuncWrapper");
     bool targetIsWin = opts.target.os == Triple::OSType::WINDOWS;
     IncreKind tempKind = opts.enIncrementalCompilation ? kind : IncreKind::INVALID;
     auto wrapper = WrapVirtualFunc(builder, increCachedInfo, tempKind, targetIsWin);
@@ -81,7 +98,7 @@ void GenerateVTable::CreateVirtualFuncWrapper(const IncreKind& kind, const Compi
 
 void GenerateVTable::SetSrcFuncType() const
 {
-    Utils::ProfileRecorder recorder("GenerateVTable", "SetSrcFuncType");
+    Utils::ProfileRecorder recorder(passName, "SetSrcFuncType");
     auto getSrcFuncType = [](const ClassDef& parentDef, size_t index) -> FuncType* {
         const auto& vtable = parentDef.GetDefVTable().GetExpectedTypeVTable(*parentDef.GetType());
         CJC_ASSERT(!vtable.IsEmpty());
@@ -95,7 +112,8 @@ void GenerateVTable::SetSrcFuncType() const
         for (const auto& it : vtable) {
             for (size_t i = 0; i < it.GetMethodNum(); ++i) {
                 auto& funcInfo = it.GetVirtualMethods()[i];
-                if (auto instance = funcInfo.GetVirtualMethod()) {
+                auto instance = funcInfo.GetVirtualMethod();
+                if (!instance->IsPureAbstract()) {
                     instance->Set<OverrideSrcFuncType>(getSrcFuncType(*it.GetSrcParentType()->GetClassDef(), i));
                 }
             }
@@ -105,7 +123,7 @@ void GenerateVTable::SetSrcFuncType() const
 
 void GenerateVTable::CreateMutFuncWrapper()
 {
-    Utils::ProfileRecorder recorder("GenerateVTable", "CreateMutFuncWrapper");
+    Utils::ProfileRecorder recorder(passName, "CreateMutFuncWrapper");
     auto wrapper = WrapMutFunc(builder);
     for (auto customDef : candidateDefs) {
         if (customDef->TestAttr(Attribute::SKIP_ANALYSIS)) {
@@ -116,8 +134,8 @@ void GenerateVTable::CreateMutFuncWrapper()
     mutFuncWrappers = wrapper.GetWrappers();
 }
 
-FuncBase* GenerateVTable::GetMutFuncWrapper(const Type& thisType, const std::vector<Value*>& args,
-    const std::vector<Type*>& instTypeArgs, Type& retType, const FuncBase& callee)
+Function* GenerateVTable::GetMutFuncWrapper(const Type& thisType, const std::vector<Value*>& args,
+    const std::vector<Type*>& instTypeArgs, Type& retType, const Function& callee)
 {
     std::vector<Type*> paramTypes;
     for (auto arg : args) {
@@ -142,21 +160,21 @@ FuncBase* GenerateVTable::GetMutFuncWrapper(const Type& thisType, const std::vec
 
 void GenerateVTable::UpdateFuncCall()
 {
-    Utils::ProfileRecorder recorder("GenerateVTable", "UpdateFuncCall");
+    Utils::ProfileRecorder recorder(passName, "UpdateFuncCall");
     auto preVisit = [this](Expression& e) {
         if (auto dyExpr = DynamicCast<DynamicDispatch*>(&e)) {
             e.Set<VirMethodOffset>(dyExpr->GetVirtualMethodOffset(&builder));
         } else if (auto dyExprE = DynamicCast<DynamicDispatchWithException*>(&e)) {
             e.Set<VirMethodOffset>(dyExprE->GetVirtualMethodOffset(&builder));
         } else if (auto apply = DynamicCast<Apply*>(&e)) {
-            auto callee = DynamicCast<FuncBase*>(apply->GetCallee());
+            auto callee = DynamicCast<Function*>(apply->GetCallee());
             if (CalleeIsMutFuncFromParent(apply->GetThisType(), callee, *e.GetTopLevelFunc())) {
                 auto wrapperFunc = GetMutFuncWrapper(*apply->GetThisType(), apply->GetArgs(),
                     apply->GetInstantiatedTypeArgs(), *apply->GetResult()->GetType(), *callee);
                 apply->ReplaceOperand(callee, wrapperFunc);
             }
         } else if (auto applyE = DynamicCast<ApplyWithException*>(&e)) {
-            auto callee = DynamicCast<FuncBase*>(applyE->GetCallee());
+            auto callee = DynamicCast<Function*>(applyE->GetCallee());
             if (CalleeIsMutFuncFromParent(applyE->GetThisType(), callee, *e.GetTopLevelFunc())) {
                 auto wrapperFunc = GetMutFuncWrapper(*applyE->GetThisType(), applyE->GetArgs(),
                     applyE->GetInstantiatedTypeArgs(), *applyE->GetResult()->GetType(), *callee);
@@ -165,7 +183,7 @@ void GenerateVTable::UpdateFuncCall()
         }
         return VisitResult::CONTINUE;
     };
-    for (auto func : package.GetGlobalFuncs()) {
+    for (auto func : package.GetGlobalFuncsWithBody()) {
         Visitor::Visit(*func, preVisit);
     }
 }

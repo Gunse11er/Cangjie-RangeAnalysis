@@ -64,10 +64,10 @@ OwnedPtr<Generic> CloneGeneric(const Generic& generic, const VisitFunc& visitor)
 MacroInvocation CloneMacroInvocation(const MacroInvocation& me)
 {
     MacroInvocation mi;
-    mi.fullName = me.fullName;
+    mi.macroCallDiagInfo.fullName = me.macroCallDiagInfo.fullName;
     mi.fullNameDotPos = me.fullNameDotPos;
-    mi.identifier = me.identifier;
-    mi.identifierPos = me.identifierPos;
+    mi.macroCallDiagInfo.identifier = me.macroCallDiagInfo.identifier;
+    mi.macroCallDiagInfo.identifierPos = me.macroCallDiagInfo.identifierPos;
     mi.leftSquarePos = me.leftSquarePos;
     mi.attrs = me.attrs;
     mi.rightSquarePos = me.rightSquarePos;
@@ -87,7 +87,7 @@ void CopyNodeField(Ptr<Node> ret, const Node& e)
 {
     ret->begin = e.begin;
     ret->end = e.end;
-    ret->ty = e.ty;
+    ret->SetTy(e.GetTy());
     ret->curMacroCall = e.curMacroCall;
     ret->isInMacroCall = e.isInMacroCall;
     ret->comments = e.comments;
@@ -1436,7 +1436,6 @@ OwnedPtr<Annotation> ASTCloner::CloneAnnotation(const Annotation& annotation, co
     ret->isCompileTimeVisible = annotation.isCompileTimeVisible;
     ret->attrs = annotation.attrs;
     ret->attrCommas = annotation.attrCommas;
-    ret->adAnnotation = annotation.adAnnotation;
     ret->rsquarePos = annotation.rsquarePos;
     ret->lsquarePos = annotation.lsquarePos;
     for (auto& arg : annotation.args) {

@@ -15,6 +15,9 @@ ERROR(permission_denied, "Permission denied: '%s'.")
 ERROR(invalid_path, "Invalid path: '%s'.")
 ERROR(no_such_file_or_directory_of_macro_obj, "No such file or directory: '%s', please check if input file exists, separate paths by space if there are multiple input files")
 ERROR(input_file_overwritten_by_generated_output, "The input file '%s' would be overwritten by the generated output.")
+ERROR(bc_file_open_failed, "cannot open bitcode file '%s': %s")
+ERROR(bc_parse_failed, "failed to parse bitcode file: %s")
+ERROR(bc_invalid_package_name, "invalid package name format in bitcode file: %s")
 
 // Ignore argument warnings
 WARNING(driver_warning_no_such_file, DRIVER_ARG, "No such file: '%s'")
@@ -24,13 +27,7 @@ WARNING(driver_warning_not_a_directory, DRIVER_ARG, "Not a directory: '%s'.%s")
 WARNING(driver_warning_not_a_file, DRIVER_ARG, "Not a file: '%s'.%s")
 WARNING(driver_warning_permission_denied, DRIVER_ARG, "Permission denied: '%s'.%s")
 WARNING(driver_warning_invalid_path, DRIVER_ARG, "Invalid path: '%s'.%s")
-WARNING(driver_warning_not_pdba_file, DRIVER_ARG, "Not a .pdba file: '%s' ('%s').%s")
-WARNING(driver_warning_not_cjo_file, DRIVER_ARG, "Not a .cjo file: '%s' ('%s').%s")
-WARNING(driver_warning_not_cj_file, DRIVER_ARG, "Not a .cj file: '%s' ('%s').%s")
-WARNING(driver_warning_not_chir_file, DRIVER_ARG, "Not a .chir file: '%s' ('%s').%s")
-WARNING(driver_warning_not_bc_file, DRIVER_ARG, "Not a .bc file: '%s' ('%s').%s")
-WARNING(driver_warning_not_archive_file, DRIVER_ARG, "Not a .a file: '%s' ('%s').%s")
-WARNING(driver_warning_not_object_file, DRIVER_ARG, "Not a .o file: '%s' ('%s').%s")
+WARNING(driver_warning_unexpected_file_extension, DRIVER_ARG, "Not a .%s file: '%s' ('%s').%s")
 WARNING(driver_warning_argument_unused, DRIVER_ARG, "the arg '%s' may be unused")
 WARNING(driver_warning_path_close_to_length_limit, DRIVER_ARG, "the path length for %s is close to the system limit (%s characters). The compilation has a possibility to fail.")
 WARNING(driver_invalid_compile_target, DRIVER_ARG, "--compile-target only takes effect when --output-type=obj, this option will be ignored in other scenarios")
@@ -54,7 +51,7 @@ ERROR(driver_invalid_unsupport_extension, "unsupported output extension '.%s', e
 ERROR(driver_invalid_require_extension, "output to '%s' is not allowed, extension '.%s' is required")
 ERROR(driver_path_exceeds_length_limit, "the path length for %s exceeds the system limit (%s characters)")
 ERROR(driver_unsupported_target_cpu, "cpu type '%s' is not supported for the current target")
-ERROR(driver_require_chir_directory, "expected one chir path to build")
+ERROR(driver_require_common_chir_for_each_common_cjo, "common .chir files count should be equal to common .cjo files count")
 ERROR(driver_require_experimental, "compilation with input object files is currently experimental and requires the --experimental flag to be enabled")
 ERROR(driver_static_dystd_conflict, "options --static and --dy-std are mutually exclusive")
 ERROR(driver_target_lto_unsupported, "%s does not support LTO.")
@@ -73,9 +70,12 @@ ERROR(driver_cfg_file_read_failed, "read '%s' failed, due to '%s'")
 WARNING(driver_cfg_path_ignored, DRIVER_ARG,
     "conditional compilation has been set by key-value mode, cfg.toml will be ignored")
 
-
 ERROR(driver_invalid_compile_as_exe, "--compile-as-exe only takes effect when lto mode is enabled")
 ERROR(driver_invalid_compile_as_exe_platform, "Windows, Mac, IOS does not support --compile-as-exe")
+
+ERROR(driver_invalid_visible_pkgs, "--lto-keep-pkg-visibility only takes effect when lto mode is enabled")
+ERROR(driver_invalid_visible_pkgs_conflict, "--lto-keep-pkg-visibility and --compile-as-exe cannot be used together")
+WARNING(driver_visible_pkgs_only_for_dylib, DRIVER_ARG, "--lto-keep-pkg-visibility only takes effect when outputting a dylib")
 
 WARNING(driver_useless_option, DEPRECATED, "option '%s' is deprecated and will be removed in the future")
 

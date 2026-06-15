@@ -18,12 +18,12 @@
 
 namespace Cangjie::CodeGen {
 void EmitBasicBlockIR(CGModule& cgMod, const CHIR::Block& chirBB);
-void BuildCJFunc(CGModule& cgMod, const CHIR::Func& chirFunc, const CGFunction& cgFunc);
+void BuildCJFunc(CGModule& cgMod, const CHIR::Function& chirFunc, const CGFunction& cgFunc);
 
 namespace {
 llvm::Function* CreateFunctionWrapperForNoBasePtrCases(const CHIR::Value* chirFunc, CGModule& cgMod)
 {
-    auto func = VirtualCast<CHIR::Func*>(chirFunc);
+    auto func = StaticCast<CHIR::Function*>(chirFunc);
     CJC_ASSERT(func);
     auto cgFunc = cgMod.GetOrInsertCGFunction(chirFunc, true);
     BuildCJFunc(cgMod, *func, *cgFunc);
@@ -67,7 +67,14 @@ void CreateFunctionWrapperForNormalCases(
         auto paramDerefType = CGType::GetOrCreate(cgMod, DeRef(cgType.GetParamType(0)->GetOriginal()))->GetLLVMType();
         CJC_ASSERT(paramDerefType->isIntegerTy(8U) && "Should not reach here.");
         auto tmp = builder.LLVMIRBuilder2::CreateAlloca(paramDerefType, size);
-        builder.CallGCReadAgg({tmp, thisVal, dataPtr, builder.CreateSExt(size, builder.getInt64Ty())});
+        auto i8Ty = llvm::Type::getInt8Ty(cgMod.GetLLVMContext());
+        auto structType = llvm::StructType::getTypeByName(cgMod.GetLLVMContext(), "i8_array");
+        if (structType == nullptr) {
+            structType = llvm::StructType::create(cgMod.GetLLVMContext(), "i8_array");
+            SetStructTypeBody(structType, std::vector<llvm::Type*>{i8Ty});
+            cgMod.GetCGContext().AddGeneratedStructType("i8_array");
+        }
+        builder.CallGCReadAgg(structType, {tmp, thisVal, dataPtr, builder.CreateSExt(size, builder.getInt64Ty())});
         dataPtr = tmp;
     }
     args[thisValOffset] = dataPtr;
@@ -91,7 +98,7 @@ llvm::Function* CreateFunctionWrapper(
         return nullptr;
     }
 
-    auto outerType = VirtualCast<CHIR::FuncBase*>(chirFunc)->GetParentCustomTypeOrExtendedType();
+    auto outerType = StaticCast<CHIR::Function*>(chirFunc)->GetParentCustomTypeOrExtendedType();
     if (!outerType || !outerType->IsStruct() || CGType::GetOrCreate(cgMod, outerType)->GetSize()) {
         return nullptr;
     }
@@ -155,7 +162,7 @@ CGFunction::CGFunction(
     }
 
     CJC_ASSERT(chirFunc->IsFunc());
-    bool isFastNative = VirtualCast<CHIR::FuncBase*>(chirFunc)->IsFastNative();
+    bool isFastNative = StaticCast<CHIR::Function*>(chirFunc)->IsFastNative();
     if (isFastNative) {
         function->addAttributeAtIndex(static_cast<unsigned>(llvm::AttributeList::FunctionIndex),
             llvm::Attribute::get(function->getContext(), FAST_NATIVE_ATTR));

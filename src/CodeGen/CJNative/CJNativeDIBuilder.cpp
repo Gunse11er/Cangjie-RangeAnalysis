@@ -85,14 +85,14 @@ llvm::DIType* DIBuilder::CreateInterfaceType(const CHIR::ClassType& interfaceTy)
     typeCache[&interfaceTy] = llvm::TrackingMDRef(fwdDecl);
     CodeGenDIVector16 elements;
     CreateInheritedInterface(elements, fwdDecl, interfaceTy);
-    for (auto funcInfo : interfaceTy.GetInstAbstractMethodTypes(cgMod.GetCGContext().GetCHIRBuilder())) {
-        auto funcIdentifier = GenerateGenericFuncName(funcInfo.methodName, funcInfo.methodGenericTypeParams);
-        auto funcName = funcInfo.GetASTMangledName();
-        bool hasThis = funcInfo.TestAttr(CHIR::Attribute::STATIC) ? false : true;
-        auto funcType = CreateFuncType(StaticCast<CHIR::FuncType*>(funcInfo.methodTy), false, hasThis);
+    for (auto [func, instFuncType] : GetInstAbstractMethodTypes(interfaceTy, cgMod.GetCGContext().GetCHIRBuilder())) {
+        auto funcIdentifier = GenerateGenericFuncName(func->GetSrcCodeIdentifier(), func->GetGenericTypeParams());
+        auto funcName = func->GetIdentifierWithoutPrefix();
+        auto hasThis = func->TestAttr(CHIR::Attribute::STATIC) ? false : true;
+        auto funcType = CreateFuncType(instFuncType, false, hasThis);
         llvm::DINode::DIFlags flags = llvm::DINode::FlagPrototyped;
-        llvm::DISubprogram::DISPFlags spFlags =
-            funcInfo.hasBody ? llvm::DISubprogram::SPFlagZero : llvm::DISubprogram::SPFlagPureVirtual;
+        llvm::DISubprogram::DISPFlags spFlags = func->TestAttr(CHIR::Attribute::ABSTRACT) ?
+            llvm::DISubprogram::SPFlagPureVirtual : llvm::DISubprogram::SPFlagZero;
         auto funcElement = createFunction(fwdDecl, funcIdentifier, funcName, diFile, 0u, funcType, 0u, flags, spFlags);
         elements.emplace_back(funcElement);
         finalizeSubprogram(funcElement);

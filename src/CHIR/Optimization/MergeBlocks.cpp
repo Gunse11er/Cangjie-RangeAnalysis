@@ -114,7 +114,7 @@ void MergeForInCondBlock(CHIRBuilder& builder, Block& block)
 
 void MergeBlocks::RunOnPackage(const Package& package, CHIRBuilder& builder, const GlobalOptions& opts)
 {
-    for (auto func : package.GetGlobalFuncs()) {
+    for (auto func : package.GetGlobalFuncsWithBody()) {
         bool isCommonFunctionWithoutBody = func->TestAttr(Attribute::SKIP_ANALYSIS);
         if (isCommonFunctionWithoutBody) {
             continue; // Nothing to visit

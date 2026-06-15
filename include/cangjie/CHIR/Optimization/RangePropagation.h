@@ -7,6 +7,7 @@
 #ifndef CANGJIE_CHIR_TRANSFORMATION_RANGE_PROPAGATION_H
 #define CANGJIE_CHIR_TRANSFORMATION_RANGE_PROPAGATION_H
 
+#include "cangjie/Basic/DiagnosticEngine.h"
 #include "cangjie/CHIR/Analysis/AnalysisWrapper.h"
 #include "cangjie/CHIR/Analysis/ValueRangeAnalysis.h"
 #include "cangjie/CHIR/IR/Expression/Terminator.h"
@@ -16,6 +17,7 @@
 #include "cangjie/CHIR/IR/Value/Value.h"
 
 namespace Cangjie::CHIR {
+class Function;
 /**
  * CHIR Opt Pass: do optimization with analysis results of range analysis.
  */
@@ -34,7 +36,7 @@ public:
      * @param enIncre flag whether is incremental compile.
      */
     explicit RangePropagation(
-        CHIRBuilder& builder, RangeAnalysisWrapper* rangeAnalysisWrapper, DiagAdapter* diag, bool enIncre);
+        CHIRBuilder& builder, RangeAnalysisWrapper* rangeAnalysisWrapper, DiagnosticEngine& diag, bool enIncre);
 
     /**
      * @brief Main process to do range propagation.
@@ -48,7 +50,7 @@ public:
      * @param func func to do optimization.
      * @param isDebug flag whether print debug log.
      */
-    void RunOnFunc(const Ptr<const Func>& func, bool isDebug);
+    void RunOnFunc(const Ptr<const Function>& func, bool isDebug);
 
     /**
      * @brief Get effect map after this pass.
@@ -60,7 +62,7 @@ public:
      * @brief Get all funcs need to remove unreachable blocks.
      * @return functions
      */
-    const std::vector<const Func*>& GetFuncsNeedRemoveBlocks() const;
+    const std::vector<const Function*>& GetFuncsNeedRemoveBlocks() const;
 
     // 当当前工作目录存在 input.txt 时输出竞赛值域查询结果。
     static void EmitContestOutput(const Ptr<const Package>& package, RangeAnalysisWrapper& rangeAnalysisWrapper);
@@ -99,16 +101,16 @@ private:
      */
     void RewriteBranchTerminator(const Ptr<Terminator>& branch, const Ptr<Block>& targetSucc, bool isDebug);
 
-    void RecordEffectMap(const Expression* expr, const Func* func) const;
+    void RecordEffectMap(const Expression* expr, const Function* func) const;
 
     void CheckVarrayIndex(const Ptr<Intrinsic>& intrin, const RangeDomain& state) const;
 
     CHIRBuilder& builder;
     RangeAnalysisWrapper* analysisWrapper;
-    DiagAdapter* diag;
+    DiagnosticEngine& diag;
     bool enIncre;
     static OptEffectCHIRMap effectMap;
-    std::vector<const Func*> funcsNeedRemoveBlocks;
+    std::vector<const Function*> funcsNeedRemoveBlocks;
 };
 
 } // namespace Cangjie::CHIR

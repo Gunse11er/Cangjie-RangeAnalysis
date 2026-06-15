@@ -30,17 +30,17 @@ Ptr<Ty> GetInnerNumericType(Ty& boxTy, Ty& basicTy)
 bool TypeChecker::TypeCheckerImpl::ChkLitConstExprOfTypeBool(Ty& target, LitConstExpr& lce)
 {
     if (target.IsBooleanSubType()) {
-        lce.ty = &target;
+        lce.SetTy(&target);
         return true;
     } else if (typeManager.IsLitBoxableType(TypeManager::GetPrimitiveTy(TypeKind::TYPE_BOOLEAN), &target)) {
-        lce.ty = TypeManager::GetPrimitiveTy(TypeKind::TYPE_BOOLEAN);
+        lce.SetTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_BOOLEAN));
         return true;
     } else if (target.IsAny() || target.IsCType()) {
-        lce.ty = TypeManager::GetPrimitiveTy(TypeKind::TYPE_BOOLEAN);
+        lce.SetTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_BOOLEAN));
         return true;
     } else {
         diag.Diagnose(lce, DiagKind::sema_cannot_convert_literal, "a boolean", target.String());
-        lce.ty = TypeManager::GetNonNullTy(lce.ty);
+        lce.SetTy(TypeManager::GetNonNullTy(lce.GetTy()));
         return false;
     }
 }
@@ -49,11 +49,11 @@ bool TypeChecker::TypeCheckerImpl::ChkLitConstExprOfTypeUnit(Ty& target, LitCons
 {
     if (target.IsAny() || target.IsUnit() || target.IsCType() ||
         typeManager.IsLitBoxableType(TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT), &target)) {
-        lce.ty = TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT);
+        lce.SetTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT));
         return true;
     } else {
         DiagMismatchedTypesWithFoundTy(diag, lce, target.String(), "Unit");
-        lce.ty = TypeManager::GetInvalidTy();
+        lce.SetTy(TypeManager::GetInvalidTy());
         return false;
     }
 }
@@ -65,7 +65,7 @@ bool TypeChecker::TypeCheckerImpl::ChkLitConstExprOfTypeInteger(Ty& target, LitC
         intSuffixTokenKind == TypeKind::TYPE_IDEAL_INT ? TypeKind::TYPE_INT64 : intSuffixTokenKind;
     if (target.IsIntegerSubType()) {
         if (intSuffixTokenKind == target.kind || intSuffixTokenKind == TypeKind::TYPE_IDEAL_INT) {
-            lce.ty = &target;
+            lce.SetTy(&target);
             return true;
         } else {
             diag.Diagnose(lce, DiagKind::sema_cannot_convert_literal, lce.stringValue, target.String());
@@ -73,17 +73,17 @@ bool TypeChecker::TypeCheckerImpl::ChkLitConstExprOfTypeInteger(Ty& target, LitC
         }
     } else if (typeManager.IsLitBoxableType(TypeManager::GetPrimitiveTy(defaultIntTokenKind), &target)) {
         // Check for extendable or option boxable type as int64.
-        lce.ty = GetInnerNumericType(target, *TypeManager::GetPrimitiveTy(defaultIntTokenKind));
+        lce.SetTy(GetInnerNumericType(target, *TypeManager::GetPrimitiveTy(defaultIntTokenKind)));
         return true;
     } else if (target.IsAny() || target.IsCType()) {
-        lce.ty = GetInnerNumericType(target, *TypeManager::GetPrimitiveTy(defaultIntTokenKind));
+        lce.SetTy(GetInnerNumericType(target, *TypeManager::GetPrimitiveTy(defaultIntTokenKind)));
         return true;
     } else if (!target.IsInvalid()) {
         diag.Diagnose(lce, DiagKind::sema_cannot_convert_literal, "an integer", target.String());
-        lce.ty = TypeManager::GetInvalidTy();
+        lce.SetTy(TypeManager::GetInvalidTy());
         return false;
     }
-    lce.ty = TypeManager::GetNonNullTy(lce.ty);
+    lce.SetTy(TypeManager::GetNonNullTy(lce.GetTy()));
     return false;
 }
 
@@ -94,7 +94,7 @@ bool TypeChecker::TypeCheckerImpl::ChkLitConstExprOfTypeFloat(Ty& targetTy, LitC
         intSuffixTokenKind == TypeKind::TYPE_IDEAL_FLOAT ? TypeKind::TYPE_FLOAT64 : intSuffixTokenKind;
     if (targetTy.IsFloatingSubType()) {
         if (intSuffixTokenKind == targetTy.kind || intSuffixTokenKind == TypeKind::TYPE_IDEAL_FLOAT) {
-            lce.ty = &targetTy;
+            lce.SetTy(&targetTy);
             return true;
         } else {
             diag.Diagnose(lce, DiagKind::sema_cannot_convert_literal, lce.stringValue, targetTy.String());
@@ -102,14 +102,14 @@ bool TypeChecker::TypeCheckerImpl::ChkLitConstExprOfTypeFloat(Ty& targetTy, LitC
         }
     } else if (typeManager.IsLitBoxableType(TypeManager::GetPrimitiveTy(defaultFloat64TokenKind), &targetTy)) {
         // Check for extendable or option boxable type as float64.
-        lce.ty = GetInnerNumericType(targetTy, *TypeManager::GetPrimitiveTy(defaultFloat64TokenKind));
+        lce.SetTy(GetInnerNumericType(targetTy, *TypeManager::GetPrimitiveTy(defaultFloat64TokenKind)));
         return true;
     } else if (targetTy.IsAny() || targetTy.IsCType()) {
-        lce.ty = GetInnerNumericType(targetTy, *TypeManager::GetPrimitiveTy(defaultFloat64TokenKind));
+        lce.SetTy(GetInnerNumericType(targetTy, *TypeManager::GetPrimitiveTy(defaultFloat64TokenKind)));
         return true;
     } else {
         diag.Diagnose(lce, DiagKind::sema_cannot_convert_literal, "a floating-point", targetTy.String());
-        lce.ty = TypeManager::GetNonNullTy(lce.ty);
+        lce.SetTy(TypeManager::GetNonNullTy(lce.GetTy()));
         return false;
     }
 }
@@ -117,17 +117,17 @@ bool TypeChecker::TypeCheckerImpl::ChkLitConstExprOfTypeFloat(Ty& targetTy, LitC
 bool TypeChecker::TypeCheckerImpl::ChkLitConstExprOfTypeChar(Ty& targetTy, LitConstExpr& lce)
 {
     if (&targetTy == TypeManager::GetPrimitiveTy(TypeKind::TYPE_RUNE)) {
-        lce.ty = &targetTy;
+        lce.SetTy(&targetTy);
         return true;
     } else if (typeManager.IsLitBoxableType(TypeManager::GetPrimitiveTy(TypeKind::TYPE_RUNE), &targetTy)) {
-        lce.ty = TypeManager::GetPrimitiveTy(TypeKind::TYPE_RUNE);
+        lce.SetTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_RUNE));
         return true;
     } else if (targetTy.IsAny()) {
-        lce.ty = TypeManager::GetPrimitiveTy(TypeKind::TYPE_RUNE);
+        lce.SetTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_RUNE));
         return true;
     } else {
         diag.Diagnose(lce, DiagKind::sema_cannot_convert_literal, "a character", targetTy.String());
-        lce.ty = TypeManager::GetNonNullTy(lce.ty);
+        lce.SetTy(TypeManager::GetNonNullTy(lce.GetTy()));
         return false;
     }
 }
@@ -136,51 +136,51 @@ Ptr<Ty> TypeChecker::TypeCheckerImpl::SynLitConstStringExpr(ASTContext& ctx, Lit
 {
     // For string literal expr.
     if (!lce.siExpr) {
-        lce.ty = Synthesize(ctx, lce.ref.get());
-        return lce.ty;
+        lce.SetTy(Synthesize({ctx, SynPos::EXPR_ARG}, lce.ref.get()));
+        return lce.GetTy();
     }
     // For String Interpolation.
     // 1. Get Struct-String and Interface-ToString type.
     auto stringDecl = importManager.GetCoreDecl<InheritableDecl>(STD_LIB_STRING);
     auto toStringInterface = importManager.GetCoreDecl<InheritableDecl>(TOSTRING_NAME);
     if (!stringDecl || !toStringInterface) {
-        lce.ty = TypeManager::GetInvalidTy();
-        return lce.ty;
+        lce.SetTy(TypeManager::GetInvalidTy());
+        return lce.GetTy();
     }
     // 2. Check all interpolated expressions.
     auto strExpr = lce.siExpr.get();
     bool isWellTyped = true;
     for (auto& expr : strExpr->strPartExprs) {
         if (expr->astKind != ASTKind::INTERPOLATION_EXPR) {
-            isWellTyped = Check(ctx, stringDecl->ty, expr.get()) && isWellTyped;
+            isWellTyped = Check(ctx, stringDecl->GetTy(), expr.get()) && isWellTyped;
             continue;
         }
         auto ie = StaticCast<InterpolationExpr*>(expr.get());
         CJC_NULLPTR_CHECK(ie->block);
-        ie->block->ty = Synthesize(ctx, ie->block.get());
-        if (!typeManager.IsSubtype(ie->block->ty, toStringInterface->ty)) {
-            if (Ty::IsTyCorrect(ie->block->ty)) {
-                diag.Diagnose(*ie->block, DiagKind::sema_invalid_string_implementation, ie->block->ty->String());
+        ie->block->SetTy(Synthesize({ctx, SynPos::EXPR_ARG}, ie->block.get()));
+        if (!typeManager.IsSubtype(ie->block->GetTy(), toStringInterface->GetTy())) {
+            if (Ty::IsTyCorrect(ie->block->GetTy())) {
+                diag.Diagnose(*ie->block, DiagKind::sema_invalid_string_implementation, ie->block->GetTy()->String());
             }
             isWellTyped = false;
-        } else if (ie->block->ty->IsNothing()) {
+        } else if (ie->block->GetTy()->IsNothing()) {
             // After typechecker, it will desugar as 'expr.toString()', and Nothing type can't access member.
             diag.DiagnoseRefactor(DiagKindRefactor::sema_undeclared_identifier, *ie->block, "toString");
             isWellTyped = false;
         }
         if (!isWellTyped) {
-            ie->block->ty = TypeManager::GetInvalidTy();
+            ie->block->SetTy(TypeManager::GetInvalidTy());
         }
-        ie->ty = ie->block->ty;
+        ie->SetTy(ie->block->GetTy());
     }
     // If not all interpolated expression check passed, directly quit current check.
     if (!isWellTyped) {
-        lce.ty = TypeManager::GetInvalidTy();
-        return lce.ty;
+        lce.SetTy(TypeManager::GetInvalidTy());
+        return lce.GetTy();
     }
-    lce.siExpr->ty = stringDecl->ty;
-    lce.ty = stringDecl->ty;
-    return lce.ty;
+    lce.siExpr->SetTy(stringDecl->GetTy());
+    lce.SetTy(stringDecl->GetTy());
+    return lce.GetTy();
 }
 
 bool TypeChecker::TypeCheckerImpl::ChkLitConstExprOfTypeString(ASTContext& ctx, Ty& target, LitConstExpr& lce)
@@ -212,7 +212,7 @@ bool TypeChecker::TypeCheckerImpl::ChkLitConstExpr(ASTContext& ctx, Ty& target, 
         case LitConstKind::JSTRING:
             return ChkLitConstExprOfTypeString(ctx, target, lce);
         default:
-            lce.ty = TypeManager::GetInvalidTy();
+            lce.SetTy(TypeManager::GetInvalidTy());
             return false;
     }
 }
@@ -221,31 +221,34 @@ Ptr<Ty> TypeChecker::TypeCheckerImpl::SynLitConstExpr(ASTContext& ctx, LitConstE
 {
     switch (lce.kind) {
         case LitConstKind::BOOL:
-            lce.ty = TypeManager::GetPrimitiveTy(TypeKind::TYPE_BOOLEAN);
+            lce.SetTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_BOOLEAN));
             break;
         case LitConstKind::UNIT:
-            lce.ty = TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT);
+            lce.SetTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT));
             break;
         case LitConstKind::INTEGER:
         case LitConstKind::RUNE_BYTE:
         case LitConstKind::FLOAT:
             if (TypeKind kind = lce.GetNumLitTypeKind(); kind == TypeKind::TYPE_INVALID) {
-                lce.ty = TypeManager::GetInvalidTy();
+                lce.SetTy(TypeManager::GetInvalidTy());
             } else {
-                lce.ty = TypeManager::GetPrimitiveTy(kind);
+                lce.SetTy(TypeManager::GetPrimitiveTy(kind));
             }
             break;
         case LitConstKind::STRING:
         case LitConstKind::JSTRING:
-            lce.ty = SynLitConstStringExpr(ctx, lce);
+            lce.SetTy(SynLitConstStringExpr(ctx, lce));
             break;
         case LitConstKind::RUNE:
-            lce.ty = TypeManager::GetPrimitiveTy(TypeKind::TYPE_RUNE);
+            lce.SetTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_RUNE));
             break;
         case LitConstKind::NONE:
-            lce.ty = TypeManager::GetInvalidTy();
+            lce.SetTy(TypeManager::GetInvalidTy());
+            break;
+        default:
+            CJC_ABORT();
             break;
     }
     ChkLitConstExprRange(lce);
-    return lce.ty;
+    return lce.GetTy();
 }

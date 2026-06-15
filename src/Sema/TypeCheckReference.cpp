@@ -48,7 +48,7 @@ inline bool CheckForQuestFuncRetType(DiagnosticEngine& diag, Decl& target, const
     if (hasTargetTy) {
         return true; // Check after the return type later in 'ChkCallExpr' or 'ChkRefExpr'.
     }
-    if (Ty::IsTyCorrect(target.ty) && target.ty->HasQuestTy() && target.astKind == ASTKind::FUNC_DECL) {
+    if (Ty::IsTyCorrect(target.GetTy()) && target.GetTy()->HasQuestTy() && target.astKind == ASTKind::FUNC_DECL) {
         DiagUnableToInferReturnType(diag, *StaticAs<ASTKind::FUNC_DECL>(&target), expr);
         return false;
     }
@@ -58,7 +58,7 @@ inline bool CheckForQuestFuncRetType(DiagnosticEngine& diag, Decl& target, const
 
 void TypeChecker::TypeCheckerImpl::CheckThisOrSuper(const ASTContext& ctx, RefExpr& re)
 {
-    re.ty = TypeManager::GetInvalidTy();
+    re.SetTy(TypeManager::GetInvalidTy());
     auto sym = ScopeManager::GetCurSymbolByKind(SymbolKind::STRUCT, ctx, re.scopeName);
     if (!sym || !Is<InheritableDecl>(sym->node)) {
         diag.Diagnose(re, DiagKind::sema_this_super_use_error_outside_class, re.ref.identifier.Val());
@@ -67,9 +67,9 @@ void TypeChecker::TypeCheckerImpl::CheckThisOrSuper(const ASTContext& ctx, RefEx
     auto decl = RawStaticCast<InheritableDecl*>(sym->node);
     // Set this/super's type and target first. Will not diagnose.
     if (re.isThis) {
-        re.ty = InferTypeOfThis(re, *decl);
+        re.SetTy(InferTypeOfThis(re, *decl));
     } else {
-        re.ty = InferTypeOfSuper(re, *decl);
+        re.SetTy(InferTypeOfSuper(re, *decl));
     }
     // Legality of using this/super will be checked after typecheck in 'CheckLegalityOfReference'.
 }
@@ -79,12 +79,12 @@ Ptr<Ty> TypeChecker::TypeCheckerImpl::InferTypeOfThis(RefExpr& re, InheritableDe
     Ptr<InheritableDecl> outerDecl = &objDecl;
     auto typeDecl = outerDecl;
     // Handle special case: this in ExtendDecl: if extended types is built-in type, directly return extended Type.
-    if (auto ed = AST::As<ASTKind::EXTEND_DECL>(typeDecl); ed && ed->extendedType && ed->extendedType->ty) {
-        if (ed->extendedType->ty->IsBuiltin()) {
-            return ed->extendedType->ty;
+    if (auto ed = AST::As<ASTKind::EXTEND_DECL>(typeDecl); ed && ed->extendedType && ed->extendedType->GetTy()) {
+        if (ed->extendedType->GetTy()->IsBuiltin()) {
+            return ed->extendedType->GetTy();
         }
         // Real type decl is decl of extened type.
-        auto realTypeDecl = Ty::GetDeclPtrOfTy(ed->extendedType->ty);
+        auto realTypeDecl = Ty::GetDeclPtrOfTy(ed->extendedType->GetTy());
         if (!Is<InheritableDecl>(realTypeDecl)) {
             return TypeManager::GetInvalidTy();
         }
@@ -93,7 +93,7 @@ Ptr<Ty> TypeChecker::TypeCheckerImpl::InferTypeOfThis(RefExpr& re, InheritableDe
     ReplaceTarget(&re, typeDecl);
 
     // all this reference are checked as This type if possible (i.e. it is instance of class decl).
-    auto ret = ReplaceWithGenericTyInInheritableDecl(outerDecl->ty, *outerDecl, *typeDecl);
+    auto ret = ReplaceWithGenericTyInInheritableDecl(outerDecl->GetTy(), *outerDecl, *typeDecl);
     if (auto cd = DynamicCast<ClassTy>(ret)) {
         ret = typeManager.GetClassThisTy(*cd->decl, cd->typeArgs);
     }
@@ -107,12 +107,13 @@ Ptr<Ty> TypeChecker::TypeCheckerImpl::InferTypeOfSuper(RefExpr& re, const Inheri
         return TypeManager::GetInvalidTy();
     }
     auto cd = RawStaticCast<const ClassDecl*>(&objDecl);
-    if (auto classTy = DynamicCast<ClassTy*>(cd->ty); classTy) {
+    if (auto classTy = DynamicCast<ClassTy*>(cd->GetTy()); classTy) {
         auto superClassTy = classTy->GetSuperClassTy();
         if (superClassTy) {
             CJC_NULLPTR_CHECK(superClassTy->declPtr);
             ReplaceTarget(&re, superClassTy->declPtr);
-            return ReplaceWithGenericTyInInheritableDecl(superClassTy->declPtr->ty, objDecl, *superClassTy->declPtr);
+            return ReplaceWithGenericTyInInheritableDecl(
+                superClassTy->declPtr->GetTy(), objDecl, *superClassTy->declPtr);
         }
     }
     return TypeManager::GetInvalidTy();
@@ -138,10 +139,10 @@ Ptr<Ty> TypeChecker::TypeCheckerImpl::ReplaceWithGenericTyInInheritableDecl(
     // So we need to replace the T's to T1's.
     // currentType is the A<T> (AST node) in class B<T> <: A<T>, or extend A<T>
     // targetGeneric is the <T> (AST node) at the declaration of A<T>, e.g. class A<T>
-    Ptr<Ty> currentTy = outerDecl.ty;
+    Ptr<Ty> currentTy = outerDecl.GetTy();
     MultiTypeSubst typeMapping;
-    if (currentTy && id.ty) {
-        typeMapping = promotion.GetPromoteTypeMapping(*currentTy, *id.ty);
+    if (currentTy && id.GetTy()) {
+        typeMapping = promotion.GetPromoteTypeMapping(*currentTy, *id.GetTy());
     }
     if (typeMapping.empty()) {
         return ty;
@@ -297,7 +298,7 @@ void TypeChecker::TypeCheckerImpl::FilterCandidatesForRef(
     });
     auto sym = ScopeManager::GetCurSymbolByKind(SymbolKind::STRUCT, ctx, re.scopeName);
     if (sym && Is<InheritableDecl>(sym->node)) {
-        FilterTargetsInExtend(re, sym->node->ty, targets);
+        FilterTargetsInExtend(re, sym->node->GetTy(), targets);
     }
 
     // Filter incompatible and shadowed function if all candidates are functions.
@@ -404,24 +405,24 @@ void TypeChecker::TypeCheckerImpl::RemoveTargetNotMeetExtendConstraint(
 {
     Utils::EraseIf(targets, [this, &baseTy](auto target) -> bool {
         bool ignored = !target || !Ty::IsTyCorrect(baseTy) || !Is<InheritableDecl>(target->outerDecl) ||
-            !Ty::IsTyCorrect(target->outerDecl->ty);
+            !Ty::IsTyCorrect(target->outerDecl->GetTy());
         if (ignored) {
             return false;
         }
         // Check whether target in extend decl or inherited interface decl is accessible from member base type.
-        auto prTys = promotion.Promote(*baseTy, *target->outerDecl->ty);
+        auto prTys = promotion.Promote(*baseTy, *target->outerDecl->GetTy());
         if (prTys.empty()) {
             // No promoted type existed means the 'baseTy' not fit constraint of inheriting target's type.
             return true;
         }
         Ptr<ExtendDecl> extend = nullptr;
-        if (auto res = typeManager.GetExtendDeclByInterface(*baseTy, *target->outerDecl->ty)) {
+        if (auto res = typeManager.GetExtendDeclByInterface(*baseTy, *target->outerDecl->GetTy())) {
             extend = *res;
         } else {
             extend = DynamicCast<ExtendDecl*>(target->outerDecl);
         }
-        if (extend && extend->extendedType && extend->extendedType->ty) {
-            prTys = promotion.Promote(*baseTy, *extend->extendedType->ty);
+        if (extend && extend->extendedType && extend->extendedType->GetTy()) {
+            prTys = promotion.Promote(*baseTy, *extend->extendedType->GetTy());
             auto promotedTy = prTys.empty() ? TypeManager::GetInvalidTy() : *prTys.begin();
             if (Ty::IsTyCorrect(promotedTy)) {
                 return !typeManager.CheckGenericDeclInstantiation(extend, promotedTy->typeArgs);
@@ -467,7 +468,7 @@ bool TypeChecker::TypeCheckerImpl::FilterAndCheckTargetsOfNameAccess(
         return false;
     }
     RemoveDuplicateElements(targets);
-    if (!FilterTargetsInExtend(ma, ma.baseExpr->ty, targets)) {
+    if (!FilterTargetsInExtend(ma, ma.baseExpr->GetTy(), targets)) {
         DiagMemberAccessNotFound(ma);
         return false;
     } else if (!IsRefTypeArgSizeValid(ma, targets) || !FilterInvalidEnumTargets(ma, targets)) {
@@ -509,7 +510,7 @@ Ptr<Decl> TypeChecker::TypeCheckerImpl::FilterAndGetTargetsOfObjAccess(
         return nullptr;
     }
     CJC_NULLPTR_CHECK(ma.baseExpr);
-    if (!FilterTargetsInExtend(ma, ma.baseExpr->ty, targets)) {
+    if (!FilterTargetsInExtend(ma, ma.baseExpr->GetTy(), targets)) {
         DiagMemberAccessNotFound(ma);
         return nullptr;
     }
@@ -569,18 +570,18 @@ void TypeChecker::TypeCheckerImpl::InstantiateReferenceType(
     SubstPack typeMapping;
     if (instantiateMap.empty()) {
         typeMapping = GenerateGenericTypeMapping(ctx, expr);
-        auto tys = typeManager.ApplySubstPackNonUniq(expr.ty, typeMapping, true);
+        auto tys = typeManager.ApplySubstPackNonUniq(expr.GetTy(), typeMapping, true);
         bool cannotInfer = tys.size() != 1 && Is<FuncDecl*>(target) && !ctx.HasTargetTy(&expr);
         if (cannotInfer) {
             diag.Diagnose(expr, DiagKind::sema_ambiguous_func_ref, target->identifier.Val());
         }
-        expr.ty = *tys.begin();
+        expr.SetTy(*tys.begin());
     } else {
         typeManager.PackMapping(typeMapping, instantiateMap);
-        expr.ty = typeManager.GetInstantiatedTy(expr.ty, instantiateMap);
+        expr.SetTy(typeManager.GetInstantiatedTy(expr.GetTy(), instantiateMap));
     }
-    if (!Ty::IsTyCorrect(expr.ty)) {
-        expr.ty = TypeManager::GetInvalidTy();
+    if (!Ty::IsTyCorrect(expr.GetTy())) {
+        expr.SetTy(TypeManager::GetInvalidTy());
     } else if (auto fd = DynamicCast<FuncDecl*>(target); fd) {
         DynamicBindingThisType(expr, *fd, typeMapping);
     }
@@ -1146,17 +1147,15 @@ void TypeChecker::TypeCheckerImpl::CheckOverridingOrRedefinitionOfDeprecatedFunc
     auto funcOverride = StaticCast<FuncDecl*>(member.get());
 
     for (auto& inheritedType : cd->inheritedTypes) {
-        auto inheritedDecl = Ty::GetDeclPtrOfTy(inheritedType->ty);
+        auto inheritedDecl = Ty::GetDeclPtrOfTy(inheritedType->GetTy());
         if (!inheritedDecl) {
             continue;
         }
 
         for (auto& memberDecl : inheritedDecl->GetMemberDecls()) {
             if (auto baseFuncDecl = As<ASTKind::FUNC_DECL>(memberDecl); baseFuncDecl) {
-                if (Is<FuncTy*>(baseFuncDecl->ty) &&
-                    Is<FuncTy*>(funcOverride->ty) &&
-                    typeManager.IsFuncDeclSubType(*funcOverride, *baseFuncDecl)
-                ) {
+                if (Is<FuncTy*>(baseFuncDecl->GetTy()) && Is<FuncTy*>(funcOverride->GetTy()) &&
+                    typeManager.IsFuncDeclSubType(*funcOverride, *baseFuncDecl)) {
                     CheckOverridingOrRedefiningOfDeprecated(
                         baseFuncDecl,
                         funcOverride,
@@ -1181,7 +1180,7 @@ void TypeChecker::TypeCheckerImpl::CheckOverridingOrRedefinitionOfDeprecatedProp
     auto getterOverride = GetUsableGetterForProperty(*propOverride);
     auto setterOverride = propOverride->isVar ? GetUsableSetterForProperty(*propOverride) : nullptr;
     for (auto& inheritedType : cd->inheritedTypes) {
-        auto inheritedDecl = Ty::GetDeclPtrOfTy(inheritedType->ty);
+        auto inheritedDecl = Ty::GetDeclPtrOfTy(inheritedType->GetTy());
         if (!inheritedDecl) {
             continue;
         }
@@ -1192,19 +1191,16 @@ void TypeChecker::TypeCheckerImpl::CheckOverridingOrRedefinitionOfDeprecatedProp
                     return;
                 }
                 auto propGetter = GetUsableGetterForProperty(*basePropDecl);
-                if (propGetter && getterOverride && Is<FuncTy*>(getterOverride->ty) && Is<FuncTy*>(propGetter->ty) &&
-                    typeManager.IsFuncDeclSubType(*getterOverride, *propGetter)) {
+                if (propGetter && getterOverride && Is<FuncTy*>(getterOverride->GetTy()) &&
+                    Is<FuncTy*>(propGetter->GetTy()) && typeManager.IsFuncDeclSubType(*getterOverride, *propGetter)) {
                     CheckOverridingOrRedefiningOfDeprecated(
                         basePropDecl,
                         propOverride,
                         "property");
                 }
                 auto propSetter = basePropDecl->isVar ? GetUsableSetterForProperty(*basePropDecl) : nullptr;
-                if (propSetter && setterOverride &&
-                    Is<FuncTy*>(setterOverride->ty) &&
-                    Is<FuncTy*>(propSetter->ty) &&
-                    typeManager.IsFuncDeclSubType(*setterOverride, *propSetter)
-                ) {
+                if (propSetter && setterOverride && Is<FuncTy*>(setterOverride->GetTy()) &&
+                    Is<FuncTy*>(propSetter->GetTy()) && typeManager.IsFuncDeclSubType(*setterOverride, *propSetter)) {
                     CheckOverridingOrRedefiningOfDeprecated(
                         propSetter,
                         setterOverride,
@@ -1318,7 +1314,7 @@ void TypeChecker::TypeCheckerImpl::CheckUsageOfDeprecatedWithTarget(
     }
 
     if (auto alias = As<ASTKind::TYPE_ALIAS_DECL>(target); alias) {
-        auto aliased = Ty::GetDeclOfTy(alias->type->ty);
+        auto aliased = Ty::GetDeclOfTy(alias->type->GetTy());
         if (!aliased) {
             return;
         }

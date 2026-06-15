@@ -127,7 +127,7 @@ bool DiagInferParamTyFail(DiagnosticEngine& diag, LambdaExpr& le)
     for (auto& node : le.funcBody->paramLists[0]->params) {
         if (!node->type) {
             diag.DiagnoseRefactor(DiagKindRefactor::sema_lambdaExpr_must_have_type_annotation, *node);
-            le.ty = TypeManager::GetInvalidTy();
+            le.SetTy(TypeManager::GetInvalidTy());
             return true;
         }
     }
@@ -173,7 +173,7 @@ void TypeChecker::TypeCheckerImpl::ResetLambdaForReinfer(ASTContext& ctx, const 
     AddRetTypeNode(*le.funcBody);
     le.funcBody->Clear();
     Walker(le.funcBody->body.get(), [](Ptr<Node> node) {
-        if ((Is<Decl>(node) || Is<Expr>(node)) && !Ty::IsInitialTy(node->ty)) {
+        if ((Is<Decl>(node) || Is<Expr>(node)) && !Ty::IsInitialTy(node->GetTy())) {
             node->Clear();
         }
         return VisitAction::WALK_CHILDREN;
@@ -189,11 +189,11 @@ bool TypeChecker::TypeCheckerImpl::SolveLamExprParamTys(ASTContext& ctx, AST::La
     if (sol && !HasUnsolvedTyVars(*sol, tyVars)) {
         ResetLambdaForReinfer(ctx, le);
         for (auto& node : le.funcBody->paramLists[0]->params) {
-            node->ty = typeManager.GetInstantiatedTy(node->ty, *sol);
+            node->SetTy(typeManager.GetInstantiatedTy(node->GetTy(), *sol));
         }
-        if (Ty::IsTyCorrect(Synthesize(ctx, le.funcBody.get())) && le.funcBody->body &&
-            Ty::IsTyCorrect(le.funcBody->body->ty)) {
-            le.ty = le.funcBody->ty;
+        if (Ty::IsTyCorrect(Synthesize({ctx, SynPos::EXPR_ARG}, le.funcBody.get())) && le.funcBody->body &&
+            Ty::IsTyCorrect(le.funcBody->body->GetTy())) {
+            le.SetTy(le.funcBody->GetTy());
             successful = true;
         }
     }
@@ -211,7 +211,7 @@ void TypeChecker::TypeCheckerImpl::TryInferFromSyntaxInfo(ASTContext& ctx, const
     std::map<std::string, Ptr<FuncParam>> unsolvedParams;
     std::map<std::string, std::set<Ptr<Decl>>> candidates;
     for (auto& param : le.funcBody->paramLists[0]->params) {
-        if (param->ty->IsPlaceholder()) {
+        if (param->GetTy()->IsPlaceholder()) {
             unsolvedParams[param->identifier] = param;
         }
     }
@@ -248,7 +248,7 @@ void TypeChecker::TypeCheckerImpl::TryInferFromSyntaxInfo(ASTContext& ctx, const
     Walker(le.funcBody.get(), memberScanner).Walk();
 
     for (auto& [id, decls] : candidates) {
-        TryEnforceCandidate(*StaticCast<TyVar*>(unsolvedParams[id]->ty), decls, typeManager);
+        TryEnforceCandidate(*StaticCast<TyVar*>(unsolvedParams[id]->GetTy()), decls, typeManager);
     }
 }
 
@@ -266,15 +266,15 @@ Ptr<Ty> TypeChecker::TypeCheckerImpl::SynLamExpr(ASTContext& ctx, LambdaExpr& le
     TyVarScope sc(typeManager);
     for (auto& node : le.funcBody->paramLists[0]->params) {
         CJC_NULLPTR_CHECK(node);
-        Ptr<Ty> ty = Synthesize(ctx, node->type.get());
+        Ptr<Ty> ty = Synthesize({ctx, SynPos::NONE}, node->type.get());
         if (Ty::IsTyCorrect(ty)) {
-            node->ty = ty;
+            node->SetTy(ty);
         } else if (ctx.funcArgReachable.count(&le) == 0 && !node->type) {
-            node->ty = typeManager.AllocTyVar("T-Lam", true);
+            node->SetTy(typeManager.AllocTyVar("T-Lam", true));
         } else {
             diag.DiagnoseRefactor(DiagKindRefactor::sema_lambdaExpr_must_have_type_annotation, *node);
-            le.ty = TypeManager::GetInvalidTy();
-            return le.ty;
+            le.SetTy(TypeManager::GetInvalidTy());
+            return le.GetTy();
         }
     }
     TryInferFromSyntaxInfo(ctx, le);
@@ -282,34 +282,33 @@ Ptr<Ty> TypeChecker::TypeCheckerImpl::SynLamExpr(ASTContext& ctx, LambdaExpr& le
     Ptr<Ty> leTy = nullptr;
     {
         DiagSuppressor ds(diag);
-        leTy = Synthesize(ctx, le.funcBody.get());
+        leTy = Synthesize({ctx, SynPos::EXPR_ARG}, le.funcBody.get());
         if (skipSolving) {
             ds.ReportDiag();
         }
     }
     // `funcBody` containing invalid expressions can have valid types.
     // We have to use `funcBody->body` to determine if there are errors.
-    if (!Ty::IsTyCorrect(leTy) || !le.funcBody->body ||
-        !Ty::IsTyCorrect(le.funcBody->body->ty)) {
-        le.ty = TypeManager::GetInvalidTy();
+    if (!Ty::IsTyCorrect(leTy) || !le.funcBody->body || !Ty::IsTyCorrect(le.funcBody->body->GetTy())) {
+        le.SetTy(TypeManager::GetInvalidTy());
         if (DiagInferParamTyFail(diag, le)) {
-            return le.ty;
+            return le.GetTy();
         }
     } else {
         if (skipSolving) {
-            le.ty = le.funcBody->ty;
+            le.SetTy(le.funcBody->GetTy());
         } else {
             if (!SolveLamExprParamTys(ctx, le)) {
-                return le.ty;
+                return le.GetTy();
             }
         }
     }
-    if (auto ft = DynamicCast<FuncTy*>(le.ty)) {
-        le.funcBody->retType->ty = ft->retTy;
+    if (auto ft = DynamicCast<FuncTy*>(le.GetTy())) {
+        le.funcBody->retType->SetTy(ft->retTy);
     } else {
-        le.funcBody->retType->ty = TypeManager::GetInvalidTy();
+        le.funcBody->retType->SetTy(TypeManager::GetInvalidTy());
     }
-    return le.ty;
+    return le.GetTy();
 }
 
 bool TypeChecker::TypeCheckerImpl::ChkLamExpr(ASTContext& ctx, Ty& target, LambdaExpr& le)
@@ -318,15 +317,15 @@ bool TypeChecker::TypeCheckerImpl::ChkLamExpr(ASTContext& ctx, Ty& target, Lambd
     ClearInvalidTypeCheckCache(ctx, le, target);
     ctx.lastTargetTypeMap[&le] = &target;
     if (target.IsAny() || (le.TestAttr(AST::Attribute::C) && target.IsCType())) {
-        le.ty = Synthesize(ctx, &le);
+        le.SetTy(Synthesize({ctx, SynPos::EXPR_ARG}, &le));
         (void)ReplaceIdealTy(le);
-        return Ty::IsTyCorrect(le.ty);
+        return Ty::IsTyCorrect(le.GetTy());
     }
     Ptr<Ty> targetTy = TypeCheckUtil::UnboxOptionType(&target);
     if (!Ty::IsTyCorrect(targetTy) || !targetTy->IsFunc()) {
         auto ds = DiagSuppressor(diag);
-        auto synTy = Synthesize(ctx, &le);
-        le.ty = TypeManager::GetInvalidTy();
+        auto synTy = Synthesize({ctx, SynPos::EXPR_ARG}, &le);
+        le.SetTy(TypeManager::GetInvalidTy());
         if (!ds.HasError() && Ty::IsTyCorrect(synTy)) { // Only report type mismatch when no error happens.
             DiagMismatchedTypesWithFoundTy(diag, le, target, *synTy);
         }
@@ -345,7 +344,7 @@ bool TypeChecker::TypeCheckerImpl::ChkLamExpr(ASTContext& ctx, Ty& target, Lambd
         le.funcBody->retType = MakeOwned<RefType>();
         le.funcBody->retType->begin = le.begin;
         le.funcBody->retType->end = le.end;
-        le.funcBody->retType->ty = tgtTy->retTy;
+        le.funcBody->retType->SetTy(tgtTy->retTy);
         le.funcBody->retType->EnableAttr(AST::Attribute::COMPILER_ADD);
         ClearLambdaBodyForReCheck(le);
 
@@ -353,9 +352,9 @@ bool TypeChecker::TypeCheckerImpl::ChkLamExpr(ASTContext& ctx, Ty& target, Lambd
         if (ChkLamBody(ctx, *le.funcBody) && paramsMatched) {
             ds.ReportDiag();
             // The call to GetFunctionTy is necessary to create (cached) CPointer types if necessary.
-            le.funcBody->ty = typeManager.GetFunctionTy(lamParamTys, StaticCast<FuncTy*>(le.funcBody->ty)->retTy,
-                {tgtTy->isC, tgtTy->isClosureTy, tgtTy->hasVariableLenArg});
-            le.ty = le.funcBody->ty;
+            le.funcBody->SetTy(typeManager.GetFunctionTy(lamParamTys, StaticCast<FuncTy*>(le.funcBody->GetTy())->retTy,
+                {tgtTy->isC, tgtTy->isClosureTy, tgtTy->hasVariableLenArg}));
+            le.SetTy(le.funcBody->GetTy());
             return true;
         } else if (IsLambdaIncompatible(le, !paramsMatched)) {
             // User omitted parameter's type. We should quit early.
@@ -369,12 +368,12 @@ bool TypeChecker::TypeCheckerImpl::ChkLamExpr(ASTContext& ctx, Ty& target, Lambd
         ClearLambdaBodyForReCheck(le);
     }
     le.funcBody->retType.reset(nullptr);
-    auto bodyTy = Synthesize(ctx, le.funcBody.get());
+    auto bodyTy = Synthesize({ctx, SynPos::EXPR_ARG}, le.funcBody.get());
     if (Ty::IsTyCorrect(bodyTy) && !typeManager.IsSubtype(bodyTy, targetTy)) {
         DiagMismatchedTypesWithFoundTy(diag, le, *targetTy, *bodyTy);
     }
-    le.funcBody->ty = TypeManager::GetInvalidTy();
-    le.ty = le.funcBody->ty;
+    le.funcBody->SetTy(TypeManager::GetInvalidTy());
+    le.SetTy(le.funcBody->GetTy());
     return false;
 }
 
@@ -393,16 +392,16 @@ bool TypeChecker::TypeCheckerImpl::ChkLamParamTys(
         CJC_NULLPTR_CHECK(node);
         Ptr<Ty> paramTy = tgtParamTys[i]; // Caller guarantees the 'paramTy' is valid.
         if (!Check(ctx, paramTy, node.get())) {
-            le.ty = TypeManager::GetInvalidTy();
+            le.SetTy(TypeManager::GetInvalidTy());
             return false;
         }
         // Lambda's parameter type not support auto box.
         // NOTE: lambda should not report parameter type mismatch, only report lambda type mismatchs.
-        if (!typeManager.IsSubtype(paramTy, node->ty, false, false)) {
-            le.ty = TypeManager::GetInvalidTy();
+        if (!typeManager.IsSubtype(paramTy, node->GetTy(), false, false)) {
+            le.SetTy(TypeManager::GetInvalidTy());
             return false;
         }
-        lamParamTys.push_back(node->ty);
+        lamParamTys.push_back(node->GetTy());
         i++;
     }
     return true;
@@ -410,10 +409,10 @@ bool TypeChecker::TypeCheckerImpl::ChkLamParamTys(
 
 bool TypeChecker::TypeCheckerImpl::ChkLamBody(ASTContext& ctx, FuncBody& lamFb)
 {
-    if (CheckFuncBody(ctx, lamFb) && Ty::IsTyCorrect(lamFb.ty) && Ty::IsTyCorrect(lamFb.body->ty)) {
+    if (CheckFuncBody(ctx, lamFb) && Ty::IsTyCorrect(lamFb.GetTy()) && Ty::IsTyCorrect(lamFb.body->GetTy())) {
         return true;
     }
     // Since the return type of lambda body is added in 'ChkLamExpr', all type mismatching errors are reported before.
-    lamFb.ty = TypeManager::GetInvalidTy();
+    lamFb.SetTy(TypeManager::GetInvalidTy());
     return false;
 }

@@ -9,6 +9,7 @@
 
 #include "cangjie/CHIR/IR/Value/Value.h"
 
+#include <cstddef>
 #include <optional>
 #include <memory>
 #include <string>
@@ -28,7 +29,7 @@ struct MemberVarInfo {
     AttributeInfo attributeInfo;
     DebugLocation loc;
     AnnoInfo annoInfo;
-    FuncBase* initializerFunc = nullptr; /**< Func with initializer evaluation if any */
+    Function* initializerFunc = nullptr; /**< Function with initializer evaluation if any */
     const CustomTypeDef* outerDef = nullptr;
     bool TestAttr(Attribute attr) const
     {
@@ -49,8 +50,8 @@ enum CustomDefKind : uint8_t {
 };
 
 class CustomTypeDef : public Base {
-    friend class GlobalVarBase;
-    friend class FuncBase;
+    friend class GlobalVar;
+    friend class Function;
     friend class CustomType;
     friend class CustomDefTypeConverter;
     friend class CHIRDeserializer;
@@ -72,7 +73,7 @@ public:
     bool IsGenericDef() const;
 
     void Dump() const;
-    virtual std::string ToString() const;
+    std::string ToString() const;
 
     bool IsClass() const;
     /** @brief is class or interface */
@@ -82,14 +83,6 @@ public:
     bool IsInterface() const;
     bool IsStruct() const;
 
-    // ===--------------------------------------------------------------------===//
-    // Attribute
-    // ===--------------------------------------------------------------------===//
-    AttributeInfo GetAttributeInfo() const;
-    void AppendAttributeInfo(const AttributeInfo& info);
-    void EnableAttr(Attribute attr);
-    bool TestAttr(Attribute attr) const;
-    void DisableAttr(Attribute attr);
     // ===--------------------------------------------------------------------===//
     // Super Parent
     // ===--------------------------------------------------------------------===//
@@ -133,10 +126,10 @@ public:
     // ===--------------------------------------------------------------------===//
     // Member Function
     // ===--------------------------------------------------------------------===//
-    virtual void AddMethod(class FuncBase* method, bool recordOrder = true);
-    std::vector<FuncBase*> GetMethods() const;
+    void AddMethod(class Function* method);
+    std::vector<Function*> GetMethods() const;
     // you need to update vtable by yourself, after setting methods
-    void SetMethods(const std::vector<FuncBase*>& items);
+    void SetMethods(const std::vector<Function*>& items);
 
     /**
      * @brief Retrieves the expected function based on the given name and type.
@@ -148,18 +141,18 @@ public:
      * @param funcInstTypeArgs A vector to store the function instance type arguments.
      * @param builder The CHIR builder used for building the function.
      * @param checkAbstractMethod Indicates whether to check for an abstract method.
-     * @return A pair containing the expected function and a boolean flag.
+     * @return The expected function.
      */
-    std::pair<FuncBase*, bool> GetExpectedFunc(const std::string& funcName, FuncType& funcType, bool isStatic,
+    Function* GetExpectedFunc(const std::string& funcName, FuncType& funcType, bool isStatic,
         std::unordered_map<const GenericType*, Type*> replaceTable,
         std::vector<Type*>& funcInstTypeArgs, CHIRBuilder& builder, bool checkAbstractMethod) const;
 
     // ===--------------------------------------------------------------------===//
     // Member Var
     // ===--------------------------------------------------------------------===//
-    void AddStaticMemberVar(class GlobalVarBase* variable);
-    std::vector<GlobalVarBase*> GetStaticMemberVars() const;
-    void SetStaticMemberVars(const std::vector<GlobalVarBase*>& vars);
+    void AddStaticMemberVar(class GlobalVar* variable);
+    std::vector<GlobalVar*> GetStaticMemberVars() const;
+    void SetStaticMemberVars(const std::vector<GlobalVar*>& vars);
 
     /**
     * @brief Add member into non-static members.
@@ -197,8 +190,9 @@ public:
     std::vector<MemberVarInfo> GetDirectInstanceVars() const;
     void SetDirectInstanceVars(const std::vector<MemberVarInfo>& vars);
 
-    FuncBase* GetVarInitializationFunc() const;
-    void SetVarInitializationFunc(FuncBase* func);
+    Function* GetVarInitializationFunc() const;
+    void SetVarInitializationFunc(Function* func);
+
     // ===--------------------------------------------------------------------===//
     // Annotation
     // ===--------------------------------------------------------------------===//
@@ -229,10 +223,13 @@ public:
     * @param newName new src code name, empty means not changed
     */
     void UpdateVtableItem(ClassType& srcClassTy,
-        size_t index, FuncBase* newFunc, Type* newParentTy = nullptr, const std::string newName = "");
+        size_t index, Function* newFunc, Type* newParentTy = nullptr, const std::string newName = "");
 
     /**
-    * @brief get virtual function's index in vtable
+    * @brief get virtual function's index in vtable, there may be many results, because for one func signature,
+    *        we can get many results in different src parent class. Because in different class's vtable,
+    *        the offset is different, so we need to store all results and left them to other function to judge,
+    *        we don't have enough infomation to judge which one is best here
     *
     * @param funcCallType function name and type
     * @param replaceTable an auxiliary map
@@ -266,15 +263,15 @@ protected:
     {
     }
     virtual ~CustomTypeDef() = default;
-    virtual void PrintAttrAndTitle(std::stringstream& ss) const;
+    virtual std::string CustomTypeDefTitleToString() const;
     std::string GenericInsArgsToString(const CustomType& ty) const;
-    std::string GenericDefArgsToString() const;
-    void PrintParent(std::stringstream& ss) const;
-    virtual void PrintComment(std::stringstream& ss) const;
-    void PrintLocalVar(std::stringstream& ss) const;
-    void PrintStaticVar(std::stringstream& ss) const;
-    void PrintMethod(std::stringstream& ss) const;
-    void PrintVTable(std::stringstream& ss) const;
+    std::string ParentToString() const;
+    std::string CommentToString() const;
+    virtual std::string AddExtraComment() const;
+    virtual std::string LocalVarToString() const;
+    std::string StaticVarToString() const;
+    std::string MethodToString() const;
+    std::string VTableToString() const;
 
 protected:
     CustomDefKind kind : 8;
@@ -284,15 +281,14 @@ protected:
     CustomType* type = nullptr;          /**< Type */
     /** original generic decl which current instantiated decl derives from */
     CustomTypeDef* genericDecl = nullptr;
-    std::vector<FuncBase*> methods;               /**< non-abstract member methods */
+    std::vector<Function*> methods;               /**< non-abstract member methods */
     std::vector<ClassType*> implementedInterfaceTys; /**< implemented interfaces */
     std::vector<MemberVarInfo> instanceVars;         /**< local member variables */
-    std::vector<GlobalVarBase*> staticVars;       /**< static member variables */
-    AttributeInfo attributeInfo;                  /**< attribute */
+    std::vector<GlobalVar*> staticVars;       /**< static member variables */
     AnnoInfo annoInfo;                            /**< struct/class/enum annoInfo */
     VTableInDef vtable;
     std::vector<ExtendDef*> extends;
-    FuncBase* varInitializationFunc = nullptr; /**< Func for initializing instance variables with initializers */
+    Function* varInitializationFunc = nullptr; /**< Function for initializing instance variables with initializers */
 };
 } // namespace Cangjie::CHIR
 #endif

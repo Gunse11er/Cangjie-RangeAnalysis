@@ -23,7 +23,6 @@
 #include <cangjie/CHIR/Interpreter/InterpreterValueUtils.h>
 #include <cangjie/CHIR/IR/Package.h>
 #include <cangjie/Frontend/CompilerInstance.h>
-#include <cangjie/Mangle/BaseMangler.h>
 #include <cangjie/Option/Option.h>
 
 namespace Cangjie::CHIR::Interpreter {
@@ -77,19 +76,19 @@ public:
     // Evaluates constants (variables declared with `const`) and simplifies
     // their intializers.
     void RunOnPackage(Package& package,
-        const std::vector<CHIR::FuncBase*>& initFuncsForConstVar, std::vector<Bchir>& bchirPackages);
+        const std::vector<CHIR::Function*>& initFuncsForConstVar, std::vector<Bchir>& bchirPackages);
 
 private:
     void RunInterpreter(Package& package, std::vector<Bchir>& bchirPackages,
-        const std::vector<CHIR::FuncBase*>& initFuncsForConstVar,
+        const std::vector<CHIR::Function*>& initFuncsForConstVar,
         std::function<void(Package&, BCHIRInterpreter&, BCHIRLinker&)> onSuccess);
     void ReplaceGlobalConstantInitializers(Package& package, BCHIRInterpreter& interpreter, BCHIRLinker& linker);
     void RemoveConstructorCalls(const Value& value);
-    std::optional<BlockGroup*> CreateNewInitializer(
-        Func& oldInitializer, const BCHIRInterpreter& interpreter, const BCHIRLinker& linker, const Package& package);
+    std::optional<BlockGroup*> CreateNewInitializer(Function& oldInitializer,
+        const BCHIRInterpreter& interpreter, const BCHIRLinker& linker, const Package& package);
 
     void PrintDebugMessage(
-        const DebugLocation& loc, const Func& oldInit, const std::optional<BlockGroup*>& newInit) const;
+        const DebugLocation& loc, const Function& oldInit, const std::optional<BlockGroup*>& newInit) const;
 
     CompilerInstance& ci;
     CHIRBuilder& builder;

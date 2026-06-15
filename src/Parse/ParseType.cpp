@@ -369,35 +369,3 @@ std::pair<bool, std::vector<OwnedPtr<AST::Type>>> ParserImpl::ParseTypeArguments
     }
     return {true, std::move(ret)};
 }
-
-namespace Cangjie {
-AST::TypeKind LookupPrimitiveTypeKind(TokenKind kind)
-{
-    static constexpr int first = static_cast<int>(TokenKind::INT8);
-    static constexpr int last = static_cast<int>(TokenKind::UNIT);
-    static constexpr AST::TypeKind table[] = {
-        AST::TypeKind::TYPE_INT8,
-        AST::TypeKind::TYPE_INT16,
-        AST::TypeKind::TYPE_INT32,
-        AST::TypeKind::TYPE_INT64,
-        AST::TypeKind::TYPE_INT_NATIVE,
-        AST::TypeKind::TYPE_UINT8,
-        AST::TypeKind::TYPE_UINT16,
-        AST::TypeKind::TYPE_UINT32,
-        AST::TypeKind::TYPE_UINT64,
-        AST::TypeKind::TYPE_UINT_NATIVE,
-        AST::TypeKind::TYPE_FLOAT16,
-        AST::TypeKind::TYPE_FLOAT32,
-        AST::TypeKind::TYPE_FLOAT64,
-        AST::TypeKind::TYPE_RUNE,
-        AST::TypeKind::TYPE_BOOLEAN,
-        AST::TypeKind::TYPE_NOTHING,
-        AST::TypeKind::TYPE_UNIT,
-    };
-    int idx = static_cast<int>(kind) - first;
-    if (idx < 0 || idx > last - first) {
-        return AST::TypeKind::TYPE_INVALID;
-    }
-    return table[idx];
-}
-} // namespace Cangjie

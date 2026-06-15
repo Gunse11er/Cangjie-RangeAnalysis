@@ -19,12 +19,12 @@ ConstPropagation::ConstPropagation(CHIRBuilder& builder, ConstAnalysisWrapper* c
 
 void ConstPropagation::RunOnPackage(const Ptr<const Package>& package, bool isDebug, bool isCJLint)
 {
-    for (auto func : package->GetGlobalFuncs()) {
+    for (auto func : package->GetGlobalFuncsWithBody()) {
         RunOnFunc(func, isDebug, isCJLint);
     }
 }
 
-void ConstPropagation::RunOnFunc(const Ptr<const Func>& func, bool isDebug, bool isCJLint)
+void ConstPropagation::RunOnFunc(const Ptr<const Function>& func, bool isDebug, bool isCJLint)
 {
     bool isCommonFunctionWithoutBody = func->TestAttr(Attribute::SKIP_ANALYSIS);
     if (isCommonFunctionWithoutBody) {
@@ -42,13 +42,13 @@ const OptEffectCHIRMap& ConstPropagation::GetEffectMap() const
     return effectMap;
 }
 
-const std::vector<const Func*>& ConstPropagation::GetFuncsNeedRemoveBlocks() const
+const std::vector<const Function*>& ConstPropagation::GetFuncsNeedRemoveBlocks() const
 {
     return funcsNeedRemoveBlocks;
 }
 
 template <typename TConstDomain>
-void ConstPropagation::VisitFunc(const Func& func, bool isDebug, bool isCJLint, Results<TConstDomain>& result)
+void ConstPropagation::VisitFunc(const Function& func, bool isDebug, bool isCJLint, Results<TConstDomain>& result)
 {
     std::vector<RewriteInfo> toBeRewrited;
     std::unordered_map<Terminator*, std::pair<LiteralValue*, Block*>> targetSuccMap;
@@ -322,7 +322,7 @@ void ConstPropagation::RewriteTerminator(
 
 static std::mutex g_mtx;
 OptEffectCHIRMap ConstPropagation::effectMap;
-void ConstPropagation::RecordEffectMap(const Expression* expr, const Func* func) const
+void ConstPropagation::RecordEffectMap(const Expression* expr, const Function* func) const
 {
     if (!opts.enIncrementalCompilation ||
         !opts.IsOptimizationExisted(GlobalOptions::OptimizationFlag::CONST_PROPAGATION)) {
@@ -331,18 +331,18 @@ void ConstPropagation::RecordEffectMap(const Expression* expr, const Func* func)
     GlobalVar* gv = nullptr;
     if (expr->GetExprKind() == ExprKind::LOAD) {
         auto loc = StaticCast<Load*>(expr)->GetLocation();
-        if (loc->IsGlobalVarInCurPackage()) {
+        if (loc->IsGlobalVarWithInitializer()) {
             // let a = 3
             // Load(gv_a)
-            gv = DynamicCast<GlobalVar*>(loc);
+            gv = StaticCast<GlobalVar*>(loc);
         } else if (loc->IsLocalVar()) {
             // let sa = SA(); sa.x
             // %0 = GetElementRef(gv_sa); %1 = Load(%0)
             auto locExpr = StaticCast<LocalVar*>(loc)->GetExpr();
             if (locExpr->GetExprKind() == ExprKind::GET_ELEMENT_REF) {
                 auto base = StaticCast<GetElementRef*>(locExpr)->GetLocation();
-                if (base->IsGlobalVarInCurPackage()) {
-                    gv = DynamicCast<GlobalVar*>(base);
+                if (base->IsGlobalVarWithInitializer()) {
+                    gv = StaticCast<GlobalVar*>(base);
                 }
             }
         }
@@ -352,10 +352,10 @@ void ConstPropagation::RecordEffectMap(const Expression* expr, const Func* func)
             auto baseExpr = StaticCast<LocalVar*>(base)->GetExpr();
             if (baseExpr->GetExprKind() == ExprKind::LOAD) {
                 auto loc = StaticCast<Load*>(baseExpr)->GetLocation();
-                if (loc->IsGlobalVarInCurPackage()) {
+                if (loc->IsGlobalVarWithInitializer()) {
                     // let a = (1, 2); a[0]
                     // %0 = Load(gv_a); %1 = Field(%0, 0)
-                    gv = DynamicCast<GlobalVar*>(loc);
+                    gv = StaticCast<GlobalVar*>(loc);
                 }
             }
         }
@@ -363,9 +363,9 @@ void ConstPropagation::RecordEffectMap(const Expression* expr, const Func* func)
     if (gv) {
         if (opts.GetJobs() > 1) {
             std::lock_guard<std::mutex> guard(g_mtx);
-            effectMap[gv].emplace(const_cast<Func*>(func));
+            effectMap[gv].emplace(const_cast<Function*>(func));
         } else {
-            effectMap[gv].emplace(const_cast<Func*>(func));
+            effectMap[gv].emplace(const_cast<Function*>(func));
         }
     }
 }

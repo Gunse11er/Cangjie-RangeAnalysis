@@ -45,7 +45,7 @@ void BlockifyFlowExpr(BinaryExpr& be)
     std::vector<OwnedPtr<Node>> nodes;
     nodes.emplace_back(std::move(vd));
     nodes.emplace_back(std::move(be.desugarExpr));
-    auto block = CreateBlock(std::move(nodes), be.ty);
+    auto block = CreateBlock(std::move(nodes), be.GetTy());
     CopyBasicInfo(&be, block.get());
     AddCurFile(*block, be.curFile);
     be.desugarExpr = std::move(block);
@@ -55,7 +55,7 @@ void BlockifyFlowExpr(BinaryExpr& be)
 namespace Cangjie::Sema::Desugar::AfterTypeCheck {
 void DesugarBinaryExpr(BinaryExpr& be)
 {
-    if (!Ty::IsTyCorrect(be.ty)) {
+    if (!Ty::IsTyCorrect(be.GetTy())) {
         return;
     }
     if (be.op == TokenKind::PIPELINE) {

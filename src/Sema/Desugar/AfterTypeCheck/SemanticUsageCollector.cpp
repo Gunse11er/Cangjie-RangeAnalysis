@@ -114,12 +114,12 @@ private:
             return;
         }
         // Collect real parent of accessd parent.
-        CJC_NULLPTR_CHECK(decl.outerDecl->ty);
+        CJC_NULLPTR_CHECK(decl.outerDecl->GetTy());
         auto& nameUsage = usage.usedNames[decl.identifier];
-        CollectUseOfParentByTy(*decl.outerDecl->ty, usage, nameUsage);
-        if (currentTypeDecl && Ty::IsTyCorrect(currentTypeDecl->ty)) {
+        CollectUseOfParentByTy(*decl.outerDecl->GetTy(), usage, nameUsage);
+        if (currentTypeDecl && Ty::IsTyCorrect(currentTypeDecl->GetTy())) {
             // Collect current 'this' parent decl.
-            CollectUseOfParentByTy(*currentTypeDecl->ty, usage, nameUsage);
+            CollectUseOfParentByTy(*currentTypeDecl->GetTy(), usage, nameUsage);
         }
     }
 
@@ -127,7 +127,7 @@ private:
         const MemberAccess& ma, const Decl& target, UseInfo& usage, NameUsage& nameUsage) const
     {
         CJC_NULLPTR_CHECK(target.outerDecl);
-        auto accessedTy = ma.isExposedAccess ? target.outerDecl->ty : ma.baseExpr->ty;
+        auto accessedTy = ma.isExposedAccess ? target.outerDecl->GetTy() : ma.baseExpr->GetTy();
         if (Ty::IsTyCorrect(accessedTy)) {
             CollectUseOfParentByTy(*accessedTy, usage, nameUsage);
         }
@@ -135,10 +135,10 @@ private:
 
     void CollectForEnumAndStructTypeUse(const Node& node, UseInfo& usage) const
     {
-        if (!Ty::IsTyCorrect(node.ty) || (!node.ty->IsEnum() && !node.ty->IsStruct())) {
+        if (!Ty::IsTyCorrect(node.GetTy()) || (!node.GetTy()->IsEnum() && !node.GetTy()->IsStruct())) {
             return;
         }
-        auto ed = Ty::GetDeclPtrOfTy(node.ty);
+        auto ed = Ty::GetDeclPtrOfTy(node.GetTy());
         CJC_NULLPTR_CHECK(ed);
         usage.usedDecls.emplace(ed->rawMangleName);
     }
@@ -146,7 +146,7 @@ private:
     VisitAction CollectUseInfo(const Node& node, UseInfo& usage) const
     {
         CollectForEnumAndStructTypeUse(node, usage);
-        auto target = Is<Type>(node) ? Ty::GetDeclPtrOfTy(node.ty) : node.GetTarget();
+        auto target = Is<Type>(node) ? Ty::GetDeclPtrOfTy(node.GetTy()) : node.GetTarget();
         if (target == nullptr || target->IsBuiltIn() || target->astKind == ASTKind::PACKAGE_DECL) {
             return VisitAction::WALK_CHILDREN;
         }
@@ -216,7 +216,7 @@ private:
     {
         for (auto& gc : generic.genericConstraints) {
             for (const auto& upperBound : gc->upperBounds) {
-                auto decl = Ty::GetDeclPtrOfTy(upperBound->ty);
+                auto decl = Ty::GetDeclPtrOfTy(upperBound->GetTy());
                 if (decl && !decl->rawMangleName.empty()) {
                     usage.usedDecls.emplace(decl->rawMangleName);
                 }
@@ -275,11 +275,11 @@ private:
             return;
         }
         CJC_ASSERT(!id.rawMangleName.empty());
-        CJC_NULLPTR_CHECK(id.ty);
-        auto decl = Ty::GetDeclPtrOfTy(id.ty);
+        CJC_NULLPTR_CHECK(id.GetTy());
+        auto decl = Ty::GetDeclPtrOfTy(id.GetTy());
         CJC_ASSERT(!decl || !decl->rawMangleName.empty());
         auto& relation = decl ? info.relations[decl->rawMangleName]
-                              : info.builtInTypeRelations[ASTMangler::MangleBuiltinType(Ty::KindName(id.ty->kind))];
+                              : info.builtInTypeRelations[ASTMangler::MangleBuiltinType(Ty::KindName(id.TyKind()))];
         bool isExtend = false;
         if (Is<const ExtendDecl*>(&id)) {
             relation.extends.emplace(id.rawMangleName);
@@ -287,7 +287,7 @@ private:
         }
         auto& inherited = isExtend ? relation.extendedInterfaces : relation.inherits;
         for (auto& type : id.inheritedTypes) {
-            auto target = Ty::GetDeclPtrOfTy(type->ty); // Type without target will never be valid inherited type.
+            auto target = Ty::GetDeclPtrOfTy(type->GetTy()); // Type without target will never be valid inherited type.
             CJC_ASSERT(target && !target->rawMangleName.empty());
             inherited.emplace(target->rawMangleName);
         }

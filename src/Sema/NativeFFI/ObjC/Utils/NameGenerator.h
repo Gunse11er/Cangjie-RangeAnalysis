@@ -15,7 +15,6 @@
 
 #include "cangjie/AST/Node.h"
 #include "cangjie/Mangle/BaseMangler.h"
-#include "cangjie/Sema/TypeManager.h"
 
 namespace Cangjie::Interop::ObjC {
 class NameGenerator {
@@ -27,12 +26,10 @@ public:
     std::string GenerateDeleteCjObjectName(const AST::Decl& target, const std::string* genericActualName = nullptr);
     std::string GenerateLockCjObjectName(const AST::Decl& target);
     std::string GenerateUnlockCjObjectName(const AST::Decl& target);
-    std::string GenerateMethodWrapperName(
-        const AST::FuncDecl& target, const std::string* genericActualName = nullptr, bool isInnerGeneric = false);
+    std::string GenerateMethodWrapperName(const AST::FuncDecl& target, const std::string* genericActualName = nullptr, bool isInnerGeneric = false);
     std::string GeneratePropGetterWrapperName(const AST::PropDecl& target);
     std::string GetPropSetterWrapperName(const AST::PropDecl& target);
-    std::string GetFieldGetterWrapperName(
-        const AST::VarDecl& target, const std::string* genericActualName = nullptr, bool isInnerGeneric = false);
+    std::string GetFieldGetterWrapperName(const AST::VarDecl& target, const std::string* genericActualName = nullptr, bool isInnerGeneric = false);
     std::string GetFieldSetterWrapperName(const AST::VarDecl& target);
 
     /**

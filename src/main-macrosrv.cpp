@@ -16,7 +16,11 @@
 #include <windows.h>
 #else
 #include <csignal>
+#ifdef __ohos__
+#include <signal.h>
+#else
 #include <sys/signal.h>
+#endif
 #include <sys/stat.h>
 #endif
 
@@ -177,5 +181,5 @@ int main(int argc, const char* argv[], [[maybe_unused]] const char** envp)
     [[maybe_unused]] std::lock_guard lg(MacroProcMsger::GetInstance().mutex);
     MacroProcMsger::GetInstance().CloseClientResource();
 #endif
-    return 0;
+    _exit(0);
 }

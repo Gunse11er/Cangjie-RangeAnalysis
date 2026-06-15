@@ -50,7 +50,7 @@ void DiagJavaMirrorChildMustBeAnnotated(DiagnosticEngine& diag, const ClassLikeD
     Ptr<Decl> parentDecl;
 
     for (auto& parentType : decl.inheritedTypes) {
-        auto pty = parentType->ty;
+        auto pty = parentType->GetTy();
         if (auto parent = DynamicCast<ClassTy>(pty)) {
             parentDecl = parent->decl;
         } else if (auto parentI = DynamicCast<InterfaceTy>(pty)) {
@@ -74,9 +74,10 @@ void DiagJavaDeclCannotInheritPureCangjieType(DiagnosticEngine& diag, ClassLikeD
     auto builder = diag.DiagnoseRefactor(kind, decl);
 
     for (const auto& superType : decl.inheritedTypes) {
-        auto superDecl = Ty::GetDeclOfTy(superType->ty);
+        auto superDecl = Ty::GetDeclOfTy(superType->GetTy());
         CJC_ASSERT(superDecl);
-        if (!IsMirror(*superDecl) && !IsImpl(*superDecl) && !superDecl->ty->IsObject() && !superDecl->ty->IsAny()) {
+        if (!IsMirror(*superDecl) && !IsImpl(*superDecl) && !superDecl->GetTy()->IsObject() &&
+            !superDecl->GetTy()->IsAny()) {
             builder.AddNote(*superType, "'" + superType->ToString() + "'" + " is not a java-compatible type");
         }
     }
@@ -84,7 +85,7 @@ void DiagJavaDeclCannotInheritPureCangjieType(DiagnosticEngine& diag, ClassLikeD
 
 void DiagJavaDeclCannotBeExtendedWithInterface(DiagnosticEngine& diag, ExtendDecl& decl)
 {
-    auto& ty = *decl.extendedType->ty;
+    auto& ty = *decl.extendedType->GetTy();
     CJC_ASSERT(IsMirror(ty) || IsImpl(ty));
     CJC_ASSERT(!decl.inheritedTypes.empty());
     auto kind = IsMirror(ty) ? DiagKindRefactor::sema_java_mirror_cannot_be_extended_with_interface
@@ -129,30 +130,6 @@ const std::string& GetOuterDeclKindName(const Decl& outerDecl)
             CJC_ABORT();
             static const std::string UNDEFINED = "";
             return UNDEFINED;
-    }
-}
-
-void DiagUsageOfJavaTypes(
-    DiagnosticEngine& diag, const Decl& varDecl, std::vector<Ptr<Decl>>&& javaDecls, Ptr<Decl> nonJavaOuterDecl)
-{
-    if (javaDecls.empty()) {
-        return;
-    }
-
-    auto primaryDiagJavaDecl = javaDecls.back();
-    javaDecls.pop_back();
-
-    auto builder = diag.DiagnoseRefactor(DiagKindRefactor::sema_variable_of_java_type, varDecl, GetVarKindName(varDecl),
-        primaryDiagJavaDecl->identifier);
-
-    for (auto javaDecl : javaDecls) {
-        builder.AddNote("Also uses java interoperability type '" + javaDecl->identifier + "'");
-    }
-
-    if (nonJavaOuterDecl) {
-        builder.AddNote(*nonJavaOuterDecl,
-            "Declared inside non java interoperability " + GetOuterDeclKindName(*nonJavaOuterDecl) + " '" +
-                nonJavaOuterDecl->identifier + "'");
     }
 }
 

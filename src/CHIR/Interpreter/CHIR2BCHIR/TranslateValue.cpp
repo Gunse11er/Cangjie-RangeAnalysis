@@ -37,14 +37,14 @@ void CHIR2BCHIR::TranslateValue(Context& ctx, const Value& value)
         PushOpCodeWithAnnotations(ctx, OpCode::NULLPTR, value);
     } else if (value.IsFuncWithBody()) {
         PushOpCodeWithAnnotations<true>(ctx, OpCode::FUNC, value, UINT32_MAX);
-    } else if (Is<GlobalVarBase>(value) || value.IsImportedFunc()) {
+    } else if (Is<GlobalVar>(value) || value.IsImportedFunc()) {
         // global vars and imported vars will be resolved during linking
         auto mangledName = value.GetIdentifierWithoutPrefix();
         if (mangledName == CHIR::GV_PKG_INIT_ONCE_FLAG) {
             // This is an hack because $has_applied_pkg_init_func is not a real mangled name. It's
             // not unique amongst packages. T0D0: issue 2079
             auto opIdx = ctx.def.NextIndex();
-            PushOpCodeWithAnnotations<false>(ctx, OpCode::GVAR, value, 0);
+            PushOpCodeWithAnnotations<false>(ctx, OpCode::GVAR, value, 0u);
             auto fixedMangledName = CHIR::GV_PKG_INIT_ONCE_FLAG + "-" + bchir.packageName;
             ctx.def.AddMangledNameAnnotation(opIdx, fixedMangledName);
         } else {

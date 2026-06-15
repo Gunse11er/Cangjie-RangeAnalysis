@@ -7,7 +7,7 @@
 /**
  * @file
  *
- * This file implements a thin bridge to interoplib.objc library
+ * This file implements a thin bridge to interop runtime and support library
  */
 
 #include "InteropLibBridge.h"
@@ -20,6 +20,7 @@ using namespace Cangjie::Interop::ObjC;
 
 namespace {
 
+constexpr auto INTEROPLIB_OBJ_C_ID = "ObjCId";
 constexpr auto INTEROPLIB_NATIVE_OBJ_C_ID = "NativeObjCId";
 constexpr auto INTEROPLIB_NATIVE_OBJ_C_SEL = "NativeObjCSel";
 constexpr auto INTEROPLIB_NATIVE_OBJ_C_SUPER_PTR = "NativeObjCSuperPtr";
@@ -43,6 +44,7 @@ constexpr auto INTEROPLIB_OBJ_C_SET_INSTANCE_VARIABLE_OBJ = "setInstanceVariable
 constexpr auto INTEROPLIB_OBJ_C_GET_INSTANCE_VARIABLE = "getInstanceVariable";
 constexpr auto INTEROPLIB_OBJ_C_SET_INSTANCE_VARIABLE = "setInstanceVariable";
 constexpr auto INTEROPLIB_OBJ_C_GET_CLASS = "getClass";
+constexpr auto INTEROPLIB_OBJ_C_GET_PROTOCOL = "getProtocol";
 constexpr auto INTEROPLIB_OBJ_C_GET_SUPER_CLASS = "getSuperClass";
 constexpr auto INTEROPLIB_OBJ_C_WITH_METHOD_ENV = "withMethodEnv";
 constexpr auto INTEROPLIB_OBJ_C_WITH_METHOD_ENV_OBJ = "withMethodEnvObj";
@@ -59,6 +61,10 @@ constexpr auto MUTEX_UNLOCK_IDENT = "unlock";
 constexpr auto INTEROPLIB_OBJC_STORE_LAMBDA_AS_BLOCK = "registerCangjieLambdaAsBlock";
 constexpr auto INTEROPLIB_OBJC_GET_LAMBDA_FROM_BLOCK = "getCangjieLambdaFromBlock";
 constexpr auto INTEROPLIB_OBJ_C_OBJECT_GET_CLASS = "objectGetClass";
+constexpr auto INTEROPLIB_OBJ_C_IS_KIND_OF_CLASS = "isKindOfClass";
+constexpr auto INTEROPLIB_OBJ_C_CONFORMS_TO_PROTOCOL = "conformsToProtocol";
+constexpr auto INTEROPLIB_OBJ_C_CONVERT_TO_NSSTRING = "convertToNSString";
+constexpr auto INTEROPLIB_OBJ_C_DESCRIPTION_AS_STRING = "descriptionAsString";
 
 // objc.lang
 constexpr auto OBJ_C_FUNC_GET_FPOINTER = "unsafeGetFunctionPointer";
@@ -92,7 +98,7 @@ Ptr<TypeAliasDecl> InteropLibBridge::GetForwarderMutexDecl()
  */
 Ptr<Ty> InteropLibBridge::GetForwarderMutexTy()
 {
-    return GetForwarderMutexDecl()->type->ty;
+    return GetForwarderMutexDecl()->type->GetTy();
 }
 
 /**
@@ -155,9 +161,15 @@ Ptr<TypeAliasDecl> InteropLibBridge::GetNativeObjCIdDecl()
     return decl;
 }
 
+Ptr<InterfaceDecl> InteropLibBridge::GetObjCIdDecl()
+{
+    static auto decl = GetObjCLangDecl<ASTKind::INTERFACE_DECL>(INTEROPLIB_OBJ_C_ID);
+    return decl;
+}
+
 Ptr<Ty> InteropLibBridge::GetNativeObjCIdTy()
 {
-    return GetNativeObjCIdDecl()->type->ty;
+    return GetNativeObjCIdDecl()->type->GetTy();
 }
 
 Ptr<TypeAliasDecl> InteropLibBridge::GetNativeObjCSelDecl()
@@ -174,7 +186,7 @@ Ptr<TypeAliasDecl> InteropLibBridge::GetNativeObjCClassDecl()
 
 Ptr<Ty> InteropLibBridge::GetNativeObjCClassTy()
 {
-    return GetNativeObjCClassDecl()->type->ty;
+    return GetNativeObjCClassDecl()->type->GetTy();
 }
 
 Ptr<TypeAliasDecl> InteropLibBridge::GetNativeObjCSuperPtrDecl()
@@ -185,7 +197,7 @@ Ptr<TypeAliasDecl> InteropLibBridge::GetNativeObjCSuperPtrDecl()
 
 Ptr<Ty> InteropLibBridge::GetNativeObjCSuperPtrTy()
 {
-    return GetNativeObjCSuperPtrDecl()->type->ty;
+    return GetNativeObjCSuperPtrDecl()->type->GetTy();
 }
 
 Ptr<TypeAliasDecl> InteropLibBridge::GetRegistryIdDecl()
@@ -196,7 +208,7 @@ Ptr<TypeAliasDecl> InteropLibBridge::GetRegistryIdDecl()
 
 Ptr<Ty> InteropLibBridge::GetRegistryIdTy()
 {
-    return GetRegistryIdDecl()->type->ty;
+    return GetRegistryIdDecl()->type->GetTy();
 }
 
 Ptr<ClassDecl> InteropLibBridge::GetObjCUnreachableCodeExceptionDecl()
@@ -207,7 +219,7 @@ Ptr<ClassDecl> InteropLibBridge::GetObjCUnreachableCodeExceptionDecl()
 
 Ptr<ClassDecl> InteropLibBridge::GetObjCOptionalMethodUnimplementedExceptionDecl()
 {
-    static auto decl = GetInteropLibDecl<ASTKind::CLASS_DECL>(INTEROPLIB_OBJ_C_OPTIONAL_METHOD_UNIMPLEMENTED_EXCEPTION);
+    static auto decl = GetObjCLangDecl<ASTKind::CLASS_DECL>(INTEROPLIB_OBJ_C_OPTIONAL_METHOD_UNIMPLEMENTED_EXCEPTION);
     return decl;
 }
 
@@ -296,6 +308,11 @@ Ptr<FuncDecl> InteropLibBridge::GetGetClassDecl()
     return decl;
 }
 
+Ptr<FuncDecl> InteropLibBridge::GetGetProtoDecl()
+{
+    static auto decl = GetInteropLibDecl<ASTKind::FUNC_DECL>(INTEROPLIB_OBJ_C_GET_PROTOCOL);
+    return decl;
+}
 
 Ptr<FuncDecl> InteropLibBridge::GetGetSuperClassDecl()
 {
@@ -357,6 +374,30 @@ Ptr<FuncDecl> InteropLibBridge::GetWithObjCSuperDecl()
     return decl;
 }
 
+Ptr<FuncDecl> InteropLibBridge::GetObjCIsKindOfClassDecl()
+{
+    static auto decl = GetInteropLibDecl<ASTKind::FUNC_DECL>(INTEROPLIB_OBJ_C_IS_KIND_OF_CLASS);
+    return decl;
+}
+
+Ptr<FuncDecl> InteropLibBridge::GetObjCConformsToProtocolDecl()
+{
+    static auto decl = GetInteropLibDecl<ASTKind::FUNC_DECL>(INTEROPLIB_OBJ_C_CONFORMS_TO_PROTOCOL);
+    return decl;
+}
+
+Ptr<FuncDecl> InteropLibBridge::GetConvertToNSStringDecl()
+{
+    static auto decl = GetInteropLibDecl<ASTKind::FUNC_DECL>(INTEROPLIB_OBJ_C_CONVERT_TO_NSSTRING);
+    return decl;
+}
+
+Ptr<FuncDecl> InteropLibBridge::GetDescriptionAsStringDecl()
+{
+    static auto decl = GetInteropLibDecl<ASTKind::FUNC_DECL>(INTEROPLIB_OBJ_C_DESCRIPTION_AS_STRING);
+    return decl;
+}
+
 Ptr<StructDecl> InteropLibBridge::GetObjCPointerDecl()
 {
     static auto result = GetObjCLangDecl<ASTKind::STRUCT_DECL>(OBJ_C_POINTER_IDENT);
@@ -369,8 +410,7 @@ Ptr<StructDecl> InteropLibBridge::GetObjCFuncDecl()
     return result;
 }
 
-Ptr<ClassDecl> InteropLibBridge::GetObjCBlockDecl()
-{
+Ptr<ClassDecl> InteropLibBridge::GetObjCBlockDecl() {
     static auto result = GetObjCLangDecl<ASTKind::CLASS_DECL>(OBJ_C_BLOCK_IDENT);
     return result;
 }
@@ -405,7 +445,7 @@ Ptr<VarDecl> InteropLibBridge::GetObjCPointerPointerField()
     auto outer = GetObjCPointerDecl();
     for (auto& member : outer->body->decls) {
         if (auto fieldDecl = DynamicCast<VarDecl*>(member.get())) {
-            if (fieldDecl->ty->IsPointer()) {
+            if (fieldDecl->GetTy()->IsPointer()) {
                 result = fieldDecl;
                 break;
             }
@@ -455,8 +495,7 @@ Ptr<FuncDecl> InteropLibBridge::GetObjCFuncFPointerAccessor()
 
 namespace {
 
-Ptr<FuncDecl> GetObjCBlockConstructorByABIName(InteropLibBridge& bridge, const std::string& abiTypeName)
-{
+Ptr<FuncDecl> GetObjCBlockConstructorByABIName(InteropLibBridge& bridge, const std::string& abiTypeName) {
     auto outer = bridge.GetObjCBlockDecl();
     for (auto& member : outer->body->decls) {
         if (auto funcDecl = DynamicCast<FuncDecl*>(member.get())) {
@@ -469,7 +508,7 @@ Ptr<FuncDecl> GetObjCBlockConstructorByABIName(InteropLibBridge& bridge, const s
                 || funcDecl->funcBody->paramLists[0]->params.size() != 1) {
                 continue;
             }
-            Ptr<Ty> paramTy = funcDecl->funcBody->paramLists[0]->params[0]->ty;
+            Ptr<Ty> paramTy = funcDecl->funcBody->paramLists[0]->params[0]->GetTy();
             if (!paramTy->IsPointer()) {
                 continue;
             }
@@ -484,14 +523,12 @@ Ptr<FuncDecl> GetObjCBlockConstructorByABIName(InteropLibBridge& bridge, const s
 
 } // empty namespace
 
-Ptr<FuncDecl> InteropLibBridge::GetObjCBlockConstructorFromObjC()
-{
+Ptr<FuncDecl> InteropLibBridge::GetObjCBlockConstructorFromObjC() {
     static Ptr<FuncDecl> result = GetObjCBlockConstructorByABIName(*this, INTEROPLIB_NATIVE_BLOCK_ABI);
     return result;
 }
 
-Ptr<FuncDecl> InteropLibBridge::GetObjCBlockConstructorFromCangjie()
-{
+Ptr<FuncDecl> InteropLibBridge::GetObjCBlockConstructorFromCangjie() {
     static Ptr<FuncDecl> result = GetObjCBlockConstructorByABIName(*this, INTEROPLIB_CANGJIE_BLOCK_ABI);
     return result;
 }

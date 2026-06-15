@@ -34,14 +34,14 @@ private:
         std::unordered_map<const GenericType*, Type*> replaceTable;
         std::unordered_map<const GenericType*, Type*> inverseReplaceTable;
     };
-    FuncBase* CreateVirtualWrapperIfNeeded(const VirtualMethodInfo& funcInfo,
+    Function* CreateVirtualWrapperIfNeeded(const VirtualMethodInfo& funcInfo,
         const VirtualMethodInfo& parentFuncInfo, Type& selfTy, CustomTypeDef& customTypeDef, const ClassType& parentTy);
-    void CreateWrapperFuncBody(Func& wrapperFunc,
+    void CreateWrapperFuncBody(Function& wrapperFunc,
         const VirtualMethodInfo& childFuncInfo, Type& selfTy, WrapVirtualFunc::WrapperFuncGenericTable& genericTable);
     WrapperFuncGenericTable GetReplaceTableForVirtualFunc(
         const ClassType& parentTy, const std::string& funcIdentifier, const VirtualMethodInfo& parentFuncInfo);
     FuncType* RemoveThisArg(FuncType* funcTy);
-    void HandleVirtualFuncWrapperForIncrCompilation(const FuncBase* wrapper, const FuncBase& curFunc);
+    void HandleVirtualFuncWrapperForIncrCompilation(const Function* wrapper, const Function& curFunc);
     FuncType* GetWrapperFuncType(FuncType& parentFuncTyWithoutThisArg,
         Type& selfTy, const std::unordered_map<const GenericType*, Type*>& replaceTable, bool isStatic);
 
@@ -51,7 +51,7 @@ private:
     const IncreKind incrementalKind;
     const bool targetIsWin;
 
-    std::unordered_map<std::string, FuncBase*> wrapperCache;
+    std::unordered_map<std::string, Function*> wrapperCache;
     VirtualWrapperDepMap curVirtFuncWrapDep;
     VirtualWrapperDepMap delVirtFuncWrapForIncr;
 };

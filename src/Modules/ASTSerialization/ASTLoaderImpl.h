@@ -13,6 +13,7 @@
 #ifndef CANGJIE_MODULES_ASTSERIALIZATION_ASTLOADER_IMPL_H
 #define CANGJIE_MODULES_ASTSERIALIZATION_ASTLOADER_IMPL_H
 
+#include "cangjie/Option/Option.h"
 #include "flatbuffers/ModuleFormat_generated.h"
 
 #include "cangjie/AST/ASTCasting.h"
@@ -44,9 +45,9 @@ public:
     OwnedPtr<AST::Package> LoadPackageDependencies();
     void LoadPackageDecls();
     // Add for CJMP
-    void PreloadCommonPartOfPackage(AST::Package& pkg);
+    bool PreloadCommonPartOfPackage(AST::Package& pkg);
+    bool ValidateOptions();
     std::vector<OwnedPtr<AST::ImportSpec>> LoadImportSpecs(const PackageFormat::Imports* imports);
-    std::string PreReadAndSetPackageName();
     std::vector<std::string> ReadFileNames() const;
     std::unordered_set<std::string> LoadCachedTypeForPackage(
         const AST::Package& sourcePackage, const std::map<std::string, Ptr<AST::Decl>>& mangledName2DeclMap);
@@ -139,6 +140,7 @@ private:
     void LoadEnumDeclAdvancedInfo(const PackageFormat::Decl& decl, AST::EnumDecl& enumDecl);
     void LoadInheritableDeclAdvancedInfo(const PackageFormat::Decl& decl, AST::InheritableDecl& id);
     void AddDeclToImportedPackage(AST::Decl& decl);
+    GlobalOptions::OptimizationLevel LoadOptimizationLevel(const PackageFormat::CompilationOptions& options);
 
     // Get decl pointer according to DeclId obtained from flatbuffers.
     Ptr<AST::Decl> GetDeclFromIndex(const PackageFormat::FullId* fullId);
@@ -232,6 +234,8 @@ private:
     OwnedPtr<AST::Package> PreLoadImportedPackageNode();
     OwnedPtr<AST::File> CreateFileNode(
         AST::Package& pkg, unsigned int fileID, std::vector<OwnedPtr<AST::ImportSpec>>&& imports);
+    // Add for CJMP
+    OwnedPtr<AST::File> PreloadCommonFile(uoffset_t indexOfFile);
     void LoadCachedTypeForDecl(const PackageFormat::Decl& decl, AST::Decl& astDecl);
     using DeclLoaderT =
         std::function<OwnedPtr<AST::Decl>(ASTLoaderImpl*, const PackageFormat::Decl&, int64_t exprIndex)>;

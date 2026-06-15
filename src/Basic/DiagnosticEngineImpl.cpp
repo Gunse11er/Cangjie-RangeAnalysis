@@ -90,6 +90,41 @@ void DiagnosticEngine::AddMacroCallNote(Diagnostic& diagnostic, const AST::Node&
     return impl->AddMacroCallNote(diagnostic, node, pos);
 }
 
+void DiagnosticEngine::AddMacroCallNote(Diagnostic& diagnostic, const MacroCallDiagInfo& info, const Position& pos)
+{
+    return impl->AddMacroCallNote(diagnostic, info, pos);
+}
+
+MacroCallDiagInfo* DiagnosticEngine::FindMacroCallInfo(Position pos) const
+{
+    return impl->FindMacroCallInfo(pos);
+}
+
+void DiagnosticEngine::RegisterMacroCallDiagInfo(std::unique_ptr<MacroCallDiagInfo> info)
+{
+    return impl->RegisterMacroCallDiagInfo(std::move(info));
+}
+
+DiagnosticBuilder DiagnosticEngine::DiagnoseRefactor(DiagKindRefactor kind, const MacroCallDiagInfo& info,
+    const Range& range, std::vector<std::string> formatArgs)
+{
+    CheckRange(Diagnostic::GetDiagnoseCategory(kind), range);
+    auto newRange = MakeRange(info.MapPos(range.begin), info.MapPos(range.end, true));
+    Diagnostic diagnostic(true, newRange, kind, std::move(formatArgs));
+    AddMacroCallNote(diagnostic, info, range.begin);
+    return DiagnosticBuilder(*this, diagnostic);
+}
+
+DiagnosticBuilder DiagnosticEngine::DiagnoseRefactor(DiagKindRefactor kind, const MacroCallDiagInfo& info,
+    const Position pos, std::vector<std::string> formatArgs)
+{
+    auto begin = info.MapPos(pos);
+    Range range = MakeRange(begin, begin + 1);
+    Diagnostic diagnostic(true, range, kind, std::move(formatArgs));
+    AddMacroCallNote(diagnostic, info, pos);
+    return DiagnosticBuilder(*this, diagnostic);
+}
+
 void DiagnosticEngine::Prepare()
 {
     impl->Prepare();
@@ -221,6 +256,12 @@ DiagEngineErrorCode DiagnosticEngine::GetCategoryDiagnosticsString(DiagCategory 
 {
     return impl->GetCategoryDiagnosticsString(cate, diagOut);
 }
+
+DiagEngineErrorCode DiagnosticEngine::GetCategoryDiagnosticInfos(DiagCategory cate, std::vector<DiagnosticInfo>& diagOut)
+{
+    return impl->GetCategoryDiagnosticInfos(cate, diagOut);
+}
+
 void DiagnosticEngine::EmitCategoryGroup()
 {
     impl->EmitCategoryGroup();

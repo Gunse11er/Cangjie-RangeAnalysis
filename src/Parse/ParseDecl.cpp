@@ -26,11 +26,11 @@ constexpr std::string_view ELLIPSIS("...");
 
 ParserImpl::DeclHandler ParserImpl::LookupDeclHandler(TokenKind kind)
 {
-    static constexpr int firstKind = static_cast<int>(TokenKind::STRUCT);
-    static constexpr int lastKind = static_cast<int>(TokenKind::MAIN);
-    static constexpr int arraySize = lastKind - firstKind + 1;
+    static constexpr int FIRST_KIND = static_cast<int>(TokenKind::STRUCT);
+    static constexpr int LAST_KIND = static_cast<int>(TokenKind::MAIN);
+    static constexpr int ARRAY_SIZE = LAST_KIND - FIRST_KIND + 1;
     // clang-format off
-    static const DeclHandler handlers[arraySize] = {
+    static const DeclHandler HANDLERS[ARRAY_SIZE] = {
 SUPPRESS_WARNING("-Wcast-function-type-mismatch")
         reinterpret_cast<DeclHandler>(&ParserImpl::ParseStructDecl),
         reinterpret_cast<DeclHandler>(&ParserImpl::ParseEnumDecl),
@@ -59,11 +59,11 @@ UNSUPPRESS_WARNING()
     };
     // clang-format on
 
-    int index = static_cast<int>(kind) - firstKind;
-    if (index < 0 || index >= arraySize) {
+    int index = static_cast<int>(kind) - FIRST_KIND;
+    if (index < 0 || index >= ARRAY_SIZE) {
         return nullptr;
     }
-    return handlers[index];
+    return HANDLERS[index];
 }
 
 OwnedPtr<Decl> ParserImpl::ParseDecl(ScopeKind scopeKind, std::set<Modifier> modifiers, PtrVector<Annotation> annos)
@@ -82,7 +82,7 @@ OwnedPtr<Decl> ParserImpl::ParseDecl(ScopeKind scopeKind, std::set<Modifier> mod
 
     // Enum construtor.
     if (SeeingEnumConstructor(scopeKind)) {
-        return ParseEnumConstructor(modifiers, annos);
+        return ParseEnumConstructor(modifiers, std::move(annos));
     }
     // Macro expression.
     if (SeeingMacroCallDecl()) {
@@ -100,31 +100,40 @@ OwnedPtr<Decl> ParserImpl::ParseDecl(ScopeKind scopeKind, std::set<Modifier> mod
         SetDeclBeginPos(*ret);
 
         mpImpl->CheckCJMPDecl(*ret);
+        SetBeginToAnnotationsBegin(*ret, annos);
         return ret;
     }
 
     if (SeeingPropMember(scopeKind)) {
-        return ParsePropMemberDecl(modifiers);
+        auto ret = ParsePropMemberDecl(modifiers);
+        SetBeginToAnnotationsBegin(*ret, annos);
+        return ret;
     }
     // Primary constructor decl.
     if (SeeingPrimaryConstructor(scopeKind)) {
-        return ParsePrimaryConstructor(scopeKind, modifiers, std::move(annos));
+        auto ret = ParsePrimaryConstructor(scopeKind, modifiers, std::move(annos));
+        SetBeginToAnnotationsBegin(*ret, annos);
+        return ret;
     }
     // Const Variable.
     if (HasModifier(modifiers, TokenKind::CONST) && lastToken == "const") {
         auto ret = ParseConstVariable(scopeKind, modifiers, std::move(annos));
         SetDeclBeginPos(*ret);
+        SetBeginToAnnotationsBegin(*ret, annos);
         return ret;
     }
     // Finalizer
     if (SeeingFinalizer()) {
-        return ParseFinalizer(scopeKind, modifiers, std::move(annos));
+        auto ret = ParseFinalizer(scopeKind, modifiers, std::move(annos));
+        SetBeginToAnnotationsBegin(*ret, annos);
+        return ret;
     }
     auto ret = MakeOwned<InvalidDecl>(lookahead.Begin());
     DiagExpectedDeclaration(scopeKind);
 
     ret->EnableAttr(Attribute::IS_BROKEN);
     ImplementConsumeStrategy(scopeKind);
+    SetBeginToAnnotationsBegin(*ret, annos);
     ret->end = lastToken.End();
     return ret;
 }
@@ -360,6 +369,7 @@ void ParserImpl::ParsePropBody(const std::set<Modifier>& modifiers, PropDecl& pr
                 getPropMemberDecls.emplace_back(std::move(res));
                 getter = getPropMemberDecls.back().get();
                 SkipSemi();
+                SetBeginToAnnotationsBegin(*getter, annos);
             } else {
                 auto res = ParsePropMemberDecl(modis);
                 CheckSetterAnnotations(annos, res);
@@ -368,6 +378,7 @@ void ParserImpl::ParsePropBody(const std::set<Modifier>& modifiers, PropDecl& pr
                 setPropMemberDecls.emplace_back(std::move(res));
                 setter = setPropMemberDecls.back().get();
                 SkipSemi();
+                SetBeginToAnnotationsBegin(*setter, annos);
             }
         } else {
             DiagExpectedGetOrSetInProp(propDecl.begin);
@@ -481,37 +492,9 @@ void ParserImpl::CheckOverflowAnno(PtrVector<Annotation>& annos, ScopeKind scope
 void ParserImpl::CheckPropDeclJavaMirror(PropDecl& decl)
 {
     if (decl.outerDecl && decl.outerDecl->TestAttr(Attribute::JAVA_MIRROR)) {
-        decl.EnableAttr(Attribute::JAVA_MIRROR);
-        ParseDiagnoseRefactor(DiagKindRefactor::parse_java_mirror_prop_is_deprecated, decl);
-        if (decl.outerDecl && !decl.outerDecl->TestAttr(Attribute::ABSTRACT)) {
-            decl.DisableAttr(Attribute::ABSTRACT);
-        }
-
-        if (decl.TestAttr(Attribute::PRIVATE)) {
-            ParseDiagnoseRefactor(DiagKindRefactor::parse_java_mirror_cannot_have_private_member, decl);
-            decl.EnableAttr(Attribute::IS_BROKEN);
-            decl.outerDecl->EnableAttr(Attribute::HAS_BROKEN, Attribute::IS_BROKEN);
-        }
-
-        if (decl.TestAttr(Attribute::OPEN)) {
-            ParseDiagnoseRefactor(DiagKindRefactor::parse_java_mirror_cannot_have_open_prop, decl);
-            decl.EnableAttr(Attribute::IS_BROKEN);
-            decl.outerDecl->EnableAttr(Attribute::HAS_BROKEN, Attribute::IS_BROKEN);
-        }
-
-        if (!decl.getters.empty()) {
-            ParseDiagnoseRefactor(DiagKindRefactor::parse_java_mirror_prop_cannot_have_getter, decl);
-            decl.EnableAttr(Attribute::IS_BROKEN);
-        } else {
-            InsertPropGetterSignature(decl, Attribute::JAVA_MIRROR);
-        }
-
-        if (!decl.setters.empty()) {
-            ParseDiagnoseRefactor(DiagKindRefactor::parse_java_mirror_prop_cannot_have_setter, decl);
-            decl.EnableAttr(Attribute::IS_BROKEN);
-        } else if (decl.isVar) {
-            InsertPropSetterSignature(decl, Attribute::JAVA_MIRROR);
-        }
+        ParseDiagnoseRefactor(DiagKindRefactor::parse_java_mirror_prop_is_forbidden, decl);
+        decl.EnableAttr(Attribute::IS_BROKEN);
+        decl.outerDecl->EnableAttr(Attribute::HAS_BROKEN);
     }
 }
 
@@ -727,7 +710,7 @@ void ParserImpl::CheckInitCtorDeclJavaMirror(FuncDecl& ctor)
         body->begin = ctor.end;
         body->curFile = ctor.curFile;
         body->end = ctor.end;
-        body->ty = ctor.ty;
+        body->SetTy(ctor.GetTy());
         ctor.funcBody->body = std::move(body);
     }
 }
@@ -768,7 +751,7 @@ void ParserImpl::CheckInitCtorDeclObjCMirror(FuncDecl& ctor)
         body->begin = ctor.end;
         body->curFile = ctor.curFile;
         body->end = ctor.end;
-        body->ty = ctor.ty;
+        body->SetTy(ctor.GetTy());
         ctor.funcBody->body = std::move(body);
     }
 }
@@ -1212,7 +1195,7 @@ OwnedPtr<InterfaceBody> ParserImpl::ParseInterfaceBody(InterfaceDecl& id)
 }
 
 OwnedPtr<Decl> ParserImpl::ParseEnumConstructor(
-    const std::set<AST::Modifier>& modifiers, PtrVector<AST::Annotation>& annos)
+    const std::set<AST::Modifier>& modifiers, PtrVector<AST::Annotation>&& annos)
 {
     OwnedPtr<Decl> ret;
     std::string caseIdent = lookahead.Value();
@@ -1234,6 +1217,9 @@ OwnedPtr<Decl> ParserImpl::ParseEnumConstructor(
         if (!(anno->kind == AnnotationKind::WHEN || anno->kind == AnnotationKind::DEPRECATED)) {
             DiagUnexpectedAnnoOn(*annos[0], caseIdentPos, annos[0]->identifier, caseIdent);
         }
+    }
+    if (ret) {
+        SetBeginToAnnotationsBegin(*ret, annos);
     }
     return ret;
 }
@@ -1267,7 +1253,7 @@ OwnedPtr<Decl> ParserImpl::ParseEnumConstructorWithArgs(const Token& id, PtrVect
     funcParamList->end = funcParamList->rightParenPos;
 
     OwnedPtr<FuncBody> funcBody = MakeOwned<FuncBody>();
-    funcBody->begin = lastToken.Begin();
+    funcBody->begin = funcParamList->begin;
     funcBody->paramLists.emplace_back(std::move(funcParamList));
     funcBody->end = lastToken.End();
 
@@ -1428,10 +1414,6 @@ OwnedPtr<ClassDecl> ParserImpl::ParseClassDecl(
     ret->end = lastToken.End();
     ret->annotations = std::move(annos);
 
-    if (Interop::Java::IsDeclAppropriateForSyntheticClassGeneration(*ret)) {
-        Interop::Java::InsertSyntheticClassDecl(*ret, *currentFile);
-    }
-
     CheckCJMappingAttr(*ret);
 
     return ret;
@@ -1457,10 +1439,6 @@ OwnedPtr<InterfaceDecl> ParserImpl::ParseInterfaceDecl(
     ret->body = ParseInterfaceBody(*ret);
     ret->end = lastToken.End();
     ret->annotations = std::move(annos);
-
-    if (Interop::Java::IsDeclAppropriateForSyntheticClassGeneration(*ret)) {
-        Interop::Java::InsertSyntheticClassDecl(*ret, *currentFile);
-    }
 
     CheckCJMappingAttr(*ret);
     if (Interop::ObjC::IsDeclAppropriateForSyntheticClassGeneration(*ret)) {
@@ -1894,8 +1872,8 @@ std::vector<OwnedPtr<GenericConstraint>> ParserImpl::ParseGenericConstraints()
         SpreadAttrAndConsume(genericConstraint->type.get(), genericConstraint.get(), {TokenKind::UPPERBOUND});
         auto illegalConstraint = ParseGenericUpperBound(genericConstraint);
         if (!illegalConstraint) {
-            genericConstraint->begin =
-                genericConstraint->wherePos.IsZero() ? genericConstraint->type->begin : genericConstraint->wherePos;
+            genericConstraint->begin = genericConstraint->wherePos.IsZero() ?
+                genericConstraint->type->begin : genericConstraint->wherePos;
             genericConstraint->end = lastToken.End();
             ret.push_back(std::move(genericConstraint));
         }
@@ -2185,7 +2163,7 @@ void ParserImpl::CheckClassLikeFuncBodyAbstractness(FuncDecl& decl)
     }
 
     bool hasAbstractModifier = HasModifier(decl.modifiers, TokenKind::ABSTRACT);
-    
+
     if (isJavaMirrorOrJavaMirrorSubtype) {
         if (ffiParser->Java().IsAbstractFunction(decl, *decl.outerDecl)) {
             decl.EnableAttr(Attribute::ABSTRACT);
@@ -2528,6 +2506,7 @@ OwnedPtr<FuncParam> ParserImpl::ParseParamInParamList(
     OwnedPtr<FuncParam> param = MakeOwned<FuncParam>();
     ChainScope cs(*this, param.get());
     ParseAnnotations(param->annotations);
+    SetBeginToAnnotationsBegin(*param, param->annotations);
     ParseModifiers(param->modifiers);
     ParseParameter(scopeKind, *param);
     // Check named parameter rule.

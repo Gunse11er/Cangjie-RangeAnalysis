@@ -270,19 +270,8 @@ private:
      * Attach comment group to the ast nodes in File
      */
     void AttachCommentToFile(Ptr<AST::File> node);
-    /**
-     * Attach comment group to the ast nodes(sorted by range)
-     */
-    void AttachCommentToSortedNodes(std::vector<Ptr<AST::Node>>& nodes);
-    /**
-     * Attach comment group to the ast nodes
-     * note : only run in ParseNodes in macro expansion
-     */
-    void AttachCommentToNodes(std::vector<OwnedPtr<AST::Node>>& nodes);
-    /**
-     * Collect comment groups from token stream
-     */
-    void CollectCommentGroups(AST::CommentGroupsLocInfo& cgInfo) const;
+
+    void AttachCommentToNodes(std::vector<OwnedPtr<Node>>& nodes);
     bool SeeingExprOperator();
     Token GetExprOperator();
     void SkipExprOperator();
@@ -406,8 +395,9 @@ private:
             return false;
         }
         return (SeeingModifier() && !Seeing({TokenKind::UNSAFE, TokenKind::LCURL})) ||
-            SeeingAny({TokenKind::FUNC, TokenKind::MACRO,TokenKind::LET, TokenKind::VAR, TokenKind::ENUM, TokenKind::TYPE,
-                TokenKind::STRUCT, TokenKind::CLASS, TokenKind::INTERFACE, TokenKind::MAIN, TokenKind::EXTEND}) ||
+            SeeingAny(
+                {TokenKind::FUNC, TokenKind::MACRO, TokenKind::LET, TokenKind::VAR, TokenKind::ENUM, TokenKind::TYPE,
+                    TokenKind::STRUCT, TokenKind::CLASS, TokenKind::INTERFACE, TokenKind::MAIN, TokenKind::EXTEND}) ||
             (SeeingBuiltinAnnotation() && !SeeingAnnotationLambdaExpr());
     }
     bool SeeingPrimaryIdentifer();
@@ -432,17 +422,15 @@ private:
         return Seeing(TokenKind::IDENTIFIER) && (lookahead == "get" || lookahead == "set");
     }
 
-    bool SeeingInitializer()
-    {
-        return Seeing(TokenKind::INIT);
-    }
-
     bool SeeingEnumConstructor(const ScopeKind& scopeKind)
     {
         return (Seeing(TokenKind::IDENTIFIER) || SeeingContextualKeyword()) &&
             (scopeKind == ScopeKind::ENUM_BODY || scopeKind == ScopeKind::ENUM_CONSTRUCTOR);
     }
-
+    bool SeeingInitializer()
+    {
+        return Seeing(TokenKind::INIT);
+    }
     bool SeeingFinalizer()
     {
         if (Seeing({TokenKind::BITNOT, TokenKind::INIT}, false)) {
@@ -511,10 +499,13 @@ private:
     // return: seeing end of file.
     bool ParsePackageHeaderEnd();
     void CheckAndHandleUnexpectedTopLevelDeclAfterFeatures();
+    void CheckExpectedTopLevelDeclWhenNoPackage(
+        const PtrVector<AST::Annotation>& annos, const std::set<AST::Modifier>& modifiers);
     bool IsExpectedTokenAfterFeaturesOrPackage(bool allowPackageKeyword);
     void ParseTopLevelDecls(AST::File& file, std::vector<OwnedPtr<AST::Annotation>>& annos);
     void ParseTopLevelDecl(AST::File& file, std::vector<OwnedPtr<AST::Annotation>>& annos);
     void ParseAnnotations(PtrVector<AST::Annotation>& annos);
+    void SetBeginToAnnotationsBegin(Node& node, const PtrVector<Annotation>& annos);
     OwnedPtr<AST::Annotation> ParseCustomAnnotation();
     OwnedPtr<AST::Annotation> ParseAnnotation();
     void ParseModifiers(std::set<AST::Modifier>& modifiers);
@@ -640,8 +631,6 @@ private:
     OwnedPtr<AST::Expr> ParseCallExpr(OwnedPtr<AST::Expr> baseExpr);
     AST::SuffixKind ParseSuffix(OwnedPtr<AST::Expr>& baseExpr);
     void ParseBaseExprPostfix(OwnedPtr<AST::Expr>& baseExpr, ExprKind ek = ExprKind::ALL);
-    OwnedPtr<AST::Expr> ParseOptionalExpr(
-        const Position questPos, OwnedPtr<AST::Expr> baseExpr, AST::SuffixKind suffix) const;
     void ParseQuestSuffixExpr(OwnedPtr<AST::Expr>& expr);
     OwnedPtr<AST::Expr> ParseAtom(ExprKind ek = ExprKind::ALL);
     bool IsNeedToCreateOptionalChain(TokenKind token, AST::Expr& expr) const;
@@ -755,7 +744,7 @@ private:
     OwnedPtr<AST::ClassBody> ParseClassBody(AST::ClassDecl& cd);
     OwnedPtr<AST::InterfaceBody> ParseInterfaceBody(AST::InterfaceDecl& id);
     OwnedPtr<AST::Decl> ParseEnumConstructor(
-        const std::set<AST::Modifier>& modifiers, PtrVector<AST::Annotation>& annos);
+        const std::set<AST::Modifier>& modifiers, PtrVector<AST::Annotation>&& annos);
     OwnedPtr<AST::TypePattern> ParseTypePattern(const Position& begin);
     OwnedPtr<AST::ConstPattern> ParseConstPattern();
 
@@ -819,8 +808,6 @@ private:
     /// Note that trailing comma is invalid if there are zero elements.
     void ParseZeroOrMoreSepTrailing(std::function<void(const Position&)>&& storeSeparator,
         std::function<void()>&& parseElement, TokenKind end, TokenKind separator = TokenKind::COMMA);
-    void ParseZeroOrMoreWithSeparator(TokenKind separator, const std::function<void(const Position)>& storeSeparator,
-        const std::function<void()>& parseElement, TokenKind terminator);
     void CheckOverflowAnno(
         std::vector<OwnedPtr<AST::Annotation>>& annos, ScopeKind scopeKind = ScopeKind::UNKNOWN_SCOPE);
     void CheckAnnotationAnno(PtrVector<AST::Annotation>& annos, std::set<AST::Modifier> modifiers);
@@ -867,8 +854,6 @@ private:
      * @param del left symbol
      * @param pos position of left symbol
      */
-    void DiagAndSuggestKeywordForExpectedDeclaration(
-        const std::vector<std::string>& keywords, size_t minLevDis = 1, ScopeKind scopeKind = ScopeKind::TOPLEVEL);
     void DiagRawIdentifierNotAllowed(std::string& str);
     void DiagExpectedRightDelimiter(const std::string& del, const Position& pos);
     void DiagInvalidIncreExpr(const AST::Expr& expr);
@@ -905,6 +890,14 @@ private:
     void DiagRedundantArrowAfterFunc(const AST::Type& type);
     void DiagExpectedDeclaration(ScopeKind scopeKind);
     void DiagExpectedDeclaration(const Position& pos, const std::string& str);
+    /**
+        * Suggest keywords for expected declaration.
+        * @param keywords keywords to suggest
+        * @param minLevDis minimum Levenshtein distance to suggest
+        * @param scopeKind scope kind to determine which keywords to suggest
+    */
+    void DiagAndSuggestKeywordForExpectedDeclaration(
+        const std::vector<std::string>& keywords, size_t minLevDis = 1, ScopeKind scopeKind = ScopeKind::TOPLEVEL);
     void DiagUnExpectedModifierOnDeclaration(const AST::Decl& vd);
     void DiagConstVariableExpectedStatic(const Token& key);
     void DiagConstVariableExpectedInitializer(AST::Decl& vd);
@@ -1164,7 +1157,35 @@ private:
     bool oldNewlineSkipped;
 };
 
-AST::TypeKind LookupPrimitiveTypeKind(TokenKind kind);
+inline AST::TypeKind LookupPrimitiveTypeKind(TokenKind kind)
+{
+    static constexpr int FIRST = static_cast<int>(TokenKind::INT8);
+    static constexpr int LAST = static_cast<int>(TokenKind::UNIT);
+    static constexpr AST::TypeKind TABLE[] = {
+        AST::TypeKind::TYPE_INT8,
+        AST::TypeKind::TYPE_INT16,
+        AST::TypeKind::TYPE_INT32,
+        AST::TypeKind::TYPE_INT64,
+        AST::TypeKind::TYPE_INT_NATIVE,
+        AST::TypeKind::TYPE_UINT8,
+        AST::TypeKind::TYPE_UINT16,
+        AST::TypeKind::TYPE_UINT32,
+        AST::TypeKind::TYPE_UINT64,
+        AST::TypeKind::TYPE_UINT_NATIVE,
+        AST::TypeKind::TYPE_FLOAT16,
+        AST::TypeKind::TYPE_FLOAT32,
+        AST::TypeKind::TYPE_FLOAT64,
+        AST::TypeKind::TYPE_RUNE,
+        AST::TypeKind::TYPE_BOOLEAN,
+        AST::TypeKind::TYPE_NOTHING,
+        AST::TypeKind::TYPE_UNIT,
+    };
+    int idx = static_cast<int>(kind) - FIRST;
+    if (idx < 0 || idx > LAST - FIRST) {
+        return AST::TypeKind::TYPE_INVALID;
+    }
+    return TABLE[idx];
+}
 
 // Levenshtein distance calculation for suggesting similar names in diagnostics.
 unsigned LevenshteinDistance(const std::string& source, const std::string& target);

@@ -23,7 +23,7 @@ public:
      */
     static void RunOnPackage(const Package& package, CHIRBuilder& builder);
 private:
-    static void RunOnFunc(const Func& func, CHIRBuilder& builder);
+    static void RunOnFunc(const Function& func, CHIRBuilder& builder);
 };
 } // namespace Cangjie::CHIR
 

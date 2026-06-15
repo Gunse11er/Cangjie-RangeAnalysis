@@ -32,7 +32,7 @@ inline bool IsCPointerFrozenMember(const Decl& decl)
         return false;
     }
 
-    return StaticCast<ExtendDecl>(decl.outerDecl)->extendedType->ty->IsPointer();
+    return StaticCast<ExtendDecl>(decl.outerDecl)->extendedType->GetTy()->IsPointer();
 }
 } // namespace
 
@@ -59,27 +59,7 @@ bool IsOpenDecl(const Decl& decl)
     return decl.TestAnyAttr(AST::Attribute::ABSTRACT, AST::Attribute::OPEN) || decl.astKind == ASTKind::INTERFACE_DECL;
 };
 
-/**
- * Check whether the location where the instantiation is triggered is in the context with Open semantics.
- * Return true if expr is in a member of an open class or interface.
- */
-bool IsInOpenContext(const std::vector<Ptr<AST::Decl>>& contextDecl)
-{
-    bool isInOpenContext = !contextDecl.empty();
-    if (isInOpenContext) {
-        auto toplevelDecl = contextDecl.front();
-        if (toplevelDecl->IsNominalDecl()) {
-            isInOpenContext = IsOpenDecl(*toplevelDecl);
-        } else {
-            // In global function if outer is null, and global function context can be instantated.
-            auto outer = GetOuterStructDecl(*toplevelDecl);
-            isInOpenContext = outer == nullptr || IsOpenDecl(*outer);
-        }
-    }
-    return isInOpenContext;
-}
-
-bool RequireInstantiation(const Decl& decl, bool isInOpenContext)
+bool RequireInstantiation(const Decl& decl)
 {
     // Skip instantiations in common code compilation because:
     // 1. Common code may be incomplete at this stage
@@ -101,8 +81,8 @@ bool RequireInstantiation(const Decl& decl, bool isInOpenContext)
         }
         if (decl.TestAttr(Attribute::GENERIC)) {
             auto& members = decl.GetMemberDecls();
-            return std::any_of(members.begin(), members.end(),
-                [&isInOpenContext](auto& member) { return RequireInstantiation(*member, isInOpenContext); });
+            return std::any_of(
+                members.begin(), members.end(), [](auto& member) { return RequireInstantiation(*member); });
         }
         return false;
     }
@@ -116,7 +96,7 @@ bool RequireInstantiation(const Decl& decl, bool isInOpenContext)
     //      class A <: I { static func foo(): Int64 {1} }
     //      class B <: I { static func foo(): Int64 {2} }
     // CallExpr `foo()` cannot pointer to any instantation version, it must be a static-invoke.
-    if (IsVirtualMember(decl) || isInOpenContext) {
+    if (IsVirtualMember(decl)) {
         return false;
     }
     if (decl.IsConst()) {
@@ -155,10 +135,10 @@ OwnedPtr<Generic> InstantiateGeneric(const Generic& generic, const VisitFunc& vi
 MacroInvocation InstantiateMacroInvocation(const MacroInvocation& me)
 {
     MacroInvocation mi;
-    mi.fullName = me.fullName;
+    mi.macroCallDiagInfo.fullName = me.macroCallDiagInfo.fullName;
     mi.fullNameDotPos = me.fullNameDotPos;
-    mi.identifier = me.identifier;
-    mi.identifierPos = me.identifierPos;
+    mi.macroCallDiagInfo.identifier = me.macroCallDiagInfo.identifier;
+    mi.macroCallDiagInfo.identifierPos = me.macroCallDiagInfo.identifierPos;
     mi.leftSquarePos = me.leftSquarePos;
     mi.attrs = me.attrs;
     mi.rightSquarePos = me.rightSquarePos;
@@ -178,7 +158,7 @@ void CopyNodeField(Ptr<Node> ret, const Node& e)
 {
     ret->begin = e.begin;
     ret->end = e.end;
-    ret->ty = e.ty;
+    ret->SetTy(e.GetTy());
     ret->curMacroCall = e.curMacroCall;
     ret->isInMacroCall = e.isInMacroCall;
     CopyNodeScopeInfo(ret, &e);
@@ -1502,7 +1482,6 @@ OwnedPtr<Annotation> PartialInstantiation::InstantiateAnnotation(const Annotatio
     ret->identifier = annotation.identifier;
     ret->attrs = annotation.attrs;
     ret->attrCommas = annotation.attrCommas;
-    ret->adAnnotation = annotation.adAnnotation;
     ret->rsquarePos = annotation.rsquarePos;
     ret->lsquarePos = annotation.lsquarePos;
     for (auto& arg : annotation.args) {

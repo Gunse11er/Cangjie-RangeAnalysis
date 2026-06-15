@@ -125,6 +125,14 @@ namespace InvokeRuntime {
     int CloseSymbolTable(HANDLE handle);
 
     /**
+     * @brief Open dynamic library with default flags for plugin/runtime loading.
+     *
+     * @param path Dynamic library path.
+     * @return HANDLE Handle for the dynamic library.
+     */
+    HANDLE OpenSymbolTableSafely(const std::string& path);
+
+    /**
      * @brief get libs that has been open.
      *
      * @return std::vector<HANDLE> opened llibrary Handle.

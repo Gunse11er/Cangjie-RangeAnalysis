@@ -109,7 +109,7 @@ inline bool NeedSynOnUsed(const AST::Decl& target)
     // because the ty is already set at PreCheck stage.
     // Source imported function will not been checked from toplevel, so we must synthesize it when used.
     return !target.IsTypeDecl() && target.astKind != AST::ASTKind::FUNC_PARAM &&
-        (!AST::Ty::IsTyCorrect(target.ty) || target.ty->HasQuestTy());
+        (!AST::Ty::IsTyCorrect(target.GetTy()) || target.GetTy()->HasQuestTy());
 }
 
 std::string GetFullInheritedTy(AST::ExtendDecl& extend);
@@ -291,8 +291,7 @@ OwnedPtr<AST::CallExpr> CreateInitCall(
     std::vector<OwnedPtr<AST::Expr>>& valueArgs,
     AST::File& curFile, const std::vector<Ptr<AST::Ty>> instTys = {});
 
-Ptr<AST::FuncDecl> GenerateGetTypeForTypeParamIntrinsic(
-    AST::Package& pkg, TypeManager& typeManager, Ptr<AST::Ty> strTy);
+Ptr<AST::FuncDecl> GenerateGetTypeForTypeParamIntrinsic(AST::Package& pkg, TypeManager& typeManager);
 
 // Generates declaration of intrinsic that is roughly eqivalent to expression `TypeLeft is TypeRight`,
 // where `TypeLeft` and `TypeRight` are types and the result is true iff TypeLeft is subtype of TypeRight:
@@ -305,11 +304,6 @@ OwnedPtr<AST::GenericParamDecl> CreateGenericParamDecl(
     AST::Decl& decl, const std::string& name, TypeManager& typeManager);
 OwnedPtr<AST::GenericParamDecl> CreateGenericParamDecl(AST::Decl& decl, TypeManager& typeManager);
 
-static bool const IS_GENERIC_INSTANTIATION_ENABLED =
-#ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
-    false;
-#endif
-
 template <typename T> T* GetMemberDecl(
     const AST::Decl& decl, const std::string& identifier, std::vector<Ptr<AST::Ty>> paramTys, TypeManager& typeManager)
 {
@@ -319,7 +313,7 @@ template <typename T> T* GetMemberDecl(
         }
         bool isSuitableDecl = true;
         if (auto funcMember = DynamicCast<AST::FuncDecl>(member.get()); funcMember) {
-            auto originalParamTys = RawStaticCast<const AST::FuncTy*>(funcMember->ty)->paramTys;
+            auto originalParamTys = RawStaticCast<const AST::FuncTy*>(funcMember->GetTy())->paramTys;
             if (originalParamTys.size() != paramTys.size()) {
                 continue;
             }

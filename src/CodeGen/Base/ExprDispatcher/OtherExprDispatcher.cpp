@@ -253,7 +253,8 @@ llvm::Value* HandleBoxExpr(IRBuilder2& irBuilder, const CHIR::Expression& chirEx
         // - we are in the scope of a struct instance method(without "$withTI" postfix),
         //   the "struct" mentioned above is the `this` parameter of the method.
         if (IsTypeContainsRef(srcCGType->GetLLVMType())) {
-            irBuilder.CallGCWriteAgg({tmp, payloadPtr, cgVal.GetRawValue(), size});
+            irBuilder.CallGCWriteAgg(
+                srcCGType->GetLayoutType(), {tmp, payloadPtr, cgVal.GetRawValue(), size});
         } else {
             irBuilder.CreateMemCpy(payloadPtr, llvm::MaybeAlign(), cgVal.GetRawValue(), llvm::MaybeAlign(), size);
         }
@@ -274,12 +275,12 @@ llvm::Value* HandleUnBoxExpr(IRBuilder2& irBuilder, const CHIR::Expression& chir
     auto srcFuncType = chirExpr.GetTopLevelFunc()->Get<CHIR::OverrideSrcFuncType>();
     if (srcFuncType && unboxExpr.GetSourceValue()->IsParameter() && DeRef(*unboxExpr.GetSourceTy())->IsBox()) {
         for (size_t i = 0; i < chirExpr.GetTopLevelFunc()->GetNumOfParams(); i++) {
-            if (unboxExpr.GetSourceValue()->GetIdentifier() ==
-                chirExpr.GetTopLevelFunc()->GetParam(i)->GetIdentifier()) {
+            if (unboxExpr.GetSourceValue() == chirExpr.GetTopLevelFunc()->GetParam(i)) {
                 auto cgParamType = CGType::GetOrCreate(cgMod, srcFuncType->GetParamType(i));
                 if (cgParamType->GetSize()) {
                     return cgVal->GetRawValue();
                 }
+                break;
             }
         }
     }

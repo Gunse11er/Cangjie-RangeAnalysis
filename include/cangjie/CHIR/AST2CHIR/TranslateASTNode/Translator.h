@@ -36,10 +36,10 @@ public:
         const ElementList<Ptr<const AST::Decl>>& localConstVars,
         const ElementList<Ptr<const AST::FuncDecl>>& localConstFuncs, const IncreKind& kind,
         const std::unordered_map<std::string, Value*>& deserializedVals,
-        std::vector<std::pair<const AST::Decl*, Func*>>& annoFactories,
+        std::vector<std::pair<const AST::Decl*, Function*>>& annoFactories,
         std::unordered_map<Block*, Terminator*>& maybeUnreachable,
         bool computeAnnotations,
-        std::vector<CHIR::Func*>& initFuncForAnnoFactory,
+        std::vector<CHIR::Function*>& initFuncForAnnoFactory,
         const Cangjie::TypeManager& typeManager)
         : builder(builder),
           chirTy(chirTy),
@@ -117,14 +117,6 @@ public:
         bool isVirtualFuncCall{false};
     };
 
-    struct InstInvokeCalleeInfo {
-        std::string srcCodeIdentifier;
-        FuncType* instFuncType{nullptr};
-        FuncType* originalFuncType{nullptr}; // not ()->Unit, include this type
-        std::vector<Type*> instantiatedTypeArgs;
-        std::vector<GenericType*> genericTypeParams;
-        Type* thisType{nullptr};
-    };
     // === static helper functions ==
     /**
      * @brief Retrieves the constructor ID of an enum.
@@ -350,7 +342,7 @@ public:
      * @param isConst The global var is const or not.
      * @return A pointer to the created function.
      */
-    Ptr<Func> CreateEmptyGVInitFunc(const std::string& mangledName, const std::string& identifier,
+    Ptr<Function> CreateEmptyGVInitFunc(const std::string& mangledName, const std::string& identifier,
         const std::string& rawMangledName, const std::string& pkgName, const Linkage& linkage,
         const DebugLocation& loc, bool isConst);
     
@@ -406,10 +398,10 @@ public:
      * @param decl The declaration.
      * @param func The function to translate the body for.
      */
-    void TranslateAnnoFactoryFuncBody(const AST::Decl& decl, Func& func);
-    void TranslateAnnotationsArrayBody(const AST::Decl& decl, Func& func);
-    std::vector<GlobalVar*> TranslateAnnotationsArraySig(const AST::ArrayLit& annos, const Func& func);
-    GlobalVar* TranslateCustomAnnoInstanceSig(const AST::Expr& expr, const Func& func, size_t i);
+    void TranslateAnnoFactoryFuncBody(const AST::Decl& decl, Function& func);
+    void TranslateAnnotationsArrayBody(const AST::Decl& decl, Function& func);
+    std::vector<GlobalVar*> TranslateAnnotationsArraySig(const AST::ArrayLit& annos, const Function& func);
+    GlobalVar* TranslateCustomAnnoInstanceSig(const AST::Expr& expr, const Function& func, size_t i);
 
     /**
      * @brief Creates annotation information for a function parameter.
@@ -516,9 +508,6 @@ public:
     /// 2. translating the initialiser of a discarded pattern
     void TranslateSubExprToDiscarded(const AST::Node& node);
 
-    void CollectValueAnnotation(const AST::Decl& decl);
-    void CollectTypeAnnotation(const AST::InheritableDecl& decl, const CustomTypeDef& cl);
-
     /**
      * @brief Creates var init func for class/struct decls, because of cjmp.
      *
@@ -547,8 +536,8 @@ private:
     /** Used for store side effect expressions and other expression which does not have associated valid ast. */
     AST2CHIRNodeMap<Value> exprValueTable;
     // Since property's getter and setter will share same annotation function, we need to cache the function name.
-    std::unordered_map<Ptr<const AST::Decl>, std::string> annotationFuncMap;
-    static std::unordered_map<std::string, Ptr<Func>> jAnnoFuncMap;
+    std::unordered_map<Ptr<const AST::Decl>, AnnoInfo> annotationFuncMap;
+    static std::unordered_map<std::string, Ptr<Function>> jAnnoFuncMap;
     std::vector<Ptr<BlockGroup>> blockGroupStack;
     Ptr<Block> currentBlock;
     Ptr<Value> delayExitSignal;
@@ -618,10 +607,10 @@ private:
     const IncreKind& increKind;
     const bool mergingSpecific; // add by cjmp
     const std::unordered_map<std::string, Value*>& deserializedVals; // add by cjmp
-    std::vector<std::pair<const AST::Decl*, Func*>>& annoFactoryFuncs;
+    std::vector<std::pair<const AST::Decl*, Function*>>& annoFactoryFuncs;
     std::unordered_map<Block*, Terminator*>& maybeUnreachable;
     bool isComputingAnnos{};
-    std::vector<CHIR::Func*>& initFuncsForAnnoFactory;
+    std::vector<CHIR::Function*>& initFuncsForAnnoFactory;
     const Cangjie::TypeManager& typeManager;
 
     class ScopeContext {
@@ -662,7 +651,7 @@ private:
     }
     void SetFuncBlockGroup(BlockGroup& group);
     bool OverloadableExprMayThrowException(const AST::OverloadableExpr& expr, const Type& leftValTy) const;
-    void SetRawMangledNameForIncrementalCompile(const AST::FuncDecl& astFunc, Func& chirFunc) const;
+    void SetRawMangledNameForIncrementalCompile(const AST::FuncDecl& astFunc, Function& chirFunc) const;
 
     /** @brief Wrapped expression creation to handle both normal context and try-catch context.*/
     template <typename TExpr, typename... Args> Expression* TryCreate(Block* parent, Args&&... args)
@@ -724,12 +713,13 @@ private:
 
     std::vector<Type*> GetFuncInstArgs(const AST::CallExpr& expr);
 
-    Expression* GenerateFuncCall(Value& callee, const FuncType* instantiedFuncTy,
-        const std::vector<Type*> calleeInstTypeArgs, Type* thisTy,
-        const std::vector<Value*>& args, DebugLocation loc);
-
-    Expression* GenerateDynmaicDispatchFuncCall(const InstInvokeCalleeInfo& funcInfo, const std::vector<Value*>& args,
-        Value* thisObj = nullptr, Value* thisRTTI = nullptr, DebugLocation loc = INVALID_LOCATION);
+    Expression* CreateAndAppendApplyCallFromCallExpr(
+        Value& callee, FuncCallContext& context, const FuncType& instFuncTy, const AST::CallExpr& expr);
+    Expression* CreateAndAppendApplyCallFromArray(
+        Value& callee, FuncCallContext& context, const FuncType& instFuncTy, const AST::Expr& array);
+    Expression* CreateAndAppendGVInitFuncCall(Value& callee);
+    void CreateAndAppendVArraySet(
+        Value& lhs, Value& rhs, Value& index, Type& elementType, const DebugLocation& loc);
 
     CHIR::Type* GetExactParentType(Type& fuzzyParentType, const AST::FuncDecl& resolvedFunction, FuncType& funcType,
         std::vector<Type*>& funcInstTypeArgs, bool checkAbstractMethod);
@@ -749,13 +739,11 @@ private:
     Ptr<FuncType> CreateVirtualFuncType(const AST::FuncDecl& decl);
     void AddMemberVarDecl(CustomTypeDef& def, const AST::VarDecl& decl);
     inline bool IsOpenSpecificReplaceAbstractCommon(ClassDef& classDef, const AST::FuncDecl& decl) const;
-    inline void RemoveAbstractMethod(ClassDef& classDef, const AST::FuncDecl& decl) const;
     void TranslateClassLikeMemberFuncDecl(ClassDef& classDef, const AST::FuncDecl& decl);
     bool SkipMemberFuncInSpecificMerging(ClassDef& classDef, const AST::FuncDecl& decl);
     void AddMemberFunctionGenericInstantiations(
         ClassDef& classDef, const std::vector<AST::FuncDecl*>& instFuncs, const AST::FuncDecl& originalDecl);
     void AddMemberPropDecl(CustomTypeDef& def, const AST::PropDecl& decl);
-    void TranslateAbstractMethod(ClassDef& classDef, const AST::FuncDecl& decl, bool hasBody);
 
     /* Add methods for CJMP. */
     // Micro refactoring for CJMP.
@@ -763,11 +751,11 @@ private:
     void SetClassImplementedInterface(ClassDef& classDef, const AST::ClassLikeDecl& decl);
     // Translate member var init func for common/specific decls.
     // Return empty `xxx$varInit` func for member var of common/specific decl, otherwise return nullptr.
-    Func* ClearOrCreateVarInitFunc(const AST::Decl& decl);
+    Function* ClearOrCreateVarInitFunc(const AST::Decl& decl);
     // Translate `xxx$varInit` func for member var of common/specific decl, otherwise return nullptr.
-    Func* TranslateVarInit(const AST::VarDecl& varDecl);
+    Function* TranslateVarInit(const AST::VarDecl& varDecl);
     // Translate `A$varInit` func for member vars of common/specific decl, otherwise return nullptr.
-    Func* TranslateVarsInit(const AST::Decl& decl);
+    Function* TranslateVarsInit(const AST::Decl& decl);
     // Add `apply` `xxx$varInit` func of all fields into `A$varInit` func.
     void TranslateVariablesInit(const AST::Decl& parent, CHIR::Parameter& thisVar);
     // Add inlined apply for xxx$varInit func.
@@ -855,7 +843,7 @@ private:
     Value* TranslateCompoundAssign(const AST::AssignExpr& assign);
     Value* TranslateTrivialAssign(const AST::AssignExpr& assign);
 
-    Func* GetCurrentFunc() const
+    Function* GetCurrentFunc() const
     {
         CJC_ASSERT(!blockGroupStack.empty());
         return blockGroupStack.front()->GetOwnerFunc();
@@ -910,7 +898,7 @@ private:
     Ptr<Value> TranslateForInIter(const AST::ForInExpr& forInExpr);
     /// Make a Option::None value of option type \param optionType.
     Ptr<Value> MakeNone(Type& optionType, const DebugLocation& loc);
-    Ptr<Value> TranslateForInIterCondition(Ptr<Value>& iterNextLocation, Ptr<AST::Ty>& astTy);
+    Ptr<Value> TranslateForInIterCondition(Ptr<Value>& iterNextLocation, Ptr<AST::Ty> astTy);
     void TranslateForInIterPattern(const AST::ForInExpr& forInExpr, Ptr<Value>& iterNextLocation);
     void TranslateForInIterLatchBlockGroup(const AST::MatchExpr& matchExpr, Ptr<Value>& iterNextLocation);
     // ========End methods used for translating ForInExpr=========
@@ -979,7 +967,6 @@ private:
         const AST::NameReferenceExpr& expr, Type& thisType, const AST::FuncDecl& funcDecl, bool& isVirtualFuncCall);
     InstCalleeInfo GetInstCalleeInfoFromRefExpr(const AST::RefExpr& expr);
     InstCalleeInfo GetInstCalleeInfoFromMemberAccess(const AST::MemberAccess& expr);
-    Ptr<Value> GetBaseFromMemberAccess(const AST::Expr& base);
 
     Ptr<Value> TransformThisType(Value& rawThis, Type& expectedTy, Lambda& curLambda);
 
@@ -1074,25 +1061,11 @@ private:
         const std::vector<SecondSwitchInfo>& infos,
         std::unordered_map<size_t, std::vector<Ptr<Block>>>& blockBranchInfos);
 
-    template <typename... Args>
-    void CreateWrappedStore(const DebugLocation& loc, Ptr<Value> value, Ptr<Value> location, Args&&... args)
-    {
-        auto resultType = location->GetType();
-        CJC_ASSERT(resultType->IsRef());
-        resultType = StaticCast<RefType*>(resultType)->GetBaseType();
-        CreateAndAppendExpression<Store>(loc, builder.GetUnitTy(), TypeCastOrBoxIfNeeded(*value, *resultType, loc),
-            location, std::forward<Args>(args)...);
-    }
-    template <typename... Args>
-    void CreateWrappedStore(const Ptr<Value>& value, const Ptr<Value>& location, Args&&... args)
-    {
-        auto resultType = location->GetType();
-        CJC_ASSERT(resultType->IsRef());
-        resultType = StaticCast<RefType*>(resultType)->GetBaseType();
-        CreateAndAppendExpression<Store>(
-            builder.GetUnitTy(), TypeCastOrBoxIfNeeded(*value, *resultType, value->GetDebugLocation()),
-            location, std::forward<Args>(args)...);
-    }
+    void CreateAndAppendWrappedStoreElementByName(
+        const DebugLocation& loc, Value& rhs, Value& lhs, const std::vector<std::string>& path);
+    void CreateAndAppendWrappedStore(Value& rhs, Value& lhs, const DebugLocation& loc = INVALID_LOCATION);
+    void CreateAndAppendWrappedStore(
+        Value& rhs, Value& lhs, Block& parent, const DebugLocation& loc = INVALID_LOCATION);
 
     template <typename... Args> void CreateWrappedBranch(const SourceExpr& sourceExpr, Args&&... args)
     {
@@ -1116,13 +1089,11 @@ private:
     void HandleInitializedArgVal(const AST::CallExpr& ce, std::vector<Value*>& args);
 
     Value* TranslateThisObjectForNonStaticMemberFuncCall(const AST::CallExpr& expr, bool needsMutableThis);
-    void TranslateTrivialArgsWithSugar(
-        const AST::CallExpr& expr, std::vector<Value*>& args, const std::vector<Type*>& expectedArgTys);
-    Value* TranslateTrivialArgWithNoSugar(const AST::FuncArg& arg, Type* expectedArgTy, const DebugLocation& loc);
-    void TranslateTrivialArgsWithNoSugar(
-        const AST::CallExpr& expr, std::vector<Value*>& args, const std::vector<Type*>& expectedArgTys);
-    void TranslateTrivialArgs(
-        const AST::CallExpr& expr, std::vector<Value*>& args, const std::vector<Type*>& expectedArgTys);
+    void TranslateFuncArgsWithoutThisObj(
+        const AST::CallExpr& expr, std::vector<Value*>& args, const std::vector<Type*>* expectedParamTys);
+    Value* TranslateTrivialArgWithNoSugar(const AST::FuncArg& arg, const DebugLocation& loc, Type* expectedTy);
+    std::vector<Value*> TranslateFuncArgs(
+        const AST::CallExpr& expr, Type* expectedThisObjTy, const std::vector<Type*>* expectedParamTys);
 
     Ptr<Value> GetCurrentThisObject(const AST::FuncDecl& resolved);
     Value* GetCurrentThisObjectByMemberAccess(const AST::MemberAccess& memAccess, const AST::FuncDecl& resolved,
@@ -1172,8 +1143,9 @@ private:
 
     GenericType* TranslateCompleteGenericType(AST::GenericsTy& ty);
     
-    // intrinsic special
-    Type* HandleSpecialIntrinsic(IntrinsicKind intrinsicKind, std::vector<Value*>& args, Type* retTy);
+    // Helper to intrinsic translate.
+    void BlackBoxModifyArgTypeToRef(std::vector<Value*>& args);
+
     void AddMemberMethodToCustomTypeDef(const AST::FuncDecl& decl, CustomTypeDef& def);
 };
 

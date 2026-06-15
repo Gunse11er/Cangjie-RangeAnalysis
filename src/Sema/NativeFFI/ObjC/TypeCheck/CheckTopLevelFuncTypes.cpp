@@ -25,7 +25,7 @@ void CheckTopLevelFuncTypes::HandleImpl(TypeCheckContext& ctx)
 
     for (auto& paramList : fd->funcBody->paramLists) {
         for (auto& param : paramList->params) {
-            if (!ctx.typeMapper.IsObjCCompatible(*param->ty)) {
+            if (!ctx.typeMapper.IsObjCCompatible(*param->GetTy())) {
                 ctx.diag.DiagnoseRefactor(DiagKindRefactor::sema_objc_interop_toplevel_param_must_be_objc_compatible,
                     *param->type, fd->identifier.Val());
 
@@ -33,7 +33,7 @@ void CheckTopLevelFuncTypes::HandleImpl(TypeCheckContext& ctx)
             }
         }
     }
-    if (fd->funcBody->retType && !ctx.typeMapper.IsObjCCompatible(*fd->funcBody->retType->ty)) {
+    if (fd->funcBody->retType && !ctx.typeMapper.IsObjCCompatible(*fd->funcBody->retType->GetTy())) {
         ctx.diag.DiagnoseRefactor(DiagKindRefactor::sema_objc_interop_toplevel_ret_must_be_objc_compatible,
             *fd->funcBody->retType, fd->identifier.Val());
 

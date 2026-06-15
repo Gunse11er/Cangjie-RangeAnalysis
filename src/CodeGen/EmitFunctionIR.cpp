@@ -45,7 +45,7 @@ inline llvm::Value* ProcessParamOnDemand(
 }
 
 inline void InitIRBuilder(
-    std::unique_ptr<IRBuilder2>& builder, CGModule& cgMod, const CHIR::Func& chirFunc, llvm::Function& llvmFunc)
+    std::unique_ptr<IRBuilder2>& builder, CGModule& cgMod, const CHIR::Function& chirFunc, llvm::Function& llvmFunc)
 {
     if (!builder) {
         builder = std::make_unique<IRBuilder2>(cgMod);
@@ -57,7 +57,7 @@ inline void InitIRBuilder(
     }
 }
 
-void HandleCFuncParams(CGModule& cgMod, const CHIR::Func& chirFunc, llvm::Function& llvmFunc)
+void HandleCFuncParams(CGModule& cgMod, const CHIR::Function& chirFunc, llvm::Function& llvmFunc)
 {
     auto chirFuncTy = chirFunc.GetFuncType();
     std::unique_ptr<IRBuilder2> builder;
@@ -92,7 +92,7 @@ void HandleCFuncParams(CGModule& cgMod, const CHIR::Func& chirFunc, llvm::Functi
 inline void HandleCFuncParams(CGModule& cgMod, const CHIR::Value& chirFunc, llvm::Function& llvmFunc)
 {
     if (chirFunc.IsFuncWithBody()) {
-        HandleCFuncParams(cgMod, *VirtualCast<const CHIR::Func>(&chirFunc), llvmFunc);
+        HandleCFuncParams(cgMod, *StaticCast<const CHIR::Function>(&chirFunc), llvmFunc);
     } else {
         // The remaining case can only be imported function, we needn't process params for it.
         CJC_ASSERT(chirFunc.IsImportedFunc());
@@ -100,7 +100,7 @@ inline void HandleCFuncParams(CGModule& cgMod, const CHIR::Value& chirFunc, llvm
 }
 #endif
 
-void HandleFuncParams(CGModule& cgMod, const CHIR::Func& chirFunc, const CGFunction& cgFunc)
+void HandleFuncParams(CGModule& cgMod, const CHIR::Function& chirFunc, const CGFunction& cgFunc)
 {
     for (size_t idx = 0; idx < chirFunc.GetNumOfParams(); ++idx) {
         auto chirFuncArg = chirFunc.GetParam(idx);
@@ -133,7 +133,7 @@ inline void BuildCFunc(CGModule& cgMod, const CHIR::Value& chirFunc, const CGFun
 
     if (chirFunc.IsFuncWithBody()) {
         // CFFI wrap func should not set Personality
-        auto funcNode = VirtualCast<const CHIR::Func*>(&chirFunc);
+        auto funcNode = StaticCast<const CHIR::Function*>(&chirFunc);
         if (!funcNode->IsCFFIWrapper()) {
             llvmFunc->setPersonalityFn(cgMod.GetExceptionIntrinsicPersonality());
         } else {
@@ -153,7 +153,7 @@ inline void BuildCFunc(CGModule& cgMod, const CHIR::Value& chirFunc, const CGFun
 
 namespace Cangjie {
 namespace CodeGen {
-void BuildCJFunc(CGModule& cgMod, const CHIR::Func& chirFunc, const CGFunction& cgFunc)
+void BuildCJFunc(CGModule& cgMod, const CHIR::Function& chirFunc, const CGFunction& cgFunc)
 {
     llvm::Function* llvmFunc = cgFunc.GetRawFunction();
     llvmFunc->setPersonalityFn(cgMod.GetExceptionIntrinsicPersonality());
@@ -164,7 +164,7 @@ class FunctionGeneratorImpl : public IRGeneratorImpl {
     friend class CGModule;
 
 public:
-    explicit FunctionGeneratorImpl(CGModule& cgMod, const CHIR::Func& chirFunc) : cgMod(cgMod), chirFunc(chirFunc)
+    explicit FunctionGeneratorImpl(CGModule& cgMod, const CHIR::Function& chirFunc) : cgMod(cgMod), chirFunc(chirFunc)
     {
     }
 
@@ -172,12 +172,12 @@ public:
 
 private:
     CGModule& cgMod;
-    const CHIR::Func& chirFunc;
+    const CHIR::Function& chirFunc;
 };
 
 template <> class IRGenerator<FunctionGeneratorImpl> : public IRGenerator<> {
 public:
-    IRGenerator(CGModule& cgMod, const CHIR::Func& chirFunc)
+    IRGenerator(CGModule& cgMod, const CHIR::Function& chirFunc)
         : IRGenerator<>(std::make_unique<FunctionGeneratorImpl>(cgMod, chirFunc))
     {
     }
@@ -230,19 +230,22 @@ void FunctionGeneratorImpl::EmitIR()
 #endif
 }
 
-void EmitFunctionIR(CGModule& cgMod, const CHIR::Func& chirFunc)
+void EmitFunctionIR(CGModule& cgMod, CHIR::Function& chirFunc)
 {
     IRGenerator<FunctionGeneratorImpl>(cgMod, chirFunc).EmitIR();
+    
+    auto body = chirFunc.GetBody();
+    cgMod.GetCGContext().GetCHIRBuilder().GetChirContext().FreeMemoryInFunc(*body);
 }
 
-void EmitFunctionIR(CGModule& cgMod, const std::vector<CHIR::Func*>& chirFuncs)
+void EmitFunctionIR(CGModule& cgMod, const std::vector<CHIR::Function*>& chirFuncs)
 {
     for (auto chirFunc : chirFuncs) {
         EmitFunctionIR(cgMod, *chirFunc);
     }
 }
 
-void EmitImportedCFuncIR(CGModule& cgMod, const std::vector<CHIR::ImportedFunc*>& importedCFuncs)
+void EmitImportedCFuncIR(CGModule& cgMod, const std::vector<CHIR::Function*>& importedCFuncs)
 {
     IRBuilder2 builder(cgMod);
     for (auto importedCFunc : importedCFuncs) {
@@ -254,7 +257,7 @@ void EmitImportedCFuncIR(CGModule& cgMod, const std::vector<CHIR::ImportedFunc*>
 #endif
         CJC_NULLPTR_CHECK(llvmFuncTy);
 
-        auto srcPkgName = importedCFunc->GetSourcePackageName();
+        auto srcPkgName = importedCFunc->GetPackageName();
         const auto& funcPkgName = srcPkgName.empty() ? cgMod.GetCGContext().GetCurrentPkgName() : srcPkgName;
         // Case 1: the CFunc is an implicitly imported one, we need to use its wrapper func when calling it.
         if (funcPkgName != cgMod.GetCGContext().GetCurrentPkgName()) {

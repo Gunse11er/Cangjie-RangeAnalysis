@@ -81,6 +81,12 @@ inline std::string FillZero(int num, int len)
     out << std::setfill('0') << std::setw(len) << num;
     return out.str();
 }
+inline std::string FillZero(unsigned int num, int len)
+{
+    std::ostringstream out;
+    out << std::setfill('0') << std::setw(len) << num;
+    return out.str();
+}
 
 /* Get Mangled name for wrapper function of macro. */
 std::string GetMacroFuncName(const std::string& fullPackageName, bool isAttr, const std::string& ident);
@@ -340,6 +346,10 @@ inline std::string HashString64(const std::string& str)
     ss << printer;
     return std::move(*ss.rdbuf()).str();
 }
+
+void FreeIdleMemoryToOS();
+
+void ThrowNullPointerException();
 } // namespace Utils
 } // namespace Cangjie
 #endif // CANGJIE_UTILS_UTILS_H

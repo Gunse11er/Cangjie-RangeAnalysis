@@ -26,60 +26,17 @@ bool EnumDef::IsAllCtorsTrivial() const
     return true;
 }
 
-static std::string PrintParamTypes(const std::vector<Type*>& paramTypes)
+std::string EnumDef::LocalVarToString() const
 {
-    if (paramTypes.empty()) {
-        return "";
-    }
-    std::string str;
-    str += "(";
-    for (size_t i = 0; i < paramTypes.size(); ++i) {
-        str += paramTypes[i]->ToString();
-        if (i != paramTypes.size() - 1) {
-            str += ", ";
-        }
-    }
-    str += ")";
-    return str;
-}
-
-void EnumDef::PrintConstructor(std::stringstream& ss) const
-{
-    for (auto& ctor : ctors) {
-        PrintIndent(ss);
-        ss << ctor.name << PrintParamTypes(ctor.funcType->GetParamTypes()) << "\n";
-    }
-    ss << "\n";
-}
-
-void EnumDef::PrintAttrAndTitle(std::stringstream& ss) const
-{
-    ss << attributeInfo.ToString();
-    if (!IsExhaustive()) {
-        ss << "[nonExhaustive] ";
-    }
-    ss << CustomTypeKindToString(*this) << " " << GetIdentifier() << GenericDefArgsToString();
-    PrintParent(ss);
-}
-
-std::string EnumDef::ToString() const
-{
-    /* [public][generic][...] enum XXX {      // loc: xxx, genericDecl: xxx
-       ^^^^^^^^^^^^^^ attr    ^^^^^^^^^ title  ^^^^^^^^^^^^^^^^^^ comment
-           constructor
-           method
-           vtable
-       }
-    */
     std::stringstream ss;
-    PrintAttrAndTitle(ss);
-    ss << " {";
-    PrintComment(ss);
-    ss << "\n";
-    PrintConstructor(ss); // has a \n in the end
-    PrintMethod(ss);      // has a \n in the end
-    PrintVTable(ss);      // has a \n in the end
-    ss << "}";
+    for (auto& ctor : ctors) {
+        ss << AddNewLineOrNot(ctor.annoInfo.ToString(1));
+        ss << IndentToString(1) <<
+            "| " << ctor.name << TypeVecToString("(", ctor.funcType->GetParamTypes(), ")") << std::endl;
+    }
+    if (nonExhaustive) {
+        ss << IndentToString(1) << "| ..." << std::endl;
+    }
     return ss.str();
 }
 

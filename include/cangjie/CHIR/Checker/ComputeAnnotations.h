@@ -57,7 +57,7 @@ struct AnnoInstanceClassInst {
     const AnnoInstanceValue& GetField(size_t i) const { return a[i].second; }
     std::string ToString() const;
 };
-using AnnoInstance = std::shared_ptr<struct AnnoInstanceClassInst>;
+using AnnoInstance = std::shared_ptr<AnnoInstanceClassInst>;
 using AnnoMap = std::unordered_map<const Decl*, std::vector<AnnoInstance>>;
 
 /// Temporary results of computing annotations.

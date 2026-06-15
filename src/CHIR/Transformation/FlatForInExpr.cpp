@@ -24,7 +24,7 @@ FlatForInExpr::FlatForInExpr(CHIRBuilder& builder)
 
 void FlatForInExpr::RunOnPackage(const Package& package)
 {
-    for (auto& func : package.GetGlobalFuncs()) {
+    for (auto& func : package.GetGlobalFuncsWithBody()) {
         RunOnFunc(*func);
     }
 }
@@ -49,10 +49,9 @@ void ReplaceExitWithGoto(CHIRBuilder& builder, const BlockGroup& src, Block& tar
         auto term = bl->GetTerminator();
         CJC_NULLPTR_CHECK(term);
         if (term->GetExprKind() == CHIR::ExprKind::EXIT) {
-            auto oldAnnotations = term->MoveAnnotation();
-            term->RemoveSelfFromBlock();
             auto gotoCond = builder.CreateTerminator<GoTo>(&target, bl);
-            gotoCond->SetAnnotation(std::move(oldAnnotations));
+            gotoCond->CopyBaseInfoFrom(*term);
+            term->RemoveSelfFromBlock();
             bl->AppendExpression(gotoCond);
         }
     }
@@ -196,7 +195,7 @@ void FlatForInExpr::RunOnBlockGroup(BlockGroup& blockGroup)
     }
 }
 
-void FlatForInExpr::RunOnFunc(Func& func)
+void FlatForInExpr::RunOnFunc(Function& func)
 {
     bool isCommonFunctionWithoutBody = func.TestAttr(Attribute::COMMON) && !func.GetBody();
     if (isCommonFunctionWithoutBody) {

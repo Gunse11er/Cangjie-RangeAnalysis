@@ -16,20 +16,20 @@ using namespace TypeCheckUtil;
 bool TypeChecker::TypeCheckerImpl::ChkTupleLit(ASTContext& ctx, Ty& target, TupleLit& tl)
 {
     if (target.IsAny()) {
-        tl.ty = Synthesize(ctx, &tl);
+        tl.SetTy(Synthesize({ctx, SynPos::EXPR_ARG}, &tl));
         ReplaceIdealTy(tl);
-        return Ty::IsTyCorrect(tl.ty);
+        return Ty::IsTyCorrect(tl.GetTy());
     }
     Ptr<Ty> targetTy = UnboxOptionType(&target);
     if (!Ty::IsTyCorrect(targetTy) || !targetTy->IsTuple()) {
         DiagMismatchedTypesWithFoundTy(diag, tl, targetTy->String(), "Tuple");
-        tl.ty = TypeManager::GetNonNullTy(tl.ty);
+        tl.SetTy(TypeManager::GetNonNullTy(tl.GetTy()));
         return false;
     }
     auto tupleTy = StaticCast<TupleTy*>(targetTy);
     auto typeArgs = tupleTy->typeArgs;
     if (typeArgs.size() != tl.children.size()) {
-        tl.ty = Synthesize(ctx, &tl);
+        tl.SetTy(Synthesize({ctx, SynPos::EXPR_ARG}, &tl));
         ReplaceIdealTy(tl);
         DiagMismatchedTypes(diag, tl, *targetTy);
         return false;
@@ -39,20 +39,20 @@ bool TypeChecker::TypeCheckerImpl::ChkTupleLit(ASTContext& ctx, Ty& target, Tupl
     for (size_t i = 0; i < typeArgs.size(); ++i) {
         CJC_NULLPTR_CHECK(tl.children[i]);
         if (!Check(ctx, typeArgs[i], tl.children[i].get())) {
-            if (Ty::IsTyCorrect(typeArgs[i]) && Ty::IsTyCorrect(tl.children[i]->ty)) {
+            if (Ty::IsTyCorrect(typeArgs[i]) && Ty::IsTyCorrect(tl.children[i]->GetTy())) {
                 DiagMismatchedTypes(diag, *tl.children[i], *typeArgs[i]);
             }
-            tl.ty = Synthesize(ctx, &tl);
+            tl.SetTy(Synthesize({ctx, SynPos::EXPR_ARG}, &tl));
             ReplaceIdealTy(tl);
             return false;
         } else {
-            realElemTys.push_back(tl.children[i]->ty);
+            realElemTys.push_back(tl.children[i]->GetTy());
         }
     }
     // Should use SetTy(), but have bugs on ideal type, use Join() instead at current stage.
     // TupleLit allow elements been boxed by given target type.
     // Eg. Option<Int64>*Option<Int64> <=> (1,1) or I1*I1 <=> (1,1) where Int64 extends I1 allow box.
-    tl.ty = targetTy;
+    tl.SetTy(targetTy);
     return true;
 }
 
@@ -62,15 +62,15 @@ Ptr<Ty> TypeChecker::TypeCheckerImpl::SynTupleLit(ASTContext& ctx, TupleLit& tl)
     // Synthesize the type of each element.
     for (auto& it : tl.children) {
         if (!it) {
-            tl.ty = TypeManager::GetInvalidTy();
-            return tl.ty;
+            tl.SetTy(TypeManager::GetInvalidTy());
+            return tl.GetTy();
         }
-        if (!Ty::IsTyCorrect(it->ty)) {
-            (void)Synthesize(ctx, it.get());
+        if (!Ty::IsTyCorrect(it->GetTy())) {
+            Synthesize({ctx, SynPos::EXPR_ARG}, it.get());
         }
         ReplaceIdealTy(*it);
-        elemTy.push_back(it->ty);
+        elemTy.push_back(it->GetTy());
     }
-    tl.ty = typeManager.GetTupleTy(elemTy);
-    return tl.ty;
+    tl.SetTy(typeManager.GetTupleTy(elemTy));
+    return tl.GetTy();
 }

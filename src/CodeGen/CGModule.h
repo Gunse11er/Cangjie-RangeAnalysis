@@ -138,7 +138,7 @@ public:
     void GenCodeGenAddedMetadata() const;
 #endif
     CGFunction* GetOrInsertCGFunction(const CHIR::Value* func, bool forWrapper = false);
-    CGValue* GetOrInsertGlobalVariable(const CHIR::Value* chirGV);
+    CGValue* GetOrInsertGlobalVariable(const CHIR::GlobalVar* chirGV);
     llvm::GlobalVariable* GetOrCreateGlobalVariable(
         llvm::Constant* constVal, const std::string& gvContent, bool isTuple);
 #ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
@@ -240,7 +240,7 @@ public:
     bool IsLinkNameUsedInMeta(const std::string& linkageName);
 
     inline static std::string GetDataLayoutString(const Triple::Info& target);
-    inline static std::string GetTargetTripleString(const Triple::Info& target);
+    static std::string GetTargetTripleString(const Triple::Info& target);
 
     void AddNonExternalExtensionDef(llvm::GlobalVariable* extensionDef)
     {

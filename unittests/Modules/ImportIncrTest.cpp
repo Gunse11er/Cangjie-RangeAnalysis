@@ -69,7 +69,7 @@ protected:
 #endif
 #ifdef _WIN32
         invocation.globalOptions.target.os = Cangjie::Triple::OSType::WINDOWS;
-#elif __unix__
+#elif defined(__unix__)
         invocation.globalOptions.target.os = Cangjie::Triple::OSType::LINUX;
 #endif
         invocation.globalOptions.outputMode = GlobalOptions::OutputMode::STATIC_LIB;
@@ -93,7 +93,7 @@ protected:
         instance->invocation.globalOptions.implicitPrelude = false;
         instance->Compile(CompileStage::DESUGAR_AFTER_SEMA);
         std::vector<uint8_t> astData;
-        instance->importManager.ExportAST(false, astData, *instance->GetSourcePackages()[0]);
+        instance->importManager->ExportAST(false, astData, *instance->GetSourcePackages()[0]);
         allAstData["std.core"] = astData;
         instance->invocation.globalOptions.implicitPrelude = true; // reset to default
     }
@@ -125,11 +125,11 @@ protected:
                 DiagKindRefactor::module_read_file_to_buffer_failed, DEFAULT_POSITION, srcFile, failedReason);
         }
         instance = std::make_unique<TestCompilerInstance>(invocation, diag);
-        instance->importManager.SetPackageCjoCache("std.core", allAstData["std.core"]);
+        instance->importManager->SetPackageCjoCache("std.core", allAstData["std.core"]);
         instance->code = std::move(content.value());
         instance->Compile();
         std::vector<uint8_t> astData;
-        instance->importManager.ExportAST(false, astData, *instance->GetSourcePackages()[0]);
+        instance->importManager->ExportAST(false, astData, *instance->GetSourcePackages()[0]);
         allAstData[fileName] = astData;
         diag.Reset();
     }
@@ -169,9 +169,9 @@ void SetupPackageCaches(TestCompilerInstance& instance,
                         const std::unordered_map<std::string, std::vector<uint8_t>>& allAstData,
                         const std::vector<std::string>& fileNames)
 {
-    instance.importManager.SetPackageCjoCache("std.core", allAstData.at("std.core"));
+    instance.importManager->SetPackageCjoCache("std.core", allAstData.at("std.core"));
     for (const auto& fileName : fileNames) {
-        instance.importManager.SetPackageCjoCache(fileName, allAstData.at(fileName));
+        instance.importManager->SetPackageCjoCache(fileName, allAstData.at(fileName));
     }
 }
 
@@ -179,14 +179,14 @@ void VerifyInitialCompile(TestCompilerInstance& instance, Ptr<Package>& curPkg)
 {
     bool ret = instance.Compile(CompileStage::IMPORT_PACKAGE);
     EXPECT_TRUE(ret);
-    auto depPkgs = instance.importManager.GetAllImportedPackages();
+    auto depPkgs = instance.importManager->GetAllImportedPackages();
     size_t depPkgsSize = 4; // std.core, vardecl, funcdecl, default package
     EXPECT_EQ(depPkgs.size(), depPkgsSize);
     EXPECT_FALSE(instance.GetSourcePackages().empty());
     curPkg = instance.GetSourcePackages()[0];
     CJC_NULLPTR_CHECK(curPkg);
     EXPECT_FALSE(curPkg->files.empty());
-    auto decls = instance.importManager.GetImportedDecls(*curPkg->files.front());
+    auto decls = instance.importManager->GetImportedDecls(*curPkg->files.front());
     EXPECT_FALSE(decls.empty());
     bool find = FindDeclInPackage(decls, "classdecl");
     EXPECT_FALSE(find);
@@ -196,10 +196,10 @@ void VerifyIncrementalCompile(TestCompilerInstance& instance, Ptr<Package>& curP
 {
     bool ret = instance.Compile(CompileStage::IMPORT_PACKAGE);
     EXPECT_TRUE(ret);
-    auto depPkgs = instance.importManager.GetAllImportedPackages();
+    auto depPkgs = instance.importManager->GetAllImportedPackages();
     size_t depPkgsSize = 5; // std.core, vardecl, funcdecl, default package, classdecl
     EXPECT_EQ(depPkgs.size(), depPkgsSize);
-    auto decls = instance.importManager.GetImportedDecls(*curPkg->files.front());
+    auto decls = instance.importManager->GetImportedDecls(*curPkg->files.front());
     EXPECT_FALSE(decls.empty());
     bool find = FindDeclInPackage(decls, "classdecl");
     EXPECT_TRUE(find);

@@ -37,9 +37,9 @@ public:
         const TranslateASTNodeFunc& funcForTranlateASTNode,
         std::unordered_map<Block*, Terminator*>& maybeUnreachable,
         bool computeAnnotations,
-        std::vector<CHIR::Func*>& initFuncsForAnnoFactory,
+        std::vector<CHIR::Function*>& initFuncsForAnnoFactory,
         const Cangjie::TypeManager& typeManager,
-        std::vector<std::pair<const AST::Decl*, Func*>>& annoFactoryFuncs)
+        std::vector<std::pair<const AST::Decl*, Function*>>& annoFactoryFuncs)
     {
         size_t funcNum = decls.size();
         std::vector<std::unique_ptr<CHIR::CHIRBuilder>> builderList = ConstructSubBuilders(funcNum);
@@ -61,9 +61,6 @@ public:
                 [translator = tran.get(), decl, &funcForTranlateASTNode]() {
                     return funcForTranlateASTNode(*decl, *translator);
                 });
-            if (decl->TestAttr(AST::Attribute::GLOBAL) && !Is<AST::InheritableDecl>(decl)) {
-                tran->CollectValueAnnotation(*decl);
-            }
             trans.emplace_back(std::move(tran));
             chirTypes.emplace_back(std::move(subChirType));
         }

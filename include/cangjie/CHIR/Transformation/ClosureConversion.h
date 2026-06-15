@@ -25,7 +25,7 @@ public:
      * @param srcCodeImportedFuncMap
      */
     ClosureConversion(Package& package, CHIRBuilder& builder, const GlobalOptions& opts,
-        const std::unordered_set<Func*>& srcCodeImportedFuncs);
+        const std::unordered_set<Function*>& srcCodeImportedFuncs);
 
     /**
      * @brief Main process to do closure conversion.
@@ -48,7 +48,7 @@ public:
      * @brief Get useless lambda after closure conversion, will delete in remove useless pass.
      * @return useless lambda after closure conversion.
      */
-    std::unordered_set<Func*> GetUselessLambda() const;
+    std::unordered_set<Function*> GetUselessLambda() const;
 
 private:
     enum class PrintType { NESTED_FUNC, TOP_LEVEL_FUNC, BOX_MUT_VAR };
@@ -56,7 +56,6 @@ private:
     std::vector<Lambda*> CollectNestedFunctions();
     void InlineLambda(const std::vector<Lambda*>& funcs);
     void ConvertNestedFunctions(const std::vector<Lambda*>& funcs);
-    void ConvertImportedFunctions();
 
     Ptr<LocalVar> CreateAutoEnvImplObject(
         Block& parent, ClassType& autoEnvImplType, const std::vector<Value*>& envs, Expression& user, Value& srcFunc);
@@ -73,7 +72,7 @@ private:
     LocalVar* CreateBoxClassObj(const LocalVar& env, const ClassDef& classDef);
     void ReplaceEnvWithBoxObjMemberVar(LocalVar& env, LocalVar& boxObj, LocalVar& lValue);
     void LiftNestedFunctionWithCFuncType(Lambda& nestedFunc);
-    std::pair<LocalVar*, LocalVar*> SetBoxClassAsMutableVar(LocalVar& rValue);
+    std::pair<LocalVar*, LocalVar*> SetBoxClassAsMutableVar(LocalVar& rValue, const std::string& srcCodeIdentifier);
     void RecordDuplicateLambdaName(const Lambda& func);
     std::string GenerateGlobalFuncIdentifier(const Lambda& lambda);
 
@@ -95,12 +94,12 @@ private:
     CHIRBuilder& builder;
     ClassDef& objClass;
     const GlobalOptions& opts;
-    const std::unordered_set<Func*>& srcCodeImportedFuncs;
+    const std::unordered_set<Function*>& srcCodeImportedFuncs;
 
     // key: any type, value: closure type
     std::unordered_map<const Type*, Type*> typeConvertMap;
     std::unordered_map<Type*, ClassDef*> boxClassMap;
-    std::unordered_map<const Lambda*, Func*> convertedCache;
+    std::unordered_map<const Lambda*, Function*> convertedCache;
     std::unordered_map<std::string, size_t> duplicateLambdaName;
 
     ClassDef* GetOrCreateGenericAutoEnvBaseDef(size_t paramNum);
@@ -108,29 +107,29 @@ private:
     ClassDef* CreateAutoEnvImplDef(const std::string& className, const std::vector<GenericType*>& genericTypes,
         const Value& srcFunc, ClassDef& superClassDef,
         std::unordered_map<const GenericType*, Type*>& originalTypeToNewType);
-    ClassDef* GetOrCreateAutoEnvImplDef(FuncBase& func, ClassDef& superClassDef);
+    ClassDef* GetOrCreateAutoEnvImplDef(Function& func, ClassDef& superClassDef);
     ClassDef* GetOrCreateAutoEnvImplDef(Lambda& func, ClassDef& superClassDef, const std::vector<Value*>& boxedEnvs);
     void CreateInstOverrideMethodInAutoEnvImplDef(ClassDef& autoEnvImplDef,
-        FuncBase& srcFunc, const std::unordered_map<const GenericType*, Type*>& originalTypeToNewType);
-    void CreateGenericOverrideMethodInAutoEnvImplDef(ClassDef& autoEnvImplDef, FuncBase& srcFunc,
+        Function& srcFunc, const std::unordered_map<const GenericType*, Type*>& originalTypeToNewType);
+    void CreateGenericOverrideMethodInAutoEnvImplDef(ClassDef& autoEnvImplDef, Function& srcFunc,
         const std::unordered_map<const GenericType*, Type*>& originalTypeToNewType);
     void CreateMemberVarInAutoEnvImplDef(ClassDef& parentClass, const std::vector<Value*>& boxedEnvs,
         const std::unordered_map<const GenericType*, Type*>& originalTypeToNewType);
-    void ReplaceUserPoint(FuncBase& srcFunc, Expression& user, ClassDef& autoEnvImplDef);
+    void ReplaceUserPoint(Function& srcFunc, Expression& user, ClassDef& autoEnvImplDef);
     void ReplaceUserPoint(
         Lambda& srcFunc, Expression& user, const std::vector<Value*>& envs, ClassDef& autoEnvImplDef);
     void ConvertExpressions();
     void ConvertApplyWithExceptionToInvokeWithException(ApplyWithException& apply);
     void ConvertApplyToInvoke(Apply& apply);
     void CreateVTableForAutoEnvDef();
-    bool LambdaCanBeInlined(const Expression& user, const FuncBase& lambda);
+    bool LambdaCanBeInlined(const Expression& user, const Function& lambda);
     void DoFunctionInlineForLambda();
 
     ClassDef* GetOrCreateInstAutoEnvBaseDef(const FuncType& funcType, ClassDef& superClass);
-    Func* LiftLambdaToGlobalFunc(
+    Function* LiftLambdaToGlobalFunc(
         ClassDef& autoEnvImplDef, Lambda& nestedFunc, const std::vector<GenericType*>& genericTypeParams,
         const std::unordered_map<const GenericType*, Type*>& instMap, const std::vector<Value*>& capturedValues);
-    void ModifyTypeMismatchInFunc(Func& func, size_t paramIndex);
+    void ModifyTypeMismatchInFunc(Function& func, size_t paramIndex);
     void ModifyTypeMismatchInVTable();
     void ModifyTypeMismatchInExpr();
     void CastApplyArgAndRetIfNeed(Apply& e);
@@ -151,8 +150,8 @@ private:
     ClassDef* GetOrCreateAutoEnvWrapper(ClassType& instAutoEnvBaseType);
     ClassDef* CreateAutoEnvWrapper(const std::string& className, ClassType& superClassType);
     void CreateMemberVarInAutoEnvWrapper(ClassDef& autoEnvWrapperDef);
-    Func* CreateGenericMethodInAutoEnvWrapper(ClassDef& autoEnvWrapperDef);
-    void CreateInstMethodInAutoEnvWrapper(ClassDef& autoEnvWrapperDef, Func& genericFunc);
+    Function* CreateGenericMethodInAutoEnvWrapper(ClassDef& autoEnvWrapperDef);
+    void CreateInstMethodInAutoEnvWrapper(ClassDef& autoEnvWrapperDef, Function& genericFunc);
 
     std::unordered_map<std::string, ClassDef*> genericAutoEnvBaseDefs;
     std::unordered_map<std::string, ClassDef*> instAutoEnvBaseDefs;
@@ -163,7 +162,7 @@ private:
     std::set<std::string> ccOutFuncsRawMangle;
 
     std::unordered_set<ClassDef*> uselessClasses;
-    std::unordered_set<Func*> uselessLambda;
+    std::unordered_set<Function*> uselessLambda;
 };
 } // namespace Cangjie::CHIR
 #endif

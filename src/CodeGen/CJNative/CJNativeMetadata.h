@@ -152,15 +152,13 @@ public:
 
 protected:
     llvm::MDTuple* GenerateInstanceFieldMetadata(const CHIR::MemberVarInfo& field, size_t idx);
-    llvm::MDTuple* GenerateStaticFieldMetadata(const CHIR::GlobalVarBase& staticField);
-    llvm::MDTuple* GenerateMethodMetadata(const CHIR::FuncBase& method, bool isFromInterface = false);
+    llvm::MDTuple* GenerateStaticFieldMetadata(const CHIR::GlobalVar& staticField);
+    llvm::MDTuple* GenerateMethodMetadata(const CHIR::Function& method, bool isFromInterface = false);
     llvm::MDTuple* GenerateAttrsMetadata(const CHIR::AttributeInfo& attrs, ExtraAttribute extraAttr,
-        const std::string& gettingAnnotationMethod, uint8_t hasSRetMode = SRetMode::NO_SRET,
+        const CHIR::AnnoInfo& annoInfo, uint8_t hasSRetMode = SRetMode::NO_SRET,
         const std::string& enumKind = "", bool isUnknownSize = false) const;
     llvm::MDTuple* GenerateParametersMetadata(
         const std::vector<CHIR::Parameter*>& argsInfo, bool hasThis = false) const;
-    llvm::MDTuple* GenerateParametersMetadata(
-        const std::vector<CHIR::AbstractMethodParam>& paramInfos, bool hasThis = false) const;
     llvm::MDTuple* GenerateParametersMetadata(const std::vector<CHIR::GenericType*>& genericParamInfos) const;
     std::string GetTiName(const CHIR::Type& ty) const;
     CGModule& module;
@@ -208,7 +206,7 @@ private:
     void GenerateClassLikeMethodMetadata(const CHIR::ClassDef& cd, std::vector<llvm::Metadata*>& methodsVec,
         std::vector<llvm::Metadata*>& staticMethodsVec);
     llvm::MDTuple* GenerateClassLikeTypeAttrsMetadata(const CHIR::ClassDef& cd) const;
-    llvm::MDNode* GenerateClassAbsMethodMetadata(const CHIR::AbstractMethodInfo& absMethod);
+    llvm::MDNode* GenerateClassAbsMethodMetadata(const CHIR::Function& absMethod);
 };
 
 class EnumMetadataInfo : public MetadataInfo {
@@ -281,6 +279,8 @@ private:
     void GeneratePkgMetadata() const;
     void AddPrimitiveTypeInfoToCorePkgInfo() const;
 };
+
+void GenerateReflectionMetadata(CGModule& module, const SubCHIRPackage& subCHIRPkg);
 
 } // namespace CodeGen
 } // namespace Cangjie

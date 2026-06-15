@@ -10,11 +10,13 @@
  * This file implements the literal value related class in CHIR.
  */
 #include "cangjie/CHIR/IR/Value/LiteralValue.h"
+#include <cstddef>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
 
 #include "cangjie/Basic/StringConvertor.h"
+#include "cangjie/CHIR/Utils/ToStringUtils.h"
 
 using namespace Cangjie::CHIR;
 
@@ -75,10 +77,10 @@ bool BoolLiteral::GetVal() const
     return val;
 }
 
-std::string BoolLiteral::ToString() const
+std::string BoolLiteral::ToString(size_t indent) const
 {
     std::stringstream ss;
-    ss << std::boolalpha << val;
+    ss << IndentToString(indent) << std::boolalpha << val;
     return ss.str();
 }
 
@@ -93,10 +95,10 @@ char32_t RuneLiteral::GetVal() const
     return val;
 }
 
-std::string RuneLiteral::ToString() const
+std::string RuneLiteral::ToString(size_t indent) const
 {
     std::stringstream ss;
-    ss << '\'' << val << '\'';
+    ss << IndentToString(indent) << '\'' << val << '\'';
     return ss.str();
 }
 
@@ -115,10 +117,10 @@ std::string StringLiteral::GetVal() &&
     return std::move(val);
 }
 
-std::string StringLiteral::ToString() const
+std::string StringLiteral::ToString(size_t indent) const
 {
     std::stringstream ss;
-    ss << '"' << StringConvertor::Normalize(val) << '"';
+    ss << IndentToString(indent) << '"' << StringConvertor::Normalize(val) << '"';
     return ss.str();
 }
 
@@ -143,9 +145,10 @@ bool IntLiteral::IsSigned() const
     return static_cast<IntType*>(ty)->IsSigned();
 }
 
-std::string IntLiteral::ToString() const
+std::string IntLiteral::ToString(size_t indent) const
 {
     std::stringstream ss;
+    ss << IndentToString(indent);
     if (IsSigned()) {
         ss << GetSignedVal();
         ss << 'i';
@@ -166,10 +169,10 @@ double FloatLiteral::GetVal() const
     return val;
 }
 
-std::string FloatLiteral::ToString() const
+std::string FloatLiteral::ToString(size_t indent) const
 {
     std::stringstream ss;
-    ss << std::fixed << val << 'f';
+    ss << IndentToString(indent) << std::fixed << val << 'f';
     return ss.str();
 }
 
@@ -178,10 +181,10 @@ UnitLiteral::UnitLiteral(Type* ty)
 {
 }
 
-std::string UnitLiteral::ToString() const
+std::string UnitLiteral::ToString(size_t indent) const
 {
     std::stringstream ss;
-    ss << "unit";
+    ss << IndentToString(indent) << "unit";
     return ss.str();
 }
 
@@ -190,9 +193,9 @@ NullLiteral::NullLiteral(Type* ty)
 {
 }
 
-std::string NullLiteral::ToString() const
+std::string NullLiteral::ToString(size_t indent) const
 {
     std::stringstream ss;
-    ss << "null";
+    ss << IndentToString(indent) << "null";
     return ss.str();
 }

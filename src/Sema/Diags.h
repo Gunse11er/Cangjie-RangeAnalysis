@@ -13,6 +13,7 @@
 #ifndef CANGJIE_SEMA_DIAGS_H
 #define CANGJIE_SEMA_DIAGS_H
 
+#include "TypeCheckerImpl.h"
 #include "cangjie/Basic/DiagnosticEngine.h"
 #include "cangjie/Modules/ImportManager.h"
 
@@ -63,7 +64,7 @@ void AddDiagNotesForImportedDecls(DiagnosticBuilder& builder, const ImportManage
 void DiagAmbiguousUpperBoundTargets(DiagnosticEngine& diag, const MemberAccess& ma, const OrderedDeclSet& targets);
 void DiagPackageMemberNotFound(
     DiagnosticEngine& diag, const ImportManager& importManager, const MemberAccess& ma, const PackageDecl& pd);
-void DiagUseClosureCaptureVarAlone(DiagnosticEngine& diag, const Expr& expr);
+void DiagUseClosureCaptureVarAlone(DiagnosticEngine& diag, const Expr& expr, LambdaSource lambdaSource);
 void DiagNeedNamedArgument(
     DiagnosticEngine& diag, const CallExpr& ce, const FuncDecl& fd, size_t paramPos, size_t argPos);
 #ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND

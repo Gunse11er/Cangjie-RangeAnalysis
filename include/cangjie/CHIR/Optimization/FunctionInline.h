@@ -40,7 +40,7 @@ public:
      * @brief Main process to do function inline.
      * @param func func to do function inline.
      */
-    void Run(Func& func);
+    void Run(Function& func);
 
     /**
      * @brief Get effect map after this pass.
@@ -60,19 +60,19 @@ private:
     void RecordEffectMap(const Apply& apply);
     void ReplaceFuncResult(LocalVar* resNew, LocalVar* resOld);
 
-    std::pair<BlockGroup*, LocalVar*> CloneBlockGroupForInline(
-        const BlockGroup& other, Func& parentFunc, const Apply& apply);
+    std::pair<std::vector<Block*>, LocalVar*> CloneBlockGroupForInline(
+        const BlockGroup& oldBG, const Apply& apply);
 
-    void SetGroupDebugLocation(BlockGroup& group, const DebugLocation& loc);
+    void SetGroupDebugLocation(const std::vector<Block*>& blocks, const DebugLocation& loc);
 
     void InlineImpl(BlockGroup& bg);
 
     CHIRBuilder& builder;
     const GlobalOptions::OptimizationLevel& optLevel;
     bool debug{false};
-    Func* globalFunc{nullptr};
-    std::unordered_map<Func*, size_t> inlinedCountMap;
-    std::unordered_map<Func*, size_t> funcSizeMap;
+    Function* globalFunc{nullptr};
+    std::unordered_map<Function*, size_t> inlinedCountMap;
+    std::unordered_map<Function*, size_t> funcSizeMap;
     const std::string optName{"Function Inline"};
     OptEffectCHIRMap effectMap;
 };

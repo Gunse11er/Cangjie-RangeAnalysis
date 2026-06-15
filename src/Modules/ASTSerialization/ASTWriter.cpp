@@ -11,19 +11,20 @@
 
 #include "ASTWriterImpl.h"
 
+#include <optional>
 #include <queue>
 
 #include "cangjie/AST/AttributePack.h"
+#include "cangjie/Option/Option.h"
+#include "cangjie/Utils/ICEUtil.h"
 #include "flatbuffers/ModuleFormat_generated.h"
 
 #include "cangjie/AST/Create.h"
-#include "cangjie/AST/Match.h"
 #include "cangjie/AST/Utils.h"
 #include "cangjie/AST/Walker.h"
 #include "cangjie/Basic/Version.h"
 #include "cangjie/Mangle/ASTMangler.h"
 #include "cangjie/Mangle/BaseMangler.h"
-#include "cangjie/Mangle/CHIRMangler.h"
 #include "cangjie/Modules/CjoManager.h"
 #include "cangjie/Utils/CheckUtils.h"
 
@@ -33,61 +34,61 @@ using namespace AST;
 namespace Cangjie {
 const std::unordered_map<AST::AccessLevel, PackageFormat::AccessLevel> ACCESS_LEVEL_MAP = {
 #define ACCESS_LEVEL(AST_KIND, FBS_KIND) {AST::AccessLevel::AST_KIND, PackageFormat::AccessLevel_##FBS_KIND},
-#include "Mapping.inc"
+#include "Mapping.h"
 #undef ACCESS_LEVEL
 };
 
 const std::unordered_map<TokenKind, PackageFormat::AccessModifier> ACCESS_MODIFIER_MAP = {
 #define ACCESS_MODIFIER(AST_KIND, FBS_KIND) {TokenKind::AST_KIND, PackageFormat::AccessModifier_##FBS_KIND},
-#include "Mapping.inc"
+#include "Mapping.h"
 #undef ACCESS_MODIFIER
 };
 
 const std::unordered_map<AST::BuiltInType, PackageFormat::BuiltInType> BUILTIN_TYPE_MAP = {
 #define BUILTIN_TYPE(AST_KIND, FBS_KIND) {AST::BuiltInType::AST_KIND, PackageFormat::BuiltInType_##FBS_KIND},
-#include "Mapping.inc"
+#include "Mapping.h"
 #undef BUILTIN_TYPE
 };
 
 const std::unordered_map<OverflowStrategy, PackageFormat::OverflowPolicy> STRATEGY_MAP = {
 #define OVERFLOW_STRATEGY(AST_KIND, FBS_KIND) {OverflowStrategy::AST_KIND, PackageFormat::OverflowPolicy_##FBS_KIND},
-#include "Mapping.inc"
+#include "Mapping.h"
 #undef OVERFLOW_STRATEGY
 };
 
 const std::unordered_map<AST::TypeKind, PackageFormat::TypeKind> TYPE_KIND_MAP = {
 #define TYPE_KIND(AST_KIND, FBS_KIND) {AST::TypeKind::AST_KIND, PackageFormat::TypeKind_##FBS_KIND},
-#include "Mapping.inc"
+#include "Mapping.h"
 #undef TYPE_KIND
 };
 
 const std::unordered_map<TokenKind, PackageFormat::OperatorKind> OP_KIND_MAP = {
 #define OPERATOR_KIND(AST_KIND, FBS_KIND) {TokenKind::AST_KIND, PackageFormat::OperatorKind_##FBS_KIND},
-#include "Mapping.inc"
+#include "Mapping.h"
 #undef OPERATOR_KIND
 };
 
 const std::unordered_map<AST::CallKind, PackageFormat::CallKind> CALL_KIND_MAP = {
 #define CALL_KIND(AST_KIND, FBS_KIND) {AST::CallKind::AST_KIND, PackageFormat::CallKind_##FBS_KIND},
-#include "Mapping.inc"
+#include "Mapping.h"
 #undef CALL_KIND
 };
 
 const std::unordered_map<AST::LitConstKind, PackageFormat::LitConstKind> LIT_CONST_KIND_MAP = {
 #define LIT_CONST_KIND(AST_KIND, FBS_KIND) {AST::LitConstKind::AST_KIND, PackageFormat::LitConstKind_##FBS_KIND},
-#include "Mapping.inc"
+#include "Mapping.h"
 #undef LIT_CONST_KIND
 };
 
 const std::unordered_map<AST::StringKind, PackageFormat::StringKind> STRING_KIND_MAP = {
 #define STRING_KIND(AST_KIND, FBS_KIND) {AST::StringKind::AST_KIND, PackageFormat::StringKind_##FBS_KIND},
-#include "Mapping.inc"
+#include "Mapping.h"
 #undef STRING_KIND
 };
 
 const std::unordered_map<AST::ForInKind, PackageFormat::ForInKind> FOR_IN_KIND_MAP = {
 #define FOR_IN_KIND(AST_KIND, FBS_KIND) {AST::ForInKind::AST_KIND, PackageFormat::ForInKind_##FBS_KIND},
-#include "Mapping.inc"
+#include "Mapping.h"
 #undef FOR_IN_KIND
 };
 } // namespace Cangjie
@@ -212,7 +213,7 @@ bool IsGenericInCommonSerialization(bool serializingCommon, const Decl& decl)
 void CollectFullExportParamDecl(
     std::vector<Ptr<Decl>>& decls, FuncDecl& fd, std::queue<Ptr<Decl>>& queue, bool serializingCommon)
 {
-    if (!Ty::IsTyCorrect(fd.ty)) {
+    if (!Ty::IsTyCorrect(fd.GetTy())) {
         return;
     }
     // When 'fd''s type is correct, following conditions must fit.
@@ -258,15 +259,15 @@ std::unordered_set<Ty*> CollectInstantiations(const Decl& decl)
     std::unordered_set<Ty*> instTys;
     if (auto id = DynamicCast<const InheritableDecl*>(&decl)) {
         for (auto& it : id->inheritedTypes) {
-            CollectInstantiatedTys(it->ty, instTys);
+            CollectInstantiatedTys(it->GetTy(), instTys);
         }
         for (auto it : id->GetMemberDeclPtrs()) {
             if (!it->TestAttr(Attribute::GENERIC)) {
-                CollectInstantiatedTys(it->ty, instTys);
+                CollectInstantiatedTys(it->GetTy(), instTys);
             }
         }
     } else {
-        CollectInstantiatedTys(decl.ty, instTys);
+        CollectInstantiatedTys(decl.GetTy(), instTys);
     }
     return instTys;
 }
@@ -288,11 +289,11 @@ void CollectInstantiationRecursively(std::unordered_set<Ty*>& instTys)
         CJC_NULLPTR_CHECK(id);
         std::unordered_set<Ty*> newTys;
         for (auto& it : id->inheritedTypes) {
-            CollectInstantiatedTys(it->ty, newTys);
+            CollectInstantiatedTys(it->GetTy(), newTys);
         }
         for (auto it : id->GetMemberDeclPtrs()) {
             if (!it->TestAttr(Attribute::GENERIC)) {
-                CollectInstantiatedTys(it->ty, newTys);
+                CollectInstantiatedTys(it->GetTy(), newTys);
             }
         }
         for (auto it : newTys) {
@@ -309,7 +310,7 @@ inline Ptr<Decl> GetCallee(const CallExpr& ce)
 
 bool ShouldExportSource(const VarDecl& varDecl)
 {
-    if (!Ty::IsTyCorrect(varDecl.ty) || !varDecl.initializer || varDecl.TestAttr(Attribute::IMPORTED)) {
+    if (!Ty::IsTyCorrect(varDecl.GetTy()) || !varDecl.initializer || varDecl.TestAttr(Attribute::IMPORTED)) {
         return false;
     }
     if (varDecl.IsCommonMatchedWithSpecific()) {
@@ -382,7 +383,7 @@ inline bool CanSkip4CJMP(const Decl& decl, bool serializingCommon)
  * @brief Get the import package name by import spec.
  * @param importSpec The import spec.
  * @return The import package name.
- */
+*/
 std::string GetImportPackageNameByImportSpec(const AST::ImportSpec& importSpec)
 {
     if (importSpec.IsImportMulti()) {
@@ -452,8 +453,8 @@ template <typename T> TVectorOffset<FormattedIndex> ASTWriter::ASTWriterImpl::Ge
 {
     // Body.
     std::vector<FormattedIndex> body;
-    // Track specific implementations that have been added to avoid duplicates
-    std::unordered_set<Decl*> addedSpecificImpls;
+    // Track platform implementations that have been added to avoid duplicates
+    std::unordered_set<Decl*> addedPlatformImpls;
     // Incr compilation need load ty by cached cjo, so not only cache visible signature
     bool onlyVisibleSig = !config.exportForIncr && !config.exportContent;
     // For LSP usage, when decl is not external, ignore all members, only keep the typeDecl it self.
@@ -489,13 +490,13 @@ template <typename T> TVectorOffset<FormattedIndex> ASTWriter::ASTWriterImpl::Ge
 
     for (auto& it : decl.GetMemberDeclPtrs()) {
         CJC_NULLPTR_CHECK(it);
-        // Skip if this decl is already added as a specific implementation
-        if (it->TestAttr(AST::Attribute::SPECIFIC) && addedSpecificImpls.count(it.get()) > 0) {
+        // Skip if this decl is already added as a platform implementation
+        if (it->TestAttr(AST::Attribute::SPECIFIC) && addedPlatformImpls.count(it.get()) > 0) {
             continue;
         }
-        // Process specific implementation first, applying same filter logic
+        // Process platform implementation first, applying same filter logic
         if (it->specificImplementation) {
-            addedSpecificImpls.insert(it->specificImplementation.get());
+            addedPlatformImpls.insert(it->specificImplementation.get());
             if (shouldExportDecl(it->specificImplementation.get())) {
                 body.push_back(GetDeclIndex(it->specificImplementation));
             }
@@ -508,12 +509,56 @@ template <typename T> TVectorOffset<FormattedIndex> ASTWriter::ASTWriterImpl::Ge
 }
 
 /**
+ * @brief Save compilation options to the cjo file
+ * @param debug Whether debug mode is enabled
+ * @param level The optimization level
+ */
+void ASTWriter::SaveOptions(bool debug, GlobalOptions::OptimizationLevel level)
+{
+    pImpl->SaveOptions(debug, level);
+}
+
+/**
+ * @brief Save compilation options to the cjo file
+ * @param debug Whether debug mode is enabled
+ * @param level The optimization level
+ */
+void ASTWriter::ASTWriterImpl::SaveOptions(bool debug, GlobalOptions::OptimizationLevel level)
+{
+    PackageFormat::OptimizationLevel saveLevel;
+    switch (level) {
+        case GlobalOptions::OptimizationLevel::O0:
+            saveLevel = PackageFormat::OptimizationLevel::OptimizationLevel_O0;
+            break;
+        case GlobalOptions::OptimizationLevel::O1:
+            saveLevel = PackageFormat::OptimizationLevel::OptimizationLevel_O1;
+            break;
+        case GlobalOptions::OptimizationLevel::O2:
+            saveLevel = PackageFormat::OptimizationLevel::OptimizationLevel_O2;
+            break;
+        case GlobalOptions::OptimizationLevel::O3:
+            saveLevel = PackageFormat::OptimizationLevel::OptimizationLevel_O3;
+            break;
+        case GlobalOptions::OptimizationLevel::Os:
+            saveLevel = PackageFormat::OptimizationLevel::OptimizationLevel_Os;
+            break;
+        case GlobalOptions::OptimizationLevel::Oz:
+            saveLevel = PackageFormat::OptimizationLevel::OptimizationLevel_Oz;
+            break;
+        default:
+            return InternalError("Unsupported optimization level");
+    }
+
+    options = PackageFormat::CreateCompilationOptions(builder, saveLevel, debug);
+}
+
+/**
  * Pre-save full exporting decls after sema's desugar before generic instantiation.
  * NOTE: avoid export boxed decl creation.
  */
 void ASTWriter::ASTWriterImpl::PreSaveFullExportDecls(Package& package)
 {
-    for (auto& file : package.files) {
+    for (auto &file : package.files) {
         if (file->package && file->package->hasCommon) {
             serializingCommon = true;
             break;
@@ -602,7 +647,8 @@ inline bool ASTWriter::ASTWriterImpl::NeedToExportDecl(Ptr<const Decl> decl)
 // all dependent file declarations goes before declaration of file that depend.
 // NOTE: File dependency defined in specification.
 void ASTWriter::ASTWriterImpl::DFSCollectFilesDeclarations(Ptr<File> file,
-    std::unordered_set<File*>& alreadyVisitedFiles, std::vector<Ptr<const Decl>>& topLevelDeclsOrdered,
+    std::unordered_set<File*>& alreadyVisitedFiles,
+    std::vector<Ptr<const Decl>>& topLevelDeclsOrdered,
     std::unordered_set<Ty*>& usedTys)
 {
     if (alreadyVisitedFiles.find(file) != alreadyVisitedFiles.end()) {
@@ -709,7 +755,7 @@ void ASTWriter::SetSerializingCommon()
 {
     pImpl->SetSerializingCommon();
 }
-
+ 
 void ASTWriter::ASTWriterImpl::SetSerializingCommon()
 {
     serializingCommon = true;
@@ -758,7 +804,7 @@ void ASTWriter::ASTWriterImpl::AST2FB(std::vector<uint8_t>& data, const PackageD
     PackageFormat::CjoVersion cjoVersion(CJO_MAJOR_VERSION, CJO_MINOR_VERSION, CJO_PATCH_VERSION);
     auto root = PackageFormat::CreatePackage(builder, cjcVersion, &cjoVersion, packageName, dependencyInfo, vimports,
         vfiles, vfileImports, vtypes, vdecls, vexprs, INVALID_FORMAT_INDEX, kind, access, moduleName, vfileInfo,
-        vdependentStdPkgs);
+        vdependentStdPkgs, options.has_value() ? options.value() : INVALID_FORMAT_INDEX);
     FinishPackageBuffer(builder, root);
     auto size = static_cast<size_t>(builder.GetSize());
     data.resize(size);
@@ -836,6 +882,27 @@ flatbuffers::Offset<PackageFormat::Imports> ASTWriter::ASTWriterImpl::SaveFileIm
     return importsBuilder.Finish();
 }
 
+TFeatureIdOffset ASTWriter::ASTWriterImpl::CreateFeatureId(const FeatureId& featureId)
+{
+    std::vector<std::string> identifiers;
+    for (auto identifier: featureId.identifiers) {
+        identifiers.push_back(identifier);
+    }
+
+    return PackageFormat::CreateFeatureId(builder, builder.CreateVectorOfStrings(identifiers));
+}
+
+TFeaturesDirectiveOffset ASTWriter::ASTWriterImpl::SaveFeaturesDirective(Ptr<FeaturesDirective> fd)
+{
+    auto features = std::vector<TFeatureIdOffset>();
+    for (auto& featureId: fd->featuresSet->content) {
+        features.push_back(CreateFeatureId(featureId));
+    }
+
+    auto featuresSet = PackageFormat::CreateFeaturesSet(builder, builder.CreateVector<TFeatureIdOffset>(features));
+    return PackageFormat::CreateFeaturesDirective(builder, featuresSet);
+}
+
 // Save fileNames, and add to savedFileMap and return its index.
 void ASTWriter::ASTWriterImpl::SaveFileInfo(const File& file)
 {
@@ -855,7 +922,12 @@ void ASTWriter::ASTWriterImpl::SaveFileInfo(const File& file)
         auto fileID = file.begin.fileID;
         auto begin = TPosition(fileIndex, 0, file.begin.line, file.begin.column, false);
         auto end = TPosition(fileIndex, 0, file.end.line, file.end.column, false);
-        allFileInfo.push_back(PackageFormat::CreateFileInfo(builder, fileID, &begin, &end));
+        if (file.feature) {
+            auto feature = SaveFeaturesDirective(file.feature);
+            allFileInfo.push_back(PackageFormat::CreateFileInfo(builder, fileID, &begin, &end, feature));
+        } else {
+            allFileInfo.push_back(PackageFormat::CreateFileInfo(builder, fileID, &begin, &end));
+        }
     }
 }
 
@@ -893,8 +965,8 @@ template <typename T>
 std::optional<Ptr<const Ty>> TryGetSpecificImplementationTy(const Ptr<const Ty>& pType)
 {
     auto ty = StaticCast<T*>(pType);
-    if (ty->decl && ty == ty->decl->ty && ty->decl->specificImplementation) {
-        return ty->decl->specificImplementation->ty;
+    if (ty->decl && ty == ty->decl->GetTy() && ty->decl->specificImplementation) {
+        return ty->decl->specificImplementation->GetTy();
     }
 
     return std::nullopt;
@@ -1136,7 +1208,7 @@ flatbuffers::Offset<PackageFormat::Generic> ASTWriter::ASTWriterImpl::SaveGeneri
     std::vector<FormattedIndex> typeParameters;
     std::vector<flatbuffers::Offset<PackageFormat::Constraint>> constraints;
     for (auto& gpd : generic->typeParameters) {
-        auto gty = DynamicCast<GenericsTy*>(gpd->ty);
+        auto gty = DynamicCast<GenericsTy*>(gpd->GetTy());
         // When 'gty' is valid, and its parent decl is a local function, using generic type decl,
         // otherwise keep 'gpd' itself.
         CJC_NULLPTR_CHECK(gpd->outerDecl);
@@ -1149,7 +1221,7 @@ flatbuffers::Offset<PackageFormat::Generic> ASTWriter::ASTWriterImpl::SaveGeneri
             CJC_NULLPTR_CHECK(upper);
             uppers.emplace_back(SaveType(typeManager.ObtainsAliasType(upper)));
         }
-        constraint->ty = constraint->type->ty; // Sync ty to re-use 'PackNodeInfo'.
+        constraint->SetTy(constraint->type->GetTy()); // Sync ty to re-use 'PackNodeInfo'.
         auto info = PackNodeInfo(*constraint);
         auto vUppers = builder.CreateVector<FormattedIndex>(uppers);
         constraints.emplace_back(PackageFormat::CreateConstraint(
@@ -1284,7 +1356,7 @@ TFuncBodyOffset ASTWriter::ASTWriterImpl::SaveFuncBody(const FuncBody& funcBody)
     bool isGenericCJMP = fd && IsGenericInCommonSerialization(serializingCommon, *fd);
     bool shouldExportBody = config.exportContent && exportFuncBody &&
         (!fd || CanBeSrcExported(*fd) || isGenericCJMP);
-    bool validBody = shouldExportBody && Ty::IsTyCorrect(funcBody.ty) && funcBody.body;
+    bool validBody = shouldExportBody && Ty::IsTyCorrect(funcBody.GetTy()) && funcBody.body;
     auto bodyIdx = validBody ? SaveExpr(*funcBody.body) : INVALID_FORMAT_INDEX;
     // CaptureKind is need if the 'funcBody' is exported.
     uint8_t kind = validBody ? static_cast<uint8_t>(funcBody.captureKind) : 0;
@@ -1498,7 +1570,8 @@ TDeclOffset ASTWriter::ASTWriterImpl::SaveUnsupportDecl(const DeclInfo& declInfo
 }
 
 flatbuffers::Offset<flatbuffers::Vector<AttrSizeType>> ASTWriter::ASTWriterImpl::SaveAttributes(
-    const AttributePack& attrs)
+    const AttributePack& attrs
+)
 {
     std::vector<AttrSizeType> attrVec;
     for (auto it : attrs.GetRawAttrs()) {
@@ -1537,7 +1610,7 @@ std::vector<TFullIdOffset> ASTWriter::ASTWriterImpl::CollectInitializationDepend
             }
         }
     }
-
+    
     return dependencies;
 }
 
@@ -1579,12 +1652,16 @@ FormattedIndex ASTWriter::ASTWriterImpl::SaveDecl(const Decl& decl, bool isTopLe
     if (decl.TestAttr(Attribute::GENERIC_INSTANTIATED, Attribute::GENERIC)) {
         attrs.SetAttr(Attribute::UNREACHABLE, true); // Set 'UNREACHABLE' for export.
     }
-
+    if (decl.TestAttr(Attribute::SPECIFIC)) {
+        // CJMP compilation mid phase. This common declaration will be relative common in next compilation phases.
+        attrs.SetAttr(Attribute::SPECIFIC, false);
+        attrs.SetAttr(Attribute::COMMON, true);
+        // platform provide an implementation, so it's common with default for further compilation phases
+        attrs.SetAttr(Attribute::COMMON_WITH_DEFAULT, true);
+    }
     if (auto varDecl = DynamicCast<VarDecl>(&decl)) {
         if (varDecl->TestAttr(Attribute::FROM_COMMON_PART) && varDecl->outerDecl &&
             varDecl->outerDecl->TestAttr(Attribute::SPECIFIC)) {
-            attrs.SetAttr(Attribute::COMMON, false);
-            attrs.SetAttr(Attribute::FROM_COMMON_PART, false);
         }
         if (varDecl->outerDecl && varDecl->outerDecl->TestAttr(Attribute::COMMON)) {
             bool hasInitializer = varDecl->initializer;

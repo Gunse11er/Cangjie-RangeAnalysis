@@ -35,8 +35,8 @@ public:
     void RemoveParent(ClassType& parent);
     
 protected:
-    void PrintAttrAndTitle(std::stringstream& ss) const override;
-    void PrintComment(std::stringstream& ss) const override;
+    std::string CustomTypeDefTitleToString() const override;
+    std::string AddExtraComment() const override;
 
 private:
     explicit ExtendDef(

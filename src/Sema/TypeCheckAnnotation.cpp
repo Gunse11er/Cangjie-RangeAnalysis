@@ -62,7 +62,7 @@ void DesugarAnnotationsArray(ImportManager& importManager, TypeManager& typeMana
         auto objectClass = importManager.GetCoreDecl<ClassDecl>(OBJECT_NAME);
         auto arrayStruct = importManager.GetCoreDecl<StructDecl>(STD_LIB_ARRAY);
         if (objectClass != nullptr && arrayStruct != nullptr) {
-            auto arrayTy = typeManager.GetStructTy(*arrayStruct, {objectClass->ty});
+            auto arrayTy = typeManager.GetStructTy(*arrayStruct, {objectClass->GetTy()});
             decl.annotationsArray = CreateArrayLit(std::move(annotationsArray), arrayTy);
             decl.annotationsArray->EnableAttr(Attribute::IS_ANNOTATION);
         } else {
@@ -117,7 +117,7 @@ void TypeChecker::TypeCheckerImpl::CheckAnnotationDecl(ASTContext& ctx, Annotati
         diag.DiagnoseRefactor(DiagKindRefactor::sema_annotation_arg_target_array_lit, *arg.expr);
         return;
     }
-    // Check arg.ty <: Array<AnnotationKind>
+    // Check arg.GetTy() <: Array<AnnotationKind>
     auto arrayStruct = importManager.GetCoreDecl<StructDecl>("Array");
     auto annotationKindEnum = importManager.GetCoreDecl<EnumDecl>("AnnotationKind");
     if (arrayStruct == nullptr || annotationKindEnum == nullptr) {
@@ -137,8 +137,9 @@ OwnedPtr<CallExpr> TypeChecker::TypeCheckerImpl::CheckCustomAnnotation(
     if (!callExpr) {
         return nullptr;
     }
-    if (Ty::IsTyCorrect(Synthesize(ctx, callExpr.get())) && CheckCustomAnnotationPlace(diag, decl, ann)) {
-        CJC_ASSERT(callExpr->ty->IsClass());
+    if (Ty::IsTyCorrect(Synthesize({ctx, SynPos::EXPR_ARG}, callExpr.get())) &&
+        CheckCustomAnnotationPlace(diag, decl, ann)) {
+        CJC_ASSERT(callExpr->GetTy()->IsClass());
         // The args information needs to be save into cjo. The original node need to be recover.
         std::vector<OwnedPtr<FuncArg>> args = {};
         for (auto& arg : callExpr->args) {
@@ -168,7 +169,7 @@ void TypeChecker::TypeCheckerImpl::CheckAnnotations(ASTContext& ctx, Decl& decl)
                 if (!callExpr) {
                     break;
                 }
-                CJC_ASSERT(callExpr && Ty::IsTyCorrect(callExpr->ty));
+                CJC_ASSERT(callExpr && Ty::IsTyCorrect(callExpr->GetTy()));
 #ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
                 if (!anno->isCompileTimeVisible) {
                     // this special attribute is to tell CHIR that this attr isCompileTimeVisible when computing
@@ -198,7 +199,7 @@ void TypeChecker::TypeCheckerImpl::CheckAnnotations(ASTContext& ctx, Decl& decl)
             }
             default: {
                 for (auto& arg : anno->args) {
-                    (void)Synthesize(ctx, arg.get());
+                    Synthesize({ctx, SynPos::EXPR_ARG}, arg.get());
                 }
             }
         }

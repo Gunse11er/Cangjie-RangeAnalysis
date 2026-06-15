@@ -23,7 +23,6 @@
 #include "cangjie/CHIR/Interpreter/BCHIRPrinter.h"
 #include "cangjie/CHIR/IR/Package.h"
 #include "cangjie/CHIR/IR/Value/Value.h"
-#include "cangjie/Mangle/BaseMangler.h"
 #include "cangjie/Option/Option.h"
 
 namespace Cangjie::CHIR::Interpreter {
@@ -34,7 +33,7 @@ public:
      * to evaluate constants. */
     template <bool ForConstEval = false>
     static void CompileToBCHIR(const Package& chirPkg, Bchir& destBchir,
-        const std::vector<CHIR::FuncBase*>& initFuncsForConstVar, SourceManager& sm,
+        const std::vector<CHIR::Function*>& initFuncsForConstVar, SourceManager& sm,
         const GlobalOptions& options, bool printBchir = false, bool incremental = false)
     {
         CHIR2BCHIR chir2bchir(destBchir, sm, incremental);
@@ -74,7 +73,7 @@ private:
 
     /** @brief translate a CHIR package into BCHIR */
     template <bool ForConstEval> void TranslatePackage(
-        const Package& chirPkg, const std::vector<CHIR::FuncBase*>& initFuncsForConstVar);
+        const Package& chirPkg, const std::vector<CHIR::Function*>& initFuncsForConstVar);
     template <bool ForConstEval> void TranslateClassesLike(const Package& chirPkg);
     template <bool ForConstEval> void TranslateClasses(const Package& chirPkg);
     template <bool ForConstEval> void TranslateStucts(const Package& chirPkg);
@@ -86,7 +85,7 @@ private:
     /** @brief Adds a new type to the types section of bchir and returns its index. Uses typesMemoization. */
     Bchir::ByteCodeContent GetTypeIdx(CHIR::Type& chirType);
 
-    void SetDefaultFunction(const Package& chirPkg, const Func& f);
+    void SetDefaultFunction(const Package& chirPkg, const Function& f);
 
     /* These functions should possibly be marked as intrinsic in CHIR, but since they aren't at the moment we
     intercept them in CHIR2BCHIR and translate them to intrinsic functions in BCHIR. */
@@ -112,7 +111,7 @@ private:
 
     template <bool ForConstEval> Context TranslateGlobalVar(const GlobalVar& gv);
 
-    void TranslateFuncDef(Context& ctx, const Func& func);
+    void TranslateFuncDef(Context& ctx, const Function& func);
 
     void TranslateValue(Context& ctx, const Value& value);
     void TranslateLiteralValue(Context& ctx, const LiteralValue& value);
@@ -156,10 +155,6 @@ private:
     {
     }
 
-#if defined(__clang__)
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wsign-conversion"
-#endif
     template <typename... Args> inline void PushArgs(Context& ctx, Bchir::ByteCodeContent v, Args&&... args)
     {
         ctx.def.Push(v);
@@ -204,9 +199,6 @@ private:
         }
         PushArgs(ctx, args...);
     }
-#if defined(__clang__)
-#pragma clang diagnostic pop
-#endif
 
     bool IsConstClass(const CustomTypeDef& def) const;
 };

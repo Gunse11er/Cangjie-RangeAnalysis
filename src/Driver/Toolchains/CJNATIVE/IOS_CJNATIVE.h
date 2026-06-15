@@ -41,6 +41,7 @@ protected:
     TempFileInfo GenerateLinkingTool(
         const std::vector<TempFileInfo>& objFiles, const std::string& darwinSDKVersion) override;
     void GenerateLinkOptions(Tool& tool) override;
+    std::string GetClangRTProfileLibraryName() const override;
 };
 
 #endif // CANGJIE_DRIVER_TOOLCHAIN_IOS_CJNATIVE_H

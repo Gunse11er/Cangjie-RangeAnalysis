@@ -127,8 +127,7 @@ void OCFFIParserImpl::DiagObjCMirrorFuncCannotHaveBody(const FuncDecl& decl) con
 
 void OCFFIParserImpl::DiagObjCMirrorFuncMustHaveExplicitType(const FuncDecl& decl) const
 {
-    p.ParseDiagnoseRefactor(
-        DiagKindRefactor::parse_objc_mirror_func_must_have_explicit_type, decl, decl.identifier.Val());
+    p.ParseDiagnoseRefactor(DiagKindRefactor::parse_objc_mirror_func_must_have_explicit_type, decl, decl.identifier.Val());
 }
 
 void OCFFIParserImpl::DiagObjCMirrorFuncCannotBeConst(const FuncDecl& decl) const

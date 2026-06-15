@@ -12,11 +12,11 @@
 
 #include "cangjie/Option/Option.h"
 
+#include <cctype>
 #include <numeric>
 #include <regex>
 #include <string>
 #include <unordered_map>
-#include <cctype>
 
 #include "cangjie/Basic/DiagnosticEngine.h"
 #include "cangjie/Basic/Print.h"
@@ -24,8 +24,8 @@
 #include "cangjie/Utils/FileUtil.h"
 #include "cangjie/Utils/Semaphore.h"
 #include "cangjie/Utils/SipHash.h"
-#include "cangjie/Utils/Utils.h"
 #include "cangjie/Utils/Unicode.h"
+#include "cangjie/Utils/Utils.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -66,13 +66,9 @@ std::string BoolToSerializedString(bool val)
     return val ? "t" : "f";
 }
 
-const std::unordered_map<ArchType, std::string> ARCH_STRING_MAP = {
-    {ArchType::X86_64, "x86_64"},
-    {ArchType::AARCH64, "aarch64"},
-    {ArchType::ARM32, "arm"},
-    {ArchType::ARM64, "arm64"},
-    {ArchType::UNKNOWN, "unknown"},
-};
+const std::unordered_map<ArchType, std::string> ARCH_STRING_MAP = {{ArchType::X86_64, "x86_64"},
+    {ArchType::AARCH64, "aarch64"}, {ArchType::ARM64, "arm64"}, {ArchType::ARM32, "arm"},
+    {ArchType::UNKNOWN, "unknown"}};
 
 const std::unordered_map<OSType, std::string> OS_STRING_MAP = {
     {OSType::WINDOWS, "windows"},
@@ -186,6 +182,20 @@ std::string Triple::Info::GetEffectiveTripleString() const
     if (tripleString == "aarch64-ios-simulator") {
         return "arm64-apple-ios17.5-simulator";
     }
+    constexpr std::string_view androidPrefix = "arm-linux-android";
+    constexpr std::string_view androidBackendPrefix = "armv7a-linux-androideabi";
+    constexpr size_t androidBackendPrefixExtraSize = androidBackendPrefix.size() - androidPrefix.size();
+    if (tripleString.size() >= androidPrefix.size() &&
+        tripleString.compare(0, androidPrefix.size(), androidPrefix.data()) == 0) {
+        std::string result;
+        result.reserve(tripleString.size() + androidBackendPrefixExtraSize);
+        // The mtriple passed to the backend llc must be armv7a-xx, otherwise Core compilation will fail with missing
+        // _sync_val_compare. It needs to be properly lowered to atomic.
+        result = androidBackendPrefix;
+        result.append(tripleString, androidPrefix.size(), std::string::npos);
+        return result;
+    }
+
     return tripleString;
 }
 
@@ -258,9 +268,11 @@ bool GlobalOptions::PerformPostActions()
     success = success && CheckSanitizerOptions();
     success = success && CheckLtoOptions();
     success = success && CheckCompileAsExeOptions();
+    success = success && CheckLTOPkgVisibilityOptions();
     success = success && CheckPgoOptions();
     success = success && CheckOutputModeOptions();
     success = success && ReprocessObfuseOption();
+    success = success && CheckCJMPOptions();
     RefactJobs();
     RefactAggressiveParallelCompileOption();
     DisableStaticStdForOhos();
@@ -294,6 +306,9 @@ void GlobalOptions::SetupCompileTargetOptions()
 bool GlobalOptions::ReprocessReflectionOption()
 {
     if (target.IsMacOS()) {
+        disableReflection = true;
+    }
+    if (target.IsArm32()) {
         disableReflection = true;
     }
     return true;
@@ -598,6 +613,28 @@ bool GlobalOptions::CheckCompileAsExeOptions() const
     return true;
 }
 
+bool GlobalOptions::CheckLTOPkgVisibilityOptions() const
+{
+    if (IsLTOPkgVisibilityEnabled() && !IsLTOEnabled()) {
+        DiagnosticEngine diag;
+        diag.DiagnoseRefactor(DiagKindRefactor::driver_invalid_visible_pkgs, DEFAULT_POSITION);
+        return false;
+    }
+
+    if (!ltoVisiblePkgs.empty() && IsCompileAsExeEnabled()) {
+        DiagnosticEngine diag;
+        diag.DiagnoseRefactor(DiagKindRefactor::driver_invalid_visible_pkgs_conflict, DEFAULT_POSITION);
+        return false;
+    }
+
+    if (IsLTOPkgVisibilityEnabled() && outputMode != OutputMode::SHARED_LIB) {
+        DiagnosticEngine diag;
+        diag.DiagnoseRefactor(DiagKindRefactor::driver_visible_pkgs_only_for_dylib, DEFAULT_POSITION);
+    }
+
+    return true;
+}
+
 bool GlobalOptions::CheckPgoOptions() const
 {
     DiagnosticEngine diag;
@@ -626,6 +663,36 @@ bool GlobalOptions::CheckPgoOptions() const
         }
     }
     return true;
+}
+
+bool GlobalOptions::VerifyFileExtension(
+    const std::string& file, const std::string& fullPath, const std::string& extension, DiagnosticEngine& diag) const
+{
+    if (GetFileExtension(fullPath) != extension) {
+        RaiseArgumentUnusedMessage(
+            diag, DiagKindRefactor::driver_warning_unexpected_file_extension, extension, file, fullPath);
+        return false;
+    }
+
+    return true;
+}
+
+bool GlobalOptions::CheckCJMPOptions() const
+{
+    DiagnosticEngine diag;
+    bool ok = true;
+    for (const auto& cjoFile : commonPartCjos) {
+        ok &= VerifyFileExtension(cjoFile, cjoFile, CJO_EXTENSION, diag);
+    }
+    for (const auto& chirFile : commonPartChirs) {
+        ok &= VerifyFileExtension(chirFile, chirFile, CHIR_EXTENSION, diag);
+    }
+    if (commonPartCjos.size() != commonPartChirs.size()) {
+        diag.DiagnoseRefactor(DiagKindRefactor::driver_require_common_chir_for_each_common_cjo, DEFAULT_POSITION);
+        ok = false;
+    }
+
+    return ok;
 }
 
 void GlobalOptions::RefactJobs()
@@ -674,7 +741,7 @@ void GlobalOptions::DisableStaticStdForOhos()
     if (target.env == Triple::Environment::OHOS) {
         if (linkStaticStd.has_value() && linkStaticStd.value()) {
             DiagnosticEngine diag;
-            (void) diag.DiagnoseRefactor(DiagKindRefactor::driver_static_std_for_ohos, DEFAULT_POSITION);
+            (void)diag.DiagnoseRefactor(DiagKindRefactor::driver_static_std_for_ohos, DEFAULT_POSITION);
         }
         linkStaticStd = false;
     }
@@ -686,22 +753,14 @@ bool GlobalOptions::HandleArchiveExtension(DiagnosticEngine& diag, const std::st
     if (!maybePath.has_value()) {
         return false;
     }
+    auto fullPath = maybePath.value();
     auto ext = GetFileExtension(value);
-    if (ext == ARCHIVE_EXTENSION && GetFileExtension(maybePath.value()) != ARCHIVE_EXTENSION) {
-        RaiseArgumentUnusedMessage(diag, DiagKindRefactor::driver_warning_not_archive_file, value, maybePath.value());
+    if (!VerifyFileExtension(value, fullPath, ext, diag)) {
         return true;
     }
-    if (ext == OBJECT_EXTENSION && GetFileExtension(maybePath.value()) != OBJECT_EXTENSION) {
-        RaiseArgumentUnusedMessage(diag, DiagKindRefactor::driver_warning_not_object_file, value, maybePath.value());
-        return true;
-    }
-    if (ext == COFF_OBJECT_EXTENSION && GetFileExtension(maybePath.value()) != COFF_OBJECT_EXTENSION) {
-        RaiseArgumentUnusedMessage(diag, DiagKindRefactor::driver_warning_not_object_file, value, maybePath.value());
-        return true;
-    }
-    inputObjs.emplace_back(maybePath.value());
+    inputObjs.emplace_back(fullPath);
     // The .o and .a file is replaced with the absolute path
-    ReplaceInputFileName(value, maybePath.value());
+    ReplaceInputFileName(value, fullPath);
     return true;
 }
 
@@ -711,8 +770,7 @@ bool GlobalOptions::HandleCJOExtension(DiagnosticEngine& diag, const std::string
     if (!maybePath.has_value()) {
         return false;
     }
-    if (GetFileExtension(maybePath.value()) != CJO_EXTENSION) {
-        RaiseArgumentUnusedMessage(diag, DiagKindRefactor::driver_warning_not_cjo_file, value, maybePath.value());
+    if (!VerifyFileExtension(value, maybePath.value(), CJO_EXTENSION, diag)) {
         return true;
     }
     if (!inputCjoFile.empty()) {
@@ -721,20 +779,6 @@ bool GlobalOptions::HandleCJOExtension(DiagnosticEngine& diag, const std::string
         return false;
     }
     inputCjoFile = value;
-    return true;
-}
-
-bool GlobalOptions::HandleCHIRExtension(DiagnosticEngine& diag, const std::string& value)
-{
-    auto maybePath = ValidateInputFilePath(value, DiagKindRefactor::no_such_file_or_directory);
-    if (!maybePath.has_value()) {
-        return false;
-    }
-    if (GetFileExtension(maybePath.value()) != CHIR_EXTENSION) {
-        RaiseArgumentUnusedMessage(diag, DiagKindRefactor::driver_warning_not_chir_file, value, maybePath.value());
-        return true;
-    }
-    inputChirFiles.push_back(maybePath.value());
     return true;
 }
 
@@ -749,8 +793,7 @@ bool GlobalOptions::HandleCJExtension(DiagnosticEngine& diag, const std::string&
     if (!maybePath.has_value()) {
         return false;
     }
-    if (GetFileExtension(maybePath.value()) != CJ_EXTENSION) {
-        RaiseArgumentUnusedMessage(diag, DiagKindRefactor::driver_warning_not_cj_file, value, maybePath.value());
+    if (!VerifyFileExtension(value, maybePath.value(), CJ_EXTENSION, diag)) {
         return true;
     }
     srcFiles.push_back(value);
@@ -778,13 +821,13 @@ bool GlobalOptions::HandleBCExtension(DiagnosticEngine& diag, const std::string&
     if (!maybePath.has_value()) {
         return false;
     }
-    if (GetFileExtension(maybePath.value()) != BC_EXTENSION) {
-        RaiseArgumentUnusedMessage(diag, DiagKindRefactor::driver_warning_not_bc_file, value, maybePath.value());
+    auto fullPath = maybePath.value();
+    if (!VerifyFileExtension(value, fullPath, BC_EXTENSION, diag)) {
         return true;
     }
-    bcInputFiles.push_back(maybePath.value());
+    bcInputFiles.push_back(fullPath);
     // The .bc file is replaced with the absolute path
-    ReplaceInputFileName(value, maybePath.value());
+    ReplaceInputFileName(value, fullPath);
     return true;
 }
 
@@ -819,8 +862,7 @@ bool GlobalOptions::ProcessInputs(const std::vector<std::string>& inputs)
 {
     DiagnosticEngine diag;
     bool ret = true;
-    bool needChir = (commonPartCjo != std::nullopt);
-    std::for_each(inputs.begin(), inputs.end(), [this, &ret, &diag, &needChir](const std::string& value) {
+    std::for_each(inputs.begin(), inputs.end(), [this, &ret, &diag](const std::string& value) {
         if (!ret) {
             return;
         }
@@ -831,9 +873,6 @@ bool GlobalOptions::ProcessInputs(const std::vector<std::string>& inputs)
             ret = HandleCJExtension(diag, value);
         } else if (ext == BC_EXTENSION) {
             ret = HandleBCExtension(diag, value);
-        } else if (ext == CHIR_EXTENSION) {
-            needChir = false;
-            ret = HandleCHIRExtension(diag, value);
         } else if (ext == CJO_EXTENSION) {
             ret = HandleCJOExtension(diag, value);
         } else if (HasCJDExtension(value) && compileCjd) {
@@ -845,10 +884,6 @@ bool GlobalOptions::ProcessInputs(const std::vector<std::string>& inputs)
     // Check inputs.
     if (compilePackage && packagePaths.empty()) {
         (void)diag.DiagnoseRefactor(DiagKindRefactor::driver_require_package_directory, DEFAULT_POSITION);
-        return false;
-    }
-    if (needChir) {
-        (void)diag.DiagnoseRefactor(DiagKindRefactor::driver_require_chir_directory, DEFAULT_POSITION);
         return false;
     }
     if (compilePackage && packagePaths.size() > 1) {
@@ -878,6 +913,8 @@ void GlobalOptions::CollectOrderedInputFiles(ArgInstance& arg, uint64_t idx)
             }
             break;
         }
+        default:
+            CJC_ABORT();
     }
 }
 
@@ -907,6 +944,8 @@ bool GlobalOptions::ParseFromArgs(ArgList& argList)
                 skipParsing = skipParsing || skip;
                 break;
             }
+            default:
+                CJC_ABORT();
         }
         CollectOrderedInputFiles(*arg.get(), inputIdx);
         inputIdx++;
@@ -960,6 +999,8 @@ std::vector<std::string> GlobalOptions::GenerateFrontendOptions() const
                 // All constructors of ArgInstanceType are handled here. Without `default` case,
                 // exhaustive type checking could help detect potential errors.
             }
+            default:
+                CJC_ABORT();
         }
     }
     bool multiBC = aggressiveParallelCompile.value_or(1) > 1;
@@ -974,7 +1015,8 @@ void GlobalOptions::DeprecatedOptionCheck(const OptionArgInstance& arg) const
 {
     // Check if the option is deprecated which will be removed in the future release
     Options::ID id = arg.info.GetID();
-    const std::unordered_set<Options::ID> deprecatedOptions{Options::ID::STATIC_LIBS, Options::ID::DY_LIBS};
+    const std::unordered_set<Options::ID> deprecatedOptions{
+        Options::ID::STATIC_LIBS, Options::ID::DY_LIBS, Options::ID::COMPILE_AS_EXE};
     DiagnosticEngine diag;
     if (deprecatedOptions.find(id) != deprecatedOptions.end()) {
         std::string substitutableOption = "";
@@ -1115,9 +1157,15 @@ std::optional<std::string> GlobalOptions::CheckInputFilePath(const std::string& 
 #endif
 
 std::optional<std::string> GlobalOptions::ValidateInputFilePath(
-    const std::string& path, const DiagKindRefactor notFoundError) const
+    const std::string& path, const DiagKindRefactor notFoundError)
 {
     DiagnosticEngine diag;
+    return ValidateInputFilePath(path, notFoundError, diag);
+}
+
+std::optional<std::string> GlobalOptions::ValidateInputFilePath(
+    const std::string& path, const DiagKindRefactor notFoundError, DiagnosticEngine& diag)
+{
     if (IsAbsolutePathAboveLengthLimit(path)) {
         (void)diag.DiagnoseRefactor(DiagKindRefactor::driver_path_exceeds_length_limit, DEFAULT_POSITION, path,
             std::to_string(FILE_PATH_MAX_LENGTH));
@@ -1163,6 +1211,7 @@ std::string GlobalOptions::GetSharedLibraryExtension(Triple::OSType osType)
         case Triple::OSType::WINDOWS:
             return ".dll";
         case Triple::OSType::DARWIN:
+        case Triple::OSType::IOS:
             return ".dylib";
         case Triple::OSType::LINUX:
         case Triple::OSType::UNKNOWN:
@@ -1197,7 +1246,11 @@ void GlobalOptions::ReadPathsFromEnvironmentVars(const std::unordered_map<std::s
 
 std::string GlobalOptions::GetCangjieLibHostPathName() const
 {
-    return host.OSToString() + "_" + host.ArchToString() + "_" + BackendToString(backend);
+    std::string name = host.OSToString();
+    if (host.env == Triple::Environment::OHOS) {
+        name += "_" + host.EnvironmentToString();
+    }
+    return name + "_" + host.ArchToString() + "_" + BackendToString(backend);
 }
 
 std::string GlobalOptions::GetCangjieLibTargetPathName() const
@@ -1207,7 +1260,9 @@ std::string GlobalOptions::GetCangjieLibTargetPathName() const
         std::string envName = target.EnvironmentToString();
         if (target.env == Triple::Environment::ANDROID) {
             auto envNameLen = envName.size();
-            envName.erase(envNameLen - target.apiLevel.size());
+            if (target.ArchToString() != "arm") {
+                envName.erase(envNameLen - target.apiLevel.size());
+            }
         }
         name += "_" + envName;
     }

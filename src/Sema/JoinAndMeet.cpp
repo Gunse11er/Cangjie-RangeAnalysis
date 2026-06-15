@@ -412,20 +412,20 @@ void JoinAndMeet::AddFinalErrMsgs(const Ty& ty, bool isJoin)
     }
 }
 
-std::optional<std::string> JoinAndMeet::SetJoinedType(
-    Ptr<Ty>& ty, std::variant<std::stack<std::string>, Ptr<Ty>>& joinRes)
+std::pair<std::optional<std::string>, Ptr<Ty>> JoinAndMeet::SetJoinedType(
+    Ptr<Ty> ty, std::variant<std::stack<std::string>, Ptr<Ty>>& joinRes)
 {
     if (std::get_if<Ptr<Ty>>(&joinRes)) {
         ty = std::get<Ptr<Ty>>(joinRes);
-        return {};
-    } else {
-        ty = TypeManager::GetInvalidTy();
-        auto errMsgs = std::get<std::stack<std::string>>(joinRes);
-        return {JoinAndMeet::CombineErrMsg(errMsgs)};
+        return {{}, ty};
     }
+    ty = TypeManager::GetInvalidTy();
+    auto errMsgs = std::get<std::stack<std::string>>(joinRes);
+    return {JoinAndMeet::CombineErrMsg(errMsgs), ty};
 }
 
-std::optional<std::string> JoinAndMeet::SetMetType(Ptr<Ty>& ty, std::variant<std::stack<std::string>, Ptr<Ty>>& metRes)
+std::pair<std::optional<std::string>, Ptr<Ty>> JoinAndMeet::SetMetType(
+    Ptr<Ty> ty, std::variant<std::stack<std::string>, Ptr<Ty>>& metRes)
 {
     return SetJoinedType(ty, metRes);
 }

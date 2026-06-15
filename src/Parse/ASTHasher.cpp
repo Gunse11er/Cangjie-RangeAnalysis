@@ -409,11 +409,6 @@ struct ASTHasherImpl {
         SUPERHash<whatTypeToHash>(fd.funcBody, static_cast<int64_t>(fd.op));
     }
 
-    template <int whatTypeToHash> void HashPrimaryCtorDecl(const PrimaryCtorDecl& pc)
-    {
-        HashDecl<whatTypeToHash>(pc);
-        SUPERHash<whatTypeToHash>(pc.funcBody);
-    }
     template <int whatTypeToHash> void HashVarWithPatternDecl(const VarWithPatternDecl& vwp)
     {
         HashVarDeclAbstract<whatTypeToHash>(vwp);
@@ -499,8 +494,8 @@ struct ASTHasherImpl {
         SUPERHash<whatTypeToHash>(ma.baseExpr, ma.field, ma.typeArguments, ma.isPattern);
         if (auto maTarget = ma.target) {
             SUPERHash<whatTypeToHash>(maTarget->rawMangleName);
-            CJC_ASSERT(maTarget->ty);
-            SUPERHash<whatTypeToHash>(maTarget->ty->String());
+            CJC_ASSERT(maTarget->GetTy());
+            SUPERHash<whatTypeToHash>(maTarget->GetTy()->String());
         }
     }
     template <int whatTypeToHash> void HashTypeConvExpr(const TypeConvExpr& ntc)
@@ -536,8 +531,8 @@ struct ASTHasherImpl {
             re.ref.identifier.Val(), re.typeArguments, re.isThis, re.isSuper, re.isQuoteDollar);
         if (auto refTarget = re.ref.target) {
             SUPERHash<whatTypeToHash>(refTarget->rawMangleName);
-            CJC_ASSERT(refTarget->ty);
-            SUPERHash<whatTypeToHash>(refTarget->ty->String());
+            CJC_ASSERT(refTarget->GetTy());
+            SUPERHash<whatTypeToHash>(refTarget->GetTy()->String());
         }
     }
     template <int whatTypeToHash> void HashReturnExpr(const ReturnExpr& re)
@@ -692,8 +687,8 @@ struct ASTHasherImpl {
         SUPERHash<whatTypeToHash>(qt.baseType, qt.field, qt.typeArguments);
         if (auto refTarget = qt.target) {
             SUPERHash<whatTypeToHash>(refTarget->rawMangleName);
-            CJC_ASSERT(refTarget->ty);
-            SUPERHash<whatTypeToHash>(refTarget->ty->String());
+            CJC_ASSERT(refTarget->GetTy());
+            SUPERHash<whatTypeToHash>(refTarget->GetTy()->String());
         }
     }
 
@@ -703,8 +698,8 @@ struct ASTHasherImpl {
         SUPERHash<whatTypeToHash>(rt.ref.identifier.Val(), rt.typeArguments);
         if (auto refTarget = rt.ref.target) {
             SUPERHash<whatTypeToHash>(refTarget->rawMangleName);
-            CJC_ASSERT(refTarget->ty);
-            SUPERHash<whatTypeToHash>(refTarget->ty->String());
+            CJC_ASSERT(refTarget->GetTy());
+            SUPERHash<whatTypeToHash>(refTarget->GetTy()->String());
         }
     }
 
@@ -1161,17 +1156,6 @@ void (*ASTHasherImpl::hashFuncMapNonPosition[nodeKind])(ASTHasherImpl&, Ptr<cons
 #include "cangjie/AST/ASTKind.inc"
 #undef ASTKIND
 };
-
-ASTHasher::hash_type ASTHasher::HashWithPos(Ptr<const Node> node)
-{
-    ASTHasherImpl a{};
-    return a.Hash<ALL>(node);
-}
-ASTHasher::hash_type ASTHasher::HashNoPos(Ptr<const Node> node)
-{
-    ASTHasherImpl a{};
-    return a.Hash<NON_POSITION>(node);
-}
 
 ASTHasher::hash_type ASTHasher::HashSpecs(const Package& pk)
 {

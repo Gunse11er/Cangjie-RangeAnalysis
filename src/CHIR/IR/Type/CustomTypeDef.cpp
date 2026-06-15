@@ -11,8 +11,11 @@
  */
 #include "cangjie/CHIR/IR/Type/CustomTypeDef.h"
 
+#include <cstddef>
 #include <iostream>
 #include <optional>
+#include <sstream>
+#include <unordered_set>
 #include <utility>
 
 #include "cangjie/CHIR/Utils/CHIRCasting.h"
@@ -26,14 +29,68 @@
 
 using namespace Cangjie::CHIR;
 
-void CustomTypeDef::AddMethod(FuncBase* method, [[maybe_unused]] bool recordOrder)
+namespace {
+/**
+ *  we choose the well matching but there may be many results, if there are many results, their `instance` must be same
+ *  so we need to define what function is NOT well matching, of course, the rule is from spec:
+ *  1. you can review how the `candidateTypes` are calculated
+ *  2. we assume that i and j are from `candidateTypes`, we define function `i` is NOT well matching if all parameters
+ *     in function `j` can be forwarded to function `i`, but not all parameters in function `i` can be forwarded to
+ *     function `j`
+ */
+std::vector<VTableSearchRes> GetWellMatchingResults(const std::vector<VTableSearchRes>& candidateRes,
+    const std::vector<FuncType*>& candidateTypes, CHIRBuilder& builder)
+{
+    if (candidateRes.size() <= 1) {
+        return candidateRes;
+    }
+    CJC_ASSERT(candidateRes.size() == candidateTypes.size());
+    auto candidateNum = candidateTypes.size();
+    std::vector<bool> targetMark(candidateNum, true);
+    for (size_t i = 0; i < candidateNum; ++i) {
+        if (!targetMark[i]) {
+            continue;
+        }
+        for (size_t j = i + 1; j < candidateNum; ++j) {
+            if (!targetMark[j]) {
+                continue;
+            }
+            auto iToJ = candidateTypes[i]->IsEqualOrInstantiatedTypeOf(*candidateTypes[j], builder);
+            auto jToI = candidateTypes[j]->IsEqualOrInstantiatedTypeOf(*candidateTypes[i], builder);
+            // according to spec, the more specific type is expected
+            // but if iToJ and jToI are both true, that means i and j have same func signature, we need to store both,
+            // if iToJ and jToI are both false, that means there is genric param in i and j, generic params can't
+            // be forwarded to each other
+            if (iToJ && !jToI) {
+                targetMark[j] = false;
+            } else if (!iToJ && jToI) {
+                targetMark[i] = false;
+                break;
+            }
+        }
+    }
+    std::vector<VTableSearchRes> result;
+    std::unordered_set<Function*> instances;
+    for (size_t i = 0; i < candidateNum; ++i) {
+        if (targetMark[i]) {
+            result.emplace_back(candidateRes[i]);
+            instances.emplace(candidateRes[i].instance);
+        }
+    }
+    CJC_ASSERT(!result.empty());
+    CJC_ASSERT(instances.size() == 1);
+    return result;
+}
+}
+
+void CustomTypeDef::AddMethod(Function* method)
 {
     CJC_NULLPTR_CHECK(method);
     method->declaredParent = this;
     methods.emplace_back(method);
 }
 
-void CustomTypeDef::AddStaticMemberVar(GlobalVarBase* variable)
+void CustomTypeDef::AddStaticMemberVar(GlobalVar* variable)
 {
     CJC_NULLPTR_CHECK(variable);
     variable->declaredParent = this;
@@ -74,30 +131,21 @@ std::vector<ClassType*> CustomTypeDef::GetSuperTypesInCurDef() const
     return res;
 }
 
-std::string CustomTypeDef::GenericDefArgsToString() const
+std::string CustomTypeDef::CustomTypeDefTitleToString() const
 {
-    auto genericTypeParams = GetGenericTypeParams();
-    if (genericTypeParams.empty()) {
-        return "";
+    std::string kindStr;
+    if (IsInterface()) {
+        kindStr = "interface";
+    } else if (IsClass()) {
+        kindStr = "class";
+    } else if (IsStruct()) {
+        kindStr = "struct";
+    } else if (IsEnum()) {
+        kindStr = "enum";
+    } else if (IsExtend()) {
+        kindStr = "extend";
     }
-    std::string res;
-    res += "<";
-    for (size_t i = 0; i < genericTypeParams.size(); ++i) {
-        res += genericTypeParams[i]->ToString();
-        // not the last one
-        if (i != genericTypeParams.size() - 1) {
-            res += ", ";
-        }
-    }
-    res += ">";
-    return res;
-}
-
-void CustomTypeDef::PrintAttrAndTitle(std::stringstream& ss) const
-{
-    ss << attributeInfo.ToString();
-    ss << CustomTypeKindToString(*this) << " " << GetIdentifier() << GenericDefArgsToString();
-    PrintParent(ss);
+    return kindStr + " " + identifier + TypeVecToString("<", GetGenericTypeParams(), ">");
 }
 
 std::string CustomTypeDef::GenericInsArgsToString(const CustomType& ty) const
@@ -119,104 +167,116 @@ std::string CustomTypeDef::GenericInsArgsToString(const CustomType& ty) const
     return res;
 }
 
-void CustomTypeDef::PrintParent(std::stringstream& ss) const
+std::string CustomTypeDef::ParentToString() const
 {
     auto parentTys = GetSuperTypesInCurDef();
     if (parentTys.empty()) {
-        return;
+        return "";
     }
-    ss << " <: ";
-    for (size_t i = 0; i < parentTys.size(); ++i) {
-        ss << parentTys[i]->GetCustomTypeDef()->GetIdentifier() << GenericInsArgsToString(*parentTys[i]);
-        // not the last one
-        if (i != parentTys.size() - 1) {
-            ss << " & ";
-        }
-    }
+    return " <: " + TypeVecToString("", parentTys, "",  " & ");
 }
 
-void CustomTypeDef::PrintComment(std::stringstream& ss) const
+std::string CustomTypeDef::AddExtraComment() const
 {
-    std::stringstream comment;
-    if (!srcCodeIdentifier.empty()) {
-        comment << "srcCodeIdentifier: " << srcCodeIdentifier;
+    return "";
+}
+
+std::string CustomTypeDef::CommentToString() const
+{
+    std::vector<std::string> result;
+    if (auto baseComment = BaseCommentToString(); !baseComment.empty()) {
+        result.emplace_back(baseComment);
     }
-    AddCommaOrNot(comment);
+    if (!srcCodeIdentifier.empty()) {
+        result.emplace_back("srcCodeIdentifier: " + srcCodeIdentifier);
+    }
     auto genericTypeParams = GetGenericTypeParams();
     if (!genericTypeParams.empty()) {
-        auto constraintsStr = GetGenericConstaintsStr(genericTypeParams);
+        auto constraintsStr = GetGenericTypeConstaintsStr(genericTypeParams);
         if (!constraintsStr.empty()) {
-            comment << "genericConstrains: " << constraintsStr;
+            result.emplace_back("genericConstrains: " + constraintsStr);
         }
     }
-    AddCommaOrNot(comment);
-    comment << ToStringAnnotationMap();
-    AddCommaOrNot(comment);
     if (genericDecl != nullptr) {
-        comment << "genericDecl: " << genericDecl->GetIdentifierWithoutPrefix();
-        AddCommaOrNot(comment);
+        result.emplace_back("genericDecl: " + genericDecl->GetIdentifier());
     }
-    comment << "packageName: " << packageName;
-    if (comment.str() != "") {
-        ss << " // " << comment.str();
+    if (auto extra = AddExtraComment(); !extra.empty()) {
+        result.emplace_back(extra);
     }
+    return ::CommentToString(result);
 }
 
-void CustomTypeDef::PrintLocalVar(std::stringstream& ss) const
+std::string CustomTypeDef::LocalVarToString() const
 {
+    std::stringstream ss;
     for (auto& localVar : instanceVars) {
-        PrintIndent(ss);
+        ss << AddNewLineOrNot(localVar.annoInfo.ToString(1));
+        ss << IndentToString(1) << localVar.attributeInfo.ToString();
         localVar.TestAttr(Attribute::READONLY) ? ss << "let " : ss << "var ";
-        ss << localVar.name << ": " << localVar.type->ToString() << " // " << localVar.loc.ToString() << "\n";
+        ss << localVar.name << ": " << localVar.type->ToString();
+        std::vector<std::string> comments;
+        if (!localVar.loc.IsInvalidPos()) {
+            comments.emplace_back("loc: " + localVar.loc.ToString());
+        }
+        if (localVar.initializerFunc != nullptr) {
+            comments.emplace_back("initFunc: " + localVar.initializerFunc->GetIdentifier());
+        }
+        if (!localVar.rawMangledName.empty()) {
+            comments.emplace_back("rawMangledName: " + localVar.rawMangledName);
+        }
+        ss << ::CommentToString(comments);
+        ss << std::endl;
     }
+    return ss.str();
 }
 
-void CustomTypeDef::PrintStaticVar(std::stringstream& ss) const
+std::string CustomTypeDef::StaticVarToString() const
 {
-    for (auto& staticVar : staticVars) {
-        PrintIndent(ss);
-        ss << "[static] ";
-        staticVar->TestAttr(Attribute::READONLY) ? ss << "let " : ss << "var ";
-        ss << staticVar->GetIdentifier() << ": " << staticVar->GetType()->ToString() << "\n";
+    std::stringstream ss;
+    for (auto staticVar : staticVars) {
+        ss << IndentToString(1) << staticVar->GetAttributeInfo().ToString();
+        staticVar->TestAttr(Attribute::READONLY) ? ss << " let " : ss << " var ";
+        ss << staticVar->GetIdentifier() << ": " << staticVar->GetType()->ToString() << std::endl;
     }
+    return ss.str();
 }
 
-void CustomTypeDef::PrintMethod(std::stringstream& ss) const
+std::string CustomTypeDef::MethodToString() const
 {
-    for (auto& method : methods) {
-        PrintIndent(ss);
-        ss << method->GetAttributeInfo().ToString();
-        ss << "func " << method->GetIdentifier() << ": " << method->GetType()->ToString() << "\n";
+    std::stringstream ss;
+    for (auto method : methods) {
+        ss << IndentToString(1) << method->GetAttributeInfo().ToString();
+        ss << " func " << method->GetIdentifier() << ": " << method->GetType()->ToString() << std::endl;
     }
+    return ss.str();
 }
 
-void CustomTypeDef::PrintVTable(std::stringstream& ss) const
+std::string CustomTypeDef::VTableToString() const
 {
-    unsigned indent = 1;
+    std::stringstream ss;
+    size_t indent = 1;
     const auto& vtables = vtable.GetTypeVTables();
     if (vtables.empty()) {
-        return;
+        return "";
     }
-    PrintIndent(ss, indent++);
-    ss << "vtable {\n";
+    ss << IndentToString(indent++);
+    ss << "vtable {" << std::endl;
     for (const auto& vtableInType : vtables) {
-        PrintIndent(ss, indent++);
-        ss << vtableInType.GetSrcParentType()->ToString() << " {\n";
+        ss << IndentToString(indent++);
+        ss << vtableInType.GetSrcParentType()->ToString() << " {" << std::endl;
         for (const auto& funcInfo : vtableInType.GetVirtualMethods()) {
-            PrintIndent(ss, indent);
+            ss << IndentToString(indent);
             ss << "@" << funcInfo.GetMethodName();
             ss << ": " << funcInfo.GetOriginalFuncType()->ToString();
-            ss << "=> " << (funcInfo.GetVirtualMethod() ? funcInfo.GetVirtualMethod()->GetIdentifier() : "[abstract]");
-            ss << "\n";
+            ss << "=> " << funcInfo.GetVirtualMethod()->GetIdentifier() << std::endl;
         }
-        PrintIndent(ss, --indent);
-        ss << "}\n";
+        ss << IndentToString(--indent) << "}" << std::endl;
     }
-    PrintIndent(ss, --indent);
-    ss << "}\n";
+    ss << IndentToString(--indent) << "}" << std::endl;
+    return ss.str();
 }
 
-std::pair<FuncBase*, bool> CustomTypeDef::GetExpectedFunc(
+Function* CustomTypeDef::GetExpectedFunc(
     const std::string& funcName, FuncType& funcType, bool isStatic,
     std::unordered_map<const GenericType*, Type*> replaceTable,
     std::vector<Type*>& funcInstTypeArgs, CHIRBuilder& builder, bool checkAbstractMethod) const
@@ -228,6 +288,7 @@ std::pair<FuncBase*, bool> CustomTypeDef::GetExpectedFunc(
         CJC_ASSERT(!instParamTys.empty());
         instParamTys.erase(instParamTys.begin());
     }
+    Function* foundFunc = nullptr;
     for (auto method : methods) {
         if (isStatic != method->TestAttr(Attribute::STATIC)) {
             continue;
@@ -247,12 +308,7 @@ std::pair<FuncBase*, bool> CustomTypeDef::GetExpectedFunc(
         if (originalFuncParamTys.size() != instParamTys.size()) {
             continue;
         }
-        std::vector<GenericType*> genericTypeParams;
-        if (auto func = DynamicCast<Func*>(method)) {
-            genericTypeParams = func->GetGenericTypeParams();
-        } else {
-            genericTypeParams = StaticCast<ImportedFunc*>(method)->GetGenericTypeParams();
-        }
+        auto genericTypeParams = method->GetGenericTypeParams();
         if (genericTypeParams.size() != funcInstTypeArgs.size()) {
             continue;
         }
@@ -269,60 +325,27 @@ std::pair<FuncBase*, bool> CustomTypeDef::GetExpectedFunc(
         }
         if (matched) {
             if (auto rawFunc = method->Get<WrappedRawMethod>(); rawFunc && rawFunc->GetParentCustomTypeDef() == this) {
-                return {rawFunc, true};
+                foundFunc = rawFunc;
+            } else {
+                foundFunc = method;
             }
-            return {method, true};
+            break;
         }
     }
-    auto failed = std::pair<FuncBase*, bool>{nullptr, false};
-    if (!checkAbstractMethod) {
-        return failed;
+    if (foundFunc == nullptr) {
+        return nullptr;
     }
-    auto classDef = DynamicCast<ClassDef*>(this);
-    if (classDef == nullptr) {
-        return failed;
+    if (!checkAbstractMethod && foundFunc->TestAttr(Attribute::ABSTRACT)) {
+        return nullptr;
     }
-    for (auto method : classDef->GetAbstractMethods()) {
-        if (isStatic != method.attributeInfo.TestAttr(Attribute::STATIC)) {
-            continue;
-        }
-        if (method.methodName != funcName) {
-            continue;
-        }
-        auto originalFuncParamTys = StaticCast<FuncType*>(method.methodTy)->GetParamTypes();
-        if (!method.attributeInfo.TestAttr(Attribute::STATIC)) {
-            originalFuncParamTys.erase(originalFuncParamTys.begin());
-        }
-        if (originalFuncParamTys.size() != instParamTys.size()) {
-            continue;
-        }
-        auto& genericTypeParams = method.methodGenericTypeParams;
-        if (genericTypeParams.size() != funcInstTypeArgs.size()) {
-            continue;
-        }
-        for (size_t i = 0; i < genericTypeParams.size(); ++i) {
-            replaceTable.emplace(genericTypeParams[i], funcInstTypeArgs[i]);
-        }
-        bool matched = true;
-        for (size_t i = 0; i < originalFuncParamTys.size(); ++i) {
-            auto instType = ReplaceRawGenericArgType(*originalFuncParamTys[i], replaceTable, builder);
-            if (!instParamTys[i]->IsGeneric() && instType != instParamTys[i]) {
-                matched = false;
-                break;
-            }
-        }
-        if (matched) {
-            return {nullptr, true};
-        }
-    }
-    
-    return failed;
+    return foundFunc;
 }
 
 std::vector<VTableSearchRes> CustomTypeDef::GetFuncIndexInVTable(const FuncCallType& funcCallType,
     std::unordered_map<const GenericType*, Type*>& replaceTable, CHIRBuilder& builder) const
 {
     std::vector<VTableSearchRes> res;
+    std::vector<FuncType*> candidateTypes;
     for (const auto& vtableIt : vtable.GetTypeVTables()) {
         for (size_t i = 0; i < vtableIt.GetMethodNum(); ++i) {
             const auto& funcInfo = vtableIt.GetVirtualMethods()[i];
@@ -339,32 +362,65 @@ std::vector<VTableSearchRes> CustomTypeDef::GetFuncIndexInVTable(const FuncCallT
                     .attr = funcInfo.GetAttributeInfo(),
                     .offset = i
                 });
-                break;
+                /** open class A<X> {
+                 *      open public func test<T>(x: X, y: X): Unit {
+                 *          println("a");
+                 *      }
+                 *  }
+                 *
+                 *  open class B<X> <: A<X> {
+                 *      open public func test<Y>(x: C<Y>, y: C<Y>): Unit {
+                 *          println("b");
+                 *      }
+                 *  }
+                 *
+                 *  class C<T> {}
+                 *
+                 *  main() {
+                 *      let x: C<Int64> = C<Int64>()
+                 *      B<C<Int64>>().test<Int64>(x, x)
+                 *  }
+                 *  face to this example, we can get two candidates for func call `B<C<Int64>>().test<Int64>(x, x)`
+                 *  one is A<X>.test<T>(x: X, y: X), the other is B<X>.test<Y>(x: C<Y>, y: C<Y>)
+                 *  we need to choose which one is better, according to spec, we need to instantiate func type,
+                 *  but only instantiate generic type which defined in class decl, not in func decl,
+                 *  so our candidate types are:
+                 *  1. (C<Int64>, C<Int64>), instantiated result of A<X>.test<T>(x: X, y: X)
+                 *      because generic type `X` is instantiated by `C<Int64>`
+                 *  2. (C<Y>, C<Y>), instantiated result of B<X>.test<Y>(x: C<Y>, y: C<Y>)
+                 *      because generic type `Y` is defined in func decl, not in class decl
+                 *
+                 */
+                auto instTy = ReplaceRawGenericArgType(*funcInfo.GetCondition().funcType, replaceTable, builder);
+                candidateTypes.emplace_back(StaticCast<FuncType*>(instTy));
             }
         }
     }
-    return res;
+    return GetWellMatchingResults(res, candidateTypes, builder);
 }
 
 std::string CustomTypeDef::ToString() const
 {
-    /* [public][generic][...] class XXX {      // loc: xxx, genericDecl: xxx
-       ^^^^^^^^^^^^^^ attr    ^^^^^^^^^ title  ^^^^^^^^^^^^^^^^^^ comment
-           local var
+    /* @Anno1[arg1, arg2, ...]
+       [public][generic][...] class XXX<T1, T2> <: parent1 & parent2 { // loc: xxx, genericDecl: xxx
+         ^^^^^^^^^^^^^^ attr    ^^^^^^^^^^^^^^ title   ^^^^^^^^^^^^ parent   ^^^^^^^^^^^^^^^^^^ comment
+           local var (or enum constructor)
            static var
            method
            vtable
        }
     */
     std::stringstream ss;
-    PrintAttrAndTitle(ss);
+    ss << AddNewLineOrNot(annoInfo.ToString(0));
+    ss << attributes.ToString();
+    ss << CustomTypeDefTitleToString();
+    ss << ParentToString();
     ss << " {";
-    PrintComment(ss);
-    ss << "\n";
-    PrintLocalVar(ss);   // has a \n in the end
-    PrintStaticVar(ss);  // has a \n in the end
-    PrintMethod(ss);     // has a \n in the end
-    PrintVTable(ss);     // has a \n in the end
+    ss << AddNewLineOrNot(CommentToString());
+    ss << LocalVarToString();   // has a \n in the end
+    ss << StaticVarToString();  // has a \n in the end
+    ss << MethodToString();     // has a \n in the end
+    ss << VTableToString();     // has a \n in the end
     ss << "}";
     return ss.str();
 }
@@ -374,10 +430,7 @@ std::vector<GenericType*> CustomTypeDef::GetGenericTypeParams() const
     std::vector<GenericType*> genericTypes;
     if (this->TestAttr(Attribute::GENERIC)) {
         for (auto ty : type->GetGenericArgs()) {
-            // why can `ty` can be RefType?
-            if (auto gt = DynamicCast<GenericType*>(ty); gt) {
-                genericTypes.emplace_back(gt);
-            }
+            genericTypes.emplace_back(StaticCast<GenericType*>(ty));
         }
     }
     return genericTypes;
@@ -398,7 +451,7 @@ std::vector<ClassType*> CustomTypeDef::GetSuperTypesRecusively(CHIRBuilder& buil
     return inheritanceList;
 }
 
-void CustomTypeDef::SetMethods(const std::vector<FuncBase*>& items)
+void CustomTypeDef::SetMethods(const std::vector<Function*>& items)
 {
     for (auto m : methods) {
         m->declaredParent = nullptr;
@@ -409,7 +462,7 @@ void CustomTypeDef::SetMethods(const std::vector<FuncBase*>& items)
     methods = items;
 }
 
-void CustomTypeDef::SetStaticMemberVars(const std::vector<GlobalVarBase*>& vars)
+void CustomTypeDef::SetStaticMemberVars(const std::vector<GlobalVar*>& vars)
 {
     for (auto v : staticVars) {
         v->declaredParent = nullptr;
@@ -420,7 +473,7 @@ void CustomTypeDef::SetStaticMemberVars(const std::vector<GlobalVarBase*>& vars)
     staticVars = vars;
 }
 
-std::vector<FuncBase*> CustomTypeDef::GetMethods() const
+std::vector<Function*> CustomTypeDef::GetMethods() const
 {
     return methods;
 }
@@ -467,7 +520,7 @@ void CustomTypeDef::SetVTable(VTableInDef&& table)
 }
 
 void CustomTypeDef::UpdateVtableItem(ClassType& srcClassTy,
-    size_t index, FuncBase* newFunc, Type* newParentTy, const std::string newName)
+    size_t index, Function* newFunc, Type* newParentTy, const std::string newName)
 {
     vtable.UpdateItemInTypeVTable(srcClassTy, index, newFunc, newParentTy, newName);
 }
@@ -511,11 +564,6 @@ std::string CustomTypeDef::GetIdentifier() const
     return identifier;
 }
 
-void CustomTypeDef::AppendAttributeInfo(const AttributeInfo& info)
-{
-    attributeInfo.AppendAttrs(info);
-}
-
 /**
  * Get identifier without prefix '@'
  */
@@ -525,37 +573,17 @@ std::string CustomTypeDef::GetIdentifierWithoutPrefix() const
     return identifier.substr(1);
 }
 
-void CustomTypeDef::EnableAttr(Attribute attr)
-{
-    attributeInfo.SetAttr(attr, true);
-}
-
-void CustomTypeDef::DisableAttr(Attribute attr)
-{
-    attributeInfo.SetAttr(attr, false);
-}
-
-bool CustomTypeDef::TestAttr(Attribute attr) const
-{
-    return attributeInfo.TestAttr(attr);
-}
-
-AttributeInfo CustomTypeDef::GetAttributeInfo() const
-{
-    return attributeInfo;
-}
-
-FuncBase* CustomTypeDef::GetVarInitializationFunc() const
+Function* CustomTypeDef::GetVarInitializationFunc() const
 {
     return varInitializationFunc;
 }
 
-void CustomTypeDef::SetVarInitializationFunc(FuncBase* func)
+void CustomTypeDef::SetVarInitializationFunc(Function* func)
 {
     varInitializationFunc = func;
 }
 
-std::vector<GlobalVarBase*> CustomTypeDef::GetStaticMemberVars() const
+std::vector<GlobalVar*> CustomTypeDef::GetStaticMemberVars() const
 {
     return staticVars;
 }

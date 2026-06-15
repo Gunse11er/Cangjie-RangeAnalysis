@@ -28,28 +28,28 @@ CustomTypeDef* ExtendDef::GetExtendedCustomTypeDef() const
     return nullptr;
 }
 
-void ExtendDef::PrintAttrAndTitle(std::stringstream& ss) const
+std::string ExtendDef::CustomTypeDefTitleToString() const
 {
-    ss << attributeInfo.ToString();
     std::string extendedTyStr;
     CJC_NULLPTR_CHECK(extendedType);
-    if (auto customTy = DynamicCast<const CustomType*>(extendedType); customTy) {
+    if (auto customTy = DynamicCast<const CustomType*>(extendedType)) {
         extendedTyStr = customTy->GetCustomTypeDef()->GetIdentifier() + GenericInsArgsToString(*customTy);
     } else {
         extendedTyStr = extendedType->ToString();
     }
-    ss << CustomTypeKindToString(*this) << GenericDefArgsToString() << " " << extendedTyStr;
-    PrintParent(ss);
+    return "extend" + TypeVecToString("<", genericParams, ">") + " " + extendedTyStr;
 }
 
-void ExtendDef::PrintComment(std::stringstream& ss) const
+std::string ExtendDef::AddExtraComment() const
 {
-    CustomTypeDef::PrintComment(ss);
-    AddCommaOrNot(ss);
-    if (ss.str().empty()) {
-        ss << " // ";
+    std::vector<std::string> result;
+    if (!identifier.empty()) {
+        result.emplace_back("id: " + identifier);
     }
-    ss << "id: " << identifier;
+    if (auto gStr = GetGenericTypeConstaintsStr(genericParams); !gStr.empty()) {
+        result.emplace_back("genericConstrains: " + gStr);
+    }
+    return StringJoin(result, ", ");
 }
 
 void ExtendDef::RemoveParent(ClassType& parent)

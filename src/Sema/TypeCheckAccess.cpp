@@ -58,8 +58,8 @@ void CheckMutationInStructNonMut(DiagnosticEngine& diag, const StructDecl& sd, c
     // these `varDecls` are not allowed to be assigned in non-mut function.
     std::unordered_set<Ptr<Decl>> varDecls;
     for (auto& decl : sd.body->decls) {
-        if (auto vd = DynamicCast<VarDecl*>(decl.get()); vd && !vd->TestAttr(Attribute::STATIC) &&
-            Ty::IsTyCorrect(vd->ty) && !vd->ty->IsArray()) {
+        if (auto vd = DynamicCast<VarDecl*>(decl.get());
+            vd && !vd->TestAttr(Attribute::STATIC) && Ty::IsTyCorrect(vd->GetTy()) && !vd->GetTy()->IsArray()) {
             varDecls.emplace(vd);
         }
     }
@@ -74,7 +74,7 @@ void CheckMutationInStructNonMut(DiagnosticEngine& diag, const StructDecl& sd, c
             }
             break;
         } else if (auto ma = DynamicCast<const MemberAccess*>(baseExpr); ma) {
-            if (ma->baseExpr->ty->IsClassLike()) {
+            if (ma->baseExpr->GetTy()->IsClassLike()) {
                 // don't check member access of field of class like type, unless it is a member access of this
                 // e.g. let T be a class type with field v
                 // this.a = T() // this is a mutation to this
@@ -221,7 +221,8 @@ void TypeChecker::TypeCheckerImpl::CheckIllegalMemberHelper(
             // Report error when this reference and declaration are in same decl.
             diag.Diagnose(
                 pos, DiagKind::sema_assignment_of_member_variable_cannot_use_this_or_super, identifier, errorStr);
-        } else if (!inSameDecl && typeManager.IsSubtype(symOfExprStruct->node->ty, symOfExprStruct->node->ty)) {
+        } else if (!inSameDecl &&
+            typeManager.IsSubtype(symOfExprStruct->node->GetTy(), symOfExprStruct->node->GetTy())) {
             // Report error when this reference and declaration are in decls which have inheritance relation.
             diag.Diagnose(
                 pos, DiagKind::sema_assignment_of_member_variable_cannot_use_this_or_super, identifier, errorStr);
@@ -247,8 +248,8 @@ void TypeChecker::TypeCheckerImpl::CheckMutationInStruct(const ASTContext& ctx, 
     Ptr<StructDecl> sd = nullptr;
     Symbol* outDecl = ScopeManager::GetCurOuterDeclOfScopeLevelX(ctx, expr, 0);
     // The `expr` may be nested in a `struct` or an `extend` of `struct`, and we use `StructTy` to get the `struct`.
-    if (outDecl && Ty::IsTyCorrect(outDecl->node->ty) && outDecl->node->ty->IsStruct()) {
-        sd = RawStaticCast<StructTy*>(outDecl->node->ty)->decl;
+    if (outDecl && Ty::IsTyCorrect(outDecl->node->GetTy()) && outDecl->node->GetTy()->IsStruct()) {
+        sd = RawStaticCast<StructTy*>(outDecl->node->GetTy())->decl;
     }
     if (!sd) {
         return;
@@ -297,8 +298,8 @@ void TypeChecker::TypeCheckerImpl::CheckLetInstanceAccessMutableFunc(
     const ASTContext& ctx, const MemberAccess& ma, const Decl& target)
 {
     CJC_NULLPTR_CHECK(ma.baseExpr);
-    if (!target.TestAttr(Attribute::MUT) || target.astKind != ASTKind::FUNC_DECL || !ma.baseExpr->ty ||
-        !MaybeStruct(*ma.baseExpr->ty)) {
+    if (!target.TestAttr(Attribute::MUT) || target.astKind != ASTKind::FUNC_DECL || !ma.baseExpr->GetTy() ||
+        !MaybeStruct(*ma.baseExpr->GetTy())) {
         return;
     }
     bool useInout = CheckIfUseInout(static_cast<const FuncDecl&>(target));
@@ -309,7 +310,7 @@ void TypeChecker::TypeCheckerImpl::CheckLetInstanceAccessMutableFunc(
         while (baseExpr != nullptr && baseExpr->astKind == ASTKind::PAREN_EXPR) {
             baseExpr = StaticAs<ASTKind::PAREN_EXPR>(baseExpr)->expr.get();
         }
-        bool inoutHeapAddr = useInout && baseExpr->ty->IsClassLike();
+        bool inoutHeapAddr = useInout && baseExpr->GetTy()->IsClassLike();
         if (inoutHeapAddr) {
             diag.DiagnoseRefactor(DiagKindRefactor::sema_inout_modify_heap_variable, *baseExpr);
         }
@@ -317,7 +318,7 @@ void TypeChecker::TypeCheckerImpl::CheckLetInstanceAccessMutableFunc(
         // it cannot access mutable function.
         auto vd = DynamicCast<VarDecl*>(baseExpr->GetTarget());
         bool immutableAccessMutableFunc = vd && (vd->astKind == ASTKind::PROP_DECL || !vd->isVar) &&
-            Ty::IsTyCorrect(vd->ty) && !vd->ty->IsClassLike();
+            Ty::IsTyCorrect(vd->GetTy()) && !vd->GetTy()->IsClassLike();
         if (immutableAccessMutableFunc) {
             DiagImmutableAccessMutableFunc(diag, ma, *tempMa);
             return;
@@ -325,12 +326,12 @@ void TypeChecker::TypeCheckerImpl::CheckLetInstanceAccessMutableFunc(
         if (baseExpr->astKind == ASTKind::MEMBER_ACCESS) {
             tempMa = StaticAs<ASTKind::MEMBER_ACCESS>(baseExpr);
         } else if (baseExpr->astKind == ASTKind::REF_EXPR) {
-            inoutHeapAddr = useInout && vd && vd->outerDecl && vd->outerDecl->ty->IsClassLike();
+            inoutHeapAddr = useInout && vd && vd->outerDecl && vd->outerDecl->GetTy()->IsClassLike();
             if (inoutHeapAddr) {
                 diag.DiagnoseRefactor(DiagKindRefactor::sema_inout_modify_heap_variable, *baseExpr);
             }
             break;
-        } else if (Ty::IsTyCorrect(baseExpr->ty) && !baseExpr->ty->IsClassLike()) {
+        } else if (Ty::IsTyCorrect(baseExpr->GetTy()) && !baseExpr->GetTy()->IsClassLike()) {
             DiagImmutableAccessMutableFunc(diag, ma, *tempMa);
             return;
         } else {

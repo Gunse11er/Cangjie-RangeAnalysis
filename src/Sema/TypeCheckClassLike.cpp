@@ -122,7 +122,7 @@ void TypeChecker::TypeCheckerImpl::CheckClassDecl(ASTContext& ctx, ClassDecl& cd
     // Do type check for all implemented interfaces.
     for (auto& it : cd.inheritedTypes) {
         CJC_NULLPTR_CHECK(it);
-        Synthesize(ctx, it.get());
+        Synthesize({ctx, SynPos::NONE}, it.get());
         if (auto rt = DynamicCast<RefType*>(it.get()); rt && rt->ref.target) {
             CheckSealedInheritance(cd, *rt);
             CheckThreadContextInheritance(cd, *rt);
@@ -141,7 +141,7 @@ void TypeChecker::TypeCheckerImpl::CheckClassDecl(ASTContext& ctx, ClassDecl& cd
 void TypeChecker::TypeCheckerImpl::CheckAndAddSubDecls(
     const Type& type, ClassDecl& cd, bool& hasSuperClass, int& superClassLikeNum) const
 {
-    auto target = Ty::IsTyCorrect(type.ty) ? Ty::GetDeclPtrOfTy(type.ty) : type.GetTarget();
+    auto target = Ty::IsTyCorrect(type.GetTy()) ? Ty::GetDeclPtrOfTy(type.GetTy()) : type.GetTarget();
     if (auto id = AST::As<ASTKind::INTERFACE_DECL>(target); id) {
         id->subDecls.insert(&cd);
     } else if (auto superClass = AST::As<ASTKind::CLASS_DECL>(target); superClass) {
@@ -190,7 +190,7 @@ void TypeChecker::TypeCheckerImpl::AddObjectSuperClass(ASTContext& ctx, ClassDec
         return; // Do not add 'Object' for itself.
     } else if (auto objectDecl = importManager.GetCoreDecl(OBJECT_NAME)) {
         tmp->ref.target = objectDecl;
-        tmp->ty = tmp->ref.target->ty;
+        tmp->SetTy(tmp->ref.target->GetTy());
         cd.inheritedTypes.insert(cd.inheritedTypes.begin(), std::move(tmp));
     } else {
         ctx.diag.Diagnose(cd, DiagKind::sema_no_core_object);
@@ -211,7 +211,7 @@ bool TypeChecker::TypeCheckerImpl::AddJObjectSuperClassJavaInterop(ASTContext& c
         tmp->curFile = cd.curFile;
         tmp->ref.identifier = SrcIdentifier{INTEROP_JOBJECT_NAME};
         tmp->ref.target = objectDecl;
-        tmp->ty = tmp->ref.target->ty;
+        tmp->SetTy(tmp->ref.target->GetTy());
         cd.inheritedTypes.insert(cd.inheritedTypes.begin(), std::move(tmp));
         cd.EnableAttr(Attribute::JAVA_MIRROR_SUBTYPE);
     } else {
@@ -234,7 +234,7 @@ void TypeChecker::TypeCheckerImpl::AddObjCIdSuperInterfaceObjCInterop(ASTContext
         tmp->curFile = classLikeDecl.curFile;
         tmp->ref.identifier = SrcIdentifier{OBJ_C_ID_IDENT};
         tmp->ref.target = id;
-        tmp->ty = tmp->ref.target->ty;
+        tmp->SetTy(tmp->ref.target->GetTy());
         classLikeDecl.inheritedTypes.emplace_back(std::move(tmp));
     } else {
         ctx.diag.DiagnoseRefactor(DiagKindRefactor::sema_member_not_imported, classLikeDecl.identifier.Begin(),
@@ -251,8 +251,8 @@ void TypeChecker::TypeCheckerImpl::CheckInterfaceDecl(ASTContext& ctx, Interface
     id.EnableAttr(Attribute::IS_CHECK_VISITED);
     // Do type check for all implemented interfaces.
     for (auto& interfaceType : id.inheritedTypes) {
-        Synthesize(ctx, interfaceType.get());
-        if (auto it = DynamicCast<InterfaceTy*>(interfaceType->ty); it) {
+        Synthesize({ctx, SynPos::NONE}, interfaceType.get());
+        if (auto it = DynamicCast<InterfaceTy*>(interfaceType->GetTy()); it) {
             it->decl->subDecls.insert(&id);
             CheckSealedInheritance(id, *interfaceType);
             CheckThreadContextInheritance(id, *interfaceType);

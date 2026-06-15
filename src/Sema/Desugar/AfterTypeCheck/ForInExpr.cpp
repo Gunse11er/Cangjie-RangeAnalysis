@@ -24,7 +24,7 @@ OwnedPtr<VarDecl> CreateIndexVar(const ForInExpr& forInExpr, const RangeExpr& ra
 {
     auto index = MakeOwnedNode<VarDecl>();
     index->EnableAttr(Attribute::IMPLICIT_ADD);
-    index->ty = rangeExpr.startExpr->ty;
+    index->SetTy(rangeExpr.startExpr->GetTy());
     index->initializer = ASTCloner::Clone(rangeExpr.startExpr.get());
     if (auto vp = DynamicCast<VarPattern*>(forInExpr.pattern.get()); vp) {
         // var pattern
@@ -49,7 +49,7 @@ OwnedPtr<RefExpr> GetVarRef(VarDecl& var, const Node& pos)
     auto r = CreateRefExpr(var.identifier);
     r->curFile = var.curFile;
     r->ref.target = &var;
-    r->ty = var.ty;
+    r->SetTy(var.GetTy());
     r->begin = pos.begin;
     r->end = pos.end;
     return r;
@@ -60,7 +60,7 @@ OwnedPtr<RefExpr> GetVarRef(VarDecl& var)
     auto r = CreateRefExpr(var.identifier);
     r->curFile = var.curFile;
     r->ref.target = &var;
-    r->ty = var.ty;
+    r->SetTy(var.GetTy());
     return r;
 }
 
@@ -88,7 +88,7 @@ OwnedPtr<BinaryExpr> CreateRangeCond(
 {
     auto rangeCond = CreateBinaryExpr(GetVarRef(index, rangeStop), GetVarRef(rangeStop, rangeStop), opToken);
     rangeCond->curFile = forInExpr.curFile;
-    rangeCond->ty = TypeManager::GetPrimitiveTy(TypeKind::TYPE_BOOLEAN);
+    rangeCond->SetTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_BOOLEAN));
     rangeCond->begin = forInExpr.inExpression->begin;
     rangeCond->end = forInExpr.inExpression->end;
     return rangeCond;
@@ -106,7 +106,7 @@ OwnedPtr<IfExpr> CreateGuard(ForInExpr& forInExpr, BinaryExpr& rangeCond, const 
             auto andCond =
                 CreateBinaryExpr(ASTCloner::Clone(Ptr(&rangeCond)), std::move(forInExpr.patternGuard), TokenKind::AND);
             andCond->curFile = forInExpr.curFile;
-            andCond->ty = TypeManager::GetPrimitiveTy(TypeKind::TYPE_BOOLEAN);
+            andCond->SetTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_BOOLEAN));
             andCond->begin = andCond->rightExpr->begin;
             andCond->end = andCond->rightExpr->end;
             condBody->condExpr = std::move(andCond);
@@ -118,14 +118,14 @@ OwnedPtr<IfExpr> CreateGuard(ForInExpr& forInExpr, BinaryExpr& rangeCond, const 
             condBody->condExpr = ASTCloner::Clone(Ptr(&rangeCond));
         } else {
             condBody->condExpr = MakeOwned<AST::LitConstExpr>(LitConstKind::BOOL, "true");
-            condBody->condExpr->ty = TypeManager::GetPrimitiveTy(TypeKind::TYPE_BOOLEAN);
+            condBody->condExpr->SetTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_BOOLEAN));
             condBody->condExpr->begin = rangeCond.begin;
             condBody->condExpr->end = rangeCond.end;
             condBody->condExpr->EnableAttr(Attribute::COMPILER_ADD);
         }
     }
     condBody->thenBody = std::move(forInExpr.body);
-    condBody->ty = TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT);
+    condBody->SetTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT));
     condBody->EnableAttr(Attribute::IMPLICIT_ADD);
     return condBody;
 }
@@ -137,16 +137,16 @@ OwnedPtr<AssignExpr> CreateUpdate(const ForInExpr& forInExpr, RangeExpr& rangeEx
     update->leftValue = GetVarRef(index, rangeExpr);
     if (rangeExpr.stepExpr) {
         update->rightExpr = std::move(rangeExpr.stepExpr);
-        CJC_ASSERT(update->rightExpr->ty);
+        CJC_ASSERT(update->rightExpr->GetTy());
     } else {
         update->rightExpr = MakeOwned<AST::LitConstExpr>(LitConstKind::INTEGER, "1");
-        update->rightExpr->ty = index.ty;
+        update->rightExpr->SetTy(index.GetTy());
     }
     update->begin = rangeExpr.begin;
     update->end = rangeExpr.end;
     update->op = TokenKind::ADD_ASSIGN;
     update->isCompound = true;
-    update->leftValue->ty = index.ty;
+    update->leftValue->SetTy(index.GetTy());
     return update;
 }
 
@@ -161,7 +161,7 @@ OwnedPtr<IfExpr> CreateFirstIf(const ForInExpr& forInExpr, VarDecl& firstFlag, O
     firstRun->condExpr->begin = firstRun->begin = forInExpr.inPos;
     firstRun->condExpr->end = firstRun->end = forInExpr.inPos + inLen;
     firstRun->thenBody = MakeOwnedNode<Block>();
-    firstRun->thenBody->ty = TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT);
+    firstRun->thenBody->SetTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT));
     firstRun->thenBody->begin = forInExpr.body->begin;
     firstRun->thenBody->end = forInExpr.body->end;
     // first = false
@@ -169,23 +169,23 @@ OwnedPtr<IfExpr> CreateFirstIf(const ForInExpr& forInExpr, VarDecl& firstFlag, O
     assignFalse->op = TokenKind::ASSIGN;
     assignFalse->curFile = forInExpr.curFile;
     assignFalse->leftValue = GetVarRef(firstFlag, *forInExpr.inExpression);
-    assignFalse->leftValue->ty = TypeManager::GetPrimitiveTy(TypeKind::TYPE_BOOLEAN);
+    assignFalse->leftValue->SetTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_BOOLEAN));
     assignFalse->rightExpr = MakeOwned<AST::LitConstExpr>(LitConstKind::BOOL, "false");
     assignFalse->rightExpr->curFile = forInExpr.curFile;
-    assignFalse->rightExpr->ty = TypeManager::GetPrimitiveTy(TypeKind::TYPE_BOOLEAN);
-    assignFalse->ty = TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT);
+    assignFalse->rightExpr->SetTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_BOOLEAN));
+    assignFalse->SetTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT));
     assignFalse->begin = forInExpr.inPos;
     assignFalse->end = forInExpr.inPos + inLen;
     firstRun->thenBody->body.push_back(std::move(assignFalse));
 
     auto elseBody = MakeOwnedNode<Block>();
     elseBody->body.push_back(std::move(update));
-    elseBody->ty = TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT);
+    elseBody->SetTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT));
     firstRun->begin = elseBody->begin = forInExpr.body->begin;
     firstRun->end = elseBody->end = forInExpr.body->end;
     firstRun->elseBody = std::move(elseBody);
 
-    firstRun->ty = TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT);
+    firstRun->SetTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT));
     return firstRun;
 }
 
@@ -206,38 +206,38 @@ OwnedPtr<MatchCase> CreateNoneCaseForForInIter(Ptr<Decl> optionDecl, Expr& refLo
 {
     auto caseNone = MakeOwnedNode<MatchCase>();
     auto nonePattern = MakeOwnedNode<EnumPattern>();
-    nonePattern->ty = caseTy;
+    nonePattern->SetTy(caseTy);
     auto noneRef = MakeOwnedNode<RefExpr>();
     noneRef->ref.identifier = OPTION_NONE_CTOR;
     noneRef->ref.target = LookupEnumMember(optionDecl, OPTION_NONE_CTOR);
-    noneRef->ty = nonePattern->ty;
-    noneRef->instTys = nonePattern->ty->typeArgs;
+    noneRef->SetTy(nonePattern->GetTy());
+    noneRef->instTys = nonePattern->GetTy()->typeArgs;
     auto breakExpr = MakeOwnedNode<JumpExpr>();
     breakExpr->isBreak = true;
     breakExpr->refLoop = &refLoop;
-    breakExpr->ty = TypeManager::GetNothingTy();
+    breakExpr->SetTy(TypeManager::GetNothingTy());
     nonePattern->constructor = std::move(noneRef);
     caseNone->patterns.emplace_back(std::move(nonePattern));
     caseNone->exprOrDecls = MakeOwnedNode<Block>();
     caseNone->exprOrDecls->body.push_back(std::move(breakExpr));
-    caseNone->exprOrDecls->ty = TypeManager::GetNothingTy();
-    caseNone->ty = TypeManager::GetNothingTy();
+    caseNone->exprOrDecls->SetTy(TypeManager::GetNothingTy());
+    caseNone->SetTy(TypeManager::GetNothingTy());
     return caseNone;
 }
 
 OwnedPtr<MatchCase> CreateSomeCaseForForInIter(
     Ptr<Decl> optionDecl, Expr& refLoop, Ptr<FuncTy> someRefTy, ForInExpr& forInExpr)
 {
-    Ptr<Ty> patternTy = forInExpr.pattern->ty;
+    Ptr<Ty> patternTy = forInExpr.pattern->GetTy();
     CJC_NULLPTR_CHECK(patternTy);
     // To : case Some(v)
     auto caseSome = MakeOwnedNode<MatchCase>();
     auto somePattern = MakeOwnedNode<EnumPattern>();
-    somePattern->ty = someRefTy->retTy;
+    somePattern->SetTy(someRefTy->retTy);
     auto someRef = MakeOwnedNode<RefExpr>();
     someRef->ref.identifier = OPTION_VALUE_CTOR;
     someRef->ref.target = LookupEnumMember(optionDecl, OPTION_VALUE_CTOR);
-    someRef->ty = someRefTy;
+    someRef->SetTy(someRefTy);
     somePattern->constructor = std::move(someRef);
     auto vPattern = CreateVarPattern(V_COMPILER, patternTy);
     auto vDecl = vPattern->varDecl.get();
@@ -258,29 +258,29 @@ OwnedPtr<MatchCase> CreateSomeCaseForForInIter(
     casePat->exprOrDecls->begin.Mark(PositionStatus::IGNORE);
     casePat->exprOrDecls->end.Mark(PositionStatus::IGNORE);
     RearrangeRefLoop(forInExpr, refLoop, casePat->exprOrDecls.get());
-    insideMatch->ty = casePat->exprOrDecls->ty;
-    casePat->ty = casePat->exprOrDecls->ty;
+    insideMatch->SetTy(casePat->exprOrDecls->GetTy());
+    casePat->SetTy(casePat->exprOrDecls->GetTy());
     insideMatch->matchCases.push_back(std::move(casePat));
 
     // To : case _ => continue
     auto wildCase = MakeOwnedNode<MatchCase>();
     auto wildcard = MakeOwnedNode<WildcardPattern>();
-    wildcard->ty = patternTy;
+    wildcard->SetTy(patternTy);
     wildCase->patterns.emplace_back(std::move(wildcard));
     auto continueExpr = MakeOwnedNode<JumpExpr>();
     continueExpr->refLoop = &refLoop;
     continueExpr->isBreak = false;
-    continueExpr->ty = TypeManager::GetNothingTy();
+    continueExpr->SetTy(TypeManager::GetNothingTy());
     wildCase->exprOrDecls = MakeOwnedNode<Block>();
     wildCase->exprOrDecls->body.push_back(std::move(continueExpr));
-    wildCase->exprOrDecls->ty = TypeManager::GetNothingTy();
-    wildCase->ty = TypeManager::GetNothingTy();
+    wildCase->exprOrDecls->SetTy(TypeManager::GetNothingTy());
+    wildCase->SetTy(TypeManager::GetNothingTy());
     insideMatch->matchCases.push_back(std::move(wildCase));
 
     caseSome->exprOrDecls = MakeOwnedNode<Block>();
     caseSome->exprOrDecls->body.push_back(std::move(insideMatch));
-    caseSome->exprOrDecls->ty = TypeManager::GetNothingTy();
-    caseSome->ty = TypeManager::GetNothingTy();
+    caseSome->exprOrDecls->SetTy(TypeManager::GetNothingTy());
+    caseSome->SetTy(TypeManager::GetNothingTy());
     return caseSome;
 }
 } // namespace
@@ -343,7 +343,7 @@ void TypeChecker::TypeCheckerImpl::DesugarForInCloseRange(ASTContext& ctx, AST::
     // For update the iter 'iter += step'.
     auto update = CreateUpdate(forInExpr, *rangeExpr, *index);
     AddCurFile(*update, forInExpr.curFile);
-    Ptr<Ty> updateTy = SynthesizeWithoutRecover(ctx, update.get()); // Need syn to desugar.
+    Ptr<Ty> updateTy = SynthesizeWithoutRecover({ctx, SynPos::EXPR_ARG}, update.get()); // Need syn to desugar.
     CJC_ASSERT(updateTy && updateTy->kind != TypeKind::TYPE_INVALID);
     // Create first if-else part in while body.
     auto firstRun = CreateFirstIf(forInExpr, *firstFlag, std::move(update));
@@ -358,8 +358,8 @@ void TypeChecker::TypeCheckerImpl::DesugarForInCloseRange(ASTContext& ctx, AST::
     auto rangeCond = CreateRangeCond(forInExpr, *index, *rangeStop, increasing ? TokenKind::LE : TokenKind::GE);
     auto condBody = CreateGuard(forInExpr, *rangeCond, true);
     whileExpr->body->body.push_back(std::move(condBody));
-    whileExpr->ty = TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT);
-    whileExpr->body->ty = TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT);
+    whileExpr->SetTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT));
+    whileExpr->body->SetTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT));
     auto refWhile = whileExpr.get();
 
     auto blockExpr = MakeOwnedNode<Block>();
@@ -371,7 +371,8 @@ void TypeChecker::TypeCheckerImpl::DesugarForInCloseRange(ASTContext& ctx, AST::
     blockExpr->end = whileExpr->end;
     blockExpr->body.push_back(std::move(whileExpr));
     AddCurFile(*blockExpr, forInExpr.curFile);
-    Ptr<Ty> blockExprTy = SynthesizeWithoutRecover(ctx, blockExpr.get());
+    // last expr of for in is not used as the value of the for expr, so we use UNUSED context
+    Ptr<Ty> blockExprTy = SynthesizeWithoutRecover({ctx, SynPos::UNUSED}, blockExpr.get());
     CJC_ASSERT(blockExprTy && blockExprTy->kind != TypeKind::TYPE_INVALID);
     /* must do after synthesize */
     RearrangeRefLoop(forInExpr, *refWhile, refWhile->body.get());
@@ -433,13 +434,13 @@ void TypeChecker::TypeCheckerImpl::DesugarForInNonCloseRange(ASTContext& ctx, AS
     // To: 'iter += step'
     auto update = CreateUpdate(forInExpr, *rangeExpr, *index);
     AddCurFile(*update, forInExpr.curFile);
-    Ptr<Ty> updateTy = SynthesizeWithoutRecover(ctx, update.get());
+    Ptr<Ty> updateTy = SynthesizeWithoutRecover({ctx, SynPos::EXPR_ARG}, update.get());
     CJC_ASSERT(updateTy && updateTy->kind != TypeKind::TYPE_INVALID);
     whileExpr->body->body.push_back(std::move(update));
     CopyBasicInfo(condBody->thenBody.get(), whileExpr->body.get());
     whileExpr->body->body.push_back(std::move(condBody));
-    whileExpr->ty = TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT);
-    whileExpr->body->ty = TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT);
+    whileExpr->SetTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT));
+    whileExpr->body->SetTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT));
     auto refWhile = whileExpr.get();
 
     auto blockExpr = MakeOwnedNode<Block>();
@@ -448,7 +449,7 @@ void TypeChecker::TypeCheckerImpl::DesugarForInNonCloseRange(ASTContext& ctx, AS
     blockExpr->body.push_back(std::move(rangeStop));
     blockExpr->body.push_back(std::move(whileExpr));
     AddCurFile(*blockExpr, forInExpr.curFile);
-    Ptr<Ty> blockExprTy = SynthesizeWithoutRecover(ctx, blockExpr.get());
+    Ptr<Ty> blockExprTy = SynthesizeWithoutRecover({ctx, SynPos::UNUSED}, blockExpr.get());
     /* must do after synthesize */
     RearrangeRefLoop(forInExpr, *refWhile, refWhile->body.get());
     CJC_ASSERT(blockExprTy && blockExprTy->kind != TypeKind::TYPE_INVALID);
@@ -489,7 +490,7 @@ void TypeChecker::TypeCheckerImpl::ReArrangeForInRangeExpr(ASTContext& ctx, ForI
     auto update = CreateUpdate(forInExpr, *rangeExpr, *index);
     CopyBasicInfo(forInExpr.inExpression, update.get());
     AddCurFile(*update, forInExpr.curFile);
-    Ptr<Ty> updateTy = SynthesizeWithoutRecover(ctx, update.get());
+    Ptr<Ty> updateTy = SynthesizeWithoutRecover({ctx, SynPos::EXPR_ARG}, update.get());
     CJC_ASSERT(updateTy && updateTy->kind != TypeKind::TYPE_INVALID);
     // composite block structure
     auto blockExpr = MakeOwnedNode<Block>();
@@ -499,7 +500,7 @@ void TypeChecker::TypeCheckerImpl::ReArrangeForInRangeExpr(ASTContext& ctx, ForI
     blockExpr->body.push_back(std::move(rangeStop));
     blockExpr->body.push_back(std::move(update));
     blockExpr->body.push_back(std::move(rangeCond));
-    blockExpr->ty = TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT);
+    blockExpr->SetTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT));
     forInExpr.inExpression = std::move(blockExpr);
     forInExpr.forInKind = ForInKind::FORIN_RANGE;
     /* setup flag for jumpExpr: continue/break */
@@ -513,7 +514,7 @@ void TypeChecker::TypeCheckerImpl::ReArrangeForInStringExpr(ASTContext& ctx, For
     auto index = CreateVarDecl(ITER_COMPILER, std::move(litZero));
     ctx.AddDeclName(std::make_pair(ITER_COMPILER, forInExpr.scopeName), *index);
     CopyBasicInfo(forInExpr.pattern, index.get());
-    index->ty = index->initializer->ty;
+    index->SetTy(index->initializer->GetTy());
     index->isVar = true;
     index->begin = forInExpr.pattern->begin;
     index->end = forInExpr.pattern->end;
@@ -521,27 +522,28 @@ void TypeChecker::TypeCheckerImpl::ReArrangeForInStringExpr(ASTContext& ctx, For
     auto tmp = CreateTmpVarDecl();
     tmp->initializer = std::move(forInExpr.inExpression);
     CopyBasicInfo(tmp->initializer.get(), tmp.get());
-    tmp->ty = tmp->initializer->ty;
+    tmp->SetTy(tmp->initializer->GetTy());
     tmp->isVar = false;
     // To: let end = tmp.size
     auto end = CreateTmpVarDecl();
-    auto sizeDecl = FieldLookup(ctx, Ty::GetDeclPtrOfTy(tmp->ty), "size", {.lookupExtend = false});
+    auto sizeDecl = FieldLookup(ctx, Ty::GetDeclPtrOfTy(tmp->GetTy()), "size", {.lookupExtend = false});
     CJC_ASSERT(!sizeDecl.empty());
     auto getter = StaticCast<FuncDecl*>(GetUsedMemberDecl(*sizeDecl[0], true));
     CJC_NULLPTR_CHECK(getter);
-    end->initializer = CreateCallExpr(CreateMemberAccess(CreateRefExpr(*tmp), *getter), {}, getter, sizeDecl[0]->ty);
+    end->initializer =
+        CreateCallExpr(CreateMemberAccess(CreateRefExpr(*tmp), *getter), {}, getter, sizeDecl[0]->GetTy());
     end->initializer->begin = tmp->begin;
     end->initializer->end = tmp->end;
     CopyBasicInfo(&forInExpr, end.get());
     end->begin = tmp->begin;
     end->end = tmp->end;
     AddCurFile(*end->initializer, forInExpr.curFile);
-    end->ty = SynthesizeWithoutRecover(ctx, end->initializer.get());
-    CJC_ASSERT(end->ty && end->ty->kind != TypeKind::TYPE_INVALID);
+    end->SetTy(SynthesizeWithoutRecover({ctx, SynPos::EXPR_ARG}, end->initializer.get()));
+    CJC_ASSERT(end->GetTy() && end->TyKind() != TypeKind::TYPE_INVALID);
     // To : 'let pat  = tmp[iter]'
     if (auto vp = DynamicCast<VarPattern*>(forInExpr.pattern.get())) {
         auto base = CreateMemberAccess(CreateRefExpr(*tmp, *end), "[]");
-        base->ty = Ty::GetInitialTy();
+        base->SetTy(Ty::GetInitialTy());
         CopyBasicInfo(end, base->baseExpr.get());
         std::vector<OwnedPtr<FuncArg>> args;
         args.emplace_back(CreateFuncArg(CreateRefExpr(*index, *end)));
@@ -549,7 +551,7 @@ void TypeChecker::TypeCheckerImpl::ReArrangeForInStringExpr(ASTContext& ctx, For
         auto ce = CreateCallExpr(std::move(base), std::move(args));
         CopyBasicInfo(end, ce.get());
         AddCurFile(*ce, forInExpr.curFile);
-        auto ceTy = SynthesizeWithoutRecover(ctx, ce.get());
+        auto ceTy = SynthesizeWithoutRecover({ctx, SynPos::EXPR_ARG}, ce.get());
         CJC_ASSERT(ceTy && ceTy->kind != TypeKind::TYPE_INVALID);
         vp->varDecl->initializer = std::move(ce);
     }
@@ -560,7 +562,7 @@ void TypeChecker::TypeCheckerImpl::ReArrangeForInStringExpr(ASTContext& ctx, For
     blockExpr->body.push_back(std::move(index));
     blockExpr->body.push_back(std::move(tmp));
     blockExpr->body.push_back(std::move(end));
-    blockExpr->ty = TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT);
+    blockExpr->SetTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT));
     forInExpr.inExpression = std::move(blockExpr);
     forInExpr.forInKind = ForInKind::FORIN_STRING;
     /* setup flag for jumpExpr: continue/break */
@@ -578,7 +580,7 @@ void TypeChecker::TypeCheckerImpl::ReArrangeForInIterExpr(ASTContext& ctx, ForIn
     initBase->field = "iterator";
     init->baseFunc = std::move(initBase);
     AddCurFile(*init, forInExpr.curFile);
-    SynthesizeWithoutRecover(ctx, init.get());
+    SynthesizeWithoutRecover({ctx, SynPos::EXPR_ARG}, init.get());
     RawStaticCast<MemberAccess*>(init->baseFunc.get())->target = init->resolvedFunction;
     auto iterator = CreateVarDecl(ITER_COMPILER, std::move(init));
     iterator->begin = forInExpr.pattern->begin;
@@ -598,22 +600,22 @@ void TypeChecker::TypeCheckerImpl::ReArrangeForInIterExpr(ASTContext& ctx, ForIn
         next->end = nextBase->end = init->end;
         next->baseFunc = std::move(nextBase);
         AddCurFile(*next, forInExpr.curFile);
-        SynthesizeWithoutRecover(ctx, next.get());
+        SynthesizeWithoutRecover({ctx, SynPos::EXPR_ARG}, next.get());
         RawStaticCast<MemberAccess*>(next->baseFunc.get())->target = next->resolvedFunction;
         matchExpr->selector = std::move(next);
     }
-    matchExpr->ty = matchExpr->selector->ty;
+    matchExpr->SetTy(matchExpr->selector->GetTy());
     auto optionDecl = importManager.GetCoreDecl(STD_LIB_OPTION);
     auto somePattern = MakeOwnedNode<EnumPattern>();
     AddCurFile(*somePattern, forInExpr.curFile);
     CopyBasicInfo(&forInExpr, somePattern.get());
     somePattern->begin = inExprBegin;
     somePattern->end = inExprEnd;
-    somePattern->ty = matchExpr->selector->ty;
+    somePattern->SetTy(matchExpr->selector->GetTy());
     auto someRef = MakeOwnedNode<RefExpr>();
     someRef->ref.identifier = OPTION_VALUE_CTOR;
     someRef->ref.target = LookupEnumMember(optionDecl, OPTION_VALUE_CTOR);
-    someRef->ty = typeManager.GetFunctionTy(somePattern->ty->typeArgs, somePattern->ty);
+    someRef->SetTy(typeManager.GetFunctionTy(somePattern->GetTy()->typeArgs, somePattern->GetTy()));
     somePattern->constructor = std::move(someRef);
     somePattern->patterns.emplace_back(std::move(forInExpr.pattern));
     forInExpr.pattern = std::move(somePattern);
@@ -624,7 +626,7 @@ void TypeChecker::TypeCheckerImpl::ReArrangeForInIterExpr(ASTContext& ctx, ForIn
     blockExpr->end = inExprEnd;
     blockExpr->body.push_back(std::move(iterator));
     blockExpr->body.push_back(std::move(matchExpr));
-    blockExpr->ty = TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT);
+    blockExpr->SetTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT));
     forInExpr.inExpression = std::move(blockExpr);
     forInExpr.forInKind = ForInKind::FORIN_ITER;
     /* setup flag for jumpExpr: continue/break */
@@ -662,7 +664,7 @@ void TypeChecker::TypeCheckerImpl::DesugarForInIter(ASTContext& ctx, AST::ForInE
     initBase->end = init->end = inExprEnd;
     init->baseFunc = std::move(initBase);
     AddCurFile(*init, forInExpr.curFile);
-    SynthesizeWithoutRecover(ctx, init.get());
+    SynthesizeWithoutRecover({ctx, SynPos::EXPR_ARG}, init.get());
     RawStaticCast<MemberAccess*>(init->baseFunc.get())->target = init->resolvedFunction;
     auto iterator = CreateVarDecl(ITER_COMPILER, std::move(init));
     iterator->begin = forInExpr.pattern->begin;
@@ -675,12 +677,12 @@ void TypeChecker::TypeCheckerImpl::DesugarForInIter(ASTContext& ctx, AST::ForInE
     whileExpr->condExpr = MakeOwned<LitConstExpr>(LitConstKind::BOOL, "true");
     whileExpr->condExpr->begin = inExprBegin;
     whileExpr->condExpr->end = inExprEnd;
-    whileExpr->condExpr->ty = TypeManager::GetPrimitiveTy(TypeKind::TYPE_BOOLEAN);
+    whileExpr->condExpr->SetTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_BOOLEAN));
     whileExpr->EnableAttr(Attribute::IMPLICIT_ADD);
 
     auto matchExpr = MakeOwnedNode<MatchExpr>();
     CJC_ASSERT(forInExpr.body);
-    matchExpr->ty = forInExpr.body->ty;
+    matchExpr->SetTy(forInExpr.body->GetTy());
     matchExpr->matchMode = true;
     matchExpr->begin = inExprBegin;
     matchExpr->end = inExprEnd;
@@ -695,30 +697,30 @@ void TypeChecker::TypeCheckerImpl::DesugarForInIter(ASTContext& ctx, AST::ForInE
         nextBase->field = "next";
         next->baseFunc = std::move(nextBase);
         AddCurFile(*next, forInExpr.curFile);
-        SynthesizeWithoutRecover(ctx, next.get());
+        SynthesizeWithoutRecover({ctx, SynPos::EXPR_ARG}, next.get());
         RawStaticCast<MemberAccess*>(next->baseFunc.get())->target = next->resolvedFunction;
         matchExpr->selector = std::move(next);
     }
 
     auto optionDecl = importManager.GetCoreDecl(STD_LIB_OPTION);
     // To : case None => break
-    matchExpr->matchCases.push_back(CreateNoneCaseForForInIter(optionDecl, *whileExpr, matchExpr->selector->ty));
+    matchExpr->matchCases.push_back(CreateNoneCaseForForInIter(optionDecl, *whileExpr, matchExpr->selector->GetTy()));
 
     // To : case Some(v) => match (v) { case pat if e2 => b; case _ => continue}
     auto caseSome = CreateSomeCaseForForInIter(optionDecl, *whileExpr,
-        typeManager.GetFunctionTy(matchExpr->selector->ty->typeArgs, matchExpr->selector->ty), forInExpr);
+        typeManager.GetFunctionTy(matchExpr->selector->GetTy()->typeArgs, matchExpr->selector->GetTy()), forInExpr);
     matchExpr->matchCases.push_back(std::move(caseSome));
 
     whileExpr->body = MakeOwnedNode<Block>();
     whileExpr->body->body.push_back(std::move(matchExpr));
-    whileExpr->body->ty = TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT);
-    whileExpr->ty = TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT);
+    whileExpr->body->SetTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT));
+    whileExpr->SetTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT));
     // Connect vardecl and while expr.
     auto blockExpr = MakeOwnedNode<Block>();
     blockExpr->body.push_back(std::move(iterator));
     blockExpr->body.push_back(std::move(whileExpr));
     CopyBasicInfo(&forInExpr, blockExpr.get());
-    blockExpr->ty = TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT);
+    blockExpr->SetTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT));
     AddCurFile(*blockExpr, forInExpr.curFile);
     forInExpr.desugarExpr = std::move(blockExpr);
 }
@@ -748,28 +750,29 @@ void TypeChecker::TypeCheckerImpl::DesugarForInString(ASTContext& ctx, AST::ForI
     auto index = CreateVarDecl(ITER_COMPILER, std::move(litZero));
     ctx.AddDeclName(std::make_pair(ITER_COMPILER, forInExpr.scopeName), *index);
     CopyBasicInfo(&forInExpr, index.get());
-    index->ty = index->initializer->ty;
+    index->SetTy(index->initializer->GetTy());
     index->isVar = true;
     // To : var tmp = e1
     auto tmp = CreateTmpVarDecl();
     tmp->initializer = std::move(forInExpr.inExpression);
     CopyBasicInfo(tmp->initializer.get(), tmp.get());
-    tmp->ty = tmp->initializer->ty;
+    tmp->SetTy(tmp->initializer->GetTy());
     tmp->isVar = false;
     // To: let end = tmp.size
     auto end = CreateTmpVarDecl();
-    auto sizeDecl = FieldLookup(ctx, Ty::GetDeclPtrOfTy(tmp->ty), "size", {.lookupExtend = false});
+    auto sizeDecl = FieldLookup(ctx, Ty::GetDeclPtrOfTy(tmp->GetTy()), "size", {.lookupExtend = false});
     CJC_ASSERT(!sizeDecl.empty());
     auto getter = StaticCast<FuncDecl*>(GetUsedMemberDecl(*sizeDecl[0], true));
     CJC_NULLPTR_CHECK(getter);
-    end->initializer = CreateCallExpr(CreateMemberAccess(CreateRefExpr(*tmp), *getter), {}, getter, sizeDecl[0]->ty);
+    end->initializer =
+        CreateCallExpr(CreateMemberAccess(CreateRefExpr(*tmp), *getter), {}, getter, sizeDecl[0]->GetTy());
     CopyBasicInfo(&forInExpr, end.get());
     AddCurFile(*end->initializer, forInExpr.curFile);
-    end->ty = SynthesizeWithoutRecover(ctx, end->initializer.get());
-    CJC_ASSERT(end->ty && end->ty->kind != TypeKind::TYPE_INVALID);
+    end->SetTy(SynthesizeWithoutRecover({ctx, SynPos::EXPR_ARG}, end->initializer.get()));
+    CJC_ASSERT(end->GetTy() && end->TyKind() != TypeKind::TYPE_INVALID);
     // To : where (iter < end)
     auto condition = CreateBinaryExpr(GetVarRef(*index), GetVarRef(*end), TokenKind::LT);
-    condition->ty = TypeManager::GetPrimitiveTy(TypeKind::TYPE_BOOLEAN);
+    condition->SetTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_BOOLEAN));
     // To: if (guard) { body }
     auto condBody = CreateGuard(forInExpr, *condition, false);
 
@@ -782,7 +785,7 @@ void TypeChecker::TypeCheckerImpl::DesugarForInString(ASTContext& ctx, AST::ForI
     // To : 'let pat  = tmp[iter]'
     if (auto vp = DynamicCast<VarPattern*>(forInExpr.pattern.get())) {
         auto base = CreateMemberAccess(CreateRefExpr(*tmp), "[]");
-        base->ty = Ty::GetInitialTy();
+        base->SetTy(Ty::GetInitialTy());
         CopyBasicInfo(&forInExpr, base->baseExpr.get());
         std::vector<OwnedPtr<FuncArg>> args;
         args.emplace_back(CreateFuncArg(CreateRefExpr(*index)));
@@ -790,7 +793,7 @@ void TypeChecker::TypeCheckerImpl::DesugarForInString(ASTContext& ctx, AST::ForI
         auto ce = CreateCallExpr(std::move(base), std::move(args));
         CopyBasicInfo(&forInExpr, ce.get());
         AddCurFile(*ce, forInExpr.curFile);
-        auto ceTy = SynthesizeWithoutRecover(ctx, ce.get());
+        auto ceTy = SynthesizeWithoutRecover({ctx, SynPos::EXPR_ARG}, ce.get());
         CJC_ASSERT(ceTy && ceTy->kind != TypeKind::TYPE_INVALID);
         auto letValue = std::move(vp->varDecl);
         forInExpr.pattern.reset();
@@ -806,12 +809,12 @@ void TypeChecker::TypeCheckerImpl::DesugarForInString(ASTContext& ctx, AST::ForI
     update->op = TokenKind::ADD_ASSIGN;
     update->isCompound = true;
     AddCurFile(*update, forInExpr.curFile);
-    Ty* updateTy = SynthesizeWithoutRecover(ctx, update.get());
+    Ty* updateTy = SynthesizeWithoutRecover({ctx, SynPos::EXPR_ARG}, update.get());
     CJC_ASSERT(updateTy && updateTy->kind != TypeKind::TYPE_INVALID);
     whileExpr->body->body.push_back(std::move(update));
     whileExpr->body->body.push_back(std::move(condBody));
-    whileExpr->ty = TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT);
-    whileExpr->body->ty = TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT);
+    whileExpr->SetTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT));
+    whileExpr->body->SetTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT));
     auto refWhile = whileExpr.get();
 
     auto blockExpr = MakeOwnedNode<Block>();
@@ -821,7 +824,7 @@ void TypeChecker::TypeCheckerImpl::DesugarForInString(ASTContext& ctx, AST::ForI
     blockExpr->body.push_back(std::move(end));
     blockExpr->body.push_back(std::move(whileExpr));
     AddCurFile(*blockExpr, forInExpr.curFile);
-    Ty* blockExprTy = SynthesizeWithoutRecover(ctx, blockExpr.get());
+    Ty* blockExprTy = SynthesizeWithoutRecover({ctx, SynPos::UNUSED}, blockExpr.get());
     /* must do after synthesize */
     RearrangeRefLoop(forInExpr, *refWhile, refWhile->body.get());
     CJC_ASSERT(blockExprTy && blockExprTy->kind != TypeKind::TYPE_INVALID);
@@ -833,10 +836,10 @@ void TypeChecker::TypeCheckerImpl::DesugarForInString(ASTContext& ctx, AST::ForI
 /// A range expr without step expression equals step 1.
 static bool IsStepOne(const RangeExpr& expr)
 {
-    if (expr.startExpr->ty->IsInvalid() || !expr.startExpr->ty->IsInteger()) {
+    if (expr.startExpr->GetTy()->IsInvalid() || !expr.startExpr->GetTy()->IsInteger()) {
         return false;
     }
-    if (expr.stopExpr->ty->IsInvalid() || !expr.stopExpr->ty->IsInteger()) {
+    if (expr.stopExpr->GetTy()->IsInvalid() || !expr.stopExpr->GetTy()->IsInteger()) {
         return false;
     }
     if (!expr.stepExpr) {
@@ -848,10 +851,10 @@ static bool IsStepOne(const RangeExpr& expr)
 
 void TypeChecker::TypeCheckerImpl::DesugarForInExpr(ASTContext& ctx, ForInExpr& forInExpr)
 {
-    if (!Ty::IsTyCorrect(forInExpr.ty) || diag.GetErrorCount() != 0 || forInExpr.desugarExpr != nullptr) {
+    if (!Ty::IsTyCorrect(forInExpr.GetTy()) || diag.GetErrorCount() != 0 || forInExpr.desugarExpr != nullptr) {
         return;
     }
-    auto ty = forInExpr.inExpression->ty;
+    auto ty = forInExpr.inExpression->GetTy();
     // only support RangeExpr here, because we want to determine at compile time:
     // 1. whether it is closed range
     // 2. whether it has custom step expression
@@ -891,7 +894,7 @@ static bool IsCallRangeConstructor(const CallExpr& call)
     auto b = TypeManager::GetPrimitiveTy(TypeKind::TYPE_BOOLEAN);
     constexpr size_t rangeConstructorIntLength{3};
     for (size_t i{0}; i < rangeConstructorIntLength; ++i) {
-        if (!call.args[i]->ty->IsInteger()) {
+        if (!call.args[i]->GetTy()->IsInteger()) {
             return false;
         }
     }
@@ -903,7 +906,7 @@ static bool IsCallRangeConstructor(const CallExpr& call)
         return false;
     }
     for (size_t i{rangeConstructorIntLength}; i < rangeConstructorParamSize; ++i) {
-        if (call.args[i]->ty != b) {
+        if (call.args[i]->GetTy() != b) {
             return false;
         }
     }
@@ -937,10 +940,10 @@ bool ForInExpr::IsClosedRangeOne() const
 
 void TypeChecker::TypeCheckerImpl::ReArrangeForInExpr(ASTContext& ctx, ForInExpr& forInExpr)
 {
-    if (!Ty::IsTyCorrect(forInExpr.ty) || diag.GetErrorCount() != 0 || forInExpr.desugarExpr != nullptr) {
+    if (!Ty::IsTyCorrect(forInExpr.GetTy()) || diag.GetErrorCount() != 0 || forInExpr.desugarExpr != nullptr) {
         return;
     }
-    auto ty = forInExpr.inExpression->ty;
+    auto ty = forInExpr.inExpression->GetTy();
     // only support RangeExpr here, because we want to determine at compile time:
     // 1. whether it is closed range
     // 2. whether it has custom step expression

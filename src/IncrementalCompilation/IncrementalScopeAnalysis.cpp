@@ -337,7 +337,7 @@ struct ImportPackageWalker {
         // main decl is never imported, so only func and var decl are covered here
         if (Utils::NotIn(decl.astKind, {AST::ASTKind::FUNC_DECL, AST::ASTKind::VAR_DECL}) ||
             decl.TestAnyAttr(AST::Attribute::CONSTRUCTOR, AST::Attribute::MACRO_FUNC) ||
-            !AST::Ty::IsTyCorrect(decl.ty) || decl.rawMangleName == TO_ANY) {
+            !AST::Ty::IsTyCorrect(decl.GetTy()) || decl.rawMangleName == TO_ANY) {
             // 1. Ignore VarWithPatternDecl because there is no VarWithPatternDecl in cjo.
             // 2. Constructor's return type will not be changed.
             return;
@@ -348,11 +348,11 @@ struct ImportPackageWalker {
         const static auto DELIMITER_LENGTH = std::string("$$").size();
         (void)mangledName.erase(pos + DELIMITER_LENGTH);
         if (decl.astKind == AST::ASTKind::FUNC_DECL) {
-            auto funcTy = StaticCast<AST::FuncTy*>(decl.ty);
+            auto funcTy = StaticCast<AST::FuncTy*>(decl.GetTy());
             CJC_ASSERT(funcTy && funcTy->retTy);
             mangledName += funcTy->retTy->String();
         } else {
-            mangledName += decl.ty->String();
+            mangledName += decl.GetTy()->String();
         }
     }
 

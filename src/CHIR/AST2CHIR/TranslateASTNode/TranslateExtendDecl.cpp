@@ -21,7 +21,7 @@ Ptr<Value> Translator::Visit(const AST::ExtendDecl& decl)
     CreateAnnotationInfo<ExtendDef>(decl, *extendDef, extendDef);
 
     // step 2: set extended type
-    auto extendedTy = chirTy.TranslateType(*decl.extendedType->ty);
+    auto extendedTy = chirTy.TranslateType(*decl.extendedType->GetTy());
     if (extendedTy->IsRef()) {
         extendedTy = StaticCast<RefType*>(extendedTy)->GetBaseType();
     }
@@ -57,18 +57,18 @@ Ptr<Value> Translator::Visit(const AST::ExtendDecl& decl)
             continue;
         }
         if (member->astKind == AST::ASTKind::FUNC_DECL) {
-            auto func = VirtualCast<FuncBase*>(GetSymbolTable(*member));
+            auto func = StaticCast<Function*>(GetSymbolTable(*member));
             extendDef->AddMethod(func);
             auto funcDecl = StaticCast<AST::FuncDecl*>(member.get());
             for (auto& param : funcDecl->funcBody->paramLists[0]->params) {
                 if (param->desugarDecl != nullptr) {
-                    extendDef->AddMethod(VirtualCast<FuncBase>(GetSymbolTable(*param->desugarDecl)));
+                    extendDef->AddMethod(StaticCast<Function>(GetSymbolTable(*param->desugarDecl)));
                     auto it = genericFuncMap.find(param->desugarDecl.get().get());
                     if (it != genericFuncMap.end()) {
                         for (auto instFunc : it->second) {
                             CJC_NULLPTR_CHECK(instFunc->outerDecl);
                             CJC_ASSERT(instFunc->outerDecl == &decl);
-                            extendDef->AddMethod(VirtualCast<FuncBase*>(GetSymbolTable(*instFunc)));
+                            extendDef->AddMethod(StaticCast<Function*>(GetSymbolTable(*instFunc)));
                         }
                     }
                 }
@@ -78,7 +78,7 @@ Ptr<Value> Translator::Visit(const AST::ExtendDecl& decl)
                 for (auto instFunc : it->second) {
                     CJC_NULLPTR_CHECK(instFunc->outerDecl);
                     CJC_ASSERT(instFunc->outerDecl == &decl);
-                    extendDef->AddMethod(VirtualCast<FuncBase*>(GetSymbolTable(*instFunc)));
+                    extendDef->AddMethod(StaticCast<Function*>(GetSymbolTable(*instFunc)));
                 }
             }
             CreateAnnoFactoryFuncsForFuncDecl(StaticCast<AST::FuncDecl>(*member), extendDef);
@@ -101,11 +101,8 @@ Ptr<Value> Translator::Visit(const AST::ExtendDecl& decl)
         CJC_NULLPTR_CHECK(decl.generic);
         auto genericDecl = decl.generic.get();
         for (auto& genericTy : genericDecl->typeParameters) {
-            chirTy.FillGenericArgType(*StaticCast<AST::GenericsTy*>(genericTy->ty));
+            chirTy.FillGenericArgType(*StaticCast<AST::GenericsTy*>(genericTy->GetTy()));
         }
     }
-
-    // step 6: collect annotation info of the type and members for annotation target check
-    CollectTypeAnnotation(decl, *extendDef);
     return nullptr;
 }

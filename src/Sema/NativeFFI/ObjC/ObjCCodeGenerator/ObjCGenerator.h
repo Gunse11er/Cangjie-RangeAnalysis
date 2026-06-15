@@ -71,13 +71,10 @@ private:
     std::string GenerateFunctionDeclaration(
         const ObjCFunctionType type, const std::string& returnType, const std::string& name) const;
     std::string GeneratePropertyDeclaration(const ObjCFunctionType staticType, const std::string& mode,
-        const std::string& type, const std::string& name, const std::string& getterName,
-        const std::string& setterName) const;
+        const std::string& type, const std::string& name, const std::string& getterName, const std::string& setterName) const;
     std::string GenerateImport(const std::string& name);
-    std::string GenerateStaticFunctionReference(
+    std::string GenerateExternalFunctionDeclaration(
         const std::string& funcName, const std::string& retType, const std::string& argTypes) const;
-    std::string GenerateStaticReference(const std::string& name, const std::string& type,
-        const std::string& defaultValue) const;
     std::string GenerateFuncParamLists(const std::vector<OwnedPtr<AST::FuncParamList>>& paramLists,
         const std::vector<std::string>& selectorComponents,
         FunctionListFormat format = FunctionListFormat::DECLARATION,
@@ -99,9 +96,7 @@ private:
 
     void GenerateImports(const std::string& objCDeclName);
     void GenerateForwardDeclarations();
-    void GenerateStaticReferences();
-    void GenerateFunctionSymbolsInitialization();
-    void GenerateFunctionSymInit(const std::string& fName);
+    void GenerateExternalDeclarations();
     void GenerateInterfaceDecl();
     void GenerateProtocolDecl();
     void GenerateInitializer(const std::string& objCDeclName);

@@ -125,6 +125,7 @@ ERROR(sema_return_type_incompatible,
 // Spawn
 ERROR(sema_spawn_arg_invalid, "invalid argument of spawn expr, user-defined `ThreadContext` types are prohibited now")
 WARNING(sema_spawn_arg_no_effect, UNGROUPED, "argument of spawn expr does not take effect at current backend")
+ERROR(sema_spawn_capture_var, "'spawn' expressions cannot capture mutable variables; consider using 'let' or boxing")
 
 // Interface
 ERROR(sema_interface_call_with_unimplemented_call, "static invocation contains unimplemented static %s '%s'")
@@ -238,6 +239,14 @@ ERROR(sema_varray_subscript_num, "'VArray' accepts exactly one subscript index w
 ERROR(sema_varray_in_cfunc, "return type of CFunc cannot be 'VArray' type")
 ERROR(sema_varray_arg_type_with_reftype, "'%s' directly or indirectly contains an unsupported type", "contain unsupported instance member variable with type '%s'")
 
+// C FFI Sema Prepare Check
+ERROR(sema_only_cfunc_can_use_annotation, "only CFunc can use '%s'")
+ERROR(sema_annotation_calling_conv_not_support, "'@CallingConv' have not supported '%s' yet")
+ERROR(sema_annotation_invalid_args_type, "'%s' arg should be right type")
+
+// C FFI Sema Check
+ERROR(sema_illegal_scope_use_of_annotation, "'%s' can only be used in top-level scope")
+
 // CFFI
 ERROR(sema_invalid_cfunc_return_type, "return type of CFunc must be instantiated with CType")
 
@@ -268,6 +277,7 @@ ERROR(sema_resume_no_with, "a resumption of non-Unit type '%s' must have a 'with
 ERROR(sema_resume_wrong_resumption_type, "resumptions must be of type 'core.Resumption<T>', but actual type is '%s'")
 ERROR(sema_mismatching_handle_block, "The type of this handle block is '%s', which mismatches the smallest common supertype '%s' of previous branches.")
 ERROR(sema_return_in_try_handle_block, "Return statements are not allowed within try/handle blocks")
+ERROR(sema_try_handle_capture_var, "'try'-'handle' expressions cannot capture mutable variables; consider using 'let' or boxing")
 ERROR(sema_command_incompatible_type, "type '%s' does not implement compatible instantiations of 'Command<T>'")
 ERROR(sema_resume_throwing_mismatch_type, "the type of the `resume throwing` must be a subtype of core.Exception or core.Error")
 WARNING(sema_useless_command_type, UNUSED, "useless command type")
@@ -328,16 +338,15 @@ ERROR(sema_java_mirror_subtype_anno_must_inherit_mirror, "@JavaImpl-annotated de
 ERROR(sema_java_mirror_cannot_be_extended_with_interface, "@JavaMirror class cannot be extended with interface")
 ERROR(sema_java_impl_cannot_be_extended_with_interface, "@JavaImpl class cannot be extended with interface")
 ERROR(sema_java_impl_redefinition, "redefinition of java declaration '%s'")
-ERROR(sema_java_mirror_interoplib_must_be_imported, "interoplib.interop must be imported to use java interoperability")
+ERROR(sema_java_mirror_interoplib_must_be_imported, "java.lang must be imported to use java interoperability")
 ERROR(sema_java_interop_not_supported, "Java interoperability feature '%s' is not yet supported")
 ERROR(sema_extend_ref_target_cannot_be_java_impl, "extend declaration ref target cannot be java impl")
-ERROR(sema_variable_of_java_type, "%s can not store objects of java interoperability type '%s'")
 ERROR(sema_generic_parameter_of_java_type, "Can not instantiate generic '%s' with java interoperability type '%s'")
 WARNING(sema_java_interoplib_version_too_old, UNGROUPED,
-    "java interoplib.interop library's version is too old. Compiler was built expecting versoin '%s'. "
+    "java.internal runtime version cannot be determined, compiler was built expecting version '%s'. "
     "Compatibility problems could happen. Use it at your own risk")
 WARNING(sema_java_interoplib_version_mismatch, UNGROUPED,
-    "java interoplib.interop library's version is '%s', but compiler was built expecting version '%s'. "
+    "java.internal runtime version is '%s', but compiler was built expecting version '%s'. "
     "Compatibility problems could happen. Use it at your own risk")
 
 ERROR(sema_java_has_default_annotation_args, "'@JavaHasDefault' can't have arguments")
@@ -355,7 +364,7 @@ ERROR(sema_objc_mirror_subtype_cannot_multiple_inherit, "Objective-C mirror subt
 ERROR(sema_objc_mirror_subtype_must_be_annotated, "Objective-C mirror subtype must be annotated with @ObjCMirror or @ObjCImpl")
 ERROR(sema_objc_mirror_subtype_must_inherit_mirror, "@ObjCImpl declaration must inherit @ObjCMirror")
 ERROR(sema_objc_mirror_must_inherit_mirror, "@ObjCMirror declaration cannot inherit not @ObjCMirror declarations")
-ERROR(sema_objc_mirror_interoplib_must_be_imported, "interoplib.objc must be imported to use Objective-C interoperability")
+ERROR(sema_objc_mirror_interoplib_must_be_imported, "objc.lang must be imported to use Objective-C interoperability")
 ERROR(sema_objc_interop_not_supported, "Objective-C interoperability feature '%s' is not yet supported")
 ERROR(sema_objc_pointer_argument_must_be_objc_compatible, "ObjCPointer can only be used with Objective-C compatible types")
 ERROR(sema_objc_interop_toplevel_param_must_be_objc_compatible, "param type of Objective-C mirror top-level function '%s' must be Objective-C compatible")
@@ -386,13 +395,18 @@ ERROR(sema_ifavailable_unknow_arg_name, "unknown parameter name '%s'")
 // @APILevel
 ERROR(sema_apilevel_multi_anno, "annotate more than one '@!APILevel'")
 WARNING(sema_apilevel_missing_arg, APILEVEL_CHECK,
-    "annotation missing named argument '%s' or unable to read as numerical value")
+    "'@!APILevel' annotation provides no valid '%s'; any accompanying error explains the specific cause")
+ERROR(sema_apilevel_invalid_version_format,
+    "invalid version format '%s' in @!APILevel 'since', expected 'major[.minor[.patch]]' with non-negative integers")
 ERROR(sema_only_literal_support, "only %s literal values are supported for now")
 ERROR(sema_apilevel_ref_higher,
     "cannot reference '%s'(level: %s) which higher than level of the current scope(level: %s)")
 WARNING(sema_apilevel_syscap_warning, APILEVEL_CHECK, "inappropriate syscap '%s'")
 ERROR(sema_apilevel_syscap_error, "inappropriate syscap '%s'")
 ERROR(sema_apilevel_multi_diff_syscap, "declaration mark with different syscap")
+ERROR(sema_apilevel_integer_form_unsupported,
+    "'@!APILevel' no longer accepts an integer version literal; use '@!APILevel[since: \"X.Y.Z\"]' with a dotted "
+    "semantic version string instead")
 ERROR(sema_ifavailable_level_limit,
     "`@IfAvaliable` feature is not avaliable in device where the APILevel is less than 19 due to missing capatability "
     "in ROM")
@@ -401,7 +415,7 @@ ERROR(sema_ifavailable_level_limit,
 ERROR(sema_hide_multi_annotation, "cannot be annotated with '@!Hide' more than once")
 ERROR(sema_hide_at_func_param, "function parameter cannot be annotated with '@!Hide'")
 ERROR(sema_hide_missing_hide, "should be marked with '@!Hide' to be hidden")
-ERROR(sema_hide_compile_time_invisible, "'Hide' annotation must be visible at compile time")
+ERROR(sema_hide_compile_time_invisible, "'@!Hide' annotation must be visible at compile time")
 ERROR(sema_hide_diff_param, "the parameter 'isChecked' of '@!Hide' is %s")
 WARNING(sema_hide_must_at_end, APILEVEL_CHECK, "annotation '%s' must be placed below all macros and annotations")
 

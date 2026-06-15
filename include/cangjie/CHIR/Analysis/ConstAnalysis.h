@@ -10,7 +10,7 @@
 #include <cmath>
 
 #include "cangjie/CHIR/Analysis/ValueAnalysis.h"
-#include "cangjie/CHIR/Utils/DiagAdapter.h"
+#include "cangjie/Basic/DiagnosticEngine.h"
 #include "cangjie/CHIR/Checker/OverflowChecking.h"
 #include "cangjie/CHIR/Utils/Utils.h"
 #include "cangjie/CHIR/IR/Value/Value.h"
@@ -222,8 +222,8 @@ public:
      * @param isDebug flag whether print debug log.
      * @param diag reporter to report warning or error.
      */
-    ConstAnalysis(const Func* func, CHIRBuilder& builder, bool isDebug, DiagAdapter* diag)
-        : ValueAnalysis<ConstValueDomain, ValueStatePool>(func, builder, isDebug), diag(diag)
+    ConstAnalysis(const Function* func, CHIRBuilder& builder, bool isDebug, DiagnosticEngine& diagRef)
+        : ValueAnalysis<ConstValueDomain, ValueStatePool>(func, builder, isDebug), diag(diagRef)
     {
     }
 
@@ -518,7 +518,7 @@ private:
 
         if (isOverflow && os == OverflowStrategy::THROWING) {
             if (this->isStable) {
-                auto builder = diag->DiagnoseRefactor(
+                auto builder = diag.DiagnoseRefactor(
                     DiagKindRefactor::chir_arithmetic_operator_overflow, ToRange(expr->GetDebugLocation()), "-");
                 std::string hint = "-" + dest->GetType()->ToString() + "(" + absVal->ToString() + ")";
                 builder.AddMainHintArguments(hint);
@@ -846,19 +846,14 @@ private:
 
         using LValType = decltype(left->GetVal());
         using RValType = decltype(right->GetVal());
-#if defined(__clang__)
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wsign-conversion"
-#endif
+        // Use common type for bitwise operations to avoid sign-conversion warnings
+        using CommonType = std::common_type_t<LValType, RValType>;
         const static std::unordered_map<ExprKind, std::function<LValType(LValType, RValType)>> ops = {
-            {ExprKind::LSHIFT, [](LValType x, RValType y) { return x << y; }},
-            {ExprKind::RSHIFT, [](LValType x, RValType y) { return x >> y; }},
-            {ExprKind::BITAND, [](LValType x, RValType y) { return x & y; }},
-            {ExprKind::BITXOR, [](LValType x, RValType y) { return x ^ y; }},
-            {ExprKind::BITOR, [](LValType x, RValType y) { return x | y; }}};
-#if defined(__clang__)
-#pragma clang diagnostic pop
-#endif
+            {ExprKind::LSHIFT, [](LValType x, RValType y) { return static_cast<LValType>(static_cast<CommonType>(x) << static_cast<CommonType>(y)); }},
+            {ExprKind::RSHIFT, [](LValType x, RValType y) { return static_cast<LValType>(static_cast<CommonType>(x) >> static_cast<CommonType>(y)); }},
+            {ExprKind::BITAND, [](LValType x, RValType y) { return static_cast<LValType>(static_cast<CommonType>(x) & static_cast<CommonType>(y)); }},
+            {ExprKind::BITXOR, [](LValType x, RValType y) { return static_cast<LValType>(static_cast<CommonType>(x) ^ static_cast<CommonType>(y)); }},
+            {ExprKind::BITOR, [](LValType x, RValType y) { return static_cast<LValType>(static_cast<CommonType>(x) | static_cast<CommonType>(y)); }}};
 
         auto op = ops.find(kind);
         CJC_ASSERT(op != ops.end());
@@ -971,7 +966,7 @@ private:
         if (this->isStable) {
             auto& loc = binary->GetDebugLocation();
             auto prompt = kind == ExprKind::DIV ? "divide" : "modulo";
-            auto builder = diag->DiagnoseRefactor(DiagKindRefactor::chir_divisor_is_zero, ToRange(loc), prompt);
+            auto builder = diag.DiagnoseRefactor(DiagKindRefactor::chir_divisor_is_zero, ToRange(loc), prompt);
             builder.AddMainHintArguments(prompt);
         }
     }
@@ -992,7 +987,7 @@ private:
             };
             auto token = ops.find(kind);
             CJC_ASSERT(token != ops.end());
-            auto builder = diag->DiagnoseRefactor(
+            auto builder = diag.DiagnoseRefactor(
                 DiagKindRefactor::chir_arithmetic_operator_overflow, ToRange(loc), token->second);
             std::string hint = ty->ToString() + "(" + leftVal->ToString() + ") " + token->second + " " +
                 expr->GetRHSOperand()->GetType()->ToString() + "(" + rightVal->ToString() + ")";
@@ -1005,7 +1000,7 @@ private:
     {
         if (this->isStable) {
             auto& loc = expr->GetDebugLocation();
-            auto builder = diag->DiagnoseRefactor(DiagKindRefactor::chir_shift_length_overflow, ToRange(loc));
+            auto builder = diag.DiagnoseRefactor(DiagKindRefactor::chir_shift_length_overflow, ToRange(loc));
             builder.AddMainHintArguments(std::to_string(rightVal), expr->GetLHSOperand()->GetType()->ToString());
             builder.AddNote("right operand can not be negative");
         }
@@ -1017,7 +1012,7 @@ private:
         if (this->isStable) {
             auto& loc = expr->GetDebugLocation();
             auto lhsTyString = expr->GetLHSOperand()->GetType()->ToString();
-            auto builder = diag->DiagnoseRefactor(DiagKindRefactor::chir_shift_length_overflow, ToRange(loc));
+            auto builder = diag.DiagnoseRefactor(DiagKindRefactor::chir_shift_length_overflow, ToRange(loc));
             builder.AddMainHintArguments(std::to_string(rightVal), lhsTyString);
             builder.AddNote("the type of left operand is " + lhsTyString +
                 ", the most bits that expected to shift are " + std::to_string(leftValBit - 1));
@@ -1168,7 +1163,7 @@ private:
     {
         if (this->isStable) {
             auto& loc = cast->GetDebugLocation();
-            auto builder = diag->DiagnoseRefactor(DiagKindRefactor::chir_typecast_overflow, ToRange(loc));
+            auto builder = diag.DiagnoseRefactor(DiagKindRefactor::chir_typecast_overflow, ToRange(loc));
             std::string srcValStr = cast->GetSourceTy()->ToString() + "(" + std::to_string(srcVal) + ")";
             builder.AddMainHintArguments(srcValStr, cast->GetTargetTy()->ToString());
             builder.AddNote(GenerateTypeRangePrompt(cast->GetTargetTy()));
@@ -1207,7 +1202,7 @@ private:
 
     template <typename TApply> ExceptionKind HandleApply(TConstDomain& state, const TApply* apply, Value* /* refObj */)
     {
-        auto calleeFunc = DynamicCast<FuncBase*>(apply->GetCallee());
+        auto calleeFunc = DynamicCast<Function*>(apply->GetCallee());
         if (!calleeFunc) {
             return ExceptionKind::NA;
         }
@@ -1225,21 +1220,6 @@ private:
             return HandleRangeInit(state, apply);
         }
         return ExceptionKind::NA;
-    }
-
-    template <typename TApply> void HandleBoxedArrayInit(TConstDomain& state, const TApply* apply)
-    {
-        /**
-         * func init(this: Class-_CN7default27$BOX_RNat5ArrayIlEE&, array: Struct-_CNat5ArrayIlE<Int64>)
-         */
-        auto args = apply->GetArgs();
-        CJC_ASSERT(args.size() == 2U);
-        constexpr size_t boxedValueIndex = 0;
-        auto toBeInitedArray = state.GetChild(args[thisArgIndex], boxedValueIndex);
-        CJC_ASSERT(toBeInitedArray);
-        constexpr size_t initArrayArgIndex = 1;
-        auto initArg = args[initArrayArgIndex];
-        state.Propagate(initArg, toBeInitedArray);
     }
 
     /**
@@ -1386,7 +1366,7 @@ private:
         }
         if (this->isStable) {
             auto builder =
-                diag->DiagnoseRefactor(DiagKindRefactor::chir_step_non_zero_range, ToRange(apply->GetDebugLocation()));
+                diag.DiagnoseRefactor(DiagKindRefactor::chir_step_non_zero_range, ToRange(apply->GetDebugLocation()));
             return ExceptionKind::FAIL;
         }
         return ExceptionKind::NA;
@@ -1460,14 +1440,14 @@ private:
         if (index < 0) {
             if (this->isStable) {
                 auto builder =
-                    diag->DiagnoseRefactor(DiagKindRefactor::chir_idx_out_of_bounds, ToRange(expr->GetDebugLocation()));
+                    diag.DiagnoseRefactor(DiagKindRefactor::chir_idx_out_of_bounds, ToRange(expr->GetDebugLocation()));
                 builder.AddMainHintArguments("array index can not be negative");
             }
             return ExceptionKind::FAIL;
         } else if (static_cast<size_t>(index) >= len) {
             if (this->isStable) {
                 auto builder =
-                    diag->DiagnoseRefactor(DiagKindRefactor::chir_idx_out_of_bounds, ToRange(expr->GetDebugLocation()));
+                    diag.DiagnoseRefactor(DiagKindRefactor::chir_idx_out_of_bounds, ToRange(expr->GetDebugLocation()));
                 auto hint = "array index " + std::to_string(index) + " is past the end of array (which contains " +
                     std::to_string(len) + " elements)";
                 builder.AddMainHintArguments(hint);
@@ -1478,7 +1458,7 @@ private:
         return ExceptionKind::SUCCESS;
     }
 
-    DiagAdapter* diag;
+    DiagnosticEngine& diag;
 };
 
 } // namespace Cangjie::CHIR

@@ -39,7 +39,7 @@ private:
     void RewriteVtable();
     void RewriteOneVtableEntry(
         ClassType& infType, CustomTypeDef& user, const VirtualMethodInfo& methodInfo, size_t index);
-    Func* GenerateBuiltinOverflowOperatorFunc(
+    Function* GenerateBuiltinOverflowOperatorFunc(
         const std::string& name, OverflowStrategy ovf, const ExtendDef& user, bool isBinary);
     void RewriteVtableEntryRec(const ClassDef& inf, CustomTypeDef& user, const RewriteVtableInfo& info);
     void CollectVTableUsers();
@@ -53,7 +53,7 @@ private:
         bool operator()(ClassDef* one, ClassDef* another) const;
     };
     std::map<ClassDef*, RewriteVtableInfo, RewriteInfoOrdering> interRewriteInfo;
-    std::unordered_map<std::string, Func*> cache;
+    std::unordered_map<std::string, Function*> cache;
     //             parent vtable, sub vtables
     std::unordered_map<ClassDef*, std::vector<CustomTypeDef*>> vtableUsers;
 };

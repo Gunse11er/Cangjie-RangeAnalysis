@@ -1,4 +1,4 @@
-// Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+// Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 // This source file is part of the Cangjie project, licensed under Apache-2.0
 // with Runtime Library Exception.
 //
@@ -20,6 +20,11 @@
 #include "cangjie/Sema/TypeManager.h"
 
 namespace Cangjie::Native::FFI {
+constexpr std::string_view NSSTRING_CLASS_IDENT = "NSString";
+constexpr std::string_view NSOBJECT_CLASS_IDENT = "NSObject";
+constexpr std::string_view TOSTRING_METHOD_IDENT = "toString";
+constexpr std::string_view INIT_IDENT = "init";
+
 using namespace AST;
 
 /*
@@ -105,7 +110,7 @@ template <typename... Args> OwnedPtr<CallExpr> CreateCall(Ptr<FuncDecl> fd, Ptr<
 
     (Details::WrapArg(&funcArgs, std::forward<OwnedPtr<Args>>(args)), ...);
 
-    auto funcTy = StaticCast<FuncTy*>(fd->ty);
+    auto funcTy = StaticCast<FuncTy*>(fd->GetTy());
 
     return CreateCallExpr(WithinFile(CreateRefExpr(*fd), curFile), std::move(funcArgs), fd, funcTy->retTy,
         CallKind::CALL_DECLARED_FUNCTION);
@@ -120,7 +125,7 @@ OwnedPtr<CallExpr> CreateMemberCall(OwnedPtr<Expr> receiver, Ptr<FuncDecl> fd, O
 
     (Details::WrapArg(&funcArgs, std::forward<OwnedPtr<Args>>(args)), ...);
 
-    auto funcTy = StaticCast<FuncTy*>(fd->ty);
+    auto funcTy = StaticCast<FuncTy*>(fd->GetTy());
     auto ma = CreateMemberAccess(std::move(receiver), *fd);
     CopyBasicInfo(ma->baseExpr, ma);
     return CreateCallExpr(std::move(ma), std::move(funcArgs), fd, funcTy->retTy, CallKind::CALL_DECLARED_FUNCTION);
@@ -144,8 +149,13 @@ StructDecl& GetStringDecl(const ImportManager& importManager);
  *     return noden;
  * }()
  */
-
 OwnedPtr<CallExpr> WrapReturningLambdaCall(TypeManager& typeManager, std::vector<OwnedPtr<Node>> nodes);
+
+/**
+ * Returns lambda expression of nodes returning `Unit`.
+ */
+OwnedPtr<LambdaExpr> WrapUnitLambdaExpr(TypeManager& typeManager, std::vector<OwnedPtr<Node>> nodes,
+    std::vector<OwnedPtr<FuncParam>> lambdaParams = {});
 OwnedPtr<LambdaExpr> WrapReturningLambdaExpr(
     TypeManager& typeManager, std::vector<OwnedPtr<Node>> nodes, std::vector<OwnedPtr<FuncParam>> lambdaParams = {});
 
@@ -165,6 +175,10 @@ Ptr<Annotation> GetForeignNameAnnotation(const Decl& decl);
 Ptr<Annotation> GetAnnotation(const Decl& decl, AnnotationKind annotationKind);
 
 Ptr<std::string> GetSingleArgumentAnnotationValue(const Decl& target, AnnotationKind annotationKind);
+std::string GetObjCMirrorForeignName(const ClassLikeDecl& target);
+bool IsObjCGeneratedNSStringCtor(const Decl& target);
+bool IsObjCGeneratedNSObjectToString(const Decl& target);
+bool IsObjCGeneratedMember(const Decl& target);
 
 bool IsSuperConstructorCall(const CallExpr& call);
 bool IsThisConstructorCall(const CallExpr& call);
@@ -210,6 +224,11 @@ std::string GetLambdaJavaClassName(LambdaPattern& pattern);
 std::string GetLambdaJavaClassName(Ptr<Ty> ty);
 
 std::string GetCjMappingTupleName(const Ty& tupleTy);
+
+ClassDecl& GetExceptionDecl(const ImportManager& importManager);
+OwnedPtr<ThrowExpr> CreateThrowExceptionCall(const ImportManager& importManager,
+    TypeManager& typeManager, const std::string& msg, Ptr<File> curFile);
+bool AreParamTypeKindsValid(const FuncDecl& fd, const std::vector<TypeKind>& typeKinds);
 
 } // namespace Cangjie::Native::FFI
 

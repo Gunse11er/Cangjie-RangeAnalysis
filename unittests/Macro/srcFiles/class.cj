@@ -13,4 +13,8 @@ import define.*
     }
 })
 
+class Ca6 {
+    var ab = 3
+}
+
 main() {}

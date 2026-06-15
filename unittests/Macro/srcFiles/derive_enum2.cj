@@ -5,7 +5,7 @@
  *
  * See https://cangjie-lang.cn/pages/LICENSE for license information.
  */
- 
+
 import std.deriving.*
 
 @Derive[Equatable]

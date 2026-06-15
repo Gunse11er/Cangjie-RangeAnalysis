@@ -19,7 +19,7 @@
 
 namespace Cangjie {
 namespace CHIR {
-class Func;
+class Function;
 }
 namespace CodeGen {
 class IRBuilder2;

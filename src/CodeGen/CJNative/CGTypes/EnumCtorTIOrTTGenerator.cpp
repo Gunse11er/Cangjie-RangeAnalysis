@@ -77,7 +77,7 @@ EnumCtorLayout EnumCtorTIOrTTGenerator::GenLayoutForReferenceType(const std::str
     layout.size = 8u;
     layout.align = 8u;
     auto cgEnumType = StaticCast<CGEnumType*>(CGType::GetOrCreate(cgMod, &chirEnumType));
-    layout.fieldTypes.emplace_back(const_cast<CHIR::Type*>(&CGType::GetZeroSizedCGType(cgMod)->GetOriginal()));
+    layout.fieldTypes.emplace_back(const_cast<CHIR::Type*>(&CGType::GetUnitCGType(cgMod)->GetOriginal()));
     if (cgEnumType->IsOptionLikeT()) {
         layout.fieldTypes.emplace_back(CGType::GetRefTypeOfCHIRInt8(cgMod.GetCGContext().GetCHIRBuilder()));
     } else {
@@ -114,6 +114,8 @@ EnumCtorLayout EnumCtorTIOrTTGenerator::GenLayoutForTrivial(const std::string& t
         llvm::cast<llvm::GlobalVariable>(cgMod.GetLLVMModule()->getOrInsertGlobal(name, i32ArrType));
     typeInfoOfFields->setInitializer(llvm::ConstantArray::get(i32ArrType, {llvm::ConstantInt::get(i32Ty, 0)}));
     typeInfoOfFields->setLinkage(llvm::GlobalValue::LinkageTypes::PrivateLinkage);
+    typeInfoOfFields->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+    typeInfoOfFields->setConstant(true);
     typeInfoOfFields->addAttribute(CJTI_OFFSETS_ATTR);
     layout.fieldTypes.emplace_back(cgMod.GetCGContext().GetCHIRBuilder().GetInt32Ty());
     layout.offsets = llvm::ConstantExpr::getBitCast(typeInfoOfFields, i32Ty->getPointerTo());
@@ -142,15 +144,15 @@ EnumCtorLayout EnumCtorTIOrTTGenerator::GenLayoutForStructure(const CGEnumType* 
         return ComputeLLVMLayout(fields, tiName, className);
     } else { // EXHAUSTIVE_ASSOCIATED_NONREF
         layout.fieldTypes = fields;
-        layout.align = 1;
+        auto nonRefLayout = CGEnumType::ComputeAssociatedNonRefLayout(cgMod, layout.fieldTypes);
+        // Ideally, all targets should use the computed associated non-ref size here.
+        // For compatibility, only Android ARM32 switches to the aligned layout size for now.
+        if (CGEnumType::NeedAndroidArm32AlignedEnumLayout(cgMod.GetCGContext().GetCompileOptions().target))
+            layout.size = nonRefLayout.size;
+        layout.align = nonRefLayout.align;
         std::vector<llvm::Constant*> offSets(layout.fieldTypes.size());
-        uint32_t totalSize = 0;
         for (size_t i = 0; i < layout.fieldTypes.size(); ++i) {
-            auto fieldType = layout.fieldTypes[i];
-            offSets[i] = llvm::ConstantInt::get(i32Ty, totalSize);
-            auto cgField = CGType::GetOrCreate(cgMod, DeRef(*fieldType));
-            auto fieldSize = cgField->GetSize().value_or(0);
-            totalSize += fieldSize;
+            offSets[i] = llvm::ConstantInt::get(i32Ty, nonRefLayout.offsets[i]);
         }
         auto layoutType = GetLLVMStructType(cgMod, layout.fieldTypes, GetClassObjLayoutName(className));
         if (layoutType->elements().empty()) {
@@ -162,6 +164,8 @@ EnumCtorLayout EnumCtorTIOrTTGenerator::GenLayoutForStructure(const CGEnumType* 
                 llvm::cast<llvm::GlobalVariable>(cgMod.GetLLVMModule()->getOrInsertGlobal(name, i32ArrType));
             typeInfoOfFields->setInitializer(llvm::ConstantArray::get(i32ArrType, offSets));
             typeInfoOfFields->setLinkage(llvm::GlobalValue::LinkageTypes::PrivateLinkage);
+            typeInfoOfFields->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+            typeInfoOfFields->setConstant(true);
             typeInfoOfFields->addAttribute(CJTI_OFFSETS_ATTR);
             layout.offsets = llvm::ConstantExpr::getBitCast(typeInfoOfFields, i32Ty->getPointerTo());
         }
@@ -237,7 +241,7 @@ void EnumCtorTIOrTTGenerator::GenerateNonGenericEnumCtorTypeInfo(llvm::GlobalVar
     auto meta = llvm::MDTuple::get(llvmCtx, {llvm::MDString::get(llvmCtx, layoutType->getStructName().str())});
     ti.setMetadata(GC_TYPE_META_NAME, meta);
     if (!cgCtx.GetCompileOptions().disableReflection) {
-        std::string mangledName = ctors[ctorIndex].annoInfo.mangledName;
+        std::string mangledName = ctors[ctorIndex].annoInfo.GetAnnoFactoryFuncMangledName();
         auto innerNode = llvm::MDTuple::get(
             llvmCtx, {llvm::MDString::get(llvmCtx, "enumCtor"), llvm::MDString::get(llvmCtx, mangledName)});
         auto outerNode = llvm::MDTuple::get(llvmCtx, {innerNode});
@@ -264,6 +268,7 @@ llvm::Constant* EnumCtorTIOrTTGenerator::GenSuperFnOfTypeTemplate(const std::str
     auto superTiFn =
         llvm::Function::Create(superTiFnType, llvm::Function::PrivateLinkage, funcName, cgMod.GetLLVMModule());
     superTiFn->addFnAttr("native-interface-fn");
+    superTiFn->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
     CodeGen::IRBuilder2 irBuilder(cgMod);
     auto entryBB = irBuilder.CreateEntryBasicBlock(superTiFn, "entry");
     irBuilder.SetInsertPoint(entryBB);
@@ -327,7 +332,7 @@ void EnumCtorTIOrTTGenerator::GenerateGenericEnumCtorTypeTemplate(llvm::GlobalVa
         llvm::ConstantPointerNull::get(CGType::GetOrCreateExtensionDefPtrType(llvmCtx)->getPointerTo());
     typeTemplateVec[static_cast<size_t>(TYPETEMPLATE_INHERITED_CLASS_NUM)] = llvm::ConstantInt::get(i16Ty, 0U);
     if (!cgCtx.GetCompileOptions().disableReflection) {
-        std::string mangledName = ctors[ctorIndex].annoInfo.mangledName;
+        std::string mangledName = ctors[ctorIndex].annoInfo.GetAnnoFactoryFuncMangledName();
         auto innerNode = llvm::MDTuple::get(llvmCtx,
             {llvm::MDString::get(llvmCtx, "enumCtor"),llvm::MDString::get(llvmCtx, mangledName)});
         auto outerNode = llvm::MDTuple::get(llvmCtx, {innerNode});

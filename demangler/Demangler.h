@@ -283,7 +283,7 @@ private:
     bool IsQualifiedType() const;
     bool IsDecl() const;
     bool IsNotEndOfMangledName() const;
-    bool MatchForward(const char pattern[], uint32_t len) const;
+    bool MatchForward(const char pattern[], size_t len) const;
 
     /**
      * @brief Get the current character without incrementing `currentIndex`.

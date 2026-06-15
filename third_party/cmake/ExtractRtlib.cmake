@@ -23,6 +23,10 @@ set(IOS ${CMAKE_ARGV9})
 
 set(LIB_SUFFIX ".a")
 
+if(CANGJIE_TARGET_ARCH MATCHES "^armv7.*-android")
+    set(CANGJIE_TARGET_ARCH "arm-android")
+endif()
+
 # Create the specific library
 # 1. Find the path of the specific library compiled from llvm compiler-rt
 if(CANGJIE_BUILD_CJC) # It is native-compiling

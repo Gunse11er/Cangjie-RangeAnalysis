@@ -32,13 +32,13 @@ public:
     /**
      * @brief Return cache info, map<mangled name, func pointer>.
      */
-    std::unordered_map<std::string, FuncBase*>&& GetWrappers();
+    std::unordered_map<std::string, Function*>&& GetWrappers();
 
 private:
-    void CreateMutFuncWrapper(FuncBase* rawFunc, CustomTypeDef& curDef, ClassType& srcClassTy);
+    void CreateMutFuncWrapper(Function& rawFunc, CustomTypeDef& curDef, ClassType& srcClassTy);
 
     CHIRBuilder& builder;
-    std::unordered_map<std::string, FuncBase*> wrapperFuncs;
+    std::unordered_map<std::string, Function*> wrapperFuncs;
 };
 }
 }

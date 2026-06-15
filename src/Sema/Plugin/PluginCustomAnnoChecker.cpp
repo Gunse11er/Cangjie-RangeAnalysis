@@ -13,8 +13,8 @@
 #include "PluginCustomAnnoChecker.h"
 
 #include <functional>
-#include <iterator>
 #include <iostream>
+#include <iterator>
 #include <stack>
 #include <unordered_map>
 
@@ -40,17 +40,53 @@ constexpr std::string_view SYSCAP_IDENTIFIER = "syscap";
 constexpr std::string_view CFG_PARAM_LEVEL_NAME = "APILevel_level";
 constexpr std::string_view CFG_PARAM_SYSCAP_NAME = "APILevel_syscap";
 // For level check:
-const LevelType IFAVAILABLE_LOWER_LIMITLEVEL = 19;
+constexpr uint32_t IFAVAILABLE_LOWER_LIMITLEVEL = 19;
+constexpr uint32_t APILEVEL_MAJOR_MIN = 1;
+constexpr uint32_t APILEVEL_MAJOR_MAX = 99;
 
 // For Annotation Hide:
 constexpr std::string_view HIDE_ANNO_NAME = "Hide";
 constexpr std::string_view HIDE_ARG_NAME = "isChecked";
 
-LevelType Str2LevelType(std::string s)
+/// Parse an integer or triple-string literal into an APILevelVersion. Accepts
+/// `lce` of kind INTEGER (major-only, range [1,99]) or STRING (`"xx.yy.zz"`,
+/// validated via TRIPLE_ONLY rule). Returns `std::nullopt` for any other kind
+/// or out-of-range value; the caller is responsible for issuing diagnostics.
+std::optional<APILevelVersion> ParseStrictLevelLiteral(const LitConstExpr& lce)
 {
-    return static_cast<LevelType>(Stoull(s).value_or(0));
+    if (lce.kind == LitConstKind::INTEGER) {
+        auto value = Stoull(lce.stringValue);
+        if (!value.has_value() || value.value() < APILEVEL_MAJOR_MIN || value.value() > APILEVEL_MAJOR_MAX) {
+            return std::nullopt;
+        }
+        return APILevelVersion(static_cast<uint32_t>(value.value()));
+    }
+    if (lce.kind == LitConstKind::STRING) {
+        return APILevelVersion::ParseChecked(lce.stringValue, APILevelVersion::ParseRule::TRIPLE_ONLY);
+    }
+    return std::nullopt;
 }
 
+/// Parse the version argument of a `@IfAvailable` expression. Requires `e` to
+/// be a `LitConstExpr`; delegates to `ParseStrictLevelLiteral` which accepts
+/// INTEGER (major-only) or STRING (`"xx.yy.zz"` triple). Returns `std::nullopt`
+/// when `e` is not a literal or when the literal value is out of range.
+std::optional<APILevelVersion> ParseIfAvailableArgVersion(const Expr& e)
+{
+    auto lce = DynamicCast<LitConstExpr>(&e);
+    if (!lce) {
+        return std::nullopt;
+    }
+    return ParseStrictLevelLiteral(*lce);
+}
+
+/// Parse the `level:` integer argument of `@IfAvailable`. Reads an INTEGER
+/// literal from `e` (direct `LitConstExpr` or the right-hand side of a
+/// `BinaryExpr`), validates it via `ParseStrictLevelLiteral`, and writes the
+/// result into `apilevel.since` — keeping the minimum when called multiple
+/// times. Emits `sema_only_literal_support` (ERROR) when the argument is not
+/// an integer literal, and `sema_apilevel_invalid_version_format` (ERROR) when
+/// the integer is outside the valid major-version range [1,99].
 void ParseLevel(const Expr& e, PluginCustomAnnoInfo& apilevel, DiagnosticEngine& diag)
 {
     Ptr<const LitConstExpr> lce = nullptr;
@@ -65,10 +101,25 @@ void ParseLevel(const Expr& e, PluginCustomAnnoInfo& apilevel, DiagnosticEngine&
         diag.DiagnoseRefactor(DiagKindRefactor::sema_only_literal_support, e, "integer");
         return;
     }
-    auto newLevel = Str2LevelType(lce->stringValue);
-    apilevel.since = apilevel.since == 0 ? newLevel : std::min(newLevel, apilevel.since);
+    auto newLevel = ParseStrictLevelLiteral(*lce);
+    if (!newLevel.has_value()) {
+        diag.DiagnoseRefactor(DiagKindRefactor::sema_apilevel_invalid_version_format, e, lce->stringValue.c_str());
+        return;
+    }
+    if (apilevel.since.IsZero()) {
+        apilevel.since = *newLevel;
+    } else if (*newLevel < apilevel.since) {
+        apilevel.since = *newLevel;
+    }
 }
 
+/// Parse the `since:` string argument of `@!APILevel`. Reads a STRING literal
+/// from `e` (direct `LitConstExpr` or the right-hand side of a `BinaryExpr`),
+/// validates it via `APILevelVersion::ParseChecked` under MAJOR_OR_TRIPLE rule
+/// (accepts `"xx"` or `"xx.yy.zz"`), and writes the result into `apilevel.since`
+/// — keeping the minimum when called multiple times. Emits
+/// `sema_only_literal_support` (ERROR) when the argument is not a string literal,
+/// and `sema_apilevel_invalid_version_format` (ERROR) on parse failure.
 void ParseSince(const Expr& e, PluginCustomAnnoInfo& apilevel, DiagnosticEngine& diag)
 {
     Ptr<const LitConstExpr> lce = nullptr;
@@ -83,10 +134,23 @@ void ParseSince(const Expr& e, PluginCustomAnnoInfo& apilevel, DiagnosticEngine&
         diag.DiagnoseRefactor(DiagKindRefactor::sema_only_literal_support, e, "string");
         return;
     }
-    auto newLevel = Str2LevelType(lce->stringValue);
-    apilevel.since = apilevel.since == 0 ? newLevel : std::min(newLevel, apilevel.since);
+    auto newLevel = APILevelVersion::ParseChecked(lce->stringValue, APILevelVersion::ParseRule::MAJOR_OR_TRIPLE);
+    if (!newLevel.has_value()) {
+        diag.DiagnoseRefactor(DiagKindRefactor::sema_apilevel_invalid_version_format, e, lce->stringValue.c_str());
+        return;
+    }
+    if (apilevel.since.IsZero()) {
+        apilevel.since = *newLevel;
+    } else if (*newLevel < apilevel.since) {
+        apilevel.since = *newLevel;
+    }
 }
 
+/// Parse the `syscap:` string argument of `@IfAvailable`. Reads a STRING literal
+/// from `e` — either a direct `LitConstExpr` or the sole argument of a
+/// `CallExpr` wrapper — and writes the raw syscap identifier string into
+/// `apilevel.syscap`. Emits `sema_only_literal_support` (ERROR) when the
+/// argument is not a string literal.
 void ParseSysCap(const Expr& e, PluginCustomAnnoInfo& apilevel, DiagnosticEngine& diag)
 {
     Ptr<const LitConstExpr> lce = nullptr;
@@ -104,6 +168,12 @@ void ParseSysCap(const Expr& e, PluginCustomAnnoInfo& apilevel, DiagnosticEngine
     apilevel.syscap = lce->stringValue;
 }
 
+/// Parse the `isChecked:` boolean argument of `@Hide`. Reads a BOOL literal
+/// from `e` (must be a `LitConstExpr`) and OR-accumulates the value into
+/// `apilevel.hasHideAnno`, so that multiple `@Hide` annotations on the same
+/// declaration are coalesced — the field becomes true if any annotation has
+/// `isChecked: true`. Emits `sema_only_literal_support` (ERROR) when the
+/// argument is not a boolean literal.
 void ParseCheckingHide(const Expr& e, PluginCustomAnnoInfo& apilevel, DiagnosticEngine& diag)
 {
     Ptr<const LitConstExpr> lce = nullptr;
@@ -147,6 +217,49 @@ void ClearAnnoInfoOfDepPkg(ImportManager& importManager)
     }
 }
 
+void MarkFuncDeclMembersAsExternalWeak(FuncDecl& fd)
+{
+    for (auto& param : fd.funcBody->paramLists[0]->params) {
+        if (param->desugarDecl) {
+            param->desugarDecl->linkage = Linkage::EXTERNAL_WEAK;
+        }
+    }
+    if (fd.propDecl) {
+        fd.propDecl->linkage = Linkage::EXTERNAL_WEAK;
+    }
+}
+
+void MarkPropDeclMembersAsExternalWeak(PropDecl& pd)
+{
+    for (auto& getter : pd.getters) {
+        if (getter) {
+            getter->linkage = Linkage::EXTERNAL_WEAK;
+        }
+    }
+    for (auto& setter : pd.setters) {
+        if (setter) {
+            setter->linkage = Linkage::EXTERNAL_WEAK;
+        }
+    }
+}
+
+void SetLinkageAsExternalWeak(Ptr<Decl> target)
+{
+    if (!target) {
+        return;
+    }
+    target->linkage = Linkage::EXTERNAL_WEAK;
+    if (auto fd = DynamicCast<FuncDecl>(target)) {
+        MarkFuncDeclMembersAsExternalWeak(*fd);
+    } else if (auto md = DynamicCast<MacroDecl>(target)) {
+        if (md->desugarDecl) {
+            md->desugarDecl->linkage = Linkage::EXTERNAL_WEAK;
+        }
+    } else if (auto pd = DynamicCast<PropDecl>(target)) {
+        MarkPropDeclMembersAsExternalWeak(*pd);
+    }
+}
+
 void MarkTargetAsExternalWeak(Ptr<Node> node)
 {
     if (!node) {
@@ -161,37 +274,9 @@ void MarkTargetAsExternalWeak(Ptr<Node> node)
     if (!target) {
         return;
     }
-    target->linkage = Linkage::EXTERNAL_WEAK;
-    if (auto fd = DynamicCast<FuncDecl>(target)) {
-        for (auto& param : fd->funcBody->paramLists[0]->params) {
-            if (param->desugarDecl) {
-                param->desugarDecl->linkage = Linkage::EXTERNAL_WEAK;
-            }
-        }
-        if (fd->propDecl) {
-            fd->propDecl->linkage = Linkage::EXTERNAL_WEAK;
-        }
-    } else if (auto md = DynamicCast<MacroDecl>(target)) {
-        if (md->desugarDecl) {
-            md->desugarDecl->linkage = Linkage::EXTERNAL_WEAK;
-        }
-    } else if (auto pd = DynamicCast<PropDecl>(target)) {
-        for (auto& getter : pd->getters) {
-            if (!getter) {
-                continue;
-            }
-            getter->linkage = Linkage::EXTERNAL_WEAK;
-        }
-        for (auto& setter : pd->setters) {
-            if (!setter) {
-                continue;
-            }
-            setter->linkage = Linkage::EXTERNAL_WEAK;
-        }
-    }
+    SetLinkageAsExternalWeak(target);
     if (target->outerDecl && target->outerDecl->IsNominalDecl()) {
-        target->outerDecl->linkage = Linkage::EXTERNAL_WEAK;
-        MarkTargetAsExternalWeak(target->outerDecl);
+        SetLinkageAsExternalWeak(target->outerDecl);
     }
 }
 
@@ -280,8 +365,20 @@ void PluginCustomAnnoChecker::ParseOption() noexcept
     auto& option = ci.invocation.globalOptions;
     auto found = option.passedWhenKeyValue.find(std::string(CFG_PARAM_LEVEL_NAME));
     if (found != option.passedWhenKeyValue.end()) {
-        globalLevel = Str2LevelType(found->second);
-        optionWithLevel = true;
+        if (found->second == "0") {
+            globalLevel = APILevelVersion();
+            optionWithLevel = false;
+        } else {
+            auto parsedLevel =
+                APILevelVersion::ParseChecked(found->second, APILevelVersion::ParseRule::MAJOR_OR_TRIPLE);
+            if (!parsedLevel.has_value()) {
+                diag.DiagnoseRefactor(
+                    DiagKindRefactor::sema_apilevel_invalid_version_format, DEFAULT_POSITION, found->second.c_str());
+                return;
+            }
+            globalLevel = *parsedLevel;
+            optionWithLevel = !globalLevel.IsZero();
+        }
     }
     found = option.passedWhenKeyValue.find(std::string(CFG_PARAM_SYSCAP_NAME));
     if (found != option.passedWhenKeyValue.end()) {
@@ -309,7 +406,8 @@ bool PluginCustomAnnoChecker::IsAnnoAPILevel(Ptr<Annotation> anno, [[maybe_unuse
     auto target = anno->baseExpr ? anno->baseExpr->GetTarget() : nullptr;
     if (target) {
         // With semantic info, check by target and its package name.
-        return target->GetFullPackageName() == PKG_NAME_OHOS_LABELS && target->outerDecl &&
+        return target->GetFullPackageName() == PKG_NAME_OHOS_LABELS &&
+            target->outerDecl &&
             target->outerDecl->identifier == APILEVEL_ANNO_NAME;
     }
     // Without semantic info, check by annotation name only.
@@ -352,10 +450,23 @@ void PluginCustomAnnoChecker::ParseAPILevelArgs(
     const Decl& decl, const Annotation& anno, PluginCustomAnnoInfo& annoInfo)
 {
     for (size_t i = 0; i < anno.args.size(); ++i) {
-        // To support old APILevel definition that constructor parameter list is 'level: Int8, ...'.
         std::string_view argName = anno.args[i]->name.Val();
-        if (argName.empty()) {
-            argName = LEVEL_IDENTIFIER;
+        // Detect legacy integer-form usage:
+        //   @!APILevel[20]                  (positional integer)
+        //   @!APILevel[level: 20]           (named-level with integer value, old-style call)
+        //   @!APILevel[since: 20]           (named-since with integer value, edge case)
+        // Issue #824 dropped support for integer version literals on @!APILevel. The
+        // dedicated diagnostic gives users a migration-actionable message regardless
+        // of which legacy invocation form they hit.
+        if (auto lce = DynamicCast<LitConstExpr>(anno.args[i]->expr.get());
+            lce && lce->kind == LitConstKind::INTEGER &&
+            (argName.empty() || argName == SINCE_IDENTIFIER || argName == LEVEL_IDENTIFIER)) {
+            // Anchor at the annotation, not the arg literal — the engine dedups by
+            // (range, severity) and would drop our migration hint against
+            // sema_need_named_argument otherwise.
+            diag.DiagnoseRefactor(
+                DiagKindRefactor::sema_apilevel_integer_form_unsupported, anno);
+            continue;
         }
         if (parseNameParam.count(argName) <= 0) {
             continue;
@@ -366,9 +477,13 @@ void PluginCustomAnnoChecker::ParseAPILevelArgs(
             diag.DiagnoseRefactor(DiagKindRefactor::sema_apilevel_multi_diff_syscap, decl);
         }
     }
-    // In the APILevel definition, only "since" does not provide a default value. Here, the warning that
-    // there is an issue with the APILevel annotation, which may originnate from the cj.d file.
-    if (annoInfo.since == 0) {
+    // In the APILevel definition, 'since' is the only argument without a default
+    // value. Emitting this warning here means the APILevel annotation produced no
+    // valid 'since' version — which could be because the user (or a stale .cj.d
+    // declaration) wrote no 'since:' at all, or the value failed to parse. Keep
+    // the warning unconditional on 'since == 0'; precise errors (invalid_version_format,
+    // integer_form_unsupported) fire elsewhere and complement, not replace, this signal.
+    if (annoInfo.since.IsZero()) {
         diag.DiagnoseRefactor(DiagKindRefactor::sema_apilevel_missing_arg, anno.begin, "since!: String");
     }
 }
@@ -378,7 +493,7 @@ void PluginCustomAnnoChecker::CheckHideOfExtendDecl(const Decl& decl, const Plug
     if (decl.astKind != ASTKind::EXTEND_DECL) {
         return;
     }
-    auto extendedDecl = Ty::GetDeclPtrOfTy(decl.ty);
+    auto extendedDecl = Ty::GetDeclPtrOfTy(decl.GetTy());
     if (!extendedDecl) {
         return;
     }
@@ -465,18 +580,44 @@ void PluginCustomAnnoChecker::CheckHideOfOverrideFunction(const Decl& decl, cons
     }
 }
 
+void PluginCustomAnnoChecker::MergeCachedAnnoInfo(const PluginCustomAnnoInfo& cached, PluginCustomAnnoInfo& annoInfo)
+{
+    annoInfo.since = annoInfo.since.IsZero() ? cached.since : std::min(cached.since, annoInfo.since);
+    annoInfo.syscap = cached.syscap;
+    if (cached.hasHideAnno.has_value()) {
+        annoInfo.hasHideAnno = cached.hasHideAnno;
+    } else if (!annoInfo.hasHideAnno.has_value()) {
+        annoInfo.hasHideAnno = std::nullopt;
+    }
+    // else: keep the existing annoInfo.hasHideAnno value.
+}
+
+void PluginCustomAnnoChecker::ProcessOneAnnotation(
+    const Decl& decl, Ptr<Annotation> anno, bool& hideExist, PluginCustomAnnoInfo& annoInfo)
+{
+    if (IsAnnoHide(anno)) {
+        if (hideExist) {
+            diag.DiagnoseRefactor(DiagKindRefactor::sema_hide_multi_annotation, decl);
+            return;
+        }
+        hideExist = true;
+        if (auto param = DynamicCast<FuncParam>(&decl); param && !param->isMemberParam) {
+            diag.DiagnoseRefactor(DiagKindRefactor::sema_hide_at_func_param, decl);
+            return;
+        }
+        if (!anno->isCompileTimeVisible) {
+            diag.DiagnoseRefactor(DiagKindRefactor::sema_hide_compile_time_invisible, *anno);
+        }
+        ParseHideArg(*anno, annoInfo);
+    } else if (IsAnnoAPILevel(anno, decl)) {
+        ParseAPILevelArgs(decl, *anno, annoInfo);
+    }
+}
+
 void PluginCustomAnnoChecker::Parse(const Decl& decl, PluginCustomAnnoInfo& annoInfo)
 {
     if (auto found = levelCache.find(&decl); found != levelCache.end()) {
-        annoInfo.since = annoInfo.since == 0 ? found->second.since : std::min(found->second.since, annoInfo.since);
-        annoInfo.syscap = found->second.syscap;
-        if (found->second.hasHideAnno.has_value()) {
-            annoInfo.hasHideAnno = found->second.hasHideAnno;
-        } else if (annoInfo.hasHideAnno.has_value()) {
-            // keep the existing value.
-        } else {
-            annoInfo.hasHideAnno = std::nullopt;
-        }
+        MergeCachedAnnoInfo(found->second, annoInfo);
         return;
     }
     bool hideExist = false;
@@ -484,23 +625,7 @@ void PluginCustomAnnoChecker::Parse(const Decl& decl, PluginCustomAnnoInfo& anno
         if (!anno) {
             continue;
         }
-        if (IsAnnoHide(anno)) {
-            if (hideExist) {
-                diag.DiagnoseRefactor(DiagKindRefactor::sema_hide_multi_annotation, decl);
-                continue;
-            }
-            hideExist = true;
-            if (auto param = DynamicCast<FuncParam>(&decl); param && !param->isMemberParam) {
-                diag.DiagnoseRefactor(DiagKindRefactor::sema_hide_at_func_param, decl);
-                continue;
-            }
-            if (!anno->isCompileTimeVisible) {
-                diag.DiagnoseRefactor(DiagKindRefactor::sema_hide_compile_time_invisible, *anno);
-            }
-            ParseHideArg(*anno, annoInfo);
-        } else if (IsAnnoAPILevel(anno.get(), decl)) {
-            ParseAPILevelArgs(decl, *anno, annoInfo);
-        }
+        ProcessOneAnnotation(decl, anno, hideExist, annoInfo);
     }
     levelCache[&decl] = annoInfo;
     CheckHideOfExtendDecl(decl, annoInfo);
@@ -513,13 +638,13 @@ bool PluginCustomAnnoChecker::CheckLevel(
     if (!optionWithLevel) {
         return true;
     }
-    LevelType scopeLevel = scopeAnnoInfo.since != 0 ? scopeAnnoInfo.since : globalLevel;
+    APILevelVersion scopeLevel = !scopeAnnoInfo.since.IsZero() ? scopeAnnoInfo.since : globalLevel;
     PluginCustomAnnoInfo targetAPILevel;
     Parse(target, targetAPILevel);
-    if (targetAPILevel.since > scopeLevel && !diagCfg.node->begin.IsZero()) {
-        if (diagCfg.reportDiag && !diagCfg.message.empty()) {
+    if (targetAPILevel.since > scopeLevel) {
+        if (diagCfg.reportDiag && !diagCfg.message.empty() && !diagCfg.node->begin.IsZero()) {
             diag.DiagnoseRefactor(DiagKindRefactor::sema_apilevel_ref_higher, *diagCfg.node, diagCfg.message[0],
-                std::to_string(targetAPILevel.since), std::to_string(scopeLevel));
+                targetAPILevel.since.ToDisplayString(), scopeLevel.ToDisplayString());
         }
         return false;
     }
@@ -550,8 +675,8 @@ bool PluginCustomAnnoChecker::CheckSyscap(
     // If scopeAnnoInfo.syscap is not empty and equals targetLevel, it is considered a match.
     bool inUnionSet = (unionSet.find(targetLevel) != unionSet.end()) ||
         (!scopeAnnoInfo.syscap.empty() && scopeAnnoInfo.syscap == targetLevel);
-    if (!inUnionSet && !diagCfg.node->begin.IsZero()) {
-        if (diagCfg.reportDiag) {
+    if (!inUnionSet) {
+        if (diagCfg.reportDiag && !diagCfg.node->begin.IsZero()) {
             diagForSyscap(scopeAnnoInfo.syscap, unionSet, DiagKindRefactor::sema_apilevel_syscap_error);
         }
         return false;
@@ -561,8 +686,8 @@ bool PluginCustomAnnoChecker::CheckSyscap(
     // If scopeAnnoInfo.syscap is not empty and equals targetLevel, it is considered a match.
     bool inIntersectionSet = (intersectionSet.find(targetLevel) != intersectionSet.end()) ||
         (!scopeAnnoInfo.syscap.empty() && scopeAnnoInfo.syscap == targetLevel);
-    if (!inIntersectionSet && !diagCfg.node->begin.IsZero()) {
-        if (diagCfg.reportDiag) {
+    if (!inIntersectionSet) {
+        if (diagCfg.reportDiag && !diagCfg.node->begin.IsZero()) {
             diagForSyscap(scopeAnnoInfo.syscap, intersectionSet, DiagKindRefactor::sema_apilevel_syscap_warning);
         }
         return false;
@@ -584,7 +709,38 @@ bool PluginCustomAnnoChecker::CheckCheckingHide(const Decl& target, DiagConfig d
     return true;
 }
 
-bool PluginCustomAnnoChecker::CheckNode(Ptr<Node> node, const PluginCustomAnnoInfo& scopeAnnoInfo, bool reportDiag)
+void PluginCustomAnnoChecker::MarkClassLikeMembersAsExternalWeakIfNeeded(
+    Decl& target, const PluginCustomAnnoInfo& scopeAnnoInfo)
+{
+    if (!target.IsClassLikeDecl() || !target.TestAttr(Attribute::IMPORTED)) {
+        return;
+    }
+    // Only check open or abstract class or interface.
+    if (target.astKind == ASTKind::CLASS_DECL && !target.TestAnyAttr(Attribute::ABSTRACT, Attribute::OPEN)) {
+        return;
+    }
+    auto cld = StaticCast<ClassLikeDecl>(&target);
+    for (auto member : cld->GetMemberDeclPtrs()) {
+        // Constructor, finalizer, and abstract(function without funcbody) function or property must not be in vtable.
+        if (!member->IsFuncOrProp() ||
+            member->TestAnyAttr(Attribute::CONSTRUCTOR, Attribute::FINALIZER, Attribute::ABSTRACT)) {
+            continue;
+        }
+        auto legalAPI = CheckLevel(*member, scopeAnnoInfo, {.reportDiag = false});
+        legalAPI = legalAPI && CheckSyscap(*member, scopeAnnoInfo, {.reportDiag = false});
+        if (!legalAPI) {
+            SetLinkageAsExternalWeak(member);
+        }
+    }
+    for (auto super : cld->GetAllSuperDecls()) {
+        if (super == cld) {
+            continue;
+        }
+        MarkClassLikeMembersAsExternalWeakIfNeeded(*super, scopeAnnoInfo);
+    }
+}
+
+bool PluginCustomAnnoChecker::CheckNode(Ptr<Node> node, PluginCustomAnnoInfo& scopeAnnoInfo, bool reportDiag)
 {
     if (!node) {
         return true;
@@ -617,33 +773,62 @@ bool PluginCustomAnnoChecker::CheckNode(Ptr<Node> node, const PluginCustomAnnoIn
     ret = ret && CheckCheckingHide(*target, {reportDiag, node, {target->identifier.Val()}});
     ret = ret && CheckLevel(*target, scopeAnnoInfo, {reportDiag, node, {target->identifier.Val()}});
     ret = ret && CheckSyscap(*target, scopeAnnoInfo, {reportDiag, node, {target->identifier.Val()}});
+    // When an external user inherits a parent class, but the virtual functions in the parent class
+    // do not meet the APILevel requirements, those virtual functions will exist in the vtable
+    // of downstream packages. They should be marked as External_weak, indicating they are not
+    // required to exist.
+    MarkClassLikeMembersAsExternalWeakIfNeeded(*target, scopeAnnoInfo);
     return ret;
 }
 
-void PluginCustomAnnoChecker::CheckIfAvailableExpr(IfAvailableExpr& iae, const PluginCustomAnnoInfo& scopeAnnoInfo)
+bool PluginCustomAnnoChecker::TryBuildIfAvailableScopeFromIfExpr(
+    const IfExpr& ife, PluginCustomAnnoInfo& ifscopeAnnoInfo)
 {
-    if (!iae.desugarExpr || iae.desugarExpr->astKind != ASTKind::IF_EXPR) {
+    if (!ife.condExpr) {
+        return false;
+    }
+    if (auto ce = DynamicCast<CallExpr>(ife.condExpr.get()); ce && ce->resolvedFunction &&
+        ce->resolvedFunction->identifier.Val() == "canIUse") {
+        ParseSysCap(*ce, ifscopeAnnoInfo, diag);
+        return !ifscopeAnnoInfo.syscap.empty();
+    }
+    auto be = DynamicCast<BinaryExpr>(ife.condExpr.get());
+    if (!be || !be->leftExpr) {
+        return false;
+    }
+    auto ce = DynamicCast<CallExpr>(be->leftExpr.get());
+    if (!ce || !ce->resolvedFunction || ce->resolvedFunction->identifier.Val() != "sdkApiVersion") {
+        return false;
+    }
+    ParseSince(*be, ifscopeAnnoInfo, diag);
+    return !ifscopeAnnoInfo.since.IsZero();
+}
+
+void PluginCustomAnnoChecker::WalkBranchBody(
+    Ptr<Block> body, const std::function<VisitAction(Ptr<Node>)>& checker)
+{
+    if (!body) {
         return;
     }
-    auto ifExpr = StaticCast<IfExpr>(iae.desugarExpr.get());
-    Ptr<FuncArg> arg = iae.GetArg();
-    if (parseNameParam.count(arg->name.Val()) <= 0) {
-        return;
+    for (auto& node : body->body) {
+        Walker(node.get(), checker).Walk();
     }
-    auto ifscopeAnnoInfo = PluginCustomAnnoInfo();
-    parseNameParam[arg->name.Val()](*ifExpr->condExpr, ifscopeAnnoInfo, diag);
-    if (ifscopeAnnoInfo.since != 0 && ifscopeAnnoInfo.since < IFAVAILABLE_LOWER_LIMITLEVEL) {
-        diag.DiagnoseRefactor(DiagKindRefactor::sema_ifavailable_level_limit, *arg);
-        return;
-    }
-    // if branch.
-    auto checkerIf = [this, &ifscopeAnnoInfo, &scopeAnnoInfo](Ptr<Node> node) -> VisitAction {
+}
+
+std::function<VisitAction(Ptr<Node>)> PluginCustomAnnoChecker::MakeIfBranchChecker(
+    PluginCustomAnnoInfo& ifscopeAnnoInfo, PluginCustomAnnoInfo& scopeAnnoInfo)
+{
+    return [this, &ifscopeAnnoInfo, &scopeAnnoInfo](Ptr<Node> node) -> VisitAction {
         if (auto e = DynamicCast<IfAvailableExpr>(node)) {
             CheckIfAvailableExpr(*e, ifscopeAnnoInfo);
             return VisitAction::SKIP_CHILDREN;
         }
-        // If the reference meets the 'IfAvaliable' condition but does not meet the global APILevel configuration, set
-        // linkage to 'EXTERNAL_WEAK'.
+        // Plain 'if (DeviceInfo.sdkApiVersion >= N)' or 'if (canIUse(...))' inside an
+        // @IfAvailable branch is treated as ordinary control flow, not a nested API gate.
+        // Only @IfAvailable itself opts a scope into Sema-level gate semantics; promoting
+        // arbitrary user-written runtime checks here would silently extend that contract.
+        // If the reference meets the 'IfAvailable' condition but does not meet the global APILevel
+        // configuration, set linkage to 'EXTERNAL_WEAK'.
         auto ret = CheckNode(node, ifscopeAnnoInfo);
         if (ret && !CheckNode(node, scopeAnnoInfo, false)) {
             MarkTargetAsExternalWeak(node);
@@ -653,19 +838,119 @@ void PluginCustomAnnoChecker::CheckIfAvailableExpr(IfAvailableExpr& iae, const P
         }
         return VisitAction::WALK_CHILDREN;
     };
-    Walker(ifExpr->thenBody.get(), checkerIf).Walk();
-    // else branch.
-    auto checkerElse = [this, &scopeAnnoInfo](Ptr<Node> node) -> VisitAction {
+}
+
+std::function<VisitAction(Ptr<Node>)> PluginCustomAnnoChecker::MakeElseBranchChecker(
+    PluginCustomAnnoInfo& scopeAnnoInfo)
+{
+    return [this, &scopeAnnoInfo](Ptr<Node> node) -> VisitAction {
         if (auto e = DynamicCast<IfAvailableExpr>(node)) {
             CheckIfAvailableExpr(*e, scopeAnnoInfo);
             return VisitAction::SKIP_CHILDREN;
         }
+        // Mirror MakeIfBranchChecker: only @IfAvailable opts a scope into gate
+        // semantics. Plain 'if (DeviceInfo.sdkApiVersion >= N)' / 'if (canIUse(...))'
+        // inside an else branch is left as ordinary control flow.
         if (!CheckNode(node, scopeAnnoInfo)) {
             return VisitAction::SKIP_CHILDREN;
         }
         return VisitAction::WALK_CHILDREN;
     };
-    Walker(ifExpr->elseBody.get(), checkerElse).Walk();
+}
+
+bool PluginCustomAnnoChecker::ParseIfAvailableLevelArg(FuncArg& arg, PluginCustomAnnoInfo& ifscopeAnnoInfo)
+{
+    if (!DynamicCast<LitConstExpr>(arg.expr.get())) {
+        return false;
+    }
+    auto parsedLevel = ParseIfAvailableArgVersion(*arg.expr);
+    if (!parsedLevel.has_value()) {
+        auto lce = StaticCast<LitConstExpr>(arg.expr.get());
+        diag.DiagnoseRefactor(
+            DiagKindRefactor::sema_apilevel_invalid_version_format, arg, lce->stringValue.c_str());
+        return false;
+    }
+    ifscopeAnnoInfo.since = *parsedLevel;
+    return true;
+}
+
+/// Validate that arg and both lambda bodies are present; also confirm arg->expr exists for
+/// non-syscap arguments and that the argument name is a known parseNameParam key.
+/// Returns false if any guard fails and CheckIfAvailableExpr should bail out early.
+static bool ValidateIfAvailableArgs(const FuncArg* arg, const LambdaExpr* lambda1,
+    const LambdaExpr* lambda2)
+{
+    if (!arg || !lambda1 || !lambda1->funcBody || !lambda1->funcBody->body || !lambda2 ||
+        !lambda2->funcBody || !lambda2->funcBody->body) {
+        return false;
+    }
+    // For the syscap case, DesugarIfAvailableSyscapCondition moves arg->expr into the desugared
+    // canIUse(...) call, leaving arg->expr null. Only require arg->expr for non-syscap arguments.
+    if (!arg->expr && arg->name.Val() != SYSCAP_IDENTIFIER) {
+        return false;
+    }
+    if (parseNameParam.count(arg->name.Val()) <= 0) {
+        return false;
+    }
+    return true;
+}
+
+/// Dispatch the IfAvailable argument to build ifscopeAnnoInfo.
+/// Handles the level, syscap, and generic-named-param cases.
+/// Returns false when scope construction fails and processing should stop.
+bool PluginCustomAnnoChecker::BuildIfAvailableScope(FuncArg& arg, const IfExpr* ifExpr,
+    PluginCustomAnnoInfo& ifscopeAnnoInfo)
+{
+    if (arg.name.Val() == LEVEL_IDENTIFIER) {
+        return ParseIfAvailableLevelArg(arg, ifscopeAnnoInfo);
+    }
+    if (arg.name.Val() == SYSCAP_IDENTIFIER) {
+        // arg->expr was moved into the desugared IfExpr's canIUse(...) condition during desugar.
+        // Reconstruct the syscap scope from the desugared IfExpr condition instead.
+        if (!ifExpr || !TryBuildIfAvailableScopeFromIfExpr(*ifExpr, ifscopeAnnoInfo)) {
+            return false;
+        }
+        return true;
+    }
+    parseNameParam[arg.name.Val()](*arg.expr, ifscopeAnnoInfo, diag);
+    return true;
+}
+
+/// Resolve the then/else Block bodies from the desugared IfExpr (if present) or the raw
+/// lambda bodies, then walk each with its corresponding branch checker.
+void PluginCustomAnnoChecker::WalkIfAvailableBranches(const IfExpr* ifExpr,
+    const LambdaExpr& lambda1, const LambdaExpr& lambda2,
+    PluginCustomAnnoInfo& ifscopeAnnoInfo, PluginCustomAnnoInfo& scopeAnnoInfo)
+{
+    auto checkerIf = MakeIfBranchChecker(ifscopeAnnoInfo, scopeAnnoInfo);
+    auto checkerElse = MakeElseBranchChecker(scopeAnnoInfo);
+    auto thenBody = ifExpr && ifExpr->thenBody ? ifExpr->thenBody.get() : lambda1.funcBody->body.get();
+    WalkBranchBody(thenBody, checkerIf);
+    Ptr<Block> elseBody = lambda2.funcBody->body.get();
+    if (ifExpr && ifExpr->elseBody) {
+        elseBody = DynamicCast<Block>(ifExpr->elseBody.get());
+    }
+    WalkBranchBody(elseBody, checkerElse);
+}
+
+void PluginCustomAnnoChecker::CheckIfAvailableExpr(IfAvailableExpr& iae, PluginCustomAnnoInfo& scopeAnnoInfo)
+{
+    auto ifExpr = DynamicCast<IfExpr>(iae.desugarExpr.get());
+    auto arg = iae.GetArg();
+    auto lambda1 = iae.GetLambda1();
+    auto lambda2 = iae.GetLambda2();
+    if (!ValidateIfAvailableArgs(arg, lambda1, lambda2)) {
+        return;
+    }
+    auto ifscopeAnnoInfo = PluginCustomAnnoInfo();
+    if (!BuildIfAvailableScope(*arg, ifExpr, ifscopeAnnoInfo)) {
+        return;
+    }
+    if (!ifscopeAnnoInfo.since.IsZero() && ifscopeAnnoInfo.since < APILevelVersion(IFAVAILABLE_LOWER_LIMITLEVEL)) {
+        diag.DiagnoseRefactor(DiagKindRefactor::sema_ifavailable_level_limit, *arg);
+        return;
+    }
+    WalkIfAvailableBranches(ifExpr, *lambda1, *lambda2, ifscopeAnnoInfo, scopeAnnoInfo);
 }
 
 void PluginCustomAnnoChecker::CheckAnnoBeforeMacro(Package& pkg)
@@ -716,10 +1001,14 @@ void PluginCustomAnnoChecker::Check(Package& pkg)
             Parse(**it, scopeAnnoInfo);
         }
         if (auto iae = DynamicCast<IfAvailableExpr>(node)) {
-            scopeAnnoInfo.since = scopeAnnoInfo.since == 0 ? globalLevel : scopeAnnoInfo.since;
+            scopeAnnoInfo.since = scopeAnnoInfo.since.IsZero() ? globalLevel : scopeAnnoInfo.since;
             CheckIfAvailableExpr(*iae, scopeAnnoInfo);
             return VisitAction::SKIP_CHILDREN;
         }
+        // User-written 'if (DeviceInfo.sdkApiVersion >= N)' or 'if (canIUse(...))' is
+        // ordinary runtime control flow, not a Sema-level API gate. The only way to
+        // opt a scope into gate semantics (scope-tightened API checks + EXTERNAL_WEAK
+        // linkage) is the explicit @IfAvailable expression, which is handled above.
         if (!CheckNode(node, scopeAnnoInfo)) {
             return VisitAction::SKIP_CHILDREN;
         }

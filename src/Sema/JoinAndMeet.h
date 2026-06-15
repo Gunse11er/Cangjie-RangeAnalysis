@@ -62,12 +62,10 @@ public:
     ErrOrTy MeetAsVisibleTy();
     static std::string CombineErrMsg(ErrMsg& msgs);
 
-    // Caution! The serial of functions modifies the first argument.
-    // The first argument is guaranteed to be not null after the invocation.
-    static std::optional<std::string> SetJoinedType(
-        Ptr<AST::Ty>& ty, std::variant<std::stack<std::string>, Ptr<AST::Ty>>& joinRes);
-    static std::optional<std::string> SetMetType(
-        Ptr<AST::Ty>& ty, std::variant<std::stack<std::string>, Ptr<AST::Ty>>& metRes);
+    static std::pair<std::optional<std::string>, Ptr<AST::Ty>> SetJoinedType(
+        Ptr<AST::Ty> ty, std::variant<std::stack<std::string>, Ptr<AST::Ty>>& joinRes);
+    static std::pair<std::optional<std::string>, Ptr<AST::Ty>> SetMetType(
+        Ptr<AST::Ty> ty, std::variant<std::stack<std::string>, Ptr<AST::Ty>>& metRes);
 
     // Convert the input type to a user-visible one by eliminating intersection and union types.
     // Use a boolean value isJoin to distinguish the join and meet mode.

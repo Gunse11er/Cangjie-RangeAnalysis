@@ -146,7 +146,7 @@ public:
     GenKillAnalysis() = delete;
 
     /// constructor of generate and kill analysis.
-    explicit GenKillAnalysis(const Func* func) : Analysis<Domain>(func), domainSize(0)
+    explicit GenKillAnalysis(const Function* func) : Analysis<Domain>(func)
     {
     }
 

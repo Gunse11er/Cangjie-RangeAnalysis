@@ -104,7 +104,7 @@ void DesugarSuperCtorCall(InteropContext& ctx, ClassDecl& impl, FuncDecl& ctor)
         args.insert(args.end(), std::make_move_iterator(ce->args.begin()), std::make_move_iterator(ce->args.end()));
 
         auto realTarget = ctx.factory.GetGeneratedImplCtor(*GetImplSuperClass(impl), *targetFd);
-        auto realTargetTy = StaticCast<FuncTy>(realTarget->ty);
+        auto realTargetTy = StaticCast<FuncTy>(realTarget->GetTy());
         auto superCall = CreateSuperCall(*realTarget->outerDecl, *realTarget, realTargetTy);
         superCall->args = std::move(args);
         ce->desugarExpr = std::move(superCall);
@@ -113,7 +113,7 @@ void DesugarSuperCtorCall(InteropContext& ctx, ClassDecl& impl, FuncDecl& ctor)
     }
 
     auto withMethodEnv = WithinFile(
-        ctx.factory.CreateWithMethodEnvScope(std::move(objCSelf), impl, impl.ty,
+        ctx.factory.CreateWithMethodEnvScope(std::move(objCSelf), impl, impl.GetTy(),
             [&](auto&& receiver, auto&& objCSuper) {
                 std::vector<OwnedPtr<Expr>> superInitArgs;
                 std::transform(ce->args.begin(), ce->args.end(), std::back_inserter(superInitArgs), [&](auto& arg) {
@@ -124,7 +124,8 @@ void DesugarSuperCtorCall(InteropContext& ctx, ClassDecl& impl, FuncDecl& ctor)
 
                 auto tmpSelf = WithinFile(CreateTmpVarDecl(nullptr, std::move(superInit)), curFile);
                 auto selfRef = WithinFile(CreateRefExpr(*tmpSelf), curFile);
-                auto putToRegistry = ctx.factory.CreatePutToRegistryCall(CreateThisRef(Ptr(&impl), impl.ty, curFile));
+                auto putToRegistry =
+                    ctx.factory.CreatePutToRegistryCall(CreateThisRef(Ptr(&impl), impl.GetTy(), curFile));
                 auto setRegistryId =
                     ctx.factory.CreateObjCMsgSendCall(ASTCloner::Clone(selfRef.get()), REGISTRY_ID_SETTER_SELECTOR,
                         TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT), Nodes<Expr>(std::move(putToRegistry)));
@@ -135,7 +136,7 @@ void DesugarSuperCtorCall(InteropContext& ctx, ClassDecl& impl, FuncDecl& ctor)
 
     auto baseCtor = ctx.factory.GetGeneratedBaseCtor(impl);
     CJC_NULLPTR_CHECK(baseCtor);
-    auto baseCtorCall = WithinFile(CreateSuperCall(*baseCtor->outerDecl, *baseCtor, baseCtor->ty), curFile);
+    auto baseCtorCall = WithinFile(CreateSuperCall(*baseCtor->outerDecl, *baseCtor, baseCtor->GetTy()), curFile);
     baseCtorCall->args.push_back(CreateFuncArg(std::move(withMethodEnv)));
     ce->desugarExpr = std::move(baseCtorCall);
 }
@@ -165,19 +166,19 @@ void DesugarThisCtorCall(InteropContext& ctx, ClassDecl& impl, FuncDecl& ctor)
      * if is in generated ctor:
      * this($obj, ...args)
      */
-    auto curFile = ce->curFile;
-    auto targetFd = ce->resolvedFunction;
-    auto& methodParams = ctor.funcBody->paramLists[0]->params;
-    CJC_ASSERT(methodParams.size() > 0);
-    auto objCSelf = CreateRefExpr(*methodParams[0]);
+     auto curFile = ce->curFile;
+     auto targetFd = ce->resolvedFunction;
+     auto& methodParams = ctor.funcBody->paramLists[0]->params;
+     CJC_ASSERT(methodParams.size() > 0);
+     auto objCSelf = CreateRefExpr(*methodParams[0]);
 
-    std::vector<OwnedPtr<FuncArg>> args;
-    args.push_back(CreateFuncArg(std::move(objCSelf)));
-    args.insert(args.end(), std::make_move_iterator(ce->args.begin()), std::make_move_iterator(ce->args.end()));
+     std::vector<OwnedPtr<FuncArg>> args;
+     args.push_back(CreateFuncArg(std::move(objCSelf)));
+     args.insert(args.end(), std::make_move_iterator(ce->args.begin()), std::make_move_iterator(ce->args.end()));
 
-    auto realTarget = ctx.factory.GetGeneratedImplCtor(impl, *targetFd);
-    auto realTargetTy = StaticCast<FuncTy>(realTarget->ty);
-    ce->desugarExpr = CreateThisCall(impl, *realTarget, realTargetTy, curFile, std::move(args));
+     auto realTarget = ctx.factory.GetGeneratedImplCtor(impl, *targetFd);
+     auto realTargetTy = StaticCast<FuncTy>(realTarget->GetTy());
+     ce->desugarExpr = CreateThisCall(impl, *realTarget, realTargetTy, curFile, std::move(args));
 }
 } // namespace
 
@@ -190,10 +191,7 @@ void DesugarImpls::Desugar(InteropContext& ctx, ClassDecl& impl, FuncDecl& metho
     // 2. MemberAccess, as it could be a prop getter call
     Walker(method.funcBody->body.get(), [&](auto node) {
         if (node->TestAnyAttr(
-            Attribute::HAS_BROKEN,
-            Attribute::IS_BROKEN,
-            Attribute::UNREACHABLE,
-            Attribute::LEFT_VALUE)) {
+                Attribute::HAS_BROKEN, Attribute::IS_BROKEN, Attribute::UNREACHABLE, Attribute::LEFT_VALUE)) {
             return VisitAction::SKIP_CHILDREN;
         }
 
@@ -242,11 +240,11 @@ void DesugarImpls::DesugarCallExpr(InteropContext& ctx, ClassDecl& impl, CallExp
         return;
     }
 
-    auto targetFdTy = StaticCast<FuncTy>(targetFd->ty);
+    auto targetFdTy = StaticCast<FuncTy>(targetFd->GetTy());
     auto curFile = ce.curFile;
 
     // method/prop branch
-    if (!ctx.typeMapper.IsObjCMirror(*targetFd->outerDecl->ty)) {
+    if (!ctx.typeMapper.IsObjCMirror(*targetFd->outerDecl->GetTy())) {
         // no need to desugar expr, if the target is not in the @ObjCMirror declaration
         return;
     }
@@ -261,8 +259,8 @@ void DesugarImpls::DesugarCallExpr(InteropContext& ctx, ClassDecl& impl, CallExp
             OwnedPtr<Expr> msgSendSuperCall;
             if (targetFd->propDecl) {
                 if (!msgSendSuperArgs.empty()) {
-                    msgSendSuperCall = ctx.factory.CreatePropSetterCallViaMsgSendSuper(*targetFd->propDecl,
-                        std::move(receiver), ASTCloner::Clone(objCSuper.get()), std::move(msgSendSuperArgs[0]));
+                    msgSendSuperCall = ctx.factory.CreatePropSetterCallViaMsgSendSuper(
+                        *targetFd->propDecl, std::move(receiver), ASTCloner::Clone(objCSuper.get()), std::move(msgSendSuperArgs[0]));
                 } else {
                     msgSendSuperCall = ctx.factory.CreatePropGetterCallViaMsgSendSuper(
                         *targetFd->propDecl, std::move(receiver), ASTCloner::Clone(objCSuper.get()));
@@ -275,8 +273,8 @@ void DesugarImpls::DesugarCallExpr(InteropContext& ctx, ClassDecl& impl, CallExp
             if (targetFd->HasAnno(AST::AnnotationKind::OBJ_C_OPTIONAL)) {
                 auto methodSelector = ctx.nameGenerator.GetObjCDeclName(*targetFd);
                 auto superClass = ctx.factory.CreateGetSuperClassExpr(std::move(objCSuper), curFile);
-                auto guardCall = ctx.factory.CreateOptionalMethodGuard(
-                    std::move(msgSendSuperCall), std::move(superClass), methodSelector, curFile);
+                auto guardCall = ctx.factory.CreateOptionalMethodGuard(std::move(msgSendSuperCall), std::move(superClass),
+                    methodSelector, curFile);
                 guardCall->curFile = curFile;
                 return Nodes<Node>(std::move(guardCall));
             }
@@ -309,18 +307,18 @@ void DesugarImpls::DesugarGetForPropDecl(
     }
 
     auto pd = StaticAs<ASTKind::PROP_DECL>(target);
-    if (!ctx.typeMapper.IsObjCMirror(*pd->outerDecl->ty)) {
+    if (!ctx.typeMapper.IsObjCMirror(*pd->outerDecl->GetTy())) {
         return;
     }
     auto nativeHandle = ctx.factory.CreateNativeHandleExpr(impl, false, ma.curFile);
     auto withMethodEnvCall = ctx.factory.CreateWithMethodEnvScope(
-        std::move(nativeHandle), impl, ma.ty, [&](auto&& receiver, auto&& objCSuper) {
+        std::move(nativeHandle), impl, ma.GetTy(), [&](auto&& receiver, auto&& objCSuper) {
             auto msgSendSuperCall =
                 ctx.factory.CreatePropGetterCallViaMsgSendSuper(*pd, std::move(receiver), std::move(objCSuper));
 
             return Nodes<Node>(std::move(msgSendSuperCall));
         });
     withMethodEnvCall->curFile = ma.curFile;
-    ma.desugarExpr = ctx.factory.WrapEntity(std::move(withMethodEnvCall), *ma.ty);
+    ma.desugarExpr = ctx.factory.WrapEntity(std::move(withMethodEnvCall), *ma.GetTy());
 }
 } // namespace Cangjie::Interop::ObjC

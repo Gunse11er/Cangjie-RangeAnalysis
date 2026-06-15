@@ -496,7 +496,7 @@ static void ParseInterplationString2OriginPosMap(
             auto be = t.Begin();
             be.isCurFile = strToken.Begin().isCurFile;
             t.SetValuePos(t.Value(), be, t.End());
-            pMacroInvocation.originPosMap[static_cast<unsigned int>(t.Begin().Hash32())] = be;
+            pMacroInvocation.macroCallDiagInfo.originPosMap[static_cast<unsigned int>(t.Begin().Hash32())] = be;
         }
     }
 }
@@ -507,9 +507,9 @@ void ParserImpl::ParseMacroInvocation(
     // Parse macro call attrs.
     if (Skip(TokenKind::LSQUARE)) { // Skip func always lets lastToken = lookAhead
         // macro call: @macroCall[xxx] Decl
-        if (IsBuiltinMacro(invocation.identifier)) {
-            (void)ParseDiagnoseRefactor(
-                DiagKindRefactor::parse_macro_call_illegal_with_builtin, lookahead, invocation.identifier);
+        if (IsBuiltinMacro(invocation.macroCallDiagInfo.identifier)) {
+            (void)ParseDiagnoseRefactor(DiagKindRefactor::parse_macro_call_illegal_with_builtin, lookahead,
+                invocation.macroCallDiagInfo.identifier);
         }
         invocation.hasAttr = true;
         ParseMacroCallAttr(invocation);
@@ -521,11 +521,11 @@ void ParserImpl::ParseMacroInvocation(
     }
     // For lsp.
     for (auto& tk : invocation.attrs) {
-        invocation.originPosMap[static_cast<unsigned int>(tk.Begin().Hash32())] = tk.Begin();
+        invocation.macroCallDiagInfo.originPosMap[static_cast<unsigned int>(tk.Begin().Hash32())] = tk.Begin();
     }
     // For lsp.
     for (auto& tk : invocation.args) {
-        invocation.originPosMap[static_cast<unsigned int>(tk.Begin().Hash32())] = tk.Begin();
+        invocation.macroCallDiagInfo.originPosMap[static_cast<unsigned int>(tk.Begin().Hash32())] = tk.Begin();
         if (tk.kind == TokenKind::STRING_LITERAL || tk.kind == TokenKind::MULTILINE_STRING) {
             ParseInterplationString2OriginPosMap(tk, invocation, diag);
         }
@@ -543,7 +543,7 @@ bool ParserImpl::ParseMacroCallIdentifier(MacroInvocation& invocation, Node& nod
         invocation.isCompileTimeVisible = true;
     }
     // MacroCall identifier.
-    invocation.fullName = Peek().Value();
+    invocation.macroCallDiagInfo.fullName = Peek().Value();
     invocation.atPos = tokAt.Begin();
     if (newlineSkipped) {
         // We forbid this form of macro call:
@@ -552,13 +552,13 @@ bool ParserImpl::ParseMacroCallIdentifier(MacroInvocation& invocation, Node& nod
         ParseDiagnoseRefactor(
             DiagKindRefactor::parse_unexpected_newline_between_at_and_mc, tokAt.Begin(), lookahead.Value());
     }
-    auto item = ParseIdentifierFromName(
-        invocation.fullName, lookahead.Begin(), lookahead.End(), invocation.fullName.size());
-    invocation.identifierPos = item.Begin();
+    auto item = ParseIdentifierFromName(invocation.macroCallDiagInfo.fullName, lookahead.Begin(), lookahead.End(),
+        invocation.macroCallDiagInfo.fullName.size());
+    invocation.macroCallDiagInfo.identifierPos = item.Begin();
     Next();
     // If we see @p1..M, the error msg is not useful.
     while (Skip(TokenKind::DOT)) {
-        invocation.fullName += ".";
+        invocation.macroCallDiagInfo.fullName += ".";
         invocation.fullNameDotPos.push_back(lastToken.Begin());
         item = ExpectIdentifierWithPos(node);
         if (item == INVALID_IDENTIFIER) {
@@ -569,14 +569,15 @@ bool ParserImpl::ParseMacroCallIdentifier(MacroInvocation& invocation, Node& nod
             }
             return false;
         }
-        invocation.fullName += item;
+        invocation.macroCallDiagInfo.fullName += item;
     }
     invocation.macroNamePos = lastToken.Begin();
-    invocation.identifier = item;
+    invocation.macroCallDiagInfo.identifier = item;
     return true;
 }
 
-template <typename T> OwnedPtr<T> ParserImpl::ParseMacroCall(
+template <typename T>
+OwnedPtr<T> ParserImpl::ParseMacroCall(
     ScopeKind scopeKind, const std::set<Modifier>& modifiers, std::vector<OwnedPtr<Annotation>> annos)
 {
     CheckOverflowAnno(annos, scopeKind);
@@ -605,11 +606,14 @@ template <typename T> OwnedPtr<T> ParserImpl::ParseMacroCall(
         macroCall->end = lastToken.End();
         return macroCall;
     }
-    macroCall->identifier = Identifier{macroCall->invocation.identifier, macroCall->invocation.identifierPos,
-        macroCall->invocation.identifierPos + macroCall->invocation.identifier.size()};
+    macroCall->identifier = Identifier{macroCall->invocation.macroCallDiagInfo.identifier,
+        macroCall->invocation.macroCallDiagInfo.identifierPos,
+        macroCall->invocation.macroCallDiagInfo.identifierPos +
+            macroCall->invocation.macroCallDiagInfo.identifier.size()};
     // May have multiple annotations include macro or builtin annotation. But Now annos Only have builtin annotations.
     if (!annos.empty()) {
         macroCall->annotations = std::move(annos);
+        SetBeginToAnnotationsBegin(*macroCall, macroCall->annotations);
     }
     ParseMacroInvocation(scopeKind, modifiers, macroCall->invocation);
     if (macroCall->invocation.decl) {

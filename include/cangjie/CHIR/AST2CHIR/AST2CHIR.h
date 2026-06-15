@@ -47,7 +47,7 @@ public:
         ImportManager* import;
         SourceManager* sourceManager;
         TypeManager* types;
-        DiagAdapter* diag;
+        DiagnosticEngine* diag;
         IncreKind kind;
         CompilationCache* cachedInfo;
         CHIRBuilder* builder;
@@ -124,7 +124,7 @@ public:
             sourceManager = &manager;
             return this;
         }
-        AST2CHIRBuilder* SetDiag(DiagAdapter& ciDiag)
+        AST2CHIRBuilder* SetDiag(DiagnosticEngine& ciDiag)
         {
             diag = &ciDiag;
             return this;
@@ -195,7 +195,7 @@ public:
         return package;
     }
 
-    std::unordered_set<Func*>&& GetSrcCodeImportedFuncs()
+    std::unordered_set<Function*>&& GetSrcCodeImportedFuncs()
     {
         return std::move(srcCodeImportedFuncs);
     }
@@ -205,12 +205,12 @@ public:
         return std::move(srcCodeImportedVars);
     }
 
-    std::unordered_map<std::string, FuncBase*>&& GetImplicitFuncs()
+    std::unordered_map<std::string, Function*>&& GetImplicitFuncs()
     {
         return std::move(implicitFuncs);
     }
 
-    std::vector<FuncBase*>&& GetInitFuncsForConstVar()
+    std::vector<Function*>&& GetInitFuncsForConstVar()
     {
         for (auto f : initFuncsForAnnoFactory) {
             initFuncsForConstVar.push_back(f);
@@ -223,7 +223,7 @@ public:
         return std::move(maybeUnreachable);
     }
 
-    std::vector<std::pair<const AST::Decl*, Func*>>&& GetAnnoFactoryFuncs()
+    std::vector<std::pair<const AST::Decl*, Function*>>&& GetAnnoFactoryFuncs()
     {
         return std::move(annoFactoryFuncs);
     }
@@ -288,10 +288,10 @@ private:
     void CreateCustomTypeDef(const AST::Decl& decl, bool isImported);
     void TranslateAllCustomTypeTy();
     void TranslateNominalDecls(const AST::Package& pkg);
-    void SetFuncAttributeAndLinkageType(const AST::FuncDecl& astFunc, FuncBase& chirFunc);
+    void SetFuncAttributeAndLinkageType(const AST::FuncDecl& astFunc, Function& chirFunc);
 
-    void FlatternPattern(const AST::Pattern& pattern, bool isLocalConst);
-    void CreateAndCacheGlobalVar(const AST::VarDecl& decl, bool isLocalConst);
+    void FlatternPattern(const AST::Pattern& pattern, bool isLocalConst, std::vector<AST::VarDecl*>& varDecls);
+    GlobalVar* CreateAndCacheGlobalVar(const AST::VarDecl& decl, bool isLocalConst);
     void CreateGlobalVarSignature(const std::vector<Ptr<const AST::Decl>>& decls, bool isLocalConst = false);
 
     void CreateFuncSignatureAndSetGlobalCache(const AST::FuncDecl& funcDecl);
@@ -302,6 +302,10 @@ private:
     void TranslateAllDecls(const AST::Package& pkg, const InitOrder& initOrder);
     void TranslateTopLevelDeclsInParallel();
     void TranslateInParallel(const std::vector<Ptr<const AST::Decl>>& decls);
+    void SetAnnotationTargets(CustomTypeDef& customTypeDef, const AST::Decl& decl);
+    GlobalVar* CreateAnnotationTargetVar(const AST::ClassDecl& decl, const AST::Expr& expr, size_t index);
+    Function* CreateInitFuncForAnnotationTargetVar(GlobalVar& var);
+    void TranslateAnnotationRelatedDecls();
 
     /** @brief Returns true if the AST2Chir process is unsuccessfull **/
     bool HasFailed() const;
@@ -325,7 +329,7 @@ private:
 
     Translator CreateTranslator();
     /* Micro refactoring for CJMP. */
-    void TranslateFuncParams(const AST::FuncDecl& funcDecl, Func& func) const;
+    void TranslateFuncParams(const AST::FuncDecl& funcDecl, Function& func) const;
     void TranslateVecDecl(const std::vector<Ptr<const AST::Decl>>& decls, Translator& trans) const;
 
     /* Add methods for CJMP. */
@@ -333,8 +337,7 @@ private:
     bool TryToDeserializeCHIR();
     // Check whether the decl is deserialized for CJMP.
     bool MaybeDeserialized(const AST::Decl& decl) const;
-    // Try to get deserialized node from package including CustomTypeDef (excluding Extend), Func, GlobalVar,
-    // ImportedValue.
+    // Try to get deserialized node from package including CustomTypeDef (excluding Extend), Function, GlobalVar.
     template<typename T>
     T* TryGetDeserialized(const AST::Decl& decl)
     {
@@ -354,8 +357,13 @@ private:
             auto it = deserializedVals.find(key);
             res = it == deserializedVals.end() ? nullptr : dynamic_cast<T*>(it->second);
         }
-        if (res && !decl.TestAttr(AST::Attribute::SPECIFIC)) {
-            deserializedDecls.insert(&decl);
+        // When common part chir is deserialized, the list of members of imported nominal declarations
+        // might be lacking new declarations, which were added when compiling specific part of multiplatform dependency
+        if (res &&
+            !decl.TestAttr(AST::Attribute::SPECIFIC) &&
+            !(decl.TestAttr(AST::Attribute::COMMON) && decl.TestAttr(AST::Attribute::IMPORTED))
+        ) {
+            noNeedToTranslateDecls.insert(&decl);
         }
         return res;
     }
@@ -363,11 +371,11 @@ private:
     void BuildDeserializedTable();
 
     // Reset specific func for CJMP.
-    void ResetSpecificFunc(const AST::FuncDecl& funcDecl, Func& func);
+    void ResetSpecificFunc(const AST::FuncDecl& funcDecl, Function& func);
     // Check whether the decl need be translated for CJMP.
     inline bool NeedTranslate(const AST::Decl& decl) const
     {
-        return deserializedDecls.find(&decl) == deserializedDecls.end();
+        return noNeedToTranslateDecls.find(&decl) == noNeedToTranslateDecls.end();
     }
     void ProcessCommonAndSpecificExtends();
     void ProcessClassStructVarInits(Translator& trans);
@@ -376,7 +384,7 @@ private:
     ImportManager& importManager;
     SourceManager& sourceManager;
     TypeManager& types;
-    DiagAdapter& diag;
+    DiagnosticEngine& diag;
     CompilationCache& cachedInfo;
     IncreKind kind;
     VirtualWrapperDepMap curVirtFuncWrapDep;
@@ -390,16 +398,15 @@ private:
     std::vector<Ptr<AST::Node>> allTopLevelNodes;
     /** @brief all files that after sorting in this package */
     std::vector<AST::File*> pkgFiles;
-    std::unordered_map<std::string, FuncBase*> implicitFuncs;
-    std::vector<FuncBase*> initFuncsForConstVar;
-    std::vector<Func*> initFuncsForAnnoFactory;
+    std::unordered_map<std::string, Function*> implicitFuncs;
+    std::vector<Function*> initFuncsForConstVar;
+    std::vector<Function*> initFuncsForAnnoFactory;
     std::unordered_map<Block*, Terminator*> maybeUnreachable;
 
     std::string outputPath;
     bool isComputingAnnos{};
     CHIR::Package* package{nullptr};
     bool failure{false};
-    std::set<std::string> dependencyPkg;
 
     // ======================== Imported Pkg Top-Level Decl Part ======================== //
 
@@ -450,7 +457,7 @@ private:
     ElementList<Ptr<const AST::FuncDecl>> localConstFuncs;
 
     // anno factory funcs
-    std::vector<std::pair<const AST::Decl*, Func*>> annoFactoryFuncs;
+    std::vector<std::pair<const AST::Decl*, Function*>> annoFactoryFuncs;
 
     // File and its containing vars map. Note that the static vars initialized in `static init func`
     // are not included here
@@ -460,13 +467,16 @@ private:
     /* Add fields for CJMP. */
     bool outputCHIR{false}; // Output type is CHIR
     bool mergingSpecific{false}; // Merging specific part over already compiled chir
-    std::unordered_set<Ptr<const AST::Decl>> deserializedDecls; // decls which don't need to be retranslated.
+    std::unordered_set<Ptr<const AST::Decl>> noNeedToTranslateDecls;
     // Deserialized node cache table, key is identifier.
     std::unordered_map<std::string, CustomTypeDef*> deserializedDefs;
     std::unordered_map<std::string, Value*> deserializedVals;
 
-    std::unordered_set<Func*> srcCodeImportedFuncs;
+    std::unordered_set<Function*> srcCodeImportedFuncs;
     std::unordered_set<GlobalVar*> srcCodeImportedVars;
+
+    std::unordered_map<GlobalVar*, AST::Expr*> annotationTargets;
+    std::vector<std::pair<const AST::ClassDecl*, ClassDef*>> classDeclWithAnnotation;
 
     bool creatingLocalConstVarSignature{false};
 };

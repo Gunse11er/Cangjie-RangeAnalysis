@@ -8,7 +8,7 @@
 
 #include "cangjie/CHIR/Analysis/Utils.h"
 #include "cangjie/CHIR/Utils/ConstantUtils.h"
-#include "cangjie/CHIR/Utils/DiagAdapter.h"
+#include "cangjie/Basic/DiagnosticEngine.h"
 #include "cangjie/CHIR/IR/IntrinsicKind.h"
 #include "cangjie/CHIR/IR/Type/ClassDef.h"
 #include "cangjie/CHIR/IR/Type/StructDef.h"
@@ -190,20 +190,19 @@ SanitizerCoverage::SanitizerCoverage(const GlobalOptions& option, CHIRBuilder& b
 void SanitizerCoverage::InitFuncBag(const Package& package)
 {
     // only need func, and not need generic func
-    auto importedVarAndFuncs = package.GetImportedVarAndFuncs();
-    for (auto v : importedVarAndFuncs) {
+    for (auto v : package.GetGlobalFuncsWithoutBody()) {
         funcBag.emplace(v->GetIdentifierWithoutPrefix(), v);
     }
 }
 
-bool SanitizerCoverage::RunOnPackage(const Ptr<const Package>& package, DiagAdapter& diag, bool isDebug)
+bool SanitizerCoverage::RunOnPackage(const Ptr<const Package>& package, DiagnosticEngine& diag, bool isDebug)
 {
     if (!CheckSancovOption(diag)) {
         return false;
     }
     InitFuncBag(*package);
     packageName = package->GetName();
-    for (auto func : package->GetGlobalFuncs()) {
+    for (auto func : package->GetGlobalFuncsWithBody()) {
         // skip global init function and compiled add function
         if (func->IsGVInit() || func->TestAttr(Attribute::COMPILER_ADD) ||
             func->GetPackageName() != package->GetName()) {
@@ -221,7 +220,7 @@ bool SanitizerCoverage::RunOnPackage(const Ptr<const Package>& package, DiagAdap
     return true;
 }
 
-void SanitizerCoverage::RunOnFunc(const Ptr<Func>& func, bool isDebug)
+void SanitizerCoverage::RunOnFunc(const Ptr<Function>& func, bool isDebug)
 {
     if (sanCovOption.traceCmp) {
         auto visitAction = [this, isDebug](Expression& expr) {
@@ -265,7 +264,7 @@ void SanitizerCoverage::RunOnFunc(const Ptr<Func>& func, bool isDebug)
     }
 }
 
-bool SanitizerCoverage::CheckSancovOption(DiagAdapter& diag) const
+bool SanitizerCoverage::CheckSancovOption(DiagnosticEngine& diag) const
 {
     bool isSancov = sanCovOption.inline8bitCounters || sanCovOption.inlineBoolFlag || sanCovOption.tracePCGuard;
     bool isSancovLevelVaild =
@@ -556,13 +555,6 @@ std::vector<Value*> SanitizerCoverage::GenerateStringMemCmp(
     return res;
 }
 
-uint64_t GetMultipleFromType(const Type& type)
-{
-    CJC_ASSERT(type.IsInteger() || type.IsFloat());
-    // change type to uint8, recalculate the array size = n * bits / 8U.
-    return StaticCast<NumericType*>(&type)->GetBitness() / 8U;
-}
-
 std::vector<Value*> SanitizerCoverage::GenerateArrayCmp(
     const std::string& fuzzName, Value& oper1, Value& oper2, Apply& apply)
 {
@@ -619,11 +611,15 @@ std::vector<Value*> SanitizerCoverage::GenerateArrayCmp(
         auto sizeN =
             builder.CreateExpression<Field>(loc, builder.GetInt64Ty(), &oper1, std::vector<uint64_t>{2}, parent);
         sizeN->MoveBefore(&apply);
-        auto multiple = builder.CreateConstantExpression<IntLiteral>(
-            loc, builder.GetInt64Ty(), parent, GetMultipleFromType(*elementType));
-        multiple->MoveBefore(&apply);
+        auto elementSizeContext = IntrisicCallContext {
+            .kind = IntrinsicKind::SIZE_OF,
+            .args = {},
+            .instTypeArgs = {elementType}
+        };
+        auto elementSize = builder.CreateExpression<Intrinsic>(loc, builder.GetInt64Ty(), elementSizeContext, parent);
+        elementSize->MoveBefore(&apply);
         auto calSize = builder.CreateExpression<BinaryExpression>(loc, builder.GetInt64Ty(),
-            ExprKind::MUL, sizeN->GetResult(), multiple->GetResult(), OverflowStrategy::WRAPPING, parent);
+            ExprKind::MUL, sizeN->GetResult(), elementSize->GetResult(), OverflowStrategy::WRAPPING, parent);
         calSize->MoveBefore(&apply);
         auto sizeNCasted = builder.CreateExpression<TypeCast>(loc, builder.GetUInt32Ty(), calSize->GetResult(), parent);
         sizeNCasted->MoveBefore(&apply);
@@ -705,6 +701,9 @@ std::pair<std::string, std::vector<Value*>> SanitizerCoverage::GetMemFuncSymbols
         } else if (structType->GetStructDef()->GetSrcCodeIdentifier() == "String") {
             intrinsicName = GetStringSanConvFunc(MemCmpType::STRING_TYPE, applyCallName);
             if (intrinsicName == std::nullopt) {
+                return defaultValue;
+            }
+            if (!oper2.GetType()->IsString()) {
                 return defaultValue;
             }
             params = GenerateStringMemCmp(intrinsicName.value(), oper1, oper2, apply);
@@ -998,7 +997,8 @@ GlobalVar* SanitizerCoverage::GenerateGlobalVar(
         return it->second;
     }
     auto globalVar = builder.CreateGlobalVar(
-        loc, builder.GetType<RefType>(&globalType), globalVarName, globalVarName, "", packageName);
+        builder.GetType<RefType>(&globalType), globalVarName, globalVarName, "", packageName);
+    globalVar->SetDebugLocation(loc);
     globalVar->EnableAttr(Attribute::READONLY);
     globalVar->EnableAttr(Attribute::COMPILER_ADD);
     globalVarBag.insert(std::make_pair(globalVarName, globalVar));
@@ -1013,29 +1013,31 @@ GlobalVar* SanitizerCoverage::GetGlobalVar(const std::string& globalVarName)
     return globalVarBag.at(globalVarName);
 }
 
-ImportedValue* SanitizerCoverage::GenerateForeignFunc(const std::string& globalFuncName,
-    [[maybe_unused]] const DebugLocation& loc, Type& funcType, const std::string& packName)
+Function* SanitizerCoverage::GenerateForeignFunc(const std::string& globalFuncName,
+    [[maybe_unused]] const DebugLocation& loc, FuncType& funcType, const std::string& packName)
 {
     if (auto it = funcBag.find(globalFuncName); it != funcBag.end()) {
         return it->second;
     }
-    auto func = builder.CreateImportedVarOrFunc<ImportedFunc>(&funcType, globalFuncName, globalFuncName, "", packName);
+    auto func = builder.CreateFunction(&funcType, globalFuncName, globalFuncName, "", packName);
+    func->EnableAttr(Attribute::IMPORTED);
     func->EnableAttr(Attribute::FOREIGN);
     funcBag.insert(std::make_pair(globalFuncName, func));
     return func;
 }
 
-ImportedValue* SanitizerCoverage::GetImportedFunc(const std::string& mangledName)
+Function* SanitizerCoverage::GetImportedFunc(const std::string& mangledName)
 {
     auto it = funcBag.find(mangledName);
     CJC_ASSERT(it != funcBag.end());
     return it->second;
 }
 
-Func* SanitizerCoverage::CreateInitFunc(
+Function* SanitizerCoverage::CreateInitFunc(
     const std::string& name, FuncType& funcType, [[maybe_unused]] const DebugLocation& loc)
 {
-    auto func = builder.CreateFunc(loc, &funcType, name, name, "", packageName);
+    auto func = builder.CreateFunction(&funcType, name, name, "", packageName);
+    func->SetDebugLocation(loc);
     auto body = builder.CreateBlockGroup(*func);
     func->InitBody(*body);
     func->EnableAttr(Attribute::NO_INLINE);
@@ -1046,7 +1048,7 @@ Func* SanitizerCoverage::CreateInitFunc(
     return func;
 }
 
-Func* SanitizerCoverage::CreateArrayInitFunc(const std::string& initItemName, Type& initType)
+Function* SanitizerCoverage::CreateArrayInitFunc(const std::string& initItemName, Type& initType)
 {
     auto funcTy = builder.GetType<FuncType>(std::vector<Type*>{}, builder.GetVoidTy());
     auto initName = MANGLE_CANGJIE_PREFIX + MANGLE_GLOBAL_VARIABLE_INIT_PREFIX + MangleUtils::MangleName("default") +
@@ -1076,7 +1078,7 @@ Func* SanitizerCoverage::CreateArrayInitFunc(const std::string& initItemName, Ty
     return func;
 }
 
-Func* SanitizerCoverage::CreatePCTableInitFunc()
+Function* SanitizerCoverage::CreatePCTableInitFunc()
 {
     auto funcTy = builder.GetType<FuncType>(std::vector<Type*>{}, builder.GetVoidTy());
     auto func = CreateInitFunc(MANGLE_CANGJIE_PREFIX + MANGLE_GLOBAL_VARIABLE_INIT_PREFIX +
@@ -1165,7 +1167,7 @@ Intrinsic* SanitizerCoverage::CreateRawDataAcquire(
     return rawDataAcquire;
 }
 
-void SanitizerCoverage::CreateTopLevelInitFunc(const std::vector<Func*>& initFuncs, const Func& globalInitFunc)
+void SanitizerCoverage::CreateTopLevelInitFunc(const std::vector<Function*>& initFuncs, const Function& globalInitFunc)
 {
     // create top level init func
     if (initFuncs.empty()) {
@@ -1189,7 +1191,7 @@ void SanitizerCoverage::CreateTopLevelInitFunc(const std::vector<Func*>& initFun
     AddExpressionsToGlobalInitFunc(globalInitFunc, std::vector<Expression*>{initExpr});
 }
 
-void SanitizerCoverage::GenerateInitFunc(const Func& globalInitFunc, bool isDebug)
+void SanitizerCoverage::GenerateInitFunc(const Function& globalInitFunc, bool isDebug)
 {
     // Note: insert array init func at the first of package.
     // FuncSize and basic block size are evaluated  at compile stage, firstly set 0 as placeHolder and then updated to
@@ -1199,7 +1201,7 @@ void SanitizerCoverage::GenerateInitFunc(const Func& globalInitFunc, bool isDebu
         return;
     }
 
-    std::vector<Func*> initFuncs;
+    std::vector<Function*> initFuncs;
 
     if (sanCovOption.inlineBoolFlag &&
         GetGlobalVar(SAN_COV_CTOR2_GLOBAL_VAR_NAME.at(SanCovBoolFlagInitName)) != nullptr) {

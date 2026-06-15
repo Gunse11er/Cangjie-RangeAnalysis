@@ -38,14 +38,14 @@ NameGenerator::NameGenerator(const BaseMangler& mangler, TypeManager& typeManage
 
 std::string NameGenerator::GenerateInitCjObjectName(const VarDecl& target, const std::string* genericActualName)
 {
-    std::string name = genericActualName ? target.outerDecl->identifier.Val() + '_' + *genericActualName
-                                         : target.outerDecl->identifier.Val() + '_' + target.identifier.Val();
+    std::string name = genericActualName ? target.outerDecl->identifier.Val() + '_' + *genericActualName :
+        target.outerDecl->identifier.Val() + '_' + target.identifier.Val();
     return WRAPPER_PREFIX + name;
 }
 
 std::string NameGenerator::GenerateInitCjObjectName(const FuncDecl& target, const std::string* genericActualName)
 {
-    auto& params = target.funcBody->paramLists[0]->params;
+    auto& params =  target.funcBody->paramLists[0]->params;
     auto ctorName = GetObjCDeclName(target);
     auto mangledCtorName = GetMangledMethodName(mangler, params, ctorName, typeManager);
     auto name = GetObjCFullDeclName(*target.outerDecl, genericActualName) + "_" + mangledCtorName;
@@ -93,14 +93,13 @@ std::string NameGenerator::GenerateUnlockCjObjectName(const AST::Decl& target)
     return WRAPPER_PREFIX + name + UNLOCK_CJ_OBJECT_SUFFIX;
 }
 
-std::string NameGenerator::GenerateMethodWrapperName(
-    const FuncDecl& target, const std::string* genericActualName, bool isInnerGeneric)
+std::string NameGenerator::GenerateMethodWrapperName(const FuncDecl& target, const std::string* genericActualName, bool isInnerGeneric)
 {
     auto& params = target.funcBody->paramLists[0]->params;
     auto methodName = GetObjCDeclName(target);
     auto mangledMethodName = GetMangledMethodName(mangler, params, methodName, typeManager);
-    auto outerDeclName = genericActualName ? GetObjCFullDeclName(*target.outerDecl, genericActualName)
-                                           : GetObjCFullDeclName(*target.outerDecl);
+    auto outerDeclName = genericActualName ? GetObjCFullDeclName(*target.outerDecl, genericActualName) :
+        GetObjCFullDeclName(*target.outerDecl);
 
     auto name = outerDeclName + "." + mangledMethodName;
 
@@ -152,12 +151,11 @@ std::string NameGenerator::GetPropSetterWrapperName(const PropDecl& target)
     return WRAPPER_PREFIX + name + WRAPPER_SETTER_SUFFIX;
 }
 
-std::string NameGenerator::GetFieldGetterWrapperName(
-    const VarDecl& target, const std::string* genericActualName, bool isInnerGeneric)
+std::string NameGenerator::GetFieldGetterWrapperName(const VarDecl& target, const std::string* genericActualName, bool isInnerGeneric)
 {
     CJC_NULLPTR_CHECK(target.outerDecl);
-    auto outerDeclName = genericActualName ? GetObjCFullDeclName(*target.outerDecl, genericActualName)
-                                           : GetObjCFullDeclName(*target.outerDecl);
+    auto outerDeclName = genericActualName ? GetObjCFullDeclName(*target.outerDecl, genericActualName) :
+        GetObjCFullDeclName(*target.outerDecl);
     auto name = outerDeclName + "." + GetObjCDeclName(target);
 
     std::replace(name.begin(), name.end(), '.', '_');
@@ -231,10 +229,9 @@ std::string NameGenerator::GetObjCDeclName(const Decl& target, const std::string
                 There exists Genericenum prop func get(): target->identifier = "$valueget",
                 but it actually needs to be named using "value_get" method.
             */
-            if (target.ty->HasGeneric() && !target.identifierForLsp.empty()) {
+            if (target.GetTy()->HasGeneric() && !target.identifierForLsp.empty()) {
                 std::string actualEnumName = target.identifier;
-                actualEnumName.erase(
-                    std::remove(actualEnumName.begin(), actualEnumName.end(), '$'), actualEnumName.end());
+                actualEnumName.erase(std::remove(actualEnumName.begin(), actualEnumName.end(), '$'), actualEnumName.end());
                 size_t pos = actualEnumName.find(target.identifierForLsp);
                 if (pos != std::string::npos) {
                     actualEnumName.insert(pos, "_");

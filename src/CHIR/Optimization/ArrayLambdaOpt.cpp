@@ -19,12 +19,12 @@ ArrayLambdaOpt::ArrayLambdaOpt(CHIRBuilder& builder) : builder(builder)
 
 void ArrayLambdaOpt::RunOnPackage(const Ptr<const Package>& package, bool isDebug)
 {
-    for (auto func : package->GetGlobalFuncs()) {
+    for (auto func : package->GetGlobalFuncsWithBody()) {
         RunOnFunc(func, isDebug);
     }
 }
 
-void ArrayLambdaOpt::RunOnFunc(const Ptr<Func>& func, bool isDebug)
+void ArrayLambdaOpt::RunOnFunc(const Ptr<Function>& func, bool isDebug)
 {
     auto preAcation = [this, isDebug](Expression& expr) {
         if (auto constVal = CheckCanRewriteLambda(&expr); constVal) {
@@ -58,7 +58,7 @@ Ptr<Constant> ArrayLambdaOpt::CheckCanRewriteLambda(const Ptr<Expression>& expr)
     if (!callee->IsFuncWithBody()) {
         return nullptr;
     }
-    if (!IsExpectedFunction(*VirtualCast<Func*>(callee), ARRAY_INIT_FUNC_INFO)) {
+    if (!IsExpectedFunction(*StaticCast<Function*>(callee), ARRAY_INIT_FUNC_INFO)) {
         return nullptr;
     }
 

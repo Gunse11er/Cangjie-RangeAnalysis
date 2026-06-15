@@ -41,6 +41,13 @@ public:
     bool ParseArgs();
 
     /**
+     * @brief Extract package name from .bc inputs.
+     *
+     * @return bool Return true If success.
+     */
+    bool ExtractBCPackageNames();
+
+    /**
      * @brief Read necessary paths from environment variables and store them in GlobalOptions.
      *
      * @param environmentVars The environment variables.

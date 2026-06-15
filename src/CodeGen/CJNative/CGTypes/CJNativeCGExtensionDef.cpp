@@ -307,6 +307,7 @@ llvm::Constant* CGExtensionDef::GenerateWhereConditionFn()
     }
     auto fn = llvm::Function::Create(whereCondFnType, llvm::Function::PrivateLinkage, funcName, cgMod.GetLLVMModule());
     fn->addFnAttr("native-interface-fn");
+    fn->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
     auto entryBB = llvm::BasicBlock::Create(llvmCtx, "entry", fn);
     IRBuilder2 irBuilder(cgMod, entryBB);
     auto typeInfos = fn->getArg(1); // Parameter with index 1 is an array of typeinfo.
@@ -322,8 +323,9 @@ llvm::Constant* CGExtensionDef::GenerateWhereConditionFn()
 llvm::Constant* CGExtensionDef::GenerateOuterTi(const CHIR::VirtualMethodInfo& funcInfo)
 {
     auto& llvmCtx = cgMod.GetLLVMContext();
-    if (funcInfo.GetVirtualMethod() == nullptr) {
-        return llvm::ConstantPointerNull::get(llvm::Type::getInt8PtrTy(llvmCtx));
+    if (funcInfo.GetVirtualMethod()->IsPureAbstract()) {
+        return llvm::ConstantExpr::getIntToPtr(
+            llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvmCtx), 0x1), llvm::Type::getInt8PtrTy(llvmCtx));
     }
     auto parentType = DeRef(*funcInfo.GetInstParentType());
     if (parentType->GetTypeArgs().empty()) {
@@ -340,18 +342,20 @@ llvm::Constant* CGExtensionDef::GenerateOuterTi(const CHIR::VirtualMethodInfo& f
 llvm::Constant* CGExtensionDef::GenerateOuterTiFn(const CHIR::VirtualMethodInfo& funcInfo)
 {
     auto& llvmCtx = cgMod.GetLLVMContext();
-    if (funcInfo.GetVirtualMethod() == nullptr) {
-        return llvm::ConstantPointerNull::get(llvm::Type::getInt8PtrTy(llvmCtx));
+    if (funcInfo.GetVirtualMethod()->IsPureAbstract()) {
+        return llvm::ConstantExpr::getIntToPtr(
+            llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvmCtx), 0x1), llvm::Type::getInt8PtrTy(llvmCtx));
     }
 
     auto fnName = extendDefName + "_" + funcInfo.GetVirtualMethod()->GetIdentifierWithoutPrefix() + "_GetOuterTiFn";
     auto getOuterTiFn = cgMod.GetLLVMModule()->getFunction(fnName);
     if (!getOuterTiFn) {
-        cgCtx.AddLLVMUsedVars(fnName);
         auto typeInfoPtrType = CGType::GetOrCreateTypeInfoPtrType(llvmCtx);
         llvm::FunctionType* getOuterTiFnType = llvm::FunctionType::get(typeInfoPtrType, {typeInfoPtrType}, false);
         getOuterTiFn =
             llvm::Function::Create(getOuterTiFnType, llvm::Function::PrivateLinkage, fnName, cgMod.GetLLVMModule());
+        getOuterTiFn->addFnAttr("native-interface-fn");
+        getOuterTiFn->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
         auto entryBB = llvm::BasicBlock::Create(llvmCtx, "entry", getOuterTiFn);
         IRBuilder2 irBuilder(cgMod, entryBB);
         innerTypeMap.emplace(targetType, InnerTiInfo{getOuterTiFn->getArg(0), true});
@@ -360,8 +364,8 @@ llvm::Constant* CGExtensionDef::GenerateOuterTiFn(const CHIR::VirtualMethodInfo&
         innerTypeMap.clear();
         irBuilder.CreateRet(irBuilder.CreateBitCast(outerTi, typeInfoPtrType));
     } else {
-        CJC_ASSERT(false &&
-            "GenerateOuterTiFn should not be called multiple times for the same function. Something is wrong.");
+        CJC_ASSERT_WITH_MSG(
+            false, "GenerateOuterTiFn should not be called multiple times for the same function. Something is wrong.");
     }
     return llvm::ConstantExpr::getBitCast(getOuterTiFn, llvm::Type::getInt8PtrTy(llvmCtx));
 }
@@ -387,7 +391,8 @@ llvm::Constant* CGExtensionDef::GenerateFuncTableForType(
     std::vector<llvm::Constant*> funcTable(2 * funcTableSize);
     for (size_t i = 0; i < funcTableSize; ++i) {
         const auto& funcInfo = vtableInType.GetVirtualMethods()[i];
-        if (auto method = funcInfo.GetVirtualMethod()) {
+        auto method = funcInfo.GetVirtualMethod();
+        if (!method->IsPureAbstract()) {
             auto function = cgMod.GetOrInsertCGFunction(method)->GetRawFunction();
             funcTable[i] = llvm::ConstantExpr::getBitCast(function, i8PtrType);
         } else {
@@ -423,6 +428,7 @@ std::pair<llvm::Constant*, bool> CGExtensionDef::GenerateInterfaceFn(const CHIR:
     llvm::Function* interfaceFn =
         llvm::Function::Create(interfaceFnType, llvm::Function::PrivateLinkage, funcName, cgMod.GetLLVMModule());
     interfaceFn->addFnAttr("native-interface-fn");
+    interfaceFn->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
     auto entryBB = llvm::BasicBlock::Create(llvmCtx, "entry", interfaceFn);
     // Parameter with index 1 is an array of typeinfo.
     innerTypeMap.emplace(targetType, InnerTiInfo{interfaceFn->getArg(1), false});
@@ -496,7 +502,7 @@ bool IsSameRootPackage(const std::string& packageName1, const std::string& packa
     // e.g., com::pkga.b -> com::pkga.b.
     // This transformation will make the following judgement easier.
     std::string pkgName1 = packageName1 + '.';
-    std::string pkgName2 = packageName2+ '.';
+    std::string pkgName2 = packageName2 + '.';
     return pkgName1.substr(0, pkgName1.find('.')) == pkgName2.substr(0, pkgName2.find('.'));
 }
 }

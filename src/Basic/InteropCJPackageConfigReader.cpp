@@ -14,7 +14,6 @@
 
 #include "cangjie/Basic/InteropCJPackageConfigReader.h"
 #include "cangjie/Utils/CheckUtils.h"
-#include "cangjie/Utils/FileUtil.h"
 #include <iostream>
 #include <stdexcept>
 
@@ -341,11 +340,14 @@ bool ValidateAndProcessTypeString(const std::string& typeString,
         // Remove whitespace from both ends
         auto firstChar = individualType.find_first_not_of(" \t\n\r");
         auto lastChar = individualType.find_last_not_of(" \t\n\r");
+
         if (firstChar == std::string::npos || lastChar == std::string::npos) {
             // Empty segment, skip
             continue;
         }
+
         individualType = individualType.substr(firstChar, lastChar - firstChar + 1);
+
         // Validate against allowed type set
         if (validTypeSet.find(individualType) == validTypeSet.end()) {
             std::cerr << "Error: Invalid type detected in package '"
@@ -391,8 +393,7 @@ std::string CombineTypesToString(const std::vector<std::string>& types)
 // Helper function: Processes a TOML array of type parameters
 bool ProcessTypeParameterArray(const toml::Array& typeArgs,
     const std::unordered_set<std::string>& validTypeSet,
-    const PackageConfig& pkgConfig,
-    std::vector<std::string>& collectedTypes,
+    const PackageConfig& pkgConfig, std::vector<std::string>& collectedTypes,
     std::unordered_map<std::string, GenericTypeArguments>& genericInstantiations)
 {
     for (const auto& type : typeArgs) {
@@ -405,9 +406,8 @@ bool ProcessTypeParameterArray(const toml::Array& typeArgs,
         std::vector<std::string> validatedTypes;
 
         // Validate the type string
-        if (!ValidateAndProcessTypeString(typeString, validTypeSet,
-                                          pkgConfig, validatedTypes)) {
-            return false;  // Validation failed
+        if (!ValidateAndProcessTypeString(typeString, validTypeSet, pkgConfig, validatedTypes)) {
+            return false; // Validation failed
         }
 
         if (validatedTypes.empty()) {
@@ -445,7 +445,9 @@ bool CollectTypeArguments(toml::Array& allowedGenerics,
             // Skip non-table elements.
             continue;
         }
+
         auto genTable = item.as<toml::Table>();
+
         // Check for required package name field.
         if (genTable.find(PACKAGE_NAME) == genTable.end() ||
             !genTable[PACKAGE_NAME].is<std::string>()) {
@@ -465,10 +467,9 @@ bool CollectTypeArguments(toml::Array& allowedGenerics,
         std::vector<std::string> collectedTypes;
 
         // Process all type arguments in the array
-        if (!ProcessTypeParameterArray(typeArgs, VALID_TYPE_SET,
-                                       pkgConfig, collectedTypes,
-                                       pkgConfig.allowedInteropCJGenericInstantiations[packageName])) {
-            return false;  // Validation failed
+        if (!ProcessTypeParameterArray(typeArgs, VALID_TYPE_SET, pkgConfig, collectedTypes,
+                pkgConfig.allowedInteropCJGenericInstantiations[packageName])) {
+            return false; // Validation failed
         }
 
         if (!collectedTypes.empty()) {
@@ -487,7 +488,9 @@ void ProcessSymbolConfigurations(toml::Array& allowedGenerics,
         if (!item.is<toml::Table>()) {
             continue;
         }
+
         auto genTable = item.as<toml::Table>();
+
         if (genTable.find(PACKAGE_NAME) == genTable.end() || !genTable[PACKAGE_NAME].is<std::string>()) {
             continue;
         }
@@ -534,6 +537,7 @@ void ParseDefaultConfig(toml::Table& tbl, InteropCJPackageConfigReader& reader)
     if (!defaultEntry.is<toml::Table>()) {
         return;
     }
+
     auto defaultTable = defaultEntry.as<toml::Table>();
     if (defaultTable.find(API_STRATEGY) != defaultTable.end() && defaultTable[API_STRATEGY].is<std::string>()) {
         auto strategy = defaultTable[API_STRATEGY].as<std::string>();
@@ -614,11 +618,10 @@ bool ParsePackageConfigurations(toml::Table& tbl, InteropCJPackageConfigReader& 
 
 bool InteropCJPackageConfigReader::Parse(const std::string& filePath)
 {
-    auto normalizedFilePath = FileUtil::NormalizePath(filePath);
     try {
-        std::ifstream file(normalizedFilePath);
+        std::ifstream file(filePath);
         if (!file.is_open()) {
-            std::cerr << "Error: Cannot open configuration file." << normalizedFilePath << std::endl;
+            std::cerr << "Error: Cannot open configuration file." << filePath << std::endl;
             return false;
         }
 
@@ -633,7 +636,7 @@ bool InteropCJPackageConfigReader::Parse(const std::string& filePath)
             return false;
         }
 
-        toml::Table tbl = toml::parseFile(normalizedFilePath).value.as<toml::Table>();
+        toml::Table tbl = toml::parseFile(filePath).value.as<toml::Table>();
 
         ParseDefaultConfig(tbl, *this);
 

@@ -9,6 +9,7 @@ set(BASIC_SRC
     DiagnosticEngine.cpp
     DiagnosticEngineImpl.cpp
     InteropCJPackageConfigReader.cpp
+    MacroCallDiagInfo.cpp
     Position.cpp
     SourceManager.cpp
     Display.cpp

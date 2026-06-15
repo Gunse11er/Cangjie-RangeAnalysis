@@ -31,12 +31,12 @@ void DiagExpectConstExpr(DiagnosticEngine& diag, const Expr& expr, bool isWeak)
         builder.AddNote("cannot jump to non-constant context from a constant context");
     } else if (auto tryExpr = DynamicCast<const TryExpr*>(&expr); tryExpr && tryExpr->isDesugaredFromTryWithResources) {
         builder.AddNote("try-with-resources expressions are not constant");
-    } else if (Ty::IsTyCorrect(expr.ty) && expr.ty->IsStructArray() &&
+    } else if (Ty::IsTyCorrect(expr.GetTy()) && expr.GetTy()->IsStructArray() &&
         (expr.astKind == ASTKind::LIT_CONST_EXPR || expr.astKind == ASTKind::ARRAY_LIT)) {
-        CJC_ASSERT(!expr.ty->typeArgs.empty() && expr.ty->typeArgs.front());
+        CJC_ASSERT(!expr.GetTy()->typeArgs.empty() && expr.GetTy()->typeArgs.front());
         mainHint = "expressions of type 'Array' are not constant";
         if (expr.astKind == ASTKind::ARRAY_LIT) {
-            auto expected = "VArray<" + expr.ty->typeArgs.front()->String() + ", $" +
+            auto expected = "VArray<" + expr.GetTy()->typeArgs.front()->String() + ", $" +
                 std::to_string(StaticCast<const ArrayLit&>(expr).children.size()) + ">";
             builder.AddNote("consider add type annotation '" + expected + "' to use value array");
         }
@@ -61,7 +61,7 @@ void DiagNoConstInit(DiagnosticEngine& diag, const FuncDecl& fd)
     if (outerDecl->astKind == ASTKind::EXTEND_DECL) {
         const auto& ed = StaticCast<const ExtendDecl&>(*outerDecl);
         CJC_NULLPTR_CHECK(ed.extendedType);
-        outerDecl = Ty::GetDeclPtrOfTy(ed.extendedType->ty);
+        outerDecl = Ty::GetDeclPtrOfTy(ed.extendedType->GetTy());
     }
     if (outerDecl == nullptr || outerDecl->TestAttr(Attribute::IMPORTED)) {
         return;
@@ -110,7 +110,7 @@ bool HasAnnotationDeclTarget(const Annotation& anno)
 bool IsStringBinaryExpr(const Expr& expr)
 {
     CJC_NULLPTR_CHECK(expr.desugarExpr);
-    if (!Ty::IsTyCorrect(expr.ty) || expr.astKind != ASTKind::BINARY_EXPR ||
+    if (!Ty::IsTyCorrect(expr.GetTy()) || expr.astKind != ASTKind::BINARY_EXPR ||
         expr.desugarExpr->astKind != ASTKind::CALL_EXPR) {
         return false;
     }
@@ -121,7 +121,7 @@ bool IsStringBinaryExpr(const Expr& expr)
     }
     auto& baseExpr = StaticCast<const MemberAccess&>(*ce.baseFunc).baseExpr;
     CJC_NULLPTR_CHECK(baseExpr);
-    if (!Ty::IsTyCorrect(baseExpr->ty) || !baseExpr->ty->IsString()) {
+    if (!Ty::IsTyCorrect(baseExpr->GetTy()) || !baseExpr->GetTy()->IsString()) {
         return false;
     }
     auto baseFuncTarget = ce.baseFunc->GetTarget();
@@ -480,7 +480,7 @@ private:
         }
 
         bool hasConstInit = true;
-        Ptr<const Decl> target = Ty::GetDeclPtrOfTy(ed.extendedType->ty);
+        Ptr<const Decl> target = Ty::GetDeclPtrOfTy(ed.extendedType->GetTy());
         if (target == nullptr) {
             // Do nothing..
         } else if (target->astKind == ASTKind::STRUCT_DECL) {
@@ -568,10 +568,10 @@ private:
 
     bool ChkLitConstExpr(const LitConstExpr& le)
     {
-        if (!Ty::IsTyCorrect(le.ty)) {
+        if (!Ty::IsTyCorrect(le.GetTy())) {
             return false;
         }
-        if (le.ty->IsStructArray()) {
+        if (le.GetTy()->IsStructArray()) {
             DiagExpectConstExpr(diag, le, true);
             return false;
         }
@@ -622,10 +622,10 @@ private:
 
     bool ChkArrayLit(const ArrayLit& al, bool isWeak)
     {
-        if (!Ty::IsTyCorrect(al.ty)) {
+        if (!Ty::IsTyCorrect(al.GetTy())) {
             return false;
         }
-        if (al.ty->IsStructArray()) {
+        if (al.GetTy()->IsStructArray()) {
             DiagExpectConstExpr(diag, al, isWeak);
             return false;
         }
@@ -804,11 +804,11 @@ private:
     bool ChkSubscriptExpr(const SubscriptExpr& se, bool isWeak)
     {
         CJC_NULLPTR_CHECK(se.baseExpr);
-        if (!Ty::IsTyCorrect(se.baseExpr->ty)) {
+        if (!Ty::IsTyCorrect(se.baseExpr->GetTy())) {
             // There are semantic errors, and these errors should have been reported. Just return false.
             return false;
         }
-        if (!se.baseExpr->ty->IsTuple() && !Is<VArrayTy*>(se.baseExpr->ty)) {
+        if (!se.baseExpr->GetTy()->IsTuple() && !Is<VArrayTy*>(se.baseExpr->GetTy())) {
             DiagExpectConstExpr(diag, se, isWeak);
             return false;
         }

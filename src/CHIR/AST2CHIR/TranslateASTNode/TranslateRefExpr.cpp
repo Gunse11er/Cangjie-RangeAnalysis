@@ -22,7 +22,7 @@ Translator::LeftValueInfo Translator::TranslateThisOrSuperRefAsLeftValue(const A
     CJC_ASSERT(curFunc);
     auto thisParam = GetImplicitThisParam();
     if (refExpr.isSuper) {
-        auto superTy = TranslateType(*refExpr.ty);
+        auto superTy = TranslateType(*refExpr.GetTy());
         auto loc = TranslateLocation(refExpr);
         thisParam = TypeCastOrBoxIfNeeded(*thisParam, *superTy, loc);
     }
@@ -63,7 +63,7 @@ Translator::LeftValueInfo Translator::TranslateEnumMemberVarRef(const AST::RefEx
     auto loc = TranslateLocation(refExpr);
 
     // polish here
-    auto enumTy = StaticCast<EnumTy*>(refExpr.ty);
+    auto enumTy = StaticCast<EnumTy*>(refExpr.GetTy());
     auto enumType = StaticCast<EnumType*>(chirTy.TranslateType(*enumTy));
     uint64_t enumId = GetEnumCtorId(*target);
     auto selectorTy = GetSelectorType(*enumTy);
@@ -206,15 +206,12 @@ InvokeCallContext Translator::GenerateInvokeCallContext(const InstCalleeInfo& in
 {
     auto tempDecl = typeManager.GetTopOverriddenFuncDecl(&callee);
     const AST::FuncDecl* originalFuncDecl = tempDecl ? tempDecl.get() : &callee;
-    auto originalFuncType = StaticCast<FuncType*>(TranslateType(*originalFuncDecl->ty));
+    auto originalFuncType = StaticCast<FuncType*>(TranslateType(*originalFuncDecl->GetTy()));
     if (!originalFuncDecl->TestAttr(AST::Attribute::STATIC)) {
         auto outerDecl = originalFuncDecl->outerDecl;
         CJC_NULLPTR_CHECK(outerDecl);
         auto parentType = GetNominalSymbolTable(*outerDecl)->GetType();
-        if (parentType->IsReferenceType() ||
-            (parentType->IsStruct() && originalFuncDecl->TestAttr(AST::Attribute::MUT))) {
-            parentType = builder.GetType<RefType>(parentType);
-        }
+        parentType = AddRefIfFuncIsMutOrClass(*parentType, *originalFuncDecl, builder);
         auto paramTypes = originalFuncType->GetParamTypes();
         paramTypes.insert(paramTypes.begin(), parentType);
         originalFuncType = builder.GetType<FuncType>(paramTypes, originalFuncType->GetReturnType());
@@ -222,14 +219,14 @@ InvokeCallContext Translator::GenerateInvokeCallContext(const InstCalleeInfo& in
     std::vector<GenericType*> originalGenericTypeParams;
     if (originalFuncDecl->TestAttr(AST::Attribute::GENERIC)) {
         for (const auto& genericTy : originalFuncDecl->funcBody->generic->typeParameters) {
-            originalGenericTypeParams.emplace_back(StaticCast<GenericType*>(TranslateType(*(genericTy->ty))));
+            originalGenericTypeParams.emplace_back(StaticCast<GenericType*>(TranslateType(*(genericTy->GetTy()))));
         }
     }
-    auto funcName = callee.identifier.Val();
-    if (IsOverflowOpCall(callee)) {
+    auto funcName = originalFuncDecl->identifier.Val();
+    if (IsOverflowOpCall(*originalFuncDecl)) {
         funcName = OverflowStrategyPrefix(strategy) + funcName;
     }
-    
+
     auto invokeInfo = InvokeCallContext {
         .caller = &caller,
         .funcCallCtx = FuncCallContext {
@@ -237,9 +234,9 @@ InvokeCallContext Translator::GenerateInvokeCallContext(const InstCalleeInfo& in
             .instTypeArgs = instFuncType.instantiatedTypeArgs,
             .thisType = instFuncType.thisType
         },
-        .virMethodCtx = VirMethodContext {
-            .srcCodeIdentifier = funcName,
-            .originalFuncType = originalFuncType,
+        .virMethodCtx = FuncSigInfo {
+            .funcName = funcName,
+            .funcType = originalFuncType,
             .genericTypeParams = originalGenericTypeParams
         }
     };
@@ -296,13 +293,6 @@ Value* Translator::WrapMemberMethodByLambda(
         } else {
             // Invoke
             CJC_NULLPTR_CHECK(thisObj);
-            auto objExpectedType = instFuncType.instParentCustomTy;
-            if (objExpectedType->IsReferenceType()) {
-                objExpectedType = builder.GetType<RefType>(objExpectedType);
-            }
-            if (thisObj->GetType() != objExpectedType) {
-                thisObj = TypeCastOrBoxIfNeeded(*thisObj, *objExpectedType, INVALID_LOCATION);
-            }
             auto invokeInfo = GenerateInvokeCallContext(instFuncType, *thisObj, funcDecl, args);
             ret = CreateAndAppendExpression<Invoke>(lambdaRetType, invokeInfo, currentBlock)->GetResult();
         }
@@ -333,7 +323,7 @@ Value* Translator::WrapMemberMethodByLambda(
         ret = CreateAndAppendExpression<Apply>(
             instFuncType.instRetTy, callee, funcCallContext, currentBlock)->GetResult();
     }
-    CreateWrappedStore(ret, retVal, currentBlock);
+    CreateAndAppendWrappedStore(*ret, *retVal);
     CreateAndAppendTerminator<Exit>(currentBlock);
     currentBlock = currentBlockBackup;
     return lambda->GetResult();
@@ -361,7 +351,7 @@ Value* Translator::TranslateGlobalOrLocalFuncRef(const AST::RefExpr& refExpr, Va
 {
     auto outerDeclaredTypes = GetOutDefDeclaredTypes(originalFunc);
     // 1. get inst types of outer custom type from current func's parent type
-    if (originalFunc.IsFunc() && VirtualCast<FuncBase*>(&originalFunc)->IsMemberFunc() &&
+    if (originalFunc.IsFunc() && StaticCast<Function*>(&originalFunc)->IsMemberFunc() &&
         GetCurrentFunc() && GetCurrentFunc()->GetParentCustomTypeDef() != nullptr) {
         /* orginalFunc may be defined in interface, try to get inst Types from current custom type
             interface I<T, U, V, W> {
@@ -379,7 +369,7 @@ Value* Translator::TranslateGlobalOrLocalFuncRef(const AST::RefExpr& refExpr, Va
             1. get (T, U, V, W) from visiable generic types of I
             2. replace with inst types get from me' custom type B<T>, we got results (Int32, T, Int64, T).
         */
-        auto originCustomDef = VirtualCast<FuncBase*>(&originalFunc)->GetParentCustomTypeDef();
+        auto originCustomDef = StaticCast<Function*>(&originalFunc)->GetParentCustomTypeDef();
         auto curFunc = GetCurrentFunc();
         CJC_NULLPTR_CHECK(curFunc);
         auto parentFuncCustomDef = curFunc->GetParentCustomTypeDef();
@@ -424,7 +414,7 @@ Value* Translator::TranslateGlobalOrLocalFuncRef(const AST::RefExpr& refExpr, Va
     }
 
     // 3. create GetInstantiateValue
-    auto resTy = TranslateType(*refExpr.ty);
+    auto resTy = TranslateType(*refExpr.GetTy());
     auto loc = TranslateLocation(refExpr);
     return CreateAndAppendExpression<GetInstantiateValue>(loc, resTy, &originalFunc, instArgs, currentBlock)
         ->GetResult();

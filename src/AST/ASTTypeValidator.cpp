@@ -54,10 +54,10 @@ public:
         auto curTarget = node.GetTarget();
 #ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
         bool valid = !curTarget || Is<Type>(node) || Utils::In(curTarget->astKind, ignoreKinds) ||
-            Ty::IsTyCorrect(curTarget->ty);
+            Ty::IsTyCorrect(curTarget->GetTy());
         CJC_ASSERT(valid);
 
-        valid = valid && Ty::IsTyCorrect(node.ty) && !node.ty->HasIdealTy() && !node.ty->HasQuestTy();
+        valid = valid && Ty::IsTyCorrect(node.GetTy()) && !node.GetTy()->HasIdealTy() && !node.GetTy()->HasQuestTy();
 #endif
         CJC_ASSERT(valid);
 
@@ -71,7 +71,7 @@ public:
                 target = fb->parentEnum;
             }
 #ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
-            valid = valid && (!target || Ty::IsTyCorrect(target->ty));
+            valid = valid && (!target || Ty::IsTyCorrect(target->GetTy()));
 #endif
             CJC_ASSERT(valid);
         }
@@ -111,7 +111,7 @@ private:
         } else if (Utils::In(node.astKind, noneTyKinds)) {
             // Do not check nodes that should not have sema ty.
             needCheck = false;
-        } else if (Is<Type>(node) && node.ty->IsGeneric()) {
+        } else if (Is<Type>(node) && node.GetTy()->IsGeneric()) {
             // For type node, if type itself is generic T, ignored.
             action = VisitAction::SKIP_CHILDREN;
         } else if (auto target = node.GetTarget(); target && target->astKind == ASTKind::PACKAGE_DECL) {

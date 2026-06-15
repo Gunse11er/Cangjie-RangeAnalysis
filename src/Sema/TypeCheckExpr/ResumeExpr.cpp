@@ -15,34 +15,34 @@ Ptr<Ty> TypeChecker::TypeCheckerImpl::SynResumeExpr(ASTContext& ctx, ResumeExpr&
 
     if (re.enclosing) {
         resumptionParamTy = (*re.enclosing)->commandResultTy;
-        re.ty = TypeManager::GetNothingTy();
+        re.SetTy(TypeManager::GetNothingTy());
     } else {
         diag.DiagnoseRefactor(DiagKindRefactor::sema_implicit_resume_outside_handler, re);
-        re.ty = TypeManager::GetInvalidTy();
+        re.SetTy(TypeManager::GetInvalidTy());
     }
 
     if (re.throwingExpr) {
         auto exception = importManager.GetCoreDecl<ClassDecl>(CLASS_EXCEPTION);
         auto error = importManager.GetCoreDecl<ClassDecl>(CLASS_ERROR);
-        Synthesize(ctx, re.throwingExpr.get());
-        CJC_NULLPTR_CHECK(re.throwingExpr->ty);
+        Synthesize({ctx, SynPos::EXPR_ARG}, re.throwingExpr.get());
+        CJC_NULLPTR_CHECK(re.throwingExpr->GetTy());
 
-        if (!typeManager.IsSubtype(re.throwingExpr->ty, exception->ty) &&
-            !typeManager.IsSubtype(re.throwingExpr->ty, error->ty)) {
+        if (!typeManager.IsSubtype(re.throwingExpr->GetTy(), exception->GetTy()) &&
+            !typeManager.IsSubtype(re.throwingExpr->GetTy(), error->GetTy())) {
             diag.DiagnoseRefactor(DiagKindRefactor::sema_resume_throwing_mismatch_type, re);
-            re.ty = TypeManager::GetInvalidTy();
+            re.SetTy(TypeManager::GetInvalidTy());
         }
     } else if (re.withExpr) {
         if (!Check(ctx, resumptionParamTy, re.withExpr)) {
             // `Check` produces the error message.
-            re.ty = TypeManager::GetInvalidTy();
+            re.SetTy(TypeManager::GetInvalidTy());
         }
     } else {
         auto unitTy = typeManager.GetPrimitiveTy(TypeKind::TYPE_UNIT);
         if (!typeManager.IsSubtype(resumptionParamTy, unitTy)) {
             diag.DiagnoseRefactor(DiagKindRefactor::sema_resume_no_with, re, Ty::ToString(resumptionParamTy));
-            re.ty = TypeManager::GetInvalidTy();
+            re.SetTy(TypeManager::GetInvalidTy());
         }
     }
-    return re.ty;
+    return re.GetTy();
 }

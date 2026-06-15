@@ -59,7 +59,7 @@ bool LookUpConstraintCollection(Ty& subTy, Ty& baseTy, const TyVarEnv& typeConst
 bool IsUpperBoundsValid(const std::vector<OwnedPtr<Type>>& upperBounds)
 {
     for (auto& upper : upperBounds) {
-        if (!Ty::IsTyCorrect(upper->ty)) {
+        if (!Ty::IsTyCorrect(upper->GetTy())) {
             return false;
         }
     }
@@ -70,7 +70,7 @@ bool IsUpperBoundsValid(const std::vector<OwnedPtr<Type>>& upperBounds)
 void TypeChecker::TypeCheckerImpl::PerformAssumeReferenceTypeUpperBound(TyVarUB& typeConstraintCollection,
     GCBlames& blames, const AST::Type& referenceTypeUpperBound, const TypeSubst& typeMapping)
 {
-    auto upperBoundTy = referenceTypeUpperBound.ty;
+    auto upperBoundTy = referenceTypeUpperBound.GetTy();
     Ptr<Decl> baseDecl = Ty::GetDeclPtrOfTy(upperBoundTy);
     // If the upperBound is a generic Type and has associate declaration, perform assumption recursively.
     if (baseDecl != nullptr && Ty::IsTyCorrect(upperBoundTy) && upperBoundTy->HasGeneric()) {
@@ -99,7 +99,7 @@ void TypeChecker::TypeCheckerImpl::AssumeOneUpperBound(
 void TypeChecker::TypeCheckerImpl::PerformAssumptionForOneGenericConstraint(
     TyVarUB& typeConstraintCollection, GCBlames& blames, const GenericConstraint& gc, const TypeSubst& typeMapping)
 {
-    auto subTypeTy = gc.type->ty;
+    auto subTypeTy = gc.type->GetTy();
     if (!Ty::IsTyCorrect(subTypeTy)) {
         return;
     }
@@ -108,7 +108,7 @@ void TypeChecker::TypeCheckerImpl::PerformAssumptionForOneGenericConstraint(
         if (!upperBound) {
             continue;
         }
-        auto upperBoundTy = upperBound->ty;
+        auto upperBoundTy = upperBound->GetTy();
         if (!Ty::IsTyCorrect(upperBoundTy)) {
             continue;
         }

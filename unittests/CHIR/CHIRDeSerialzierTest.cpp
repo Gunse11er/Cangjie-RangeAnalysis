@@ -269,12 +269,6 @@ Value::ValueKind DeSerialize(const PackageFormat::ValueKind& kind)
         case ValueKind_PARAMETER:
             ret = Value::ValueKind::KIND_PARAMETER;
             break;
-        case ValueKind_IMPORTED_FUNC:
-            ret = Value::ValueKind::KIND_IMP_FUNC;
-            break;
-        case ValueKind_IMPORTED_VAR:
-            ret = Value::ValueKind::KIND_IMP_VAR;
-            break;
         case ValueKind_LOCALVAR:
             ret = Value::ValueKind::KIND_LOCALVAR;
             break;
@@ -407,94 +401,99 @@ ExprKind DeSerialize(const PackageFormat::CHIRExprKind& kind)
     using namespace PackageFormat;
     auto ret = ExprKind::INVALID;
     switch (kind) {
-        case CHIRExprKind_INVALID:
+        case CHIRExprKind_Invalid:
             ret = ExprKind::INVALID;
             break;
         // Terminator
-        case CHIRExprKind_GOTO:
+        case CHIRExprKind_Goto:
             ret = ExprKind::GOTO;
             break;
-        case CHIRExprKind_BRANCH:
+        case CHIRExprKind_Branch:
             ret = ExprKind::BRANCH;
             break;
-        case CHIRExprKind_MULTIBRANCH:
+        case CHIRExprKind_MultiBranch:
             ret = ExprKind::MULTIBRANCH;
             break;
-        case CHIRExprKind_EXIT:
+        case CHIRExprKind_Exit:
             ret = ExprKind::EXIT;
             break;
-        case CHIRExprKind_APPLY_WITH_EXCEPTION:
+        case CHIRExprKind_TryApply:
             ret = ExprKind::APPLY_WITH_EXCEPTION;
             break;
-        case CHIRExprKind_INVOKE_WITH_EXCEPTION:
+        case CHIRExprKind_TryInvoke:
             ret = ExprKind::INVOKE_WITH_EXCEPTION;
             break;
-        case CHIRExprKind_INVOKESTATIC_WITH_EXCEPTION:
-            ret = ExprKind::INVOKESTATIC_WITH_EXCEPTION;
-            break;
-        case CHIRExprKind_RAISE_EXCEPTION:
+        case CHIRExprKind_RaiseException:
             ret = ExprKind::RAISE_EXCEPTION;
             break;
-        case CHIRExprKind_INT_OP_WITH_EXCEPTION:
+        case CHIRExprKind_TryNeg:
+        case CHIRExprKind_TryAdd:
+        case CHIRExprKind_TrySub:
+        case CHIRExprKind_TryMul:
+        case CHIRExprKind_TryDiv:
+        case CHIRExprKind_TryMod:
+        case CHIRExprKind_TryExp:
+        case CHIRExprKind_TryLShift:
+        case CHIRExprKind_TryRShift:
             ret = ExprKind::INT_OP_WITH_EXCEPTION;
             break;
-        case CHIRExprKind_SPAWN_WITH_EXCEPTION:
+        case CHIRExprKind_TrySpawn:
             ret = ExprKind::SPAWN_WITH_EXCEPTION;
             break;
-        case CHIRExprKind_TYPECAST_WITH_EXCEPTION:
+        case CHIRExprKind_TryNumericCast:
             ret = ExprKind::TYPECAST_WITH_EXCEPTION;
             break;
-        case CHIRExprKind_INTRINSIC_WITH_EXCEPTION:
+        case CHIRExprKind_TryIntrinsic:
             ret = ExprKind::INTRINSIC_WITH_EXCEPTION;
             break;
-        case CHIRExprKind_ALLOCATE_WITH_EXCEPTION:
+        case CHIRExprKind_TryAllocate:
             ret = ExprKind::ALLOCATE_WITH_EXCEPTION;
             break;
-        case CHIRExprKind_RAW_ARRAY_ALLOCATE_WITH_EXCEPTION:
+        case CHIRExprKind_TryRawArrayAllocate:
             ret = ExprKind::RAW_ARRAY_ALLOCATE_WITH_EXCEPTION;
             break;
             // Unary
-        case CHIRExprKind_NEG:
+        case CHIRExprKind_Neg:
             ret = ExprKind::NEG;
             break;
-        case CHIRExprKind_NOT:
+        case CHIRExprKind_Not:
             ret = ExprKind::NOT;
             break;
-        case CHIRExprKind_BITNOT:
+        case CHIRExprKind_BitNot:
             ret = ExprKind::BITNOT;
             break;
             // Binary
-        case CHIRExprKind_ADD:
+        case CHIRExprKind_Add:
             ret = ExprKind::ADD;
             break;
-        case CHIRExprKind_SUB:
+        case CHIRExprKind_Sub:
             ret = ExprKind::SUB;
             break;
-        case CHIRExprKind_MUL:
+        case CHIRExprKind_Mul:
             ret = ExprKind::MUL;
             break;
-        case CHIRExprKind_DIV:
+        case CHIRExprKind_Div:
             ret = ExprKind::DIV;
             break;
-        case CHIRExprKind_MOD:
+        case CHIRExprKind_Mod:
             ret = ExprKind::MOD;
             break;
-        case CHIRExprKind_EXP:
+        case CHIRExprKind_Exp:
             ret = ExprKind::EXP;
             break;
-        case CHIRExprKind_LSHIFT:
+        case CHIRExprKind_LShift:
             ret = ExprKind::LSHIFT;
             break;
-        case CHIRExprKind_RSHIFT:
+        case CHIRExprKind_RShift:
             ret = ExprKind::RSHIFT;
             break;
-        case CHIRExprKind_BITAND:
+        case CHIRExprKind_BitAnd:
             ret = ExprKind::BITAND;
             break;
-        case CHIRExprKind_BITOR:
+        case CHIRExprKind_BitOr:
             ret = ExprKind::BITOR;
             break;
-        case CHIRExprKind_BITXOR:
+        case CHIRExprKind_BitXor:
             ret = ExprKind::BITXOR;
             break;
         case CHIRExprKind_LT:
@@ -509,136 +508,120 @@ ExprKind DeSerialize(const PackageFormat::CHIRExprKind& kind)
         case CHIRExprKind_GE:
             ret = ExprKind::GE;
             break;
-        case CHIRExprKind_EQUAL:
+        case CHIRExprKind_Equal:
             ret = ExprKind::EQUAL;
             break;
-        case CHIRExprKind_NOTEQUAL:
+        case CHIRExprKind_NotEqual:
             ret = ExprKind::NOTEQUAL;
             break;
-        case CHIRExprKind_AND:
+        case CHIRExprKind_And:
             ret = ExprKind::AND;
             break;
-        case CHIRExprKind_OR:
+        case CHIRExprKind_Or:
             ret = ExprKind::OR;
             break;
+        case CHIRExprKind_StaticCast:
+            ret = ExprKind::INVALID;
+            break;
             // Memory
-        case CHIRExprKind_ALLOCATE:
+        case CHIRExprKind_Allocate:
             ret = ExprKind::ALLOCATE;
             break;
-        case CHIRExprKind_LOAD:
+        case CHIRExprKind_Load:
             ret = ExprKind::LOAD;
             break;
-        case CHIRExprKind_STORE:
+        case CHIRExprKind_Store:
             ret = ExprKind::STORE;
             break;
-        case CHIRExprKind_GET_ELEMENT_REF:
+        case CHIRExprKind_GetElementRef:
             ret = ExprKind::GET_ELEMENT_REF;
             break;
-        case CHIRExprKind_GET_ELEMENT_BY_NAME:
+        case CHIRExprKind_GetElementByName:
             ret = ExprKind::GET_ELEMENT_BY_NAME;
             break;
-        case CHIRExprKind_STORE_ELEMENT_REF:
+        case CHIRExprKind_StoreElementRef:
             ret = ExprKind::STORE_ELEMENT_REF;
             break;
-        case CHIRExprKind_STORE_ELEMENT_BY_NAME:
+        case CHIRExprKind_StoreElementByName:
             ret = ExprKind::STORE_ELEMENT_BY_NAME;
             break;
-            // Complext
-        case CHIRExprKind_IF:
-            ret = ExprKind::IF;
-            break;
-        case CHIRExprKind_LOOP:
-            ret = ExprKind::LOOP;
-            break;
-        case CHIRExprKind_FORIN_RANGE:
-            ret = ExprKind::FORIN_RANGE;
-            break;
-        case CHIRExprKind_FORIN_ITER:
-            ret = ExprKind::FORIN_ITER;
-            break;
-        case CHIRExprKind_FORIN_CLOSED_RANGE:
-            ret = ExprKind::FORIN_CLOSED_RANGE;
-            break;
-        case CHIRExprKind_LAMBDA:
+        case CHIRExprKind_Lambda:
             ret = ExprKind::LAMBDA;
             break;
             // Others
-        case CHIRExprKind_CONSTANT:
+        case CHIRExprKind_Constant:
             ret = ExprKind::CONSTANT;
             break;
-        case CHIRExprKind_DEBUGEXPR:
+        case CHIRExprKind_Debug:
             ret = ExprKind::DEBUGEXPR;
             break;
-        case CHIRExprKind_TUPLE:
+        case CHIRExprKind_Tuple:
             ret = ExprKind::TUPLE;
             break;
-        case CHIRExprKind_FIELD:
+        case CHIRExprKind_Field:
             ret = ExprKind::FIELD;
             break;
-        case CHIRExprKind_FIELD_BY_NAME:
+        case CHIRExprKind_FieldByName:
             ret = ExprKind::FIELD_BY_NAME;
             break;
-        case CHIRExprKind_APPLY:
+        case CHIRExprKind_Apply:
             ret = ExprKind::APPLY;
             break;
-        case CHIRExprKind_INVOKE:
+        case CHIRExprKind_Invoke:
             ret = ExprKind::INVOKE;
             break;
-        case CHIRExprKind_INVOKE_STATIC:
-            ret = ExprKind::INVOKESTATIC;
-            break;
-        case CHIRExprKind_INSTANCEOF:
+        case CHIRExprKind_InstanceOf:
             ret = ExprKind::INSTANCEOF;
             break;
-        case CHIRExprKind_TYPECAST:
+        case CHIRExprKind_NumericCast:
             ret = ExprKind::TYPECAST;
             break;
-        case CHIRExprKind_GET_EXCEPTION:
+        case CHIRExprKind_GetException:
             ret = ExprKind::GET_EXCEPTION;
             break;
-        case CHIRExprKind_RAW_ARRAY_ALLOCATE:
+        case CHIRExprKind_RawArrayAllocate:
             ret = ExprKind::RAW_ARRAY_ALLOCATE;
             break;
-        case CHIRExprKind_RAW_ARRAY_LITERAL_INIT:
+        case CHIRExprKind_RawArrayLiteralInit:
             ret = ExprKind::RAW_ARRAY_LITERAL_INIT;
             break;
-        case CHIRExprKind_RAW_ARRAY_INIT_BY_VALUE:
+        case CHIRExprKind_RawArrayInitByValue:
             ret = ExprKind::RAW_ARRAY_INIT_BY_VALUE;
             break;
-        case CHIRExprKind_VARRAY:
+        case CHIRExprKind_VArrayExpr:
             ret = ExprKind::VARRAY;
             break;
-        case CHIRExprKind_VARRAY_BUILDER:
+        case CHIRExprKind_VArrayBuilder:
             ret = ExprKind::VARRAY_BUILDER;
             break;
-        case CHIRExprKind_INTRINSIC:
+        case CHIRExprKind_Intrinsic:
             ret = ExprKind::INTRINSIC;
             break;
-        case CHIRExprKind_SPAWN:
+        case CHIRExprKind_Spawn:
             ret = ExprKind::SPAWN;
             break;
-        case CHIRExprKind_GET_INSTANTIATE_VALUE:
+        case CHIRExprKind_GetInstantiateValue:
             ret = ExprKind::GET_INSTANTIATE_VALUE;
             break;
-        case CHIRExprKind_BOX:
+        case CHIRExprKind_Box:
             ret = ExprKind::BOX;
             break;
-        case CHIRExprKind_UNBOX:
+        case CHIRExprKind_UnboxToValue:
             ret = ExprKind::UNBOX;
             break;
-        case CHIRExprKind_TRANSFORM_TO_GENERIC:
+        case CHIRExprKind_CastToGeneric:
             ret = ExprKind::TRANSFORM_TO_GENERIC;
             break;
-        case CHIRExprKind_TRANSFORM_TO_CONCRETE:
+        case CHIRExprKind_CastToConcrete:
             ret = ExprKind::TRANSFORM_TO_CONCRETE;
             break;
-        case CHIRExprKind_UNBOX_TO_REF:
+        case CHIRExprKind_UnboxToRef:
             ret = ExprKind::UNBOX_TO_REF;
             break;
-        case CHIRExprKind_GET_RTTI:
+        case CHIRExprKind_GetRtti:
             ret = ExprKind::GET_RTTI;
             break;
-        case CHIRExprKind_GET_RTTI_STATIC:
+        case CHIRExprKind_GetRttiStatic:
             ret = ExprKind::GET_RTTI_STATIC;
             break;
     }
@@ -1912,19 +1895,6 @@ TEST_F(CHIRDeSerialzierTest, CustomDefKindEnum)
     for (size_t i = static_cast<size_t>(enumBegin); i <= static_cast<size_t>(enumEnd); i++) {
         EXPECT_EQ(CustomDefKind(static_cast<PackageFormat::CustomDefKind>(i)),
             DeSerialize(static_cast<PackageFormat::CustomDefKind>(i)))
-            << "cur i: " << i;
-    }
-}
-
-TEST_F(CHIRDeSerialzierTest, ExprKindEnum)
-{
-    using namespace PackageFormat;
-    auto enumBegin = PackageFormat::CHIRExprKind_MIN;
-    auto enumEnd = PackageFormat::CHIRExprKind_MAX;
-
-    for (size_t i = static_cast<size_t>(enumBegin); i <= static_cast<size_t>(enumEnd); i++) {
-        EXPECT_EQ(ExprKind(static_cast<PackageFormat::CHIRExprKind>(i)),
-            DeSerialize(static_cast<PackageFormat::CHIRExprKind>(i)))
             << "cur i: " << i;
     }
 }

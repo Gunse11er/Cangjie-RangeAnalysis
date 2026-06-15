@@ -37,11 +37,11 @@ void TranslateFunctionGenericUpperBounds(CHIRType& chirTy, const AST::FuncDecl& 
     if (func.funcBody->generic) {
         // We need to translate functions' generic type and fill their upperBounds during translation.
         for (auto& type : func.funcBody->generic->typeParameters) {
-            chirTy.TranslateType(*type->ty);
+            chirTy.TranslateType(*type->GetTy());
         }
         // Must fill upper bounds after translation all generics.
         for (auto& type : func.funcBody->generic->typeParameters) {
-            chirTy.FillGenericArgType(StaticCast<AST::GenericsTy>(*type->ty));
+            chirTy.FillGenericArgType(StaticCast<AST::GenericsTy>(*type->GetTy()));
         }
     }
 }
@@ -52,7 +52,7 @@ FuncType* AdjustVarInitType(
     auto params = funcType.GetParamTypes();
     std::vector<Type*> paramsTy;
     paramsTy.reserve(params.size() + 1); // additional 1 means the type of this.
-    auto thisTy = chirType.TranslateType(*outerDecl.ty);
+    auto thisTy = chirType.TranslateType(*outerDecl.GetTy());
     // ClassLike decl has already been added ref type by `TranslateType`, so we just needs add ref type to
     // constructor and mut function of non-classLike type.
     if (outerDecl.astKind == AST::ASTKind::STRUCT_DECL) {
@@ -72,7 +72,7 @@ FuncType* AdjustFuncType(FuncType& funcType, const AST::FuncDecl& funcDecl, CHIR
     if (IsInstanceMember(funcDecl)) {
         std::vector<Type*> paramsTy;
         paramsTy.reserve(params.size() + 1); // additional 1 means the type of this.
-        auto thisTy = chirType.TranslateType(*funcDecl.outerDecl->ty);
+        auto thisTy = chirType.TranslateType(*funcDecl.outerDecl->GetTy());
         paramsTy.emplace_back(AddRefIfFuncIsMutOrClass(*thisTy, funcDecl, builder));
         paramsTy.insert(paramsTy.end(), params.begin(), params.end());
 
@@ -113,7 +113,7 @@ std::vector<GenericType*> GetGenericParamType(const AST::Decl& decl, CHIRType& c
     }
     CJC_NULLPTR_CHECK(generic);
     for (auto& genericTy : generic->typeParameters) {
-        ts.emplace_back(StaticCast<GenericType*>(chirType.TranslateType(*(genericTy->ty))));
+        ts.emplace_back(StaticCast<GenericType*>(chirType.TranslateType(*(genericTy->GetTy()))));
     }
     return ts;
 }
@@ -161,7 +161,7 @@ bool IsStructMutFunction(const AST::FuncDecl& function)
         return function.TestAnyAttr(AST::Attribute::CONSTRUCTOR, AST::Attribute::MUT);
     }
     if (function.outerDecl->astKind == AST::ASTKind::EXTEND_DECL &&
-        RawStaticCast<AST::ExtendDecl*>(function.outerDecl)->extendedType->ty->IsStruct()) {
+        RawStaticCast<AST::ExtendDecl*>(function.outerDecl)->extendedType->GetTy()->IsStruct()) {
         return function.TestAnyAttr(AST::Attribute::CONSTRUCTOR, AST::Attribute::MUT);
     }
     return false;
@@ -280,7 +280,7 @@ std::string OverflowStrategyPrefix(OverflowStrategy ovf)
     }
 }
 
-void SetCompileTimeValueFlagRecursivly(Func& initFunc)
+void SetCompileTimeValueFlagRecursively(Function& initFunc)
 {
     auto preVisit = [](Expression& expr) {
         if (expr.GetExprKind() == CHIR::ExprKind::LAMBDA) {

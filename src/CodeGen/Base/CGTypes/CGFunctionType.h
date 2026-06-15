@@ -90,7 +90,7 @@ private:
     explicit CGFunctionType(
         CGModule& cgMod, CGContext& cgCtx, const CHIR::FuncType& chirType, const TypeExtraInfo& extraInfo = {});
     explicit CGFunctionType(
-        CGModule& cgMod, CGContext& cgCtx, const CHIR::FuncBase& chirFunc, const TypeExtraInfo& extraInfo = {});
+        CGModule& cgMod, CGContext& cgCtx, const CHIR::Function& chirFunc, const TypeExtraInfo& extraInfo = {});
 
     llvm::Constant* GenSourceGenericOfTypeInfo() override;
     llvm::Constant* GenTypeArgsNumOfTypeInfo() override;
@@ -121,7 +121,7 @@ private:
      */
     std::vector<llvm::Metadata*> closureParamIndices;
 
-    const CHIR::FuncBase* chirFunc{nullptr};
+    const CHIR::Function* chirFunc{nullptr};
     bool allowBasePtr{true};
     bool isMethod{false};
     bool isStaticMethod{false};

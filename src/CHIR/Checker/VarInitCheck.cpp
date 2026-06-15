@@ -28,14 +28,14 @@ bool HasFuncCallWithNothingRetVal(const Block& block)
     return false;
 }
 }
-VarInitCheck::VarInitCheck(DiagAdapter* diag) : diag(diag)
+VarInitCheck::VarInitCheck(DiagnosticEngine& diag) : diag(diag)
 {
 }
 
 void VarInitCheck::RunOnPackage(const Package* package, size_t threadNum)
 {
-    std::vector<Func*> funcs;
-    for (auto func : package->GetGlobalFuncs()) {
+    std::vector<Function*> funcs;
+    for (auto func : package->GetGlobalFuncsWithBody()) {
         if (func->GetSrcCodeIdentifier().find("__ad_") == std::string::npos &&
             func->GetSrcCodeIdentifier() != STATIC_INIT_FUNC &&
             func->GetIdentifier().find("$Mocked") == std::string::npos &&
@@ -60,7 +60,7 @@ void VarInitCheck::RunOnPackage(const Package* package, size_t threadNum)
     }
 }
 
-void VarInitCheck::RunOnFunc(const Func* func)
+void VarInitCheck::RunOnFunc(const Function* func)
 {
     std::vector<MemberVarInfo> members;
     auto ctorInitInfo = std::make_unique<ConstructorInitInfo>();
@@ -86,8 +86,8 @@ void VarInitCheck::RunOnFunc(const Func* func)
     ReassignInitedLetVarCheck(func, ctorInitInfo.get(), members);
 }
 
-template <typename TApply>
-void VarInitCheck::CheckMemberFuncCall(const MaybeUninitDomain& state, const Func& initFunc, const TApply& apply) const
+template <typename TApply> void VarInitCheck::CheckMemberFuncCall(
+    const MaybeUninitDomain& state, const Function& initFunc, const TApply& apply) const
 {
     // Calling any member function in an initializer before all the member of this class/struct has
     // been initialised is illegal.
@@ -95,7 +95,7 @@ void VarInitCheck::CheckMemberFuncCall(const MaybeUninitDomain& state, const Fun
     if (!callee->IsFuncWithBody()) {
         return;
     }
-    auto calleeFunc = VirtualCast<Func*>(callee);
+    auto calleeFunc = StaticCast<Function*>(callee);
     auto thisArg = initFunc.GetParam(0);
     // check the callee is a member function and if all the member has been initialised
     // note: calling other initialiser of this class/struct is ok
@@ -126,7 +126,7 @@ void VarInitCheck::CheckMemberFuncCall(const MaybeUninitDomain& state, const Fun
 
 // Update only cjnative for cjmp
 void VarInitCheck::UseBeforeInitCheck(
-    const Func* func, const ConstructorInitInfo* ctorInitInfo, const std::vector<MemberVarInfo>& members)
+    const Function* func, const ConstructorInitInfo* ctorInitInfo, const std::vector<MemberVarInfo>& members)
 {
     bool isCommonFunctionWithoutBody = func->TestAttr(Attribute::SKIP_ANALYSIS);
     if (isCommonFunctionWithoutBody) {
@@ -137,7 +137,7 @@ void VarInitCheck::UseBeforeInitCheck(
     auto result = engine.IterateToFixpoint();
     CJC_NULLPTR_CHECK(result);
 
-    std::vector<const Func*> callStack{func};
+    std::vector<const Function*> callStack{func};
 
     const auto actionBeforeVisitExpr = [this, &callStack, &members](
                                            const MaybeUninitDomain& state, Expression* expr, size_t) {
@@ -172,7 +172,7 @@ void VarInitCheck::UseBeforeInitCheck(
 
     const auto actionAfterVisitExpr = [&callStack](const MaybeUninitDomain&, Expression* expr, size_t) {
         if (expr->GetExprKind() == ExprKind::APPLY) {
-            if (auto varInitFunc = TryGetInstanceVarInitFromApply(*expr)) {
+            if (TryGetInstanceVarInitFromApply(*expr)) {
                 callStack.pop_back();
             }
         }
@@ -229,7 +229,7 @@ bool VarInitCheck::CheckLoadToUninitedAllocation(const MaybeUninitDomain& state,
     auto targetVal = load.GetLocation();
     if (state.IsMaybeUninitedAllocation(targetVal).value_or(false)) {
         auto identifier = targetVal->GetSrcCodeIdentifier();
-        auto builder = diag->DiagnoseRefactor(
+        auto builder = diag.DiagnoseRefactor(
             DiagKindRefactor::chir_used_before_initialization, ToPosition(load.GetDebugLocation()), identifier);
         AddMaybeInitedPosNote(builder, identifier, state.GetMaybeInitedPos(targetVal));
         return true;
@@ -248,7 +248,7 @@ bool VarInitCheck::CheckGetElementRefToUninitedAllocation(
     }
     if (state.IsMaybeUninitedAllocation(targetVal).value_or(false)) {
         auto identifier = targetVal->GetSrcCodeIdentifier();
-        auto builder = diag->DiagnoseRefactor(
+        auto builder = diag.DiagnoseRefactor(
             DiagKindRefactor::chir_used_before_initialization, ToPosition(getElementRef.GetDebugLocation()),
             identifier);
         AddMaybeInitedPosNote(builder, identifier, state.GetMaybeInitedPos(targetVal));
@@ -275,15 +275,15 @@ std::optional<size_t> IsGetElemRefViaDefMember(const Expression& expr, const Par
 }
 } // namespace
 
-void VarInitCheck::CheckLoadToUninitedCustomDefMember(
-    const MaybeUninitDomain& state, const Func* func, const Load* load, const std::vector<MemberVarInfo>& members) const
+void VarInitCheck::CheckLoadToUninitedCustomDefMember(const MaybeUninitDomain& state,
+    const Function* func, const Load* load, const std::vector<MemberVarInfo>& members) const
 {
     auto targetVal = load->GetLocation();
     if (targetVal->IsLocalVar()) {
         auto expr = StaticCast<LocalVar*>(targetVal)->GetExpr();
         // Check if we are accessing an uninitialised class/struct member or a member of an uninitialised member.
         // For example:
-        // Func @<init>(%ca: CA&)
+        // Function @<init>(%ca: CA&)
         // ...
         // %0 = GetElementRef(%ca, 0) or GetElementRef(%ca, 0, 1)
         // %1 = Load(%0)
@@ -313,14 +313,14 @@ std::optional<size_t> IsStoreViaDefMember(
 }
 } // namespace
 
-void VarInitCheck::CheckStoreToUninitedCustomDefMember(const MaybeUninitDomain& state, const Func* func,
+void VarInitCheck::CheckStoreToUninitedCustomDefMember(const MaybeUninitDomain& state, const Function* func,
     const StoreElementRef* store, const std::vector<MemberVarInfo>& members) const
 {
     // a)
     // Check if we are assigning values to a nested member of an unitialised class/struct member.
     // note: assigning values to an unitialised member is totally fine.
     // For example:
-    // Func @<init>(%ca: CA&)
+    // Function @<init>(%ca: CA&)
     // ...
     // %0 = StoreElementRef(%ca, 0, 1)      illegal if %ca.0 has not been initialised
     // ...
@@ -335,7 +335,7 @@ void VarInitCheck::CheckStoreToUninitedCustomDefMember(const MaybeUninitDomain& 
     // Check if we are assigning values to an uninitialised member of the super class, or a nested
     // member of the uninitialised member.
     // For example:
-    // Func @<init>(%ca: CA&)
+    // Function @<init>(%ca: CA&)
     // ...
     // %0 = StoreElementRef(%ca, 0) or StoreElementRef(%ca, 0, 1)
     // ...
@@ -348,7 +348,7 @@ void VarInitCheck::CheckStoreToUninitedCustomDefMember(const MaybeUninitDomain& 
     }
 }
 
-void VarInitCheck::RaiseUninitedDefMemberError(const MaybeUninitDomain& state, const Func* func,
+void VarInitCheck::RaiseUninitedDefMemberError(const MaybeUninitDomain& state, const Function* func,
     const std::vector<MemberVarInfo>& members, const std::vector<size_t>& uninitedMemberIdx) const
 {
     // Skip report error when uninitedMember are all common member for CJMP.
@@ -362,7 +362,7 @@ void VarInitCheck::RaiseUninitedDefMemberError(const MaybeUninitDomain& state, c
         return;
     }
     auto builder =
-        diag->DiagnoseRefactor(DiagKindRefactor::chir_class_uninitialized_field, ToPosition(func->GetDebugLocation()));
+        diag.DiagnoseRefactor(DiagKindRefactor::chir_class_uninitialized_field, ToPosition(func->GetDebugLocation()));
     for (auto idx : uninitedMemberIdx) {
         auto identifier = members[idx].name;
         std::string msg = "in line " + std::to_string(members[idx].loc.GetBeginPos().line) + ", variable '" +
@@ -377,11 +377,11 @@ void VarInitCheck::CheckUninitedDefMember(const MaybeUninitDomain& state, const 
 {
     auto checkUninitedRes = state.IsMaybeUninitedMember(index);
     if (checkUninitedRes == MaybeUninitDomain::UninitedMemberKind::SUPER_MEMBER) {
-        diag->DiagnoseRefactor(DiagKindRefactor::chir_illegal_usage_of_super_member,
+        diag.DiagnoseRefactor(DiagKindRefactor::chir_illegal_usage_of_super_member,
             ToPosition(expr->GetDebugLocation()), members[index].name);
     } else if (checkUninitedRes == MaybeUninitDomain::UninitedMemberKind::LOCAL_MEMBER && !onlyCheckSuper) {
         auto identifier = members[index].name;
-        auto builder = diag->DiagnoseRefactor(
+        auto builder = diag.DiagnoseRefactor(
             DiagKindRefactor::chir_used_before_initialization, ToPosition(expr->GetDebugLocation()), identifier);
         AddMaybeInitedPosNote(builder, identifier, state.GetMaybeInitedPos(index));
     }
@@ -402,7 +402,7 @@ void VarInitCheck::AddMaybeInitedPosNote(
     builder.AddNote(ss.str());
 }
 
-void VarInitCheck::RaiseIllegalMemberFunCallError(const Expression* apply, const Func* memberFunc) const
+void VarInitCheck::RaiseIllegalMemberFunCallError(const Expression* apply, const Function* memberFunc) const
 {
     auto identifier = memberFunc->GetSrcCodeIdentifier();
     auto calleeFuncKind = memberFunc->GetFuncKind();
@@ -410,11 +410,11 @@ void VarInitCheck::RaiseIllegalMemberFunCallError(const Expression* apply, const
         constexpr size_t getterNameLength{4}; // length of "$get" or "$set"
         identifier = identifier.substr(1, identifier.length() - getterNameLength);
     }
-    diag->DiagnoseRefactor(
+    diag.DiagnoseRefactor(
         DiagKindRefactor::chir_illegal_usage_of_member, ToPosition(apply->GetDebugLocation()), identifier);
 }
 
-void VarInitCheck::ReassignInitedLetVarCheck(const Func* func, const ConstructorInitInfo* ctorInitInfo,
+void VarInitCheck::ReassignInitedLetVarCheck(const Function* func, const ConstructorInitInfo* ctorInitInfo,
     const std::vector<MemberVarInfo>& members) const
 {
     bool isCommonFunctionWithoutBody = func->TestAttr(Attribute::SKIP_ANALYSIS);
@@ -435,7 +435,7 @@ void VarInitCheck::ReassignInitedLetVarCheck(const Func* func, const Constructor
                 return;
             }
             if (targetVal->TestAttr(Attribute::READONLY) && state.IsMaybeInitedAllocation(targetVal).value_or(false)) {
-                diag->DiagnoseRefactor(DiagKindRefactor::chir_cannot_assign_initialized_let_variable,
+                diag.DiagnoseRefactor(DiagKindRefactor::chir_cannot_assign_initialized_let_variable,
                     ToPosition(expr->GetDebugLocation()));
             }
         } else if (expr->GetExprKind() == ExprKind::STORE_ELEMENT_REF) {
@@ -447,7 +447,7 @@ void VarInitCheck::ReassignInitedLetVarCheck(const Func* func, const Constructor
 
     result->VisitWith(actionBeforeVisitExpr, actionAfterVisitExpr, actionOnTerminator);
 }
-void VarInitCheck::CheckStoreToInitedCustomDefMember(const MaybeInitDomain& state, const Func* func,
+void VarInitCheck::CheckStoreToInitedCustomDefMember(const MaybeInitDomain& state, const Function* func,
     const StoreElementRef* store, const std::vector<MemberVarInfo>& members) const
 {
     // If the function is an initialiser, we will check if it's a StoreElementRef to an unitialised member of the
@@ -461,7 +461,7 @@ void VarInitCheck::CheckStoreToInitedCustomDefMember(const MaybeInitDomain& stat
         if (members[paths[0]].TestAttr(Attribute::READONLY) &&
             state.IsMaybeInitedMember(paths[0]) != MaybeInitDomain::InitedMemberKind::NA) {
             // this `let-defined` member variable has already been initialised
-            diag->DiagnoseRefactor(
+            diag.DiagnoseRefactor(
                 DiagKindRefactor::chir_cannot_assign_initialized_let_variable, ToPosition(store->GetDebugLocation()));
         }
         return;

@@ -28,7 +28,8 @@ bool GCCPathScanner::IsCompatiableTripleName(const Triple::Info& info, const std
             archString + "-linux-gnu",
             archString + "-pc-linux-gnu",
             archString + "-suse-linux",
-            archString + "-redhat-linux"
+            archString + "-redhat-linux",
+            archString + "-openEuler-linux"
         };
         return std::find(compatibleNames.begin(), compatibleNames.end(), name) != compatibleNames.end();
     }

@@ -65,6 +65,7 @@ TARGET_DICTIONARY = {
     "android-aarch64": "aarch64-linux-android31",
     "android31-aarch64": "aarch64-linux-android31",
     "android26-aarch64": "aarch64-linux-android26",
+    "android23-arm": "arm-linux-android23",
     "android-x86_64": "x86_64-linux-android",
     "android31-x86_64": "x86_64-linux-android31",
     "android26-x86_64": "x86_64-linux-android26"
@@ -127,9 +128,11 @@ def generate_cmake_defs(args):
         elif args.target == "arm64-apple-ios11-simulator":
             toolchain_file = "ios_simulator_arm64_toolchain.cmake"
         elif args.target == "x86_64-apple-ios11-simulator":
- 	        toolchain_file = "ios_simulator_x86_64_toolchain.cmake"
+            toolchain_file = "ios_simulator_x86_64_toolchain.cmake"
         elif args.target == "arm64-apple-ios11":
             toolchain_file = "ios_arm64_toolchain.cmake"
+        elif args.target == "arm-linux-android23":
+            toolchain_file = "android_arm32_toolchain.cmake"
         elif "aarch64-linux-android" in args.target:
             toolchain_file = "android_aarch64_toolchain.cmake"
         elif "x86_64-linux-android" in args.target:
@@ -340,6 +343,7 @@ def set_cangjie_env(args):
     os.environ[LD_LIBRARY_PATH] = PATH_ENV_SEPERATOR.join([
         os.path.join(HOME_DIR, "output/lib"),
         os.path.join(HOME_DIR, "output/runtime/lib/{os}_{arch}_cjnative".format(os=CJ_OS_NAME, arch=CJ_ARCH_NAME)),
+        os.path.join(HOME_DIR, "output/tools/lib"),
         os.environ.get(LD_LIBRARY_PATH, "")
     ])
     LOG.info("set cangjie env: %s=%s", LD_LIBRARY_PATH, os.environ[LD_LIBRARY_PATH])
@@ -516,8 +520,8 @@ def package_mingw_dependencies(args):
     copy_files_to(os.path.join(mingw_path, "x86_64-w64-mingw32"), dll_dependencies, os.path.join(mingw_package_path, "dll"))
     lib_dependencies = ["crt2.o", "dllcrt2.o", "libadvapi32.a", "libkernel32.a", "libm.a", "libmingw32.a",
                             "libmingwex.a", "libmoldname.a", "libmsvcrt.a", "libpthread.a", "libshell32.a", "libuser32.a",
-                             "libc++.a", "libdbghelp.a", "libshlwapi.a", "libunwind.a",
-                            "libws2_32.a", "libcrypt32.a", "crtbegin.o", "crtend.o"]
+                            "libc++.a", "libdbghelp.a", "libshlwapi.a", "libunwind.a",
+                            "libws2_32.a", "libcrypt32.a", "crtbegin.o", "crtend.o", "CRT_glob.o"]
     copy_files_to(os.path.join(mingw_path, "x86_64-w64-mingw32/lib"), lib_dependencies, os.path.join(mingw_package_path, "lib"))
 
     subprocess.run(["tar", "-C", "mingw", "-zcf", "windows-x86_64-mingw.tar.gz", "dll", "lib"],
@@ -645,8 +649,8 @@ def main():
         help="build cjdb without python extension"
     )
     parser_build.add_argument(
-        "--install-cjdb-script", action="store_true",
-        help="install cjdb with python script"
+            "--install-cjdb-script", action="store_true",
+            help="install cjdb with python script"
     )
     parser_build.add_argument(
         "--use-oh-llvm-repo", action="store_true",
@@ -721,7 +725,7 @@ def check_compiler(args):
     # If cross-compiling cjc, a native compiler is also needed by cross-building LLVM,
     # because it needs some native tools like llvm-tblgen to generate codes.
     # In this case, CMake will use the value in $CC as the native compiler.
-    if args.target and args.product == "cjc":
+    if args.target and args.product == "cjc" and not c_compiler.endswith("clang"):
         os.environ["CC"] = shutil.which("clang") + (" --gcc-toolchain={}".format(args.gcc_toolchain) if args.gcc_toolchain else "")
         os.environ["CXX"] = shutil.which("clang++") + (" --gcc-toolchain={}".format(args.gcc_toolchain) if args.gcc_toolchain else "")
     else:

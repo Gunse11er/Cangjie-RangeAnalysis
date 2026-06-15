@@ -1,5 +1,5 @@
 name: "缺陷反馈|Bug"
-description: "当您发现了一个缺陷，需要向社区反馈时，请使用此模板。  Please use this template when you find a bug and want to report it to the community."
+description: "当您发现了一个缺陷，需要向社区反馈时，请使用此模板。 &#124; Please use this template when you find a bug and want to report it to the community."
 title: "[Bug]: "
 labels: ["bug"]
 body:
@@ -23,7 +23,7 @@ body:
       required: true
   - type: textarea
     attributes:
-      label: "如何复现该缺陷？ | How to reproduce the bug?"
+      label: "如何复现该缺陷 | How to reproduce the bug"
       description: "提供尽可能多的信息描述如何复现该缺陷： | Provide as much information as possible on how to reproduce the bug."
     validations:
       required: true

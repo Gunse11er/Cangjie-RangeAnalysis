@@ -32,39 +32,36 @@ void CheckAnnoC(const Decl& decl, const Annotation& anno, DiagnosticEngine& diag
     if (Utils::NotIn(decl.astKind, {ASTKind::FUNC_DECL, ASTKind::STRUCT_DECL})) {
         diag.Diagnose(anno, DiagKind::sema_illegal_use_of_annotation, DeclKindToString(decl), "@C");
     } else if (decl.outerDecl != nullptr || decl.scopeLevel > 0) {
-        diag.Diagnose(anno, DiagKind::sema_illegal_scope_use_of_annotation, "@C");
+        diag.DiagnoseRefactor(DiagKindRefactor::sema_illegal_scope_use_of_annotation, anno, "@C");
     }
 }
 
 void CheckAnnoCallingConv(Decl& decl, const Annotation& anno, DiagnosticEngine& diag)
 {
     if (decl.outerDecl != nullptr || decl.scopeLevel > 0) {
-        diag.Diagnose(anno, DiagKind::sema_illegal_scope_use_of_annotation, "@CallingConv");
+        diag.DiagnoseRefactor(DiagKindRefactor::sema_illegal_scope_use_of_annotation, anno, "@CallingConv");
         return;
     }
     if (decl.astKind != ASTKind::FUNC_DECL || (!decl.TestAttr(Attribute::FOREIGN) && !decl.TestAttr(Attribute::C))) {
-        // Will be merged with sema_unsupported_annotation_in_js_interop.
         // Will be replaced with anno->identifier.
-        diag.Diagnose(anno, DiagKind::sema_only_cfunc_can_use_annotation, "@CallingConv");
+        diag.DiagnoseRefactor(DiagKindRefactor::sema_only_cfunc_can_use_annotation, anno, "@CallingConv");
         return;
     }
     if (anno.args.size() != 1) {
-        diag.Diagnose(anno, DiagKind::sema_annotation_error_arg_num, "@CallingConv", "one");
+        diag.DiagnoseRefactor(DiagKindRefactor::sema_annotation_error_arg_num, anno, "@CallingConv", "one");
         return;
     }
     if (auto refExpr = DynamicCast<RefExpr*>(anno.args.front()->expr.get()); refExpr) {
         std::unordered_map<std::string, Attribute> callingConvMap = {
             {"CDECL", Attribute::C},
-            {"STDCALL", Attribute::STD_CALL},
         };
         if (callingConvMap.find(refExpr->ref.identifier) == callingConvMap.end()) {
-            // Will be merged with sema_unsupported_annotation_in_js_interop.
-            diag.Diagnose(anno, DiagKind::sema_annotation_calling_conv_not_support, refExpr->ref.identifier.Val());
+            diag.DiagnoseRefactor(DiagKindRefactor::sema_annotation_calling_conv_not_support, anno, refExpr->ref.identifier.Val());
             return;
         }
         decl.EnableAttr(callingConvMap[refExpr->ref.identifier]);
     } else {
-        diag.Diagnose(anno, DiagKind::sema_annotation_invalid_args_type, "@CallingConv");
+        diag.DiagnoseRefactor(DiagKindRefactor::sema_annotation_invalid_args_type, anno, "@CallingConv");
     }
 }
 
@@ -80,7 +77,7 @@ void CheckAnnoFastNative(const Decl& decl, const Annotation& anno, DiagnosticEng
         return;
     }
     if (decl.outerDecl != nullptr || decl.scopeLevel > 0) {
-        diag.Diagnose(anno, DiagKind::sema_illegal_scope_use_of_annotation, "@FastNative");
+        diag.DiagnoseRefactor(DiagKindRefactor::sema_illegal_scope_use_of_annotation, anno, "@FastNative");
     }
 }
 
@@ -135,8 +132,8 @@ bool IsZeroSizedTy(const Ty& ty)
             if (member->astKind != ASTKind::VAR_DECL || member->TestAttr(Attribute::STATIC)) {
                 continue;
             }
-            CJC_ASSERT(Ty::IsTyCorrect(member->ty));
-            if (!isZeroSizedTy(*member->ty)) {
+            CJC_ASSERT(Ty::IsTyCorrect(member->GetTy()));
+            if (!isZeroSizedTy(*member->GetTy())) {
                 return false;
             }
         }
@@ -213,7 +210,7 @@ bool TypeChecker::TypeCheckerImpl::IsInCFunc(const ASTContext& ctx, const AST::R
     Symbol* curFuncSym = ScopeManager::GetCurSymbolByKind(SymbolKind::FUNC_LIKE, ctx, re.scopeName);
     while (curFuncSym && curFuncSym->scopeName.length() > 0) {
         if (auto le = DynamicCast<LambdaExpr*>(curFuncSym->node);
-            le && Ty::IsTyCorrect(le->ty) && le->ty->IsCFunc()) {
+            le && Ty::IsTyCorrect(le->GetTy()) && le->GetTy()->IsCFunc()) {
             return true;
         }
         curFuncSym = ScopeManager::GetCurSymbolByKind(SymbolKind::FUNC_LIKE, ctx, curFuncSym->scopeName);
@@ -223,18 +220,18 @@ bool TypeChecker::TypeCheckerImpl::IsInCFunc(const ASTContext& ctx, const AST::R
 
 void TypeChecker::TypeCheckerImpl::CheckCTypeMember(const Decl& decl)
 {
-    if (decl.astKind != ASTKind::VAR_DECL || Ty::IsInitialTy(decl.ty) || decl.outerDecl == nullptr ||
-        !Ty::IsTyCorrect(decl.outerDecl->ty)) {
+    if (decl.astKind != ASTKind::VAR_DECL || Ty::IsInitialTy(decl.GetTy()) || decl.outerDecl == nullptr ||
+        !Ty::IsTyCorrect(decl.outerDecl->GetTy())) {
         return;
     }
-    if (Ty::IsCStructType(*decl.outerDecl->ty)) {
+    if (Ty::IsCStructType(*decl.outerDecl->GetTy())) {
         const auto& vd = StaticCast<const VarDecl&>(decl);
-        if (vd.ty->IsUnit()) {
+        if (vd.GetTy()->IsUnit()) {
             diag.Diagnose(vd.identifier.Begin(), vd.type ? vd.type->end : vd.identifier.End(),
                 DiagKind::sema_cstruct_cannot_have_unit_fields, vd.identifier.Val());
             return;
         }
-        if (Ty::IsMetCType(*vd.ty)) {
+        if (Ty::IsMetCType(*vd.GetTy())) {
             return;
         }
         diag.Diagnose(vd.identifier.Begin(), vd.type ? vd.type->end : vd.identifier.End(),
@@ -244,10 +241,11 @@ void TypeChecker::TypeCheckerImpl::CheckCTypeMember(const Decl& decl)
 
 void TypeChecker::TypeCheckerImpl::CheckUnsafeInvoke(const CallExpr& ce)
 {
-    if (ce.resolvedFunction == nullptr || !Ty::IsTyCorrect(ce.resolvedFunction->ty) || !IsUnsafeBackend(backendType)) {
+    if (ce.resolvedFunction == nullptr || !Ty::IsTyCorrect(ce.resolvedFunction->GetTy()) ||
+        !IsUnsafeBackend(backendType)) {
         return;
     }
-    auto funcTy = StaticCast<FuncTy*>(ce.resolvedFunction->ty);
+    auto funcTy = StaticCast<FuncTy*>(ce.resolvedFunction->GetTy());
     bool isUnsafe = ce.resolvedFunction->TestAttr(Attribute::UNSAFE) ||
         ce.resolvedFunction->TestAttr(Attribute::FOREIGN) || funcTy->isC;
     if (!isUnsafe) {
@@ -268,9 +266,9 @@ void TypeChecker::TypeCheckerImpl::CheckLegalityOfUnsafeAndInout(Node& root)
             const auto& fa = static_cast<const FuncArg&>(*node);
             // If the object modified by inout isn't a RefExpr or MemberAccess node or doesn't meet CType constraint,
             // it's wrong and will be diagnosed in the previous stage.
-            if (fa.withInout && Ty::IsTyCorrect(fa.expr->ty) &&
+            if (fa.withInout && Ty::IsTyCorrect(fa.expr->GetTy()) &&
                 Utils::In(fa.expr->astKind, {ASTKind::REF_EXPR, ASTKind::MEMBER_ACCESS}) &&
-                Ty::IsMetCType(*fa.expr->ty) && IsZeroSizedTy(*fa.expr->ty)) {
+                Ty::IsMetCType(*fa.expr->GetTy()) && IsZeroSizedTy(*fa.expr->GetTy())) {
                 diag.DiagnoseRefactor(DiagKindRefactor::sema_inout_modify_cstring_or_zerosized, fa, "zero-sized type");
             }
         }
@@ -286,14 +284,14 @@ void TypeChecker::TypeCheckerImpl::UnsafeCheck(const FuncBody& fb)
             CheckCFuncParam(*arg);
         }
         CJC_NULLPTR_CHECK(fb.retType);
-        if (!Ty::IsTyCorrect(fb.retType->ty)) {
+        if (!Ty::IsTyCorrect(fb.retType->GetTy())) {
             return;
         }
-        if (!Ty::IsMetCType(*fb.retType->ty)) {
+        if (!Ty::IsMetCType(*fb.retType->GetTy())) {
             auto builder = diag.DiagnoseRefactor(DiagKindRefactor::sema_invalid_cfunc_return_type, *fb.retType,
                 GetFuncBodyRange(fb, *fb.retType));
-            builder.AddNote("return type is " + fb.retType->ty->String());
-        } else if (Is<VArrayTy>(fb.retType->ty)) {
+            builder.AddNote("return type is " + fb.retType->GetTy()->String());
+        } else if (Is<VArrayTy>(fb.retType->GetTy())) {
             // VArray not allowed as CFunc return type.
             diag.DiagnoseRefactor(
                 DiagKindRefactor::sema_varray_in_cfunc, *fb.retType, GetFuncBodyRange(fb, *fb.retType));
@@ -303,24 +301,24 @@ void TypeChecker::TypeCheckerImpl::UnsafeCheck(const FuncBody& fb)
 
 void TypeChecker::TypeCheckerImpl::CheckCFuncParam(const AST::FuncParam& fp)
 {
-    if (!Ty::IsTyCorrect(fp.ty)) {
+    if (!Ty::IsTyCorrect(fp.GetTy())) {
         return;
     }
     if (fp.isNamedParam) {
         diag.Diagnose(fp, DiagKind::sema_cfunc_cannot_have_named_args);
     }
-    if (fp.ty->IsUnit()) {
+    if (fp.GetTy()->IsUnit()) {
         diag.Diagnose(fp.identifier.Begin(), fp.type->end, DiagKind::sema_cfunc_cannot_have_unit_args);
-    } else if (!Ty::IsMetCType(*fp.ty)) {
+    } else if (!Ty::IsMetCType(*fp.GetTy())) {
         diag.Diagnose(fp.identifier.Begin(), fp.type->end, DiagKind::sema_invalid_cfunc_arg_type);
     }
 }
 
 void TypeChecker::TypeCheckerImpl::CheckCFuncParamType(const AST::Type& type)
 {
-    if (type.ty->IsUnit()) {
+    if (type.GetTy()->IsUnit()) {
         diag.Diagnose(type.begin, type.end, DiagKind::sema_cfunc_cannot_have_unit_args);
-    } else if (!Ty::IsMetCType(*type.ty)) {
+    } else if (!Ty::IsMetCType(*type.GetTy())) {
         diag.Diagnose(type.begin, type.end, DiagKind::sema_invalid_cfunc_arg_type);
     }
 }

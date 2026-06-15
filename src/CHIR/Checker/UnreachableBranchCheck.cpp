@@ -9,7 +9,7 @@
 using namespace Cangjie::CHIR;
 
 UnreachableBranchCheck::UnreachableBranchCheck(
-    ConstAnalysisWrapper* constAnalysisWrapper, DiagAdapter& diag, const std::string& packageName)
+    ConstAnalysisWrapper* constAnalysisWrapper, DiagnosticEngine& diag, const std::string& packageName)
     : diag(diag), analysisWrapper(constAnalysisWrapper), currentPackageName(packageName)
 {
 }
@@ -30,7 +30,7 @@ std::string GetKeyWordBySourceExpr(const Branch& branch)
 void UnreachableBranchCheck::RunOnPackage(const Package& package, size_t threadNum)
 {
     if (threadNum == 1) {
-        for (auto func : package.GetGlobalFuncs()) {
+        for (auto func : package.GetGlobalFuncsWithBody()) {
             /* The following code should not report warning.
             interface I {
                 func test() : Bool {
@@ -48,7 +48,7 @@ void UnreachableBranchCheck::RunOnPackage(const Package& package, size_t threadN
     } else {
         Utils::TaskQueue taskQueue(threadNum);
         // Check in generic decl is not currently supported, as constant analysis does not yet support.
-        for (auto func : package.GetGlobalFuncs()) {
+        for (auto func : package.GetGlobalFuncsWithBody()) {
             if (func->Get<SkipCheck>() == SkipKind::SKIP_DCE_WARNING) {
                 continue;
             }
@@ -112,7 +112,7 @@ void UnreachableBranchCheck::PrintWarning(
 }
 
 template <typename TConstDomain>
-void UnreachableBranchCheck::VisitFunc(Results<TConstDomain>& result)
+void UnreachableBranchCheck::VisitFunc(Results<TConstDomain>& result) 
 {
     const auto actionBeforeVisitExpr = [](const TConstDomain&, Expression*, size_t) {};
     const auto actionAfterVisitExpr = [](const TConstDomain&, Expression*, size_t) {};
@@ -155,7 +155,7 @@ void UnreachableBranchCheck::VisitFunc(Results<TConstDomain>& result)
     result.VisitWith(actionBeforeVisitExpr, actionAfterVisitExpr, actionOnTerminator);
 }
 
-void UnreachableBranchCheck::RunOnFunc(const Ptr<Func> func)
+void UnreachableBranchCheck::RunOnFunc(const Ptr<Function> func)
 {
     // we should check the generic func, not the instantiated func.
     if (func->TestAttr(Attribute::GENERIC_INSTANTIATED)) {

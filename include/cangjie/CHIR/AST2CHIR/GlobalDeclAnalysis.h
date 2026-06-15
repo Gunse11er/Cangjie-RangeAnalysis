@@ -13,15 +13,16 @@
 
 #include "cangjie/AST/Node.h"
 #include "cangjie/AST/Walker.h"
+#include "cangjie/Basic/DiagnosticEngine.h"
 #include "cangjie/Sema/GenericInstantiationManager.h"
 
 namespace Cangjie::CHIR {
 class GlobalDeclAnalysis {
 public:
-    GlobalDeclAnalysis(DiagAdapter& ciDiag, const GenericInstantiationManager* gim, IncreKind kind,
+    GlobalDeclAnalysis(DiagnosticEngine& ciDiag, const GenericInstantiationManager* gim, IncreKind kind,
         const ElementList<Ptr<const AST::Decl>>& funcsAndVars, const ElementList<Ptr<const AST::Decl>>& localConstVars,
         const StaticInitInfoMap& staticInitFuncInfoMap, bool outputChir = false, bool mergingSpecific = false)
-        : diag(&ciDiag),
+        : diag(ciDiag),
           gim(gim),
           kind(kind),
           funcsAndVars(funcsAndVars),
@@ -85,7 +86,7 @@ private:
         CompilationCache& cachedInfo);
     InitOrder SortLocalConstVarDep(const InitOrder& initOrder);
 
-    DiagAdapter* diag;
+    DiagnosticEngine& diag;
     const GenericInstantiationManager* gim;
     IncreKind kind;
 
@@ -168,27 +169,27 @@ public:
 };
 class VarCirDepsChecker : public TarjanSort<Ptr<const AST::Decl>> {
 public:
-    explicit VarCirDepsChecker(DiagAdapter& ciDiag);
+    explicit VarCirDepsChecker(DiagnosticEngine& ciDiag);
     void DetectCircularDep() override;
     std::string GetEleStr(Ptr<const AST::Decl> decl) const override
     {
         return decl->identifier;
     }
     bool IsVar(const AST::Decl& decl) const;
-    DiagAdapter* diag;
+    DiagnosticEngine& diag;
     std::vector<std::string> diagLog;
 };
 
 class FileCirDepsChecker : public TarjanSort<Ptr<const AST::File>> {
 public:
-    FileCirDepsChecker(DiagAdapter& ciDiag, const std::vector<std::string>& vardiagLog);
+    FileCirDepsChecker(DiagnosticEngine& ciDiag, const std::vector<std::string>& vardiagLog);
     void InitFileDep(const FileDepMap& depMap);
     void DetectCircularDep() override;
     std::string GetEleStr(Ptr<const AST::File> node) const override
     {
         return node->fileName;
     }
-    DiagAdapter* diag;
+    DiagnosticEngine& diag;
     std::vector<std::string> diagLog;
 };
 

@@ -11,6 +11,7 @@
 #include "cangjie/CHIR/IR/Package.h"
 
 #include <string>
+#include <flatbuffers/detached_buffer.h>
 
 namespace Cangjie::CHIR {
 
@@ -18,6 +19,7 @@ class CHIRSerializer {
     class CHIRSerializerImpl;
 public:
     static void Serialize(const Package& package, const std::string filename, ToCHIR::Phase phase);
+    static flatbuffers::DetachedBuffer Serialize(const Package& package);
 };
 
 } // namespace Cangjie::CHIR

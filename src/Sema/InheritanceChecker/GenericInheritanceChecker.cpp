@@ -64,7 +64,7 @@ void StructInheritanceChecker::CheckUpperBoundsConfliction(const Generic& generi
 {
     for (auto& gc : generic.genericConstraints) {
         CJC_ASSERT(gc && gc->type);
-        auto gTy = DynamicCast<GenericsTy*>(gc->type->ty);
+        auto gTy = DynamicCast<GenericsTy*>(gc->type->GetTy());
         if (gTy == nullptr || gTy->decl->TestAttr(Attribute::IN_REFERENCE_CYCLE)) {
             continue; // Ignore invalid generic types.
         }

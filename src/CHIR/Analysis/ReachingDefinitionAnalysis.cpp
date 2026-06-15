@@ -15,8 +15,8 @@ using namespace Cangjie::CHIR;
 
 ReachingDefinitionDomain::ReachingDefinitionDomain(std::unordered_map<const Value*, size_t>* allocateIdxMap)
     : AbstractDomain(),
-      reachingDefs(std::vector<FlatSet<const Store>>(allocateIdxMap->size(), FlatSet<const Store>(false))),
-      reachingLoadDefs(std::vector<FlatSet<const Load>>(allocateIdxMap->size(), FlatSet<const Load>(false))),
+      reachingDefs(std::vector<FlatSet<const Store*>>(allocateIdxMap->size(), FlatSet<const Store*>(false))),
+      reachingLoadDefs(std::vector<FlatSet<const Load*>>(allocateIdxMap->size(), FlatSet<const Load*>(false))),
       allocateIdxMap(allocateIdxMap)
 {
 }
@@ -71,7 +71,7 @@ const Load* ReachingDefinitionDomain::CheckReachingLoadDef(const Value* location
 template <> const std::string Analysis<ReachingDefinitionDomain>::name = "reaching-definition";
 template <> const std::optional<unsigned> Analysis<ReachingDefinitionDomain>::blockLimit = std::nullopt;
 
-ReachingDefinitionAnalysis::ReachingDefinitionAnalysis(const Func* func) : Analysis(func)
+ReachingDefinitionAnalysis::ReachingDefinitionAnalysis(const Function* func) : Analysis(func)
 {
     size_t allocateIdx = 0;
     size_t worklistIdx = 0;

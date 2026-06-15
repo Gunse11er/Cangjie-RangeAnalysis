@@ -110,7 +110,7 @@ public:
     std::list<Token> LookAheadSkipNL(size_t num);
     /// Return all comments collected, and clear the comment cache
     std::vector<Token> GetComments();
-    const std::vector<Token>& GetTokenStream() const;
+    const std::set<Token>& GetTokenStream() const;
 
     /// interface between Lexer and Parser
     /// Enter quote context. That is, # ` \\ can be parsed as tokens.

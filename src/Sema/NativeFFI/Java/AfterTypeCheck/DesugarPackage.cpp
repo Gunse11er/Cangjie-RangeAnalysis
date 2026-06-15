@@ -1,4 +1,4 @@
-// Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+// Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 // This source file is part of the Cangjie project, licensed under Apache-2.0
 // with Runtime Library Exception.
 //
@@ -6,40 +6,47 @@
 
 #include "JavaDesugarManager.h"
 #include "JavaInteropManager.h"
+#include "GenerateJavaImplApiStub.h"
+#include "GenerateInJavaImplRegistryCompanion.h"
+#include "DesugarJavaImplSuperConstructorCall.h"
+#include "DesugarJavaImplSuperMethodCall.h"
+#include "GenerateInJavaImplReferenceWrapper.h"
+#include "RewriteJavaImplReferenceWrapperFields.h"
+#include "GenerateNativeBridgeForJavaImpl.h"
+#include "DesugarTypeCheckingAndCasting.h"
+#include "DesugarJArray.h"
 #include "NativeFFI/Java/AfterTypeCheck/InteropLibBridge.h"
-#include "cangjie/AST/Match.h"
-#include "cangjie/AST/Walker.h"
-#include "cangjie/Utils/ConstantsUtils.h"
+#include <unordered_map>
 
 namespace Cangjie::Interop::Java {
 
-void JavaDesugarManager::ProcessJavaMirrorImplStage(DesugarJavaMirrorImplStage stage, File& file)
+void JavaDesugarManager::ProcessJavaMirrorImplStage(AfterTypeCheckContext& ctx,
+    std::function<void(AST::Node&)> desugarPropRef)
 {
-    switch (stage) {
-        case DesugarJavaMirrorImplStage::MIRROR_GENERATE_STUB:
-            GenerateInMirrors(file, true);
-            break;
-        case DesugarJavaMirrorImplStage::MIRROR_GENERATE:
-            GenerateInMirrors(file, false);
-            break;
-        case DesugarJavaMirrorImplStage::IMPL_GENERATE:
-            GenerateInJavaImpls(file);
-            break;
-        case DesugarJavaMirrorImplStage::MIRROR_DESUGAR:
-            DesugarMirrors(file);
-            break;
-        case DesugarJavaMirrorImplStage::IMPL_DESUGAR:
-            DesugarInJavaImpls(file);
-            break;
-        case DesugarJavaMirrorImplStage::TYPECHECKS:
-            DesugarTypechecks(file);
-            break;
-        default:
-            CJC_ABORT(); // unreachable state
+    for (auto& file : ctx.pkg.files) {
+        GenerateInMirrors(*file, true);
     }
 
-    std::move(generatedDecls.begin(), generatedDecls.end(), std::back_inserter(file.decls));
-    generatedDecls.clear();
+    Process<GenerateJavaImplWrappingConstructorStub>(ctx, *this);
+
+    for (auto& file : ctx.pkg.files) {
+        GenerateInMirrors(*file, false);
+    }
+
+    Process<GenerateInJavaImplRegistryCompanion>(ctx, *this);
+    Process<DesugarJavaImplSuperConstructorCall>(ctx, *this);
+    Process<GenerateInJavaImplReferenceWrapper>(ctx, *this);
+    Process<DesugarSuperMethodCallInJavaImplReferenceWrapper>(ctx, *this);
+    Process<RewriteJavaImplReferenceWrapperFields>(ctx, *this, desugarPropRef);
+    Process<GenerateNativeBridgeForJavaImpl>(ctx, *this);
+
+    for (auto& file : ctx.pkg.files) {
+        DesugarMirrors(*file);
+    }
+
+    Process<DesugarJArray>(ctx, *this);
+    GenerateJavaSourceCode(ctx);
+    Process<DesugarTypeCheckingAndCasting>(ctx, *this);
 }
 
 void JavaDesugarManager::ProcessCJImplStage(DesugarCJImplStage stage, File& file)
@@ -57,9 +64,6 @@ void JavaDesugarManager::ProcessCJImplStage(DesugarCJImplStage stage, File& file
         case DesugarCJImplStage::IMPL_DESUGAR:
             DesugarInCJMapping(file);
             break;
-        case DesugarCJImplStage::TYPECHECKS:
-            DesugarTypechecks(file);
-            break;
         default:
             CJC_ABORT(); // unreachable state
     }
@@ -68,8 +72,10 @@ void JavaDesugarManager::ProcessCJImplStage(DesugarCJImplStage stage, File& file
     generatedDecls.clear();
 }
 
-void JavaInteropManager::DesugarPackage(
-    Package& pkg, const std::unordered_map<Ptr<const InheritableDecl>, MemberMap>& memberMap)
+void JavaInteropManager::DesugarPackage(Package& pkg,
+    const std::unordered_map<Ptr<const InheritableDecl>,
+    MemberMap>& memberMap,
+    std::function<void(AST::Node&)> desugarPropRef)
 {
     if (!(hasMirrorOrImpl || targetInteropLanguage == GlobalOptions::InteropLanguage::Java)) {
         return;
@@ -82,17 +88,8 @@ void JavaInteropManager::DesugarPackage(
     }
 
     if (hasMirrorOrImpl) {
-        auto nbegin = static_cast<uint8_t>(DesugarJavaMirrorImplStage::BEGIN);
-        auto nend = static_cast<uint8_t>(DesugarJavaMirrorImplStage::END);
-        for (uint8_t nstage = nbegin; nstage != nend; nstage++) {
-            auto stage = static_cast<DesugarJavaMirrorImplStage>(nstage);
-            if (stage == DesugarJavaMirrorImplStage::BEGIN) {
-                continue;
-            }
-            for (auto& file : pkg.files) {
-                desugarer.ProcessJavaMirrorImplStage(stage, *file);
-            }
-        }
+        AfterTypeCheckContext ctx{importManager, typeManager, pkg};
+        desugarer.ProcessJavaMirrorImplStage(ctx, desugarPropRef);
     }
 
     // Currently CJMapping is enable by compile config --enable-interop-cjmapping

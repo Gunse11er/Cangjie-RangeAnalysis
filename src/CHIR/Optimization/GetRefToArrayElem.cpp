@@ -13,12 +13,12 @@ using namespace Cangjie::CHIR;
 
 void GetRefToArrayElem::RunOnPackage(const Package& package, CHIRBuilder& builder)
 {
-    for (auto func : package.GetGlobalFuncs()) {
+    for (auto func : package.GetGlobalFuncsWithBody()) {
         RunOnFunc(*func, builder);
     }
 }
 
-void GetRefToArrayElem::RunOnFunc(const Func& func, CHIRBuilder& builder)
+void GetRefToArrayElem::RunOnFunc(const Function& func, CHIRBuilder& builder)
 {
     for (auto block : func.GetBody()->GetBlocks()) {
         for (auto expr : block->GetExpressions()) {
@@ -39,16 +39,16 @@ void GetRefToArrayElem::RunOnFunc(const Func& func, CHIRBuilder& builder)
             };
             auto arrayGetRef = builder.CreateExpression<Intrinsic>(
                 builder.GetType<RefType>(intrinsic->GetResult()->GetType()), callContext, intrinsic->GetParentBlock());
-            arrayGetRef->CopyAnnotationMapFrom(*intrinsic);
+            arrayGetRef->CopyBaseInfoFrom(*intrinsic);
             for (auto user : users) {
                 auto field = StaticCast<Field*>(user);
                 auto fieldTy = field->GetResult()->GetType();
                 auto getElemRef = builder.CreateExpression<GetElementRef>(builder.GetType<RefType>(fieldTy),
                     arrayGetRef->GetResult(), field->GetPath(), field->GetParentBlock());
-                getElemRef->CopyAnnotationMapFrom(*field);
+                getElemRef->CopyBaseInfoFrom(*field);
                 getElemRef->GetResult()->EnableAttr(Attribute::READONLY);
                 auto load = builder.CreateExpression<Load>(fieldTy, getElemRef->GetResult(), field->GetParentBlock());
-                load->CopyAnnotationMapFrom(*field);
+                load->CopyBaseInfoFrom(*field);
                 getElemRef->MoveBefore(user);
                 field->ReplaceWith(*load);
             }

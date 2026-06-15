@@ -178,7 +178,7 @@ template <typename T> T CutOffHighBits(T srcNum, Type::TypeKind destTypeKind)
  * @param store store expression.
  * @return path of member var.
  */
-std::optional<size_t> IsInitialisingMemberVar(const Func& func, const StoreElementRef& store);
+std::optional<size_t> IsInitialisingMemberVar(const Function& func, const StoreElementRef& store);
 
 /**
  * @brief This function will check if an expression is an Apply expression, and if it's callee
@@ -208,7 +208,7 @@ bool IsRefEnum(const Ptr<Type>& type);
 bool IsUnsignedArithmetic(const BinaryExpression& expr);
 
 /// get CHIR func value from apply.
-Func* TryGetInstanceVarInitFromApply(const Expression& expr);
+Function* TryGetInstanceVarInitFromApply(const Expression& expr);
 
 /**
  * @brief Get mutable variables that captured by lambda recursively.

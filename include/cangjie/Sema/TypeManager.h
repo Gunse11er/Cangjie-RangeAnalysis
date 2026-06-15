@@ -114,6 +114,11 @@ public:
     std::set<Ptr<AST::Ty>> GetInstantiatedTys(Ptr<AST::Ty> ty, const MultiTypeSubst& mts);
     Ptr<AST::Ty> GetBestInstantiatedTy(Ptr<AST::Ty> ty, const MultiTypeSubst& mts);
     Ptr<AST::Ty> GetInstantiatedTy(Ptr<AST::Ty> ty, const TypeSubst& typeMapping);
+    /**
+     * Apply type substitution if typeMapping is not empty.
+     * This is a helper function that combines PackMapping and ApplySubstPack.
+     */
+    Ptr<AST::Ty> ApplyTypeSubstForTy(const TypeSubst& typeMapping, const Ptr<AST::Ty> ty);
     std::set<Ptr<AST::Ty>> ApplyTypeSubstForTys(const TypeSubst& subst, const std::set<Ptr<TyVar>>& tys);
     Ptr<AST::Ty> ApplySubstPack(const Ptr<AST::Ty> declaredTy, const SubstPack& maps, bool ignoreUnsolved = false);
     std::set<Ptr<AST::Ty>> ApplySubstPackNonUniq(
@@ -192,7 +197,7 @@ public:
     void GenerateGenericMapping(SubstPack& m, AST::Ty& baseType);
     TypeSubst GenerateGenericMappingFromGeneric(const AST::Decl& parentDecl, const AST::Decl& childDecl) const;
     MultiTypeSubst GenerateStructDeclTypeMapping(const AST::Decl& decl);
-    void ReplaceIdealTy(Ptr<AST::Ty>* ty);
+    Ptr<AST::Ty> ReplaceIdealTy(Ptr<AST::Ty> ty);
     void RestoreJavaGenericsTy(AST::Decl& decl) const;
 
     /**
@@ -337,6 +342,12 @@ public:
     Ptr<AST::Ty> TryGreedySubst(Ptr<AST::Ty> ty);
     // constraints for placeholder type vars
     Constraint constraints;
+
+    /// recursively replace This in type args
+    Ptr<AST::Ty> ReplaceThisTy(Ptr<AST::Ty> now);
+    /// get the class ty that This refers to if it is a This ty
+    Ptr<AST::Ty> GetThisRealTy(Ptr<AST::Ty> now);
+
     /**
      * @brief Obtains the alias type of node if node's ty have alias type reference.
      * @param node the node which map contain alias type reference.

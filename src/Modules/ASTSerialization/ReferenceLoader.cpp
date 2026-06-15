@@ -38,7 +38,7 @@ void SetMemberDeclReference(Decl& member, Decl& parentDecl)
 {
     auto parentTypeDecl = &parentDecl;
     if (parentDecl.astKind == ASTKind::EXTEND_DECL) {
-        if (auto extendedDecl = Ty::GetDeclPtrOfTy(parentDecl.ty)) {
+        if (auto extendedDecl = Ty::GetDeclPtrOfTy(parentDecl.GetTy())) {
             parentTypeDecl = extendedDecl;
         }
     }
@@ -90,11 +90,11 @@ OwnedPtr<RefType> Wrap2RefType(Ptr<Ty> ty)
         hasTypeAlias = hasTypeAlias || !Ty::IsInitialTy(refType->typeArguments.back()->aliasTy);
     }
     // The refType's ty of TypeAlias reference will be updated after loading all type aliases.
-    refType->ty = ty;
+    refType->SetTy(ty);
     refType->ref.identifier = ty->name;
     if (auto decl = Ty::GetDeclPtrOfTy(ty)) {
         refType->ref.target = decl;
-        refType->ref.identifier = Is<ClassThisTy>(refType->ty) ? "This" : decl->identifier.Val();
+        refType->ref.identifier = Is<ClassThisTy>(refType->GetTy()) ? "This" : decl->identifier.Val();
     }
     if (hasTypeAlias) {
         refType->aliasTy = ty;
@@ -117,7 +117,7 @@ OwnedPtr<Type> WrapType(Ptr<Ty> ty)
     if (ty->kind <= TypeKind::TYPE_BOOLEAN && ty->kind != TypeKind::TYPE_NOTHING) {
         auto pt = MakeOwned<PrimitiveType>();
         pt->str = ty->String();
-        pt->ty = ty;
+        pt->SetTy(ty);
         pt->EnableAttr(Attribute::IMPORTED, Attribute::COMPILER_ADD, Attribute::IS_CHECK_VISITED);
         return pt;
     } else if (ty->kind == TypeKind::TYPE_FUNC) {
@@ -127,7 +127,7 @@ OwnedPtr<Type> WrapType(Ptr<Ty> ty)
             funcType->paramTypes.emplace_back(WrapType(param));
             hasTypeAlias = hasTypeAlias || !Ty::IsInitialTy(funcType->paramTypes.back()->aliasTy);
         }
-        funcType->ty = ty;
+        funcType->SetTy(ty);
         funcType->retType = WrapType(funcTy->retTy);
         hasTypeAlias = hasTypeAlias || !Ty::IsInitialTy(funcType->retType->aliasTy);
         funcType->EnableAttr(Attribute::IMPORTED, Attribute::COMPILER_ADD, Attribute::IS_CHECK_VISITED);
@@ -142,7 +142,7 @@ OwnedPtr<Type> WrapType(Ptr<Ty> ty)
             tupleType->fieldTypes.emplace_back(WrapType(typeArg));
             hasTypeAlias = hasTypeAlias || !Ty::IsInitialTy(tupleType->fieldTypes.back()->aliasTy);
         }
-        tupleType->ty = ty;
+        tupleType->SetTy(ty);
         tupleType->EnableAttr(Attribute::IMPORTED, Attribute::COMPILER_ADD, Attribute::IS_CHECK_VISITED);
         if (hasTypeAlias) {
             tupleType->aliasTy = ty;
@@ -157,9 +157,9 @@ void UpdateType(OwnedPtr<Type>& astType, OwnedPtr<Type> loadedType)
     CJC_NULLPTR_CHECK(loadedType);
     if (astType == nullptr) {
         astType = std::move(loadedType);
-    } else if (Ty::IsTyCorrect(loadedType->ty)) {
+    } else if (Ty::IsTyCorrect(loadedType->GetTy())) {
         // If type is invalid, it means the type decl is need to be recompiled, do not load type cache further.
-        astType->ty = loadedType->ty;
+        astType->SetTy(loadedType->GetTy());
         astType->EnableAttr(Attribute::IS_CHECK_VISITED);
         if (auto rt = DynamicCast<RefType*>(astType.get())) {
             rt->ref.target = loadedType->GetTarget();
@@ -184,14 +184,14 @@ void PostLoadReference(Expr& expr)
         case ASTKind::ARRAY_EXPR:
             for (auto& arg : StaticCast<ArrayExpr&>(expr).args) {
                 CJC_NULLPTR_CHECK(arg->expr);
-                arg->ty = arg->expr->ty;
+                arg->SetTy(arg->expr->GetTy());
             }
             break;
         case ASTKind::POINTER_EXPR: {
             auto& arg = StaticCast<PointerExpr&>(expr).arg;
             if (arg) {
                 CJC_NULLPTR_CHECK(arg->expr);
-                arg->ty = arg->expr->ty;
+                arg->SetTy(arg->expr->GetTy());
             }
             break;
         }
@@ -255,7 +255,7 @@ void ASTLoader::ASTLoaderImpl::LoadRefs()
     // Set type for created dummy expressions.
     for (auto dummyExpr : allDummyExprs) {
         CJC_ASSERT(dummyExpr->desugarExpr);
-        dummyExpr->ty = dummyExpr->desugarExpr->ty;
+        dummyExpr->SetTy(dummyExpr->desugarExpr->GetTy());
     }
     // NOTE: funcArg expr's type reference is loaded after funcArg itself,
     // so we need to load for arg's ty after finish loading all reference for expression.
@@ -414,11 +414,11 @@ void ASTLoader::ASTLoaderImpl::LoadInheritedTypes(const PackageFormat::Decl& dec
         if (index != INVALID_FORMAT_INDEX) {
             auto type = WrapType(LoadType(index));
             CJC_NULLPTR_CHECK(type);
-            if (!Ty::IsTyCorrect(type->ty) && isLoadCache) {
+            if (!Ty::IsTyCorrect(type->GetTy()) && isLoadCache) {
                 return; // If any invalid type existed, do not load type cache for current 'id'.
             }
-            if (auto classLikeTy = DynamicCast<ClassLikeTy*>(type->ty)) {
-                (void)classLikeTy->directSubtypes.emplace(id.ty);
+            if (auto classLikeTy = DynamicCast<ClassLikeTy*>(type->GetTy())) {
+                (void)classLikeTy->directSubtypes.emplace(id.GetTy());
             }
             loadedTypes.emplace_back(std::move(type));
         }
@@ -460,7 +460,7 @@ void ASTLoader::ASTLoaderImpl::LoadAnnotationBaseExpr(const PackageFormat::Anno&
         auto re = MakeOwned<RefExpr>();
         re->ref.target = targetCtr;
         re->ref.identifier = targetCtr->identifier;
-        re->ty = targetCtr->ty;
+        re->SetTy(targetCtr->GetTy());
         anno.baseExpr = std::move(re);
     }
 }
@@ -488,10 +488,10 @@ void ASTLoader::ASTLoaderImpl::LoadNominalDeclRef(const PackageFormat::Decl& dec
             auto type = WrapType(LoadType(info->funcBody()->retType()));
             UpdateType(astDecl.funcBody->retType, std::move(type));
         }
-        astDecl.funcBody->ty = astDecl.ty;
+        astDecl.funcBody->SetTy(astDecl.GetTy());
     }
     if constexpr (std::is_same_v<DeclT, ExtendDecl>) {
-        UpdateType(astDecl.extendedType, WrapType(astDecl.ty));
+        UpdateType(astDecl.extendedType, WrapType(astDecl.GetTy()));
     }
     if (astDecl.TestAttr(Attribute::GENERIC_INSTANTIATED)) {
         astDecl.genericDecl = GetDeclFromIndex(decl.genericDecl());
@@ -521,8 +521,8 @@ void ASTLoader::ASTLoaderImpl::LoadDeclDependencies(const PackageFormat::Decl& d
 void ASTLoader::ASTLoaderImpl::LoadDeclRefs(const PackageFormat::Decl& declObj, Decl& decl)
 {
     // Load ty for all decls and try to load generic constraints.
-    decl.ty = LoadType(declObj.type());
-    if (!Ty::IsTyCorrect(decl.ty) && isLoadCache) {
+    decl.SetTy(LoadType(declObj.type()));
+    if (!Ty::IsTyCorrect(decl.GetTy()) && isLoadCache) {
         return; // Skip following steps if ty is not correct during loading cache.
     }
     LoadGenericConstraintsRef(declObj.generic(), decl.GetGeneric());
@@ -573,8 +573,8 @@ void ASTLoader::ASTLoaderImpl::LoadDeclRefs(const PackageFormat::Decl& declObj, 
             // In the incremental compilation scenario, the original type nodes in the source code package cannot be
             // overwritten.
             // To optimize performance, only types with aliases will generate TypeNode here.
-            if (!vda->type && (decl.ty->HasAliasTy() || decl.ty->IsFunc())) {
-                vda->type = WrapType(decl.ty);
+            if (!vda->type && (decl.GetTy()->HasAliasTy() || decl.GetTy()->IsFunc())) {
+                vda->type = WrapType(decl.GetTy());
             }
             break;
         }
@@ -585,7 +585,7 @@ void ASTLoader::ASTLoaderImpl::LoadDeclRefs(const PackageFormat::Decl& declObj, 
 
 void ASTLoader::ASTLoaderImpl::LoadExprRefs(const PackageFormat::Expr& exprObj, Expr& expr)
 {
-    expr.ty = LoadType(exprObj.type());
+    expr.SetTy(LoadType(exprObj.type()));
     expr.mapExpr = GetExprByIndex(exprObj.mapExpr());
     // Only following 4 kind of expression has referenced target decl.
     switch (exprObj.kind()) {
@@ -610,7 +610,7 @@ void ASTLoader::ASTLoaderImpl::LoadExprRefs(const PackageFormat::Expr& exprObj, 
             break;
         }
         case PackageFormat::ExprKind_ArrayLit: {
-            if (expr.ty->kind == TypeKind::TYPE_VARRAY) {
+            if (expr.TyKind() == TypeKind::TYPE_VARRAY) {
                 break;
             }
             auto info = exprObj.info_as_ArrayInfo();
@@ -620,7 +620,7 @@ void ASTLoader::ASTLoaderImpl::LoadExprRefs(const PackageFormat::Expr& exprObj, 
             break;
         }
         case PackageFormat::ExprKind_ArrayExpr: {
-            if (expr.ty->kind == TypeKind::TYPE_VARRAY) {
+            if (expr.TyKind() == TypeKind::TYPE_VARRAY) {
                 break;
             }
             auto info = exprObj.info_as_ArrayInfo();
@@ -630,11 +630,11 @@ void ASTLoader::ASTLoaderImpl::LoadExprRefs(const PackageFormat::Expr& exprObj, 
             break;
         }
         case PackageFormat::ExprKind_LambdaExpr:
-            StaticCast<LambdaExpr&>(expr).funcBody->ty = expr.ty;
+            StaticCast<LambdaExpr&>(expr).funcBody->SetTy(expr.GetTy());
             break;
         case PackageFormat::ExprKind_LitConstExpr:
-            if (expr.ty->IsString()) {
-                StaticCast<LitConstExpr&>(expr).ref = Wrap2RefType(expr.ty);
+            if (expr.GetTy()->IsString()) {
+                StaticCast<LitConstExpr&>(expr).ref = Wrap2RefType(expr.GetTy());
             }
             InitializeLitConstValue(StaticCast<LitConstExpr&>(expr));
             break;
@@ -665,10 +665,10 @@ void ASTLoader::ASTLoaderImpl::LoadSubNodeRefs(const PackageFormat::Expr& exprOb
                 CJC_ASSERT(index != INVALID_FORMAT_INDEX);
                 auto typeIdx = GetFormatExprByIndex(index)->type();
                 auto arg = ce.args[i - 1].get();
-                arg->ty = LoadType(typeIdx);
+                arg->SetTy(LoadType(typeIdx));
                 if (arg->TestAttr(Attribute::HAS_INITIAL)) {
                     // Default param's arg does not loaded expr, which should retrieve type from arg's type.
-                    arg->expr->ty = arg->ty;
+                    arg->expr->SetTy(arg->GetTy());
                 }
             }
             break;
@@ -694,7 +694,7 @@ void ASTLoader::ASTLoaderImpl::LoadSubNodeRefs(const PackageFormat::Expr& exprOb
             } else {
                 for (uoffset_t i = 0; i < exprObj.operands()->size(); i++) {
                     auto mcObj = GetFormatExprByIndex(exprObj.operands()->Get(i));
-                    me.matchCaseOthers[i]->ty = LoadType(mcObj->type());
+                    me.matchCaseOthers[i]->SetTy(LoadType(mcObj->type()));
                 }
             }
             break;
@@ -721,7 +721,7 @@ void ASTLoader::ASTLoaderImpl::LoadSubNodeRefs2(const PackageFormat::Expr& exprO
             for (uoffset_t i{0}; i < info->patterns()->size(); ++i) {
                 LoadPatternRefs(*info->patterns()->Get(i), *let.patterns[i]);
             }
-            let.initializer->ty = LoadType(GetFormatExprByIndex(exprObj.operands()->Get(0))->type());
+            let.initializer->SetTy(LoadType(GetFormatExprByIndex(exprObj.operands()->Get(0))->type()));
             break;
         }
         default:
@@ -732,7 +732,7 @@ void ASTLoader::ASTLoaderImpl::LoadSubNodeRefs2(const PackageFormat::Expr& exprO
 void ASTLoader::ASTLoaderImpl::LoadMatchCaseRef(FormattedIndex index, MatchCase& mc, Expr& selector)
 {
     auto mcObj = GetFormatExprByIndex(index);
-    mc.ty = LoadType(mcObj->type());
+    mc.SetTy(LoadType(mcObj->type()));
     auto info = mcObj->info_as_MatchCaseInfo();
     CJC_NULLPTR_CHECK(info);
     CJC_ASSERT(info->patterns()->size() == mc.patterns.size());
@@ -745,7 +745,7 @@ void ASTLoader::ASTLoaderImpl::LoadMatchCaseRef(FormattedIndex index, MatchCase&
 void ASTLoader::ASTLoaderImpl::LoadPatternRefs(const PackageFormat::Pattern& pObj, Pattern& pattern)
 {
     CJC_ASSERT(pObj.types()->size() >= 1);
-    pattern.ty = LoadType(pObj.types()->Get(0));
+    pattern.SetTy(LoadType(pObj.types()->Get(0)));
     // Sub patterns is guaranteed and created during 'LoadPattern'.
     switch (pObj.kind()) {
         case PackageFormat::PatternKind_TuplePattern:
@@ -755,7 +755,7 @@ void ASTLoader::ASTLoaderImpl::LoadPatternRefs(const PackageFormat::Pattern& pOb
             break;
         case PackageFormat::PatternKind_TypePattern:
             LoadPatternRefs(*pObj.patterns()->Get(0), *StaticCast<TypePattern&>(pattern).pattern);
-            StaticCast<TypePattern&>(pattern).type = WrapType(pattern.ty);
+            StaticCast<TypePattern&>(pattern).type = WrapType(pattern.GetTy());
             break;
         case PackageFormat::PatternKind_EnumPattern:
             for (uoffset_t i = 0; i < pObj.patterns()->size(); i++) {

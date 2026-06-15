@@ -120,7 +120,7 @@ Ptr<Constant> Translator::TranslateLitConstant(const AST::LitConstExpr& expr, AS
 
 Ptr<Value> Translator::Visit(const AST::LitConstExpr& expr)
 {
-    Constant* c = TranslateLitConstant(expr, *expr.ty, currentBlock);
+    Constant* c = TranslateLitConstant(expr, *expr.GetTy(), currentBlock);
     if (!c) {
         return nullptr;
     }

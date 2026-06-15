@@ -1,4 +1,4 @@
-// Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+// Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 // This source file is part of the Cangjie project, licensed under Apache-2.0
 // with Runtime Library Exception.
 //
@@ -18,11 +18,14 @@
 
 using namespace Cangjie::AST;
 
-namespace Cangjie::Interop::Java {
-void InsertJavaHasDefaultMethodStubs(
-    const InterfaceDecl& id, const ImportManager& importManager, TypeManager& typeManager);
-void RemoveAbstractAttributeForJavaHasDefaultMethods(const InterfaceDecl& decl);
-ClassDecl& GetExceptionDecl(const ImportManager& importManager);
-}
+namespace Cangjie::Native::FFI::Java {
+
+OwnedPtr<AST::ClassDecl> CloneClassSkeleton(AST::ClassLikeDecl& sample, std::string&& name);
+
+void InsertMethodStub(AST::FuncDecl& fd, const ImportManager& importManager, TypeManager& typeManager);
+
+AST::ClassDecl& GetExceptionDecl(const ImportManager& importManager);
+
+} // namespace Cangjie::Native::FFI::Java
 
 #endif // CANGJIE_SEMA_NATIVE_FFI_JAVA_BEFORE_TYPE_CHECK_UTILS

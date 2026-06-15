@@ -394,12 +394,12 @@ void GlobalDeclAnalysis::AnalysisDependency(const ElementList<Ptr<const AST::Dec
         std::vector<Ptr<const AST::Decl>> dependencies;
         std::vector<Ptr<const AST::Decl>> localConstVarDeps;
         AnalysisDepOf(*node, dependencies, localConstVarDeps);
-        if (outputChir) {
-            SaveCJMPDependencies(node, dependencies);
-        }
         if (mergingSpecific) {
             ReplaceCommonDependenciesWithSpecific(dependencies);
             RestoreCJMPDependencies(node, dependencies);
+        }
+        if (outputChir) {
+            SaveCJMPDependencies(node, dependencies);
         }
         (void)std::remove_if(dependencies.begin(), dependencies.end(),
             [&node](const Ptr<const AST::Decl>& element) { return element == node; });
@@ -464,7 +464,7 @@ void GlobalDeclAnalysis::CheckUseBeforeInit(const std::vector<Ptr<const AST::Dec
             auto& deps = pos->second;
             for (auto& dep : deps) {
                 if (alreadyInited.find(dep) == alreadyInited.end()) {
-                    diag->Diagnose(DiagKind::chir_used_before_initialization, dep->identifier.Val());
+                    diag.Diagnose(DiagKind::chir_used_before_initialization, dep->identifier.Val());
                 }
             }
         }
@@ -500,7 +500,7 @@ std::vector<Ptr<const AST::File>> GlobalDeclAnalysis::SortGlobalVarDep(
 
     // 4) find whether files circular dependency exist and get sorted files in current package.
     std::vector<std::string> diagLog;
-    FileCirDepsChecker fileChecker(*diag, diagLog);
+    FileCirDepsChecker fileChecker(diag, diagLog);
     fileChecker.InitFileDep(fileDependencyMap);
     fileChecker.DoTarjanSort();
     fileChecker.UpdateSccUnit(fileDependencyMap.randomOrderValue);
@@ -641,13 +641,13 @@ InitOrder GlobalDeclAnalysis::SortLocalConstVarDep(const InitOrder& initOrder)
     AnalysisGlobalVarsAndLocalConstVarsDependency(initOrder);
 
     // 4) sort all variables
-    VarCirDepsChecker varDepsChecker(*diag);
+    VarCirDepsChecker varDepsChecker(diag);
     varDepsChecker.InitDependency(globalVarsAndLocalConstVars, globalVarsAndLocalConstVarsDepMap.randomOrderValue);
     varDepsChecker.DoTarjanSort();
     varDepsChecker.UpdateSccUnit(globalVarsAndLocalConstVarsDepMap.randomOrderValue);
     auto sortedVars = varDepsChecker.GetOrderElement();
 
-    if (diag->GetErrorCount() != 0) {
+    if (diag.GetErrorCount() != 0) {
         return initOrder;
     }
 
@@ -661,7 +661,7 @@ InitOrder GlobalDeclAnalysis::Run(const ElementList<Ptr<const AST::Decl>>& nodes
 {
     auto orderedFiles = SortGlobalVarDep(nodesWithDeps, fileAndVarMap, cachedInfo);
     // No need to carry on if we find a circular dependency in files
-    if (diag->GetErrorCount() != 0) {
+    if (diag.GetErrorCount() != 0) {
         return InitOrder{};
     }
 
@@ -850,7 +850,7 @@ template <class T> void TarjanSort<T>::TarjanSortImpl(DepsUnit<T>& unit, int& in
     diagUnits.clear();
 }
 
-VarCirDepsChecker::VarCirDepsChecker(DiagAdapter& ciDiag) : diag(&ciDiag)
+VarCirDepsChecker::VarCirDepsChecker(DiagnosticEngine& ciDiag) : diag(ciDiag)
 {
 }
 
@@ -891,11 +891,11 @@ void VarCirDepsChecker::DetectCircularDep()
             diagStr = diagStr + " and " + temp;
         }
     }
-    diag->Diagnose(DiagKind::chir_var_might_circular_dependency, diagStr);
+    diag.Diagnose(DiagKind::chir_var_might_circular_dependency, diagStr);
 }
 
-FileCirDepsChecker::FileCirDepsChecker(DiagAdapter& ciDiag, const std::vector<std::string>& vardiagLog)
-    : diag(&ciDiag), diagLog(vardiagLog)
+FileCirDepsChecker::FileCirDepsChecker(DiagnosticEngine& ciDiag, const std::vector<std::string>& vardiagLog)
+    : diag(ciDiag), diagLog(vardiagLog)
 {
 }
 
@@ -922,7 +922,7 @@ void FileCirDepsChecker::DetectCircularDep()
             diagStr = diagStr + " and " + fileName;
         }
     }
-    diag->Diagnose(DiagKind::chir_file_might_circular_dependency, diagStr);
+    diag.Diagnose(DiagKind::chir_file_might_circular_dependency, diagStr);
 #if DEBUG0
     for (auto strlog : diagLog) {
         std::cout << strlog << std::endl;

@@ -7,7 +7,7 @@
 /**
  * @file
  *
- * This file declares a thin bridge to interoplib.objc library
+ * This file declares a thin bridge to interop runtime and support library
  */
 
 #ifndef CANGJIE_SEMA_OBJ_C_UTILS_INTEROPLIB_BRIDGE_H
@@ -52,6 +52,8 @@ public:
      */
     Ptr<AST::TypeAliasDecl> GetNativeObjCIdDecl();
 
+    Ptr<AST::InterfaceDecl> GetObjCIdDecl();
+
     /**
      * Gets NativeObjCId semantic type.
      */
@@ -94,8 +96,7 @@ public:
 
     /**
      * Gets ObjCUnreachableCodeException declaration.
-     * An exception that has to be used to mark an unreachable code (e.g call static method on @ObjCMirror interface
-     * wrapper).
+     * An exception that has to be used to mark an unreachable code (e.g call static method on @ObjCMirror interface wrapper).
      */
     Ptr<AST::ClassDecl> GetObjCUnreachableCodeExceptionDecl();
 
@@ -129,6 +130,8 @@ public:
 
     Ptr<AST::FuncDecl> GetGetClassDecl();
 
+    Ptr<AST::FuncDecl> GetGetProtoDecl();
+
     Ptr<AST::FuncDecl> GetWithMethodEnvDecl();
 
     Ptr<AST::FuncDecl> GetWithMethodEnvObjDecl();
@@ -149,31 +152,39 @@ public:
 
     Ptr<AST::FuncDecl> GetWithObjCSuperDecl();
 
+    Ptr<AST::FuncDecl> GetObjCIsKindOfClassDecl();
+
+    Ptr<AST::FuncDecl> GetObjCConformsToProtocolDecl();
+
+    Ptr<AST::FuncDecl> GetConvertToNSStringDecl();
+
+    Ptr<AST::FuncDecl> GetDescriptionAsStringDecl();
+
     /**
      * Get objc.lang.ObjCPointer declaration
-     */
+    */
     Ptr<AST::StructDecl> GetObjCPointerDecl();
     Ptr<AST::FuncDecl> GetObjCPointerConstructor();
     Ptr<AST::VarDecl> GetObjCPointerPointerField();
 
     /**
      * Get objc.lang.ObjCFunc declaration
-     */
+    */
     Ptr<AST::StructDecl> GetObjCFuncDecl();
     Ptr<AST::FuncDecl> GetObjCFuncConstructor();
     Ptr<AST::FuncDecl> GetObjCFuncFPointerAccessor();
 
     /**
      * Get objc.lang.ObjCBlock declaration
-     */
+    */
     Ptr<AST::ClassDecl> GetObjCBlockDecl();
     Ptr<AST::FuncDecl> GetObjCBlockConstructorFromObjC();
     Ptr<AST::FuncDecl> GetObjCBlockConstructorFromCangjie();
     Ptr<AST::FuncDecl> GetObjCBlockAbiPointerAccessor();
     Ptr<AST::FuncDecl> GetObjCBlockFPointerAccessor();
     /**
-     * Get interoplib.objc.NativeBlockABI declaration
-     */
+    * Get objc.internal.NativeBlockABI declaration
+    */
     Ptr<AST::StructDecl> GetNativeBlockABIDecl();
     Ptr<AST::StructDecl> GetCangjieBlockABIDecl();
 
@@ -185,7 +196,7 @@ public:
     static bool IsInteropLibAccessible(ImportManager& importManager);
 
 private:
-    static constexpr auto INTEROPLIB_PACKAGE_NAME = "interoplib.objc";
+    static constexpr auto INTEROPLIB_PACKAGE_NAME = "objc.internal";
 
     template <AST::ASTKind K = AST::ASTKind::DECL> auto GetInteropLibDecl(const std::string& ident)
     {

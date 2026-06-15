@@ -1,575 +1,164 @@
-// Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+// Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 // This source file is part of the Cangjie project, licensed under Apache-2.0
 // with Runtime Library Exception.
 //
 // See https://cangjie-lang.cn/pages/LICENSE for license information.
 
-#include "cangjie/CHIR/CHIR.h"
-#include "cangjie/CHIR/Interpreter/ConstEval.h"
-#include "cangjie/Utils/ProfileRecorder.h"
+#include "cangjie/CHIR/Checker/AnnotationChecker.h"
 
-namespace Cangjie::CHIR {
-using namespace AST;
+#include "cangjie/CHIR/Analysis/Utils.h"
+#include "cangjie/CHIR/Utils/CHIRCasting.h"
+#include "cangjie/Utils/CastingTemplate.h"
 
-namespace {
-// used-defined @Annotation on a decl
-struct AnnotationInfo {
-    const ClassDecl* decl;
-    AST::Annotation* anno;        // non-const for write back annotation result after consteval
-    std::vector<GlobalVar*> vars; // one global variable for each element in the argument `target` array;
-                                  // empty if no argument is provided
-    std::vector<Func*> funcs;     // init funcs of vars, to be called in file init function
-};
-
-// custom annotation defined on a decl
-struct CustomAnnoInstance {
-    const AST::Annotation* src; // from which ast node this annotation check info is generated. used for diagnostics
-    const ClassDef* def;
-};
-
-// all custom annotations on a TypeDef
-struct CustomAnnoInfoOnType {
-    const CustomTypeDef* type;
-    std::vector<CustomAnnoInstance> annos;
-};
-
-struct CustomAnnoInfoOnDecl {
-    const Decl* decl; // abstract function do not have CHIR symbol, use AST node
-    std::vector<CustomAnnoInstance> annos;
-};
-
-// static variables that records the info first and are used to check later
-// in case packages need compile in parallel, record g_annoInfo as member variable of class
-// AnnotationTranslator, store it somewhere else; the two collections can be collected as well for better performance
-// (one whole ast traversal less), or more conveniently not to store those two collections and to traverse the ast and
-// to check against the stored g_annoInfo instead.
-// record @Annotation info of translated Annotation classes
-std::unordered_map<const ClassDef*, AnnotationInfo> g_annoInfo{};
-// record custom annotation info of any cangjie decl
-std::vector<CustomAnnoInfoOnType> g_typeAnnoInfo{};
-std::vector<CustomAnnoInfoOnDecl> g_valueAnnoInfo{}; // custom annotation info on var, func, and prop
-} // namespace
-
-class AnnotationTranslator {
-public:
-    AnnotationTranslator(Translator& translator, CHIRBuilder& builder, const GlobalOptions& opts)
-        : tr{translator}, bd{builder}, parallel{opts.GetJobs() > 1UL}
-    {
-    }
-
-    static bool IsImported(const Decl& decl)
-    {
-        if (decl.outerDecl) {
-            if (auto generic = decl.outerDecl->genericDecl) {
-                return generic->TestAttr(AST::Attribute::IMPORTED);
-            }
-        }
-        if (decl.genericDecl) {
-            return decl.genericDecl->TestAttr(AST::Attribute::IMPORTED);
-        }
-        return decl.TestAttr(AST::Attribute::IMPORTED);
-    }
-
-    void CollectAnnoInfo(const Decl& decl, const CustomTypeDef& type) &&
-    {
-        if (SkipCollectCustomAnnoInfo(decl)) {
-            // from ast node directly read annotation target info
-            for (auto& anno : decl.annotations) {
-                if (anno->kind == AST::AnnotationKind::ANNOTATION) {
-                    PushAnnotation(StaticCast<ClassDef>(type), StaticCast<ClassDecl>(decl), *anno);
-                    // no custom annotation check required for imported decl
-                    return;
-                }
-            }
-            return;
-        }
-        // collect both @Annotation and custom annotation in one annotation traverse
-        std::vector<CustomAnnoInstance> res;
-        for (size_t annoIndex = 0, customAnnoIdx = 0; annoIndex < decl.annotations.size(); ++annoIndex) {
-            auto& anno = decl.annotations[annoIndex];
-            // collect @Annotation info
-            if (anno->kind == AST::AnnotationKind::ANNOTATION) {
-                CollectAnnotationInfo(*anno, StaticCast<ClassDecl&>(decl), type);
-                break; // cannot have both @Annotation and custom annotation
-            }
-            if (anno->kind == AnnotationKind::CUSTOM) {
-                // collect custom annotation info for later check
-                auto classDef = GetDefFromAnnotationInstance(*decl.annotationsArray->children[customAnnoIdx]);
-                res.emplace_back(CustomAnnoInstance{anno.get(), classDef});
-                ++customAnnoIdx;
-            }
-        }
-        if (!res.empty()) {
-            PushTypeAnno(type, std::move(res));
-        }
-
-        // collect custom annotations for members
-        for (auto member : decl.GetMemberDeclPtrs()) {
-            if (auto prop = DynamicCast<PropDecl>(member)) {
-                CollectPropAnnoInfo(*prop);
-            } else {
-                CollectAnnoInfo(*member);
-            }
-        }
-        if (auto enDecl = DynamicCast<EnumDecl>(&decl)) {
-            for (auto& cons : enDecl->constructors) {
-                CollectAnnoInfo(*cons);
-            }
-        }
-    }
-
-    void CollectAnnoInfo(const Decl& decl) const
-    {
-        if (SkipCollectCustomAnnoInfo(decl)) {
-            return;
-        }
-        if (auto res = CollectCustomAnnoInstances(decl); !res.empty()) {
-            PushValueAnno(decl, std::move(res));
-        }
-        if (auto func = DynamicCast<FuncDecl>(&decl)) {
-            if (func->funcBody) {
-                for (auto& param : func->funcBody->paramLists[0]->params) {
-                    if (auto res = CollectCustomAnnoInstances(*param); !res.empty()) {
-                        PushValueAnno(*param, std::move(res));
-                    }
-                }
-            }
-        }
-    }
-
-private:
-    Translator& tr;
-    CHIRBuilder& bd;
-    bool parallel;
-
-    static std::mutex valueLock;
-    static std::mutex typeLock;
-    static std::mutex annoLock;
-
-    void PushValueAnno(const Decl& decl, std::vector<CustomAnnoInstance>&& annos) const
-    {
-        if (parallel) {
-            std::lock_guard g{valueLock};
-            g_valueAnnoInfo.emplace_back(CustomAnnoInfoOnDecl{&decl, std::move(annos)});
-        } else {
-            g_valueAnnoInfo.emplace_back(CustomAnnoInfoOnDecl{&decl, std::move(annos)});
-        }
-    }
-    void PushTypeAnno(const CustomTypeDef& def, std::vector<CustomAnnoInstance>&& annos) const
-    {
-        if (parallel) {
-            std::lock_guard g{typeLock};
-            g_typeAnnoInfo.emplace_back(CustomAnnoInfoOnType{&def, std::move(annos)});
-        } else {
-            g_typeAnnoInfo.emplace_back(CustomAnnoInfoOnType{&def, std::move(annos)});
-        }
-    }
-    void PushAnnotation(const ClassDef& def, const ClassDecl& decl, AST::Annotation& anno) const
-    {
-        if (parallel) {
-            std::lock_guard g{annoLock};
-            g_annoInfo.emplace(&def, AnnotationInfo{&decl, &anno});
-        } else {
-            g_annoInfo.emplace(&def, AnnotationInfo{&decl, &anno});
-        }
-    }
-    void PushAnnotation(const ClassDef& def, AnnotationInfo&& info) const
-    {
-        if (parallel) {
-            std::lock_guard g{annoLock};
-            g_annoInfo.emplace(&def, std::move(info));
-        } else {
-            g_annoInfo.emplace(&def, std::move(info));
-        }
-    }
-
-    bool SkipCollectCustomAnnoInfo(const Decl& decl) const
-    {
-        if (tr.opts.enIncrementalCompilation && !decl.toBeCompiled) {
-            return true;
-        }
-        return false;
-    }
-
-    // collect @Annotation info placed on `decl`
-    void CollectAnnotationInfo(AST::Annotation& anno, const ClassDecl& decl, const CustomTypeDef& type)
-    {
-        if (anno.args.empty()) {
-            // emplace empty annotation info for @Annotation without argument
-            PushAnnotation(StaticCast<ClassDef>(type), decl, anno);
-            return;
-        }
-        auto info = CreateAnnotationInfo(decl, anno);
-        PushAnnotation(StaticCast<ClassDef>(type), std::move(info));
-    }
-
-    // get the referenced CHIR Annotation class from a custom annotation instance (constructor call)
-    ClassDef* GetDefFromAnnotationInstance(const Expr& expr) const
-    {
-        auto resolvedFunction = StaticCast<const CallExpr&>(expr).resolvedFunction;
-        CJC_NULLPTR_CHECK(resolvedFunction);
-        auto type = tr.TranslateType(*resolvedFunction->outerDecl->ty);
-        return StaticCast<ClassType*>(StaticCast<RefType*>(type)->GetBaseType())->GetClassDef();
-    }
-
-    // create a global variable for each element in the @Annotation targets. This can be reduced to a single var should
-    // cangjie support array as literal type
-    static std::string GetAnnotationVarName(const std::string& basename, size_t index)
-    {
-        return basename + ANNOTATION_VAR_POSTFIX + std::to_string(index);
-    }
-
-    // create a struct that contains all information of a @Annotation placed on a class
-    AnnotationInfo CreateAnnotationInfo(const ClassDecl& decl, AST::Annotation& anno)
-    {
-        auto annoTargetNum = StaticCast<ArrayLit&>(*anno.args[0]->expr).children.size();
-        std::vector<GlobalVar*> vars(annoTargetNum);
-        std::vector<Func*> funcs(annoTargetNum);
-        for (size_t i{0}; i < annoTargetNum; ++i) {
-            auto var = CreateAnnotationVar(decl, anno, i);
-            auto func = CreateAnnoVarInit(*var, anno, i);
-            vars[i] = var;
-            funcs[i] = func;
-        }
-        return {&decl, &anno, std::move(vars), std::move(funcs)};
-    }
-
-    GlobalVar* CreateAnnotationVar(const ClassDecl& decl, const AST::Annotation& anno, size_t i)
-    {
-        auto& basename = decl.mangledName;
-        auto varname = GetAnnotationVarName(basename, i);
-        auto& expr = *StaticCast<AST::ArrayLit>(*anno.args[0]->expr).children[i];
-        auto loc = tr.TranslateLocation(expr);
-        auto annotationTargetType = tr.TranslateType(*expr.ty);
-        auto varType = bd.GetType<RefType>(annotationTargetType);
-        auto srcCodeIdentifier = decl.identifier.Val() + ANNOTATION_VAR_POSTFIX + std::to_string(i);
-        auto var = bd.CreateGlobalVar(
-            std::move(loc), varType, varname, std::move(srcCodeIdentifier), varname, decl.fullPackageName);
-        var->Set<SkipCheck>(SkipKind::SKIP_DCE_WARNING);
-        var->EnableAttr(Attribute::COMPILER_ADD);
-        var->EnableAttr(Attribute::NO_DEBUG_INFO);
-        var->EnableAttr(Attribute::CONST);
-        var->EnableAttr(Attribute::NO_REFLECT_INFO);
-        var->Set<LinkTypeInfo>(Linkage::INTERNAL);
-        return var;
-    }
-    
-    // we need a unique name for each annotation target element for each @Annotation instance.
-    // @Annotation placed on VarWithPatternDecl cannot use the variable's identifier (it is empty), and we do not have
-    // mangledName on CHIR, so we use its raw mangled name.
-    static std::string GetAnnotationTargetElementInitName(const GlobalVar& var)
-    {
-#ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
-        auto name = MANGLE_CANGJIE_PREFIX + MANGLE_GLOBAL_VARIABLE_INIT_PREFIX;
-        if (var.GetSrcCodeIdentifier().empty()) {
-            name += var.GetRawMangledName();
-        } else {
-            name += MangleUtils::MangleName(var.GetPackageName()) + MangleUtils::MangleName(var.GetSrcCodeIdentifier());
-        }
-        return name + MANGLE_FUNC_PARAM_TYPE_PREFIX + MANGLE_VOID_TY_SUFFIX;
-#endif
-    }
-
-    Func* CreateAnnoVarInit(GlobalVar& var, AST::Annotation& anno, size_t i)
-    {
-        auto funcname = GetAnnotationTargetElementInitName(var);
-        auto& expr = *StaticCast<AST::ArrayLit>(*anno.args[0]->expr).children[i];
-        auto loc = tr.TranslateLocation(expr);
-
-        auto func =
-            tr.CreateEmptyGVInitFunc(funcname, "", funcname, var.GetPackageName(), Linkage::INTERNAL, loc, true);
-        func->EnableAttr(Attribute::COMPILER_ADD);
-        func->EnableAttr(Attribute::NO_DEBUG_INFO);
-
-        auto value = Translator::TranslateASTNode(expr, tr);
-        tr.GetCurrentBlock()->AppendExpression(
-            bd.CreateExpression<Store>(std::move(loc), bd.GetUnitTy(), value, &var, tr.GetCurrentBlock()));
-        if (auto curBlock = tr.GetCurrentBlock(); curBlock->GetTerminator() == nullptr) {
-            curBlock->AppendExpression(bd.CreateTerminator<Exit>(curBlock));
-        }
-        var.SetInitFunc(*func);
-        return func;
-    }
-
-    std::vector<CustomAnnoInstance> CollectCustomAnnoInstances(const Decl& decl) const
-    {
-        std::vector<CustomAnnoInstance> res;
-        for (size_t annoIndex{0}, customIndex{0}; annoIndex < decl.annotations.size(); ++annoIndex) {
-            auto& anno = decl.annotations[annoIndex];
-            if (anno->kind == AST::AnnotationKind::CUSTOM) {
-                auto classDef = GetDefFromAnnotationInstance(*decl.annotationsArray->children[customIndex++]);
-                res.emplace_back(CustomAnnoInstance{anno.get(), classDef});
-            }
-        }
-        return res;
-    }
-
-    void CollectPropAnnoInfo(const PropDecl& decl) const
-    {
-        if (auto res = CollectCustomAnnoInstances(decl); !res.empty()) {
-            PushValueAnno(decl, std::move(res));
-        }
-    }
-};
-std::mutex AnnotationTranslator::valueLock{};
-std::mutex AnnotationTranslator::typeLock{};
-std::mutex AnnotationTranslator::annoLock{};
-
-// interfaces between AnnotationTranslator and other modules are implemented here
-void Translator::CollectTypeAnnotation(const InheritableDecl& decl, const CustomTypeDef& cl)
-{
-#ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
-    // neither collect nor check annotations in compute annotations stage
-    // Since annotations must be consistent between common and specific sides,
-    // specific declarations can reuse serialized annotations directly.
-    if (isComputingAnnos || cl.TestAttr(CHIR::Attribute::DESERIALIZED)) {
-        return;
-    }
-#endif
-    AnnotationTranslator{*this, builder, opts}.CollectAnnoInfo(decl, cl);
-}
-void Translator::CollectValueAnnotation(const Decl& decl)
-{
-#ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
-    if (isComputingAnnos) {
-        return;
-    }
-#endif
-    // Since annotations must be consistent between common and specific sides,
-    // specific declarations can reuse serialized annotations directly.
-    if (decl.TestAttr(AST::Attribute::IMPORTED) || decl.TestAttr(AST::Attribute::GENERIC_INSTANTIATED) ||
-        decl.TestAttr(AST::Attribute::SPECIFIC)) {
-        return;
-    }
-    AnnotationTranslator{*this, builder, opts}.CollectAnnoInfo(decl);
-}
-
-#ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
-void GlobalVarInitializer::InsertAnnotationVarInitInto(Func& packageInit)
-{
-    for (auto& info : g_annoInfo) {
-        for (auto init : info.second.funcs) {
-            initFuncsForConstVar.emplace_back(init);
-            InsertInitializerIntoPackageInitializer(*init, packageInit);
-        }
-    }
-}
-#endif
+using namespace Cangjie::CHIR;
 
 namespace {
-struct AnnotationTarget {
-    unsigned val;
-    bool Matches(unsigned v) const
-    {
-        return (val & v) != 0;
-    }
-};
-
-const std::string_view ANNOTATION_TARGET_2_STRING[]{
-    "type", "parameter", "init", "member property", "member function", "member variable", "enum constructor",
-    "global function", "global variable", "extend"};
-
-class AnnotationChecker {
-public:
-    explicit AnnotationChecker(const DiagAdapter& d) : diag{d}
-    {
-    }
-
-    bool CheckAnnotations() &&
-    {
-        Utils::ProfileRecorder p{"CHIR", "AnnotationTargetCheck"};
-        BuildCheckMap();
-        auto res = CheckAnnotationsImpl();
-        return res;
-    }
-
-private:
-    const DiagAdapter& diag;
-
-    // write @Annotation info from the result of consteval back to the AST nodes
-    void BuildCheckMap()
-    {
-        std::unordered_map<const ClassDef*, AnnotationTarget> cmap;
-        for (auto it = g_annoInfo.begin(); it != g_annoInfo.end();) {
-            cmap.emplace(it->first, AnnotationTarget{it->second.anno->target});
-            ++it;
-        }
-        checkMap = std::move(cmap);
-    }
-
-    AnnotationTargetT GetAnnotationTargetFromInfo(const AnnotationInfo& info) const
-    {
-        auto& vars = info.vars;
-        if (vars.empty()) {
-            // @Annotation without argument, enable all targets
-            return static_cast<AnnotationTargetT>(~0u);
-        }
-        AnnotationTargetT target = 0;
-        for (size_t i{0}; i < vars.size(); ++i) {
-            if (!vars[i]->GetInitializer() || vars[i]->GetInitializer()->IsNullLiteral()) {
-                // if const eval fails to replace the initializer with a constant value, find the store
-                // statement from its init func
-                auto unsignedVal = GetUnsignedValFromInit(*info.funcs[i]);
-                target |= static_cast<AnnotationTargetT>(
-                    static_cast<AnnotationTargetT>(1) << static_cast<AnnotationTargetT>(unsignedVal));
-            } else {
-                auto unsignedVal = StaticCast<IntLiteral*>(vars[i]->GetInitializer())->GetUnsignedVal();
-                target |= static_cast<AnnotationTargetT>(
-                    static_cast<AnnotationTargetT>(1) << static_cast<AnnotationTargetT>(unsignedVal));
-            }
-        }
-        return target;
-    }
-
-    void UpdateAnnotationCheckMap(const ClassDef* def)
-    {
-        auto annoInfo = g_annoInfo.find(def);
-        if (annoInfo == g_annoInfo.end()) {
-            return;
-        }
-        checkMap[def] = AnnotationTarget{.val = GetAnnotationTargetFromInfo(annoInfo->second)};
-        g_annoInfo.erase(annoInfo);
-    }
-
-    // check map, from Annotation class to AnnotationTarget
-    std::unordered_map<const ClassDef*, AnnotationTarget> checkMap;
-
-    static unsigned GetUnsignedValFromInit(const Func& func)
-    {
-        // the init func after consteval shall be
-        // %1: unsigned64 = ConstantInt(xxx)
-        // %2: Enum-AnnotationTarget = TypeCast(Enum-AnnotationTarget, %1)
-        // %3 = Store(%2, `var`)
-        // just find the int literal and retrieve its value
-        for (auto exp : func.GetEntryBlock()->GetNonTerminatorExpressions()) {
-            if (auto uval = DynamicCast<Constant>(exp)) {
-                return static_cast<unsigned>(uval->GetUnsignedIntLitVal());
-            }
-        }
-        InternalError("Annotation checking failed");
-        return 0;
-    }
-
-    // paralle version. Current impl uses the serialised version
-    [[maybe_unused]] bool CheckAnnotationsParallelImpl()
-    {
-        constexpr unsigned f{8};
-        constexpr unsigned g{9};
-        size_t threadNum = std::thread::hardware_concurrency() * f / g;
-
-        Utils::TaskQueue qu{threadNum};
-        std::vector<Utils::TaskResult<bool>> results;
-
-        for (auto& info : g_typeAnnoInfo) {
-            results.emplace_back(qu.AddTask<bool>([&info, this] { return CheckType(info); }));
-        }
-        for (auto& info : g_valueAnnoInfo) {
-            results.emplace_back(qu.AddTask<bool>([&info, this] { return CheckValue(info); }));
-        }
-        qu.RunAndWaitForAllTasksCompleted();
-
-        g_typeAnnoInfo.clear();
-        g_valueAnnoInfo.clear();
-        return std::all_of(results.begin(), results.end(), [](auto& res) { return res.get(); });
-    }
-    bool CheckAnnotationsImpl()
-    {
-        bool res = true;
-        for (auto& info : g_typeAnnoInfo) {
-            res = CheckType(info) && res;
-        }
-        for (auto& info : g_valueAnnoInfo) {
-            res = CheckValue(info) && res;
-        }
-        return res;
-    }
-
-    using TargetT = AST::AnnotationTargetT;
-    static TargetT GetTarget(const Decl& decl)
-    {
-        if (Is<FuncParam>(decl)) {
-            return static_cast<TargetT>(AST::AnnotationTarget::PARAMETER);
-        }
-        if (Is<PropDecl>(decl)) {
-            return static_cast<TargetT>(AST::AnnotationTarget::MEMBER_PROPERTY);
-        }
-        // enum constructor must be checked before var and func decl
-        if (decl.TestAttr(AST::Attribute::ENUM_CONSTRUCTOR)) {
-            return static_cast<TargetT>(AST::AnnotationTarget::ENUM_CONSTRUCTOR);
-        }
-        if (Is<VarDeclAbstract>(decl)) {
-            if (decl.TestAttr(AST::Attribute::GLOBAL)) {
-                return static_cast<TargetT>(AST::AnnotationTarget::GLOBAL_VARIABLE);
-            }
-            return static_cast<TargetT>(AST::AnnotationTarget::MEMBER_VARIABLE);
-        }
-        auto func = StaticCast<FuncDecl>(&decl);
-        if (func->TestAttr(AST::Attribute::CONSTRUCTOR)) {
-            return static_cast<TargetT>(AST::AnnotationTarget::INIT);
-        }
-        if (decl.TestAttr(AST::Attribute::GLOBAL)) {
-            return static_cast<TargetT>(AST::AnnotationTarget::GLOBAL_FUNCTION);
-        }
-        return static_cast<TargetT>(AST::AnnotationTarget::MEMBER_FUNCTION);
-    }
-
-    bool CheckValue(const CustomAnnoInfoOnDecl& info)
-    {
-        auto targetid = GetTarget(*info.decl);
-        unsigned target = 1u << targetid;
-        bool res{true};
-        for (auto& annotation : info.annos) {
-            auto targets = checkMap.at(annotation.def);
-            if (targets.val == 0) {
-                UpdateAnnotationCheckMap(annotation.def);
-                targets = checkMap.at(annotation.def);
-            }
-            if (!targets.Matches(target)) {
-                (void)diag.diag.DiagnoseRefactor(DiagKindRefactor::chir_annotation_not_applicable, *annotation.src,
-                    annotation.src->identifier, std::string{ANNOTATION_TARGET_2_STRING[targetid]});
-                res = false;
-            }
-        }
-        return res;
-    }
-
-#ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
-    static TargetT GetTarget(const CustomTypeDef& type)
-    {
-        return static_cast<TargetT>(Is<ExtendDef>(type) ? AST::AnnotationTarget::EXTEND : AST::AnnotationTarget::TYPE);
-    }
-#endif
-
-    bool CheckType(const CustomAnnoInfoOnType& info)
-    {
-#ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
-        auto targetid = GetTarget(*info.type);
-#endif
-        unsigned target = 1u << targetid;
-        bool res{true};
-        for (auto& annotation : info.annos) {
-            auto targets = checkMap.at(annotation.def);
-            if (targets.val == 0) {
-                UpdateAnnotationCheckMap(annotation.def);
-                targets = checkMap.at(annotation.def);
-            }
-            if (!targets.Matches(target)) {
-                (void)diag.diag.DiagnoseRefactor(DiagKindRefactor::chir_annotation_not_applicable, *annotation.src,
-                    annotation.src->identifier, std::string{ANNOTATION_TARGET_2_STRING[targetid]});
-                res = false;
-            }
-        }
-        return res;
-    }
-};
-} // unnamed namespace
-
-bool ToCHIR::RunAnnotationChecks()
-{
-    Utils::ProfileRecorder r{"CHIR", "AnnotationCheck"};
-    if (!AnnotationChecker{diag}.CheckAnnotations()) {
-        return false;
-    }
-    return true;
+// the following strings are from `enum AnnotationKind` in std.core package
+const std::string TYPE_TARGET = "Type";
+const std::string PARAMETER_TARGET = "Parameter";
+const std::string INIT_TARGET = "Init";
+const std::string MEMBER_PROPERTY_TARGET = "MemberProperty";
+const std::string MEMBER_FUNCTION_TARGET = "MemberFunction";
+const std::string MEMBER_VARIABLE_TARGET = "MemberVariable";
+const std::string ENUM_CONSTRUCTOR_TARGET = "EnumConstructor";
+const std::string GLOBAL_FUNCTION_TARGET = "GlobalFunction";
+const std::string GLOBAL_VARIABLE_TARGET = "GlobalVariable";
+const std::string EXTENSION_TARGET = "Extension";
 }
-} // namespace Cangjie::CHIR
+
+AnnotationChecker::AnnotationChecker(const Package& pkg, DiagnosticEngine& diag)
+    : pkg(pkg), diag(diag)
+{
+    targetToErrMsg.emplace(TYPE_TARGET, "type");
+    targetToErrMsg.emplace(PARAMETER_TARGET, "parameter");
+    targetToErrMsg.emplace(INIT_TARGET, "init");
+    targetToErrMsg.emplace(MEMBER_PROPERTY_TARGET, "member property");
+    targetToErrMsg.emplace(MEMBER_FUNCTION_TARGET, "member function");
+    targetToErrMsg.emplace(MEMBER_VARIABLE_TARGET, "member variable");
+    targetToErrMsg.emplace(ENUM_CONSTRUCTOR_TARGET, "enum constructor");
+    targetToErrMsg.emplace(GLOBAL_FUNCTION_TARGET, "global function");
+    targetToErrMsg.emplace(GLOBAL_VARIABLE_TARGET, "global variable");
+    targetToErrMsg.emplace(EXTENSION_TARGET, "extend");
+}
+
+bool AnnotationChecker::Run()
+{
+    CollectAnnotationTargets();
+    CheckAnnotationTargets();
+    return diag.GetErrorCount() == 0;
+}
+
+void AnnotationChecker::CollectAnnotationTargets()
+{
+    for (auto def : pkg.GetAllClassDef()) {
+        if (!def->IsAnnotation()) {
+            continue;
+        }
+        auto targets = def->GetAnnotationTargets();
+        if (targets.empty()) {
+            annotationTargets.emplace(def->GetSrcCodeIdentifier(), std::unordered_set<std::string>{});
+            continue;
+        }
+        std::unordered_set<std::string> result;
+        for (auto target : targets) {
+            result.emplace(CalculateTarget(*target));
+        }
+        annotationTargets.emplace(def->GetSrcCodeIdentifier(), result);
+    }
+}
+
+std::string AnnotationChecker::CalculateTarget(const GlobalVar& var)
+{
+    auto users = var.GetUsers();
+    CJC_ASSERT(users.size() == 1);
+    auto store = StaticCast<Store*>(users[0]);
+    auto annotationKindDef = StaticCast<EnumType*>(store->GetValue()->GetType())->GetEnumDef();
+    CJC_ASSERT(annotationKindDef->GetSrcCodeIdentifier() == "AnnotationKind");
+    CJC_ASSERT(annotationKindDef->GetPackageName() == "std.core");
+    auto typecast = StaticCast<TypeCast*>(StaticCast<LocalVar*>(store->GetValue())->GetExpr());
+    auto constExpr = StaticCast<Constant*>(StaticCast<LocalVar*>(typecast->GetSourceValue())->GetExpr());
+    auto constValue = constExpr->GetValue();
+    CJC_ASSERT(constValue->GetType()->GetTypeKind() == Type::TypeKind::TYPE_UINT32);
+    auto enumCtorIdx = StaticCast<IntLiteral*>(constValue)->GetUnsignedVal();
+    return annotationKindDef->GetCtor(enumCtorIdx).name;
+}
+
+void AnnotationChecker::CheckAnnotationTargets()
+{
+    for (auto def : pkg.GetCurPkgCustomTypeDef()) {
+        if (def->IsExtend()) {
+            CheckTargetsOnDef(*def, EXTENSION_TARGET);
+        } else {
+            CheckTargetsOnDef(*def, TYPE_TARGET);
+        }
+    }
+    for (auto var : pkg.GetGlobalVarsWithInit(false)) {
+        CheckTargetsOnGlobalVar(*var);
+    }
+    // we need to check all functions in current package, including pure abstract functions
+    // because pure abstract function can be marked with custom annotation.
+    for (auto func : pkg.GetGlobalFunctions(true)) {
+        if (func->TestAttr(Attribute::IMPORTED)) {
+            continue;
+        }
+        CheckTargetsOnGlobalFunc(*func);
+    }
+}
+
+void AnnotationChecker::CheckTargetsOnGlobalVar(const GlobalVar& var)
+{
+    if (var.GetParentCustomTypeDef() != nullptr) {
+        CheckTargets(var.GetAnnoInfo(), MEMBER_VARIABLE_TARGET);
+    } else {
+        CheckTargets(var.GetAnnoInfo(), GLOBAL_VARIABLE_TARGET);
+    }
+}
+
+void AnnotationChecker::CheckTargetsOnGlobalFunc(const Function& func)
+{
+    if (func.GetParentCustomTypeDef() != nullptr) {
+        if (func.IsConstructor()) {
+            CheckTargets(func.GetAnnoInfo(), INIT_TARGET);
+        } else if (func.GetFuncKind() == FuncKind::GETTER || func.GetFuncKind() == FuncKind::SETTER) {
+            CheckTargets(func.GetAnnoInfo(), MEMBER_PROPERTY_TARGET);
+        } else {
+            CheckTargets(func.GetAnnoInfo(), MEMBER_FUNCTION_TARGET);
+        }
+    } else {
+        CheckTargets(func.GetAnnoInfo(), GLOBAL_FUNCTION_TARGET);
+    }
+    for (auto param : func.GetParams()) {
+        CheckTargets(param->GetAnnoInfo(), PARAMETER_TARGET);
+    }
+}
+
+void AnnotationChecker::CheckTargets(const AnnoInfo& annoInfo, const std::string& target)
+{
+    for (const auto& annoPair : annoInfo.GetCustomAnnoInstances()) {
+        auto annoClassName = annoPair.GetAnnoClassName();
+        auto it = annotationTargets.find(annoClassName);
+        CJC_ASSERT(it != annotationTargets.end());
+        if (it->second.empty()) {
+            continue;
+        }
+        if (it->second.find(target) != it->second.end()) {
+            continue;
+        }
+        auto [_, loc] = ToRangeIfNotZero(annoPair.GetDebugLocation());
+        diag.DiagnoseRefactor(
+            DiagKindRefactor::chir_annotation_not_applicable, loc, annoClassName, targetToErrMsg.at(target));
+    }
+}
+
+void AnnotationChecker::CheckTargetsOnDef(const CustomTypeDef& def, const std::string& defTarget)
+{
+    CheckTargets(def.GetAnnoInfo(), defTarget);
+    for (const auto& memberVar : def.GetDirectInstanceVars()) {
+        CheckTargets(memberVar.annoInfo, MEMBER_VARIABLE_TARGET);
+    }
+    if (auto enumDef = DynamicCast<const EnumDef*>(&def)) {
+        for (const auto& ctor : enumDef->GetCtors()) {
+            CheckTargets(ctor.annoInfo, ENUM_CONSTRUCTOR_TARGET);
+        }
+    }
+}

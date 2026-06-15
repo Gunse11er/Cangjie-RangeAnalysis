@@ -41,35 +41,6 @@ void CollectJavaTypes(Ptr<Ty> ty, std::vector<Ptr<Decl>>& javaDecls)
     }
 }
 
-void CollectJavaTypesAndDiag(DiagnosticEngine& diag, const Decl& decl, Ptr<Decl> nonJavaOuterDecl = nullptr)
-{
-    std::vector<Ptr<Decl>> javaDecls;
-    CollectJavaTypes(decl.ty, javaDecls);
-    DiagUsageOfJavaTypes(diag, decl, std::move(javaDecls), nonJavaOuterDecl);
-}
-
-void CheckMemberDeclsUseJavaTypes(DiagnosticEngine& diag, Decl& decl)
-{
-    for (auto& member : decl.GetMemberDecls()) {
-        if (auto memberVarDecl = DynamicCast<VarDecl>(member.get())) {
-            CollectJavaTypesAndDiag(diag, *memberVarDecl, &decl);
-        }
-    }
-}
-
-void CheckEnumConstructorsUseJavaTypes(DiagnosticEngine& diag, EnumDecl& enumDecl)
-{
-    for (auto& enumCtr : enumDecl.constructors) {
-        if (auto funcEnumCtr = DynamicCast<FuncDecl>(enumCtr.get())) {
-            CJC_ASSERT_WITH_MSG(
-                !funcEnumCtr->funcBody->paramLists[0]->params.empty(), "at least one paramLists expected");
-            for (auto& argDecl : funcEnumCtr->funcBody->paramLists[0]->params) {
-                CollectJavaTypesAndDiag(diag, *argDecl, &enumDecl);
-            }
-        }
-    }
-}
-
 void CollectJavaTypesAndDiag(DiagnosticEngine& diag, const NameReferenceExpr& expr)
 {
     std::vector<Ptr<Decl>> javaDecls;
@@ -83,7 +54,7 @@ void CollectJavaTypesAndDiag(DiagnosticEngine& diag, const RefType& type)
 {
     std::vector<Ptr<Decl>> javaDecls;
     for (auto& typeArg : type.typeArguments) {
-        CollectJavaTypes(typeArg->ty, javaDecls);
+        CollectJavaTypes(typeArg->GetTy(), javaDecls);
     }
     DiagJavaTypesAsGenericParam(diag, type, std::move(javaDecls));
 }
@@ -100,10 +71,10 @@ bool IsInstantiationWithJavaTypeAllowed(NameReferenceExpr& expr)
         return true;
     }
 
-    if (IsInstantiationWithJavaTypeAllowed(target->ty)) {
+    if (IsInstantiationWithJavaTypeAllowed(target->GetTy())) {
         return true;
     }
-    if (target->outerDecl && IsInstantiationWithJavaTypeAllowed(target->outerDecl->ty)) {
+    if (target->outerDecl && IsInstantiationWithJavaTypeAllowed(target->outerDecl->GetTy())) {
         return true;
     }
 
@@ -111,34 +82,6 @@ bool IsInstantiationWithJavaTypeAllowed(NameReferenceExpr& expr)
 }
 
 } // namespace
-
-void JavaInteropManager::CheckUsageOfJavaTypes(Decl& decl)
-{
-    switch (decl.astKind) {
-        case ASTKind::VAR_DECL:
-        case ASTKind::VAR_WITH_PATTERN_DECL: {
-            CollectJavaTypesAndDiag(diag, decl);
-            return;
-        }
-        case ASTKind::CLASS_DECL: {
-            if (IsMirror(decl) || IsImpl(decl)) {
-                return;
-            }
-            CheckMemberDeclsUseJavaTypes(diag, decl);
-            return;
-        }
-        case ASTKind::STRUCT_DECL: {
-            CheckMemberDeclsUseJavaTypes(diag, decl);
-            return;
-        }
-        case ASTKind::ENUM_DECL: {
-            CheckEnumConstructorsUseJavaTypes(diag, *StaticCast<EnumDecl>(&decl));
-            return;
-        }
-        default:
-            return;
-    }
-}
 
 void JavaInteropManager::CheckGenericsInstantiation(Decl& decl)
 {
@@ -148,7 +91,7 @@ void JavaInteropManager::CheckGenericsInstantiation(Decl& decl)
                 CollectJavaTypesAndDiag(diag, *nameRefExpr);
             }
         } else if (auto refType = DynamicCast<RefType>(node)) {
-            if (!IsInstantiationWithJavaTypeAllowed(refType->ty)) {
+            if (!IsInstantiationWithJavaTypeAllowed(refType->GetTy())) {
                 CollectJavaTypesAndDiag(diag, *refType);
             }
         }

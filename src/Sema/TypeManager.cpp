@@ -169,7 +169,7 @@ Ptr<Ty> TypeManager::GetUnionTy(const std::set<Ptr<Ty>>& tys)
 Ptr<Ty> TypeManager::GetBlockRealTy(const Block& block) const
 {
     if (block.desugarExpr) {
-        return block.desugarExpr->ty;
+        return block.desugarExpr->GetTy();
     }
     if (block.body.empty()) {
         return GetPrimitiveTy(TypeKind::TYPE_UNIT);
@@ -180,9 +180,9 @@ Ptr<Ty> TypeManager::GetBlockRealTy(const Block& block) const
     }
     if (Is<Expr>(lastNode)) {
         auto expr = RawStaticCast<Expr*>(lastNode);
-        return expr->desugarExpr.get() ? expr->desugarExpr->ty : expr->ty;
+        return expr->desugarExpr.get() ? expr->desugarExpr->GetTy() : expr->GetTy();
     }
-    return block.ty;
+    return block.GetTy();
 }
 
 Ptr<Ty> TypeManager::TyInstantiator::GetInstantiatedGenericTy(GenericsTy& ty)
@@ -396,11 +396,22 @@ Ptr<Ty> TypeManager::GetInstantiatedTy(Ptr<Ty> ty, const TypeSubst& typeMapping)
     return instantiator.Instantiate(ty);
 }
 
+Ptr<Ty> TypeManager::ApplyTypeSubstForTy(const TypeSubst& typeMapping, const Ptr<Ty> ty)
+{
+    if (typeMapping.empty()) {
+        return ty;
+    }
+    TyVarScope ts(*this);
+    SubstPack substPack;
+    PackMapping(substPack, typeMapping);
+    return ApplySubstPack(ty, substPack);
+}
+
 std::set<Ptr<Ty>> TypeManager::ApplyTypeSubstForTys(const TypeSubst& subst, const std::set<Ptr<TyVar>>& tys)
 {
     std::set<Ptr<Ty>> res;
     for (auto& i : tys) {
-        res.insert(GetInstantiatedTy(i, subst));
+        res.insert(ApplyTypeSubstForTy(subst, i));
     }
     return res;
 }
@@ -495,8 +506,8 @@ void TypeManager::MakeInstTyVar(SubstPack& maps, const AST::Decl& d)
 {
     if (d.generic) {
         for (auto& genParam : d.generic->typeParameters) {
-            if (Ty::IsTyCorrect(genParam->ty)) {
-                MakeInstTyVar(maps, *StaticCast<GenericsTy*>(genParam->ty));
+            if (Ty::IsTyCorrect(genParam->GetTy())) {
+                MakeInstTyVar(maps, *StaticCast<GenericsTy*>(genParam->GetTy()));
             }
         }
     }
@@ -524,8 +535,8 @@ void TypeManager::GenerateStructDeclGenericMappingVisit(MultiTypeSubst& m, const
     }
     MergeTypeSubstToMultiTypeSubst(m, GenerateTypeMapping(decl, targetTy.typeArgs));
     for (auto& inheritedType : decl.inheritedTypes) {
-        if (IsInheritableType(inheritedType->ty)) {
-            GenerateGenericMappingVisit(m, *inheritedType->ty, visited);
+        if (IsInheritableType(inheritedType->GetTy())) {
+            GenerateGenericMappingVisit(m, *inheritedType->GetTy(), visited);
         }
     }
 }
@@ -591,8 +602,8 @@ void TypeManager::GenerateStructDeclGenericMappingVisit(SubstPack& m, const AST:
         GenerateTypeMapping(*this, m, decl, typeArgs);
     }
     for (auto& inheritedType : decl.inheritedTypes) {
-        if (IsInheritableType(inheritedType->ty)) {
-            GenerateGenericMappingVisit(m, *inheritedType->ty, visited, false);
+        if (IsInheritableType(inheritedType->GetTy())) {
+            GenerateGenericMappingVisit(m, *inheritedType->GetTy(), visited, false);
         }
     }
 }
@@ -639,7 +650,8 @@ TypeSubst TypeManager::GenerateGenericMappingFromGeneric(const Decl& parentDecl,
         parentGeneric->typeParameters.size() == childGeneric->typeParameters.size();
     if (validGenerics) {
         for (size_t i = 0; i < parentGeneric->typeParameters.size(); ++i) {
-            typeMapping[StaticCast<TyVar*>(parentGeneric->typeParameters[i]->ty)] = childGeneric->typeParameters[i]->ty;
+            typeMapping[StaticCast<TyVar*>(parentGeneric->typeParameters[i]->GetTy())] =
+                childGeneric->typeParameters[i]->GetTy();
         }
     }
     return typeMapping;
@@ -650,11 +662,11 @@ MultiTypeSubst TypeManager::GenerateStructDeclTypeMapping(const Decl& decl)
     if (!decl.IsNominalDecl()) {
         return {};
     }
-    auto parentTy = decl.ty;
+    auto parentTy = decl.GetTy();
     if (decl.astKind == ASTKind::EXTEND_DECL) {
         auto& ed = static_cast<const ExtendDecl&>(decl);
         CJC_ASSERT(ed.extendedType);
-        parentTy = ed.extendedType->ty;
+        parentTy = ed.extendedType->GetTy();
     }
     if (!parentTy) {
         return {};
@@ -818,7 +830,7 @@ bool TypeManager::IsClassTyEqual(Ty& leaf, Ty& root)
         return false;
     };
     // Need add test case to verify this logic.
-    return static_cast<ClassLikeTy&>(leaf).commonDecl->ty == static_cast<ClassLikeTy&>(root).commonDecl->ty &&
+    return static_cast<ClassLikeTy&>(leaf).commonDecl->GetTy() == static_cast<ClassLikeTy&>(root).commonDecl->GetTy() &&
         (leaf.typeArgs.size() == root.typeArgs.size()) && !leaf.IsClass() &&
         std::all_of(leaf.typeArgs.begin(), leaf.typeArgs.end(), predFunc);
 }
@@ -1198,30 +1210,28 @@ TypeCompatibility TypeManager::CheckTypeCompatibility(
         : TypeCompatibility::INCOMPATIBLE;
 }
 
-void TypeManager::ReplaceIdealTy(Ptr<Ty>* ty)
+Ptr<Ty> TypeManager::ReplaceIdealTy(Ptr<Ty> ty)
 {
-    if (!ty || !Ty::IsTyCorrect(*ty)) {
-        return;
+    if (!Ty::IsTyCorrect(ty)) {
+        return ty;
     }
-    switch ((*ty)->kind) {
+    switch (ty->kind) {
         case TypeKind::TYPE_IDEAL_INT:
-            *ty = GetPrimitiveTy(TypeKind::TYPE_INT64);
-            break;
+            return GetPrimitiveTy(TypeKind::TYPE_INT64);
         case TypeKind::TYPE_IDEAL_FLOAT:
-            *ty = GetPrimitiveTy(TypeKind::TYPE_FLOAT64);
-            break;
+            return GetPrimitiveTy(TypeKind::TYPE_FLOAT64);
         case TypeKind::TYPE_CLASS:
         case TypeKind::TYPE_INTERFACE:
         case TypeKind::TYPE_ENUM:
         case TypeKind::TYPE_ARRAY:
         case TypeKind::TYPE_POINTER:
         case TypeKind::TYPE_TUPLE:
-            for (auto& typeArg : (*ty)->typeArgs) {
-                ReplaceIdealTy(&typeArg);
+            for (auto& typeArg : ty->typeArgs) {
+                typeArg = ReplaceIdealTy(std::move(typeArg));
             }
-            break;
+            return ty;
         default:
-            break;
+            return ty;
     }
 }
 
@@ -1253,8 +1263,8 @@ bool TypeManager::HasExtendInterfaceTyHelper(Ty& superTy, const std::set<Ptr<Ext
             PData::Reset(constraints);
             continue;
         }
-        bool extendTyNotMatch = (!extend->extendedType || !extend->extendedType->ty ||
-            extend->extendedType->ty->typeArgs.size() != typeArgs.size());
+        bool extendTyNotMatch = (!extend->extendedType || !extend->extendedType->GetTy() ||
+            extend->extendedType->GetTy()->typeArgs.size() != typeArgs.size());
         if (extendTyNotMatch) {
             PData::Reset(constraints);
             continue;
@@ -1262,15 +1272,15 @@ bool TypeManager::HasExtendInterfaceTyHelper(Ty& superTy, const std::set<Ptr<Ext
         TypeSubst typeMapping;
         for (size_t i = 0; i < typeArgs.size(); ++i) {
             // may be used in generic instantiation
-            if (auto genSuper = DynamicCast<TyVar*>(extend->extendedType->ty->typeArgs[i])) {
+            if (auto genSuper = DynamicCast<TyVar*>(extend->extendedType->GetTy()->typeArgs[i])) {
                 typeMapping[genSuper] = typeArgs[i];
             }
         }
         for (auto& superInterfaceTy : extend->inheritedTypes) {
-            if (!IsInheritableType(superInterfaceTy->ty)) {
+            if (!IsInheritableType(superInterfaceTy->GetTy())) {
                 continue;
             }
-            Ptr<Ty> instTy = GetInstantiatedTy(superInterfaceTy->ty, typeMapping);
+            Ptr<Ty> instTy = GetInstantiatedTy(superInterfaceTy->GetTy(), typeMapping);
             // search super interfaceTy recursively.
             if (HasSuperTy(*instTy, superTy, typeMapping)) {
                 return true;
@@ -1291,8 +1301,8 @@ std::unordered_set<Ptr<Ty>> TypeManager::GetAllExtendInterfaceTyHelper(
             PData::Reset(constraints);
             continue;
         }
-        bool extendTyNotMatch = (!extend->extendedType || !extend->extendedType->ty ||
-            extend->extendedType->ty->typeArgs.size() != typeArgs.size());
+        bool extendTyNotMatch = (!extend->extendedType || !extend->extendedType->GetTy() ||
+            extend->extendedType->GetTy()->typeArgs.size() != typeArgs.size());
         if (extendTyNotMatch) {
             PData::Reset(constraints);
             continue;
@@ -1312,13 +1322,13 @@ std::unordered_set<Ptr<Ty>> TypeManager::GetAllExtendInterfaceTyHelper(
              * but typeArgs in the extend used in instantiation of A is [SA<Int64>].
              * so we need to generate the type mapping: [T4 |-> Int64].
              */
-            typeMapping.merge(GenerateTypeMappingByTy(extend->extendedType->ty->typeArgs[i], typeArgs[i]));
+            typeMapping.merge(GenerateTypeMappingByTy(extend->extendedType->GetTy()->typeArgs[i], typeArgs[i]));
         }
         for (auto& superInterfaceTy : extend->inheritedTypes) {
-            if (!IsInheritableType(superInterfaceTy->ty)) {
+            if (!IsInheritableType(superInterfaceTy->GetTy())) {
                 continue;
             }
-            Ptr<Ty> instTy = GetInstantiatedTy(superInterfaceTy->ty, typeMapping);
+            Ptr<Ty> instTy = GetInstantiatedTy(superInterfaceTy->GetTy(), typeMapping);
             // Get super interfaceTy recursively.
             auto superInterfaceTys = GetAllSuperTys(*instTy);
             for (auto i : superInterfaceTys) {
@@ -1347,8 +1357,8 @@ bool TypeManager::HasExtendedInterfaceTy(Ty& ty, Ty& superTy, const TypeSubst& t
         for (auto& inheritedType : declPtr->inheritedTypes) {
             CJC_ASSERT(inheritedType);
             // Get inherited types recursively. BUT do not collect inherited type which has cyclic inheritance.
-            if (inheritedType->ty->IsClass() && IsInheritableType(inheritedType->ty)) {
-                return HasExtendedInterfaceTy(*inheritedType->ty, superTy, substituteMapping);
+            if (inheritedType->GetTy()->IsClass() && IsInheritableType(inheritedType->GetTy())) {
+                return HasExtendedInterfaceTy(*inheritedType->GetTy(), superTy, substituteMapping);
             }
         }
     }
@@ -1402,8 +1412,8 @@ void TypeManager::GetNominalSuperTy(
     for (auto& inheritedType : declPtr->inheritedTypes) {
         CJC_ASSERT(inheritedType);
         // Get inherited types recursively. BUT do not collect inherited type which has cyclic inheritance.
-        if (IsInheritableType(inheritedType->ty)) {
-            auto inheritedTys = GetAllSuperTys(*inheritedType->ty, substituteMapping);
+        if (IsInheritableType(inheritedType->GetTy())) {
+            auto inheritedTys = GetAllSuperTys(*inheritedType->GetTy(), substituteMapping);
             tyList.merge(inheritedTys);
         }
     }
@@ -1420,7 +1430,8 @@ bool TypeManager::HasNominalSuperTy(Ty& nominalTy, Ty& superTy, const TypeSubst&
     for (auto& inheritedType : declPtr->inheritedTypes) {
         CJC_ASSERT(inheritedType);
         // search inherited types recursively. BUT do not search inherited type which has cyclic inheritance.
-        if (IsInheritableType(inheritedType->ty) && HasSuperTy(*inheritedType->ty, superTy, substituteMapping)) {
+        if (IsInheritableType(inheritedType->GetTy()) &&
+            HasSuperTy(*inheritedType->GetTy(), superTy, substituteMapping)) {
             return true;
         }
     }
@@ -1494,7 +1505,7 @@ std::unordered_set<Ptr<Ty>> TypeManager::GetAllSuperTys(Ty& ty, const TypeSubst&
     if (auto found = tyToSuperTysMap.find(key); found != tyToSuperTysMap.end()) {
         return found->second;
     }
-    auto maybeInstTy = typeMapping.empty() ? Ptr(&ty) : GetInstantiatedTy(&ty, typeMapping);
+    auto maybeInstTy = ApplyTypeSubstForTy(typeMapping, &ty);
     if (auto classLikeTy = DynamicCast<ClassLikeTy*>(maybeInstTy)) {
         tyList.emplace(classLikeTy);
     } else if (auto structTy = DynamicCast<StructTy*>(maybeInstTy)) {
@@ -1565,10 +1576,10 @@ std::vector<Ptr<InterfaceTy>> TypeManager::GetAllSuperInterfaceTysBFS(const Inhe
     std::vector<Ptr<InterfaceTy>> allSuperTys;
     std::deque<std::pair<Ptr<InterfaceTy>, TypeSubst>> tempDeque{};
     for (auto& type : decl.inheritedTypes) {
-        if (!type->ty->IsInterface()) {
+        if (!type->GetTy()->IsInterface()) {
             continue;
         }
-        auto interfaceTy = RawStaticCast<InterfaceTy*>(type->ty);
+        auto interfaceTy = RawStaticCast<InterfaceTy*>(type->GetTy());
         auto typeMapping = GetSubstituteMapping(*interfaceTy, {});
         tempDeque.emplace_back(interfaceTy, typeMapping);
     }
@@ -1579,10 +1590,10 @@ std::vector<Ptr<InterfaceTy>> TypeManager::GetAllSuperInterfaceTysBFS(const Inhe
             allSuperTys.push_back(temp.first);
             visitedTys.insert(temp.first);
             for (auto& type : temp.first->declPtr->inheritedTypes) {
-                if (!type->ty->IsInterface()) { // Type may be non-interface when user code is invalid.
+                if (!type->GetTy()->IsInterface()) { // Type may be non-interface when user code is invalid.
                     continue;
                 }
-                auto interfaceTy = RawStaticCast<InterfaceTy*>(type->ty);
+                auto interfaceTy = RawStaticCast<InterfaceTy*>(type->GetTy());
                 auto typeMapping = GetSubstituteMapping(*interfaceTy, temp.second);
                 tempDeque.emplace_back(
                     RawStaticCast<InterfaceTy*>(GetInstantiatedTy(interfaceTy, temp.second)), typeMapping);
@@ -1644,10 +1655,10 @@ bool TypeManager::CheckGenericDeclInstantiation(Ptr<const Decl> d, const std::ve
     bool result = true;
     // Check generic constraints.
     for (auto& gc : genericDecl->genericConstraints) {
-        auto typeTy = GetInstantiatedTy(gc->type->ty, instantiateMap);
+        auto typeTy = GetInstantiatedTy(gc->type->GetTy(), instantiateMap);
         bool isNotGeneric = !typeTy || typeTy->kind != TypeKind::TYPE_GENERICS;
         for (const auto& upperBound : gc->upperBounds) {
-            auto upperBoundTy = GetInstantiatedTy(upperBound->ty, instantiateMap);
+            auto upperBoundTy = GetInstantiatedTy(upperBound->GetTy(), instantiateMap);
             bool typeNotMatch = !IsSubtype(typeTy, upperBoundTy);
             if (isNotGeneric && typeNotMatch) {
                 result = false;
@@ -1848,7 +1859,7 @@ Ptr<Ty> TypeManager::GetExtendInterfaceSuperTy(ClassTy& classTy, const Ty& inter
     GenerateGenericMapping(mts, classTy);
     auto typeMapping = MultiTypeSubstToTypeSubst(mts);
     while (sd != nullptr) {
-        auto instTy = GetInstantiatedTy(sd->ty, typeMapping);
+        auto instTy = GetInstantiatedTy(sd->GetTy(), typeMapping);
         if (instTy && IsTyExtendInterface(*instTy, interfaceTy)) {
             return instTy;
         }
@@ -1951,8 +1962,8 @@ void TypeManager::RestoreJavaGenericsTy(AST::Decl& decl) const
 
 bool TypeManager::IsFuncDeclSubType(const AST::FuncDecl& decl, const AST::FuncDecl& funcDecl)
 {
-    auto declType = StaticCast<FuncTy*>(decl.ty);
-    auto resolvedFuncType = DynamicCast<FuncTy*>(funcDecl.ty);
+    auto declType = StaticCast<FuncTy*>(decl.GetTy());
+    auto resolvedFuncType = DynamicCast<FuncTy*>(funcDecl.GetTy());
     if (resolvedFuncType && decl.identifier == funcDecl.identifier && IsFuncTySubType(*declType, *resolvedFuncType)) {
         return true;
     }
@@ -1972,6 +1983,9 @@ bool TypeManager::IsFuncDeclEqualType(const AST::FuncDecl& decl, const AST::Func
 
 void TypeManager::UpdateTopOverriddenFuncDeclMap(const AST::Decl* src, const AST::Decl* target)
 {
+    if (src == target) {
+        return;
+    }
     if (auto funcDecl = DynamicCast<AST::FuncDecl>(src)) {
         auto& temp = overrideMap[funcDecl];
         temp.emplace_back(StaticCast<AST::FuncDecl*>(target));
@@ -2045,11 +2059,11 @@ std::pair<bool, bool> TypeManager::IsExtendInheritRelation(const ExtendDecl& r, 
 {
     bool hasInheritRelat = false;
     bool isRSuper = false;
-    auto mapping = GenerateTypeMappingByTy(r.ty, l.ty);
+    auto mapping = GenerateTypeMappingByTy(r.GetTy(), l.GetTy());
     for (auto& lSuper : std::as_const(l.inheritedTypes)) {
         for (auto& rSuper : std::as_const(r.inheritedTypes)) {
-            auto lTy = GetInstantiatedTy(lSuper->ty, mapping);
-            auto rTy = GetInstantiatedTy(rSuper->ty, mapping);
+            auto lTy = GetInstantiatedTy(lSuper->GetTy(), mapping);
+            auto rTy = GetInstantiatedTy(rSuper->GetTy(), mapping);
             if (IsSubtype(lTy, rTy)) {
                 isRSuper = true;
             }
@@ -2212,8 +2226,8 @@ std::optional<Ptr<ExtendDecl>> TypeManager::GetExtendDeclByInterface(Ty& baseTy,
     for (auto extend : extends) {
         CJC_ASSERT(extend);
         auto& types = extend->inheritedTypes;
-        bool isExtended = std::any_of(
-            types.begin(), types.end(), [this, &interfaceTy](auto& type) { return IsSubtype(type->ty, &interfaceTy); });
+        bool isExtended = std::any_of(types.begin(), types.end(),
+            [this, &interfaceTy](auto& type) { return IsSubtype(type->GetTy(), &interfaceTy); });
         if (isExtended) {
             return extend;
         }
@@ -2227,8 +2241,8 @@ Ptr<ExtendDecl> TypeManager::GetExtendDeclByMember(const Decl& member, Ty& baseT
         return nullptr;
     }
     Ptr<ExtendDecl> extend = nullptr;
-    if (member.outerDecl->astKind == ASTKind::INTERFACE_DECL && member.outerDecl->ty) {
-        auto extendDeclOp = GetExtendDeclByInterface(baseTy, *member.outerDecl->ty);
+    if (member.outerDecl->astKind == ASTKind::INTERFACE_DECL && member.outerDecl->GetTy()) {
+        auto extendDeclOp = GetExtendDeclByInterface(baseTy, *member.outerDecl->GetTy());
         extend = extendDeclOp.has_value() ? extendDeclOp.value() : nullptr;
     } else if (member.outerDecl->astKind == ASTKind::EXTEND_DECL) {
         extend = StaticCast<ExtendDecl>(member.outerDecl);
@@ -2317,9 +2331,78 @@ Ptr<AST::Decl> TypeManager::GetDummyBuiltInDecl(Ptr<Ty> ty)
 {
     if (dummyBuiltInDecls.count(ty) == 0) {
         dummyBuiltInDecls.emplace(ty, MakeOwnedNode<Decl>());
-        dummyBuiltInDecls[ty]->ty = ty;
+        dummyBuiltInDecls[ty]->SetTy(ty);
     }
     return dummyBuiltInDecls[ty].get();
+}
+
+Ptr<Ty> TypeManager::GetThisRealTy(Ptr<Ty> now)
+{
+    if (!Ty::IsTyCorrect(now)) {
+        return now;
+    }
+    if (auto thisTy = DynamicCast<ClassThisTy>(now)) {
+        return GetClassTy(*thisTy->decl, thisTy->typeArgs);
+    }
+    return now;
+}
+
+Ptr<Ty> TypeManager::ReplaceThisTy(Ptr<Ty> now)
+{
+    if (auto thisTy = DynamicCast<ClassThisTy>(now)) {
+        std::vector<Ptr<Ty>> newArgs;
+        for (auto& arg : thisTy->typeArgs) {
+            newArgs.emplace_back(ReplaceThisTy(arg));
+        }
+        return GetClassTy(*thisTy->decl, newArgs);
+    }
+    // If no type args, return as-is
+    if (now->typeArgs.empty()) {
+        return now;
+    }
+    // Recursively replace type args
+    std::vector<Ptr<Ty>> newArgs;
+    bool changed = false;
+    for (auto& arg : now->typeArgs) {
+        auto replaced = ReplaceThisTy(arg);
+        newArgs.emplace_back(replaced);
+        if (replaced != arg) {
+            changed = true;
+        }
+    }
+    if (!changed) {
+        return now;
+    }
+    // Reconstruct the type with new args based on type kind
+    switch (now->kind) {
+        case TypeKind::TYPE_FUNC: {
+            auto& funcTy = static_cast<FuncTy&>(*now);
+            std::vector<Ptr<Ty>> paramTys;
+            for (auto& p : funcTy.paramTys) {
+                paramTys.push_back(ReplaceThisTy(p));
+            }
+            auto retTy = ReplaceThisTy(funcTy.retTy);
+            return GetFunctionTy(paramTys, retTy, {funcTy.IsCFunc(), funcTy.isClosureTy, funcTy.hasVariableLenArg});
+        }
+        case TypeKind::TYPE_TUPLE:
+            return GetTupleTy(newArgs, static_cast<TupleTy&>(*now).isClosureTy);
+        case TypeKind::TYPE_ARRAY:
+            return GetArrayTy(newArgs[0], static_cast<ArrayTy&>(*now).dims);
+        case TypeKind::TYPE_POINTER:
+            return GetPointerTy(newArgs[0]);
+        case TypeKind::TYPE_STRUCT:
+            return GetStructTy(*static_cast<StructTy&>(*now).decl, newArgs);
+        case TypeKind::TYPE_CLASS:
+            return GetClassTy(*static_cast<ClassTy&>(*now).decl, newArgs);
+        case TypeKind::TYPE_INTERFACE:
+            return GetInterfaceTy(*static_cast<InterfaceTy&>(*now).decl, newArgs);
+        case TypeKind::TYPE_ENUM:
+            return GetEnumTy(*static_cast<EnumTy&>(*now).decl, newArgs);
+        case TypeKind::TYPE:
+            return GetTypeAliasTy(*static_cast<TypeAliasTy&>(*now).declPtr, newArgs);
+        default:
+            return now;
+    }
 }
 
 // Create semantic type by substituting type arguments into base type.
@@ -2374,7 +2457,7 @@ Ptr<Ty> TypeManager::SubstituteTypeArgs(Ptr<Ty> baseTy, std::vector<Ptr<Ty>>& ty
 
 Ptr<Ty> TypeManager::ObtainsAliasTypeOfRefType(Ptr<const RefType> rt)
 {
-    if (rt->ty->IsCFunc()) {
+    if (rt->GetTy()->IsCFunc()) {
         CJC_ASSERT(rt->typeArguments.size() == 1);
         auto funcType = DynamicCast<FuncType>(rt->typeArguments[0].get());
         CJC_NULLPTR_CHECK(funcType);
@@ -2382,14 +2465,14 @@ Ptr<Ty> TypeManager::ObtainsAliasTypeOfRefType(Ptr<const RefType> rt)
         return ObtainsAliasType(funcType);
     }
     // 'This' type cannot use alias types. And typeArguments always be empty for 'This' type.
-    if (DynamicCast<ClassThisTy>(rt->ty)) {
-        return rt->ty;
+    if (DynamicCast<ClassThisTy>(rt->GetTy())) {
+        return rt->GetTy();
     }
     std::vector<Ptr<AST::Ty>> typeArgs;
     for (auto& typeArg : rt->typeArguments) {
         typeArgs.emplace_back(ObtainsAliasType(typeArg.get()));
     }
-    return SubstituteTypeArgs(rt->ty, typeArgs);
+    return SubstituteTypeArgs(rt->GetTy(), typeArgs);
 }
 
 Ptr<Ty> TypeManager::ObtainsAliasTypeOfFuncDecl(Ptr<const FuncDecl> fd)
@@ -2402,20 +2485,20 @@ Ptr<Ty> TypeManager::ObtainsAliasTypeOfFuncDecl(Ptr<const FuncDecl> fd)
     if (fb->retType) {
         typeArgs.emplace_back(ObtainsAliasType(fb->retType.get()));
     } else {
-        auto funcTy = StaticCast<FuncTy>(fd->ty);
+        auto funcTy = StaticCast<FuncTy>(fd->GetTy());
         typeArgs.emplace_back(funcTy->retTy);
     }
-    return SubstituteTypeArgs(fd->ty, typeArgs);
+    return SubstituteTypeArgs(fd->GetTy(), typeArgs);
 }
 
 Ptr<Ty> TypeManager::ObtainsAliasType(Ptr<const Node> node)
 {
-    if (node == nullptr || !Ty::IsTyCorrect(node->ty)) {
+    if (node == nullptr || !Ty::IsTyCorrect(node->GetTy())) {
         return TypeManager::GetInvalidTy();
     }
     // Return type create by compiler will be ignored.
     if (node->TestAttr(Attribute::COMPILER_ADD)) {
-        return node->ty;
+        return node->GetTy();
     }
     if (auto typeNode = DynamicCast<Type>(node); typeNode && !Ty::IsInitialTy(typeNode->aliasTy)) {
         auto tad = Ty::GetDeclPtrOfTy(typeNode->aliasTy);
@@ -2423,7 +2506,7 @@ Ptr<Ty> TypeManager::ObtainsAliasType(Ptr<const Node> node)
         // If typeAlias is not exported, give up replasement. The current semantics allow an exteranl declaration to use
         // internal alias declaration.
         if (!tad->IsExportedDecl() && !tad->TestAttr(Attribute::IMPLICIT_USED)) {
-            return node->ty;
+            return node->GetTy();
         }
         return typeNode->aliasTy;
     }
@@ -2441,12 +2524,12 @@ Ptr<Ty> TypeManager::ObtainsAliasType(Ptr<const Node> node)
             auto vat = StaticCast<VArrayType>(node);
             std::vector<Ptr<AST::Ty>> typeArgs;
             typeArgs.emplace_back(ObtainsAliasType(vat->typeArgument));
-            ret = SubstituteTypeArgs(node->ty, typeArgs);
+            ret = SubstituteTypeArgs(node->GetTy(), typeArgs);
             break;
         }
         case ASTKind::FUNC_TYPE: {
             auto ft = StaticCast<FuncType>(node);
-            auto fTy = StaticCast<FuncTy>(ft->ty);
+            auto fTy = StaticCast<FuncTy>(ft->GetTy());
             std::vector<Ptr<Ty>> params;
             for (auto& param : ft->paramTypes) {
                 params.emplace_back(ObtainsAliasType(param.get()));
@@ -2461,7 +2544,7 @@ Ptr<Ty> TypeManager::ObtainsAliasType(Ptr<const Node> node)
             for (auto& field : tt->fieldTypes) {
                 typeArgs.emplace_back(ObtainsAliasType(field.get()));
             }
-            ret = SubstituteTypeArgs(node->ty, typeArgs);
+            ret = SubstituteTypeArgs(node->GetTy(), typeArgs);
             break;
         }
         case ASTKind::VAR_DECL:
@@ -2469,7 +2552,7 @@ Ptr<Ty> TypeManager::ObtainsAliasType(Ptr<const Node> node)
         case ASTKind::VAR_WITH_PATTERN_DECL: {
             auto vda = StaticCast<VarDeclAbstract>(node);
             std::vector<Ptr<Ty>> typeArgs;
-            ret = vda->type ? ObtainsAliasType(vda->type) : node->ty;
+            ret = vda->type ? ObtainsAliasType(vda->type) : node->GetTy();
             break;
         }
         case ASTKind::FUNC_DECL: {
@@ -2482,7 +2565,7 @@ Ptr<Ty> TypeManager::ObtainsAliasType(Ptr<const Node> node)
             break;
         }
         default:
-            ret = node->ty;
+            ret = node->GetTy();
             break;
     }
     return ret;
@@ -2511,12 +2594,12 @@ Ptr<Ty> TypeManager::GetUnaliasedTypeFromTypeAlias(const TypeAliasTy& target, co
     CJC_NULLPTR_CHECK(target.declPtr);
     auto tad = target.declPtr;
     if (tad->TestAttr(Attribute::IN_REFERENCE_CYCLE)) {
-        return tad->ty;
+        return tad->GetTy();
     }
     CJC_NULLPTR_CHECK(tad->type);
     auto aliasedType = tad->type.get();
     TypeSubst typeMapping = GenerateTypeMapping(*tad, typeArgs);
-    auto instAliasedTy = GetInstantiatedTy(aliasedType->ty, typeMapping);
+    auto instAliasedTy = GetInstantiatedTy(aliasedType->GetTy(), typeMapping);
     // If the aliased type is still a type alias or contain a alias type, perform recursive substitution.
     if (!Ty::IsInitialTy(aliasedType->aliasTy) || instAliasedTy->kind == TypeKind::TYPE) {
         return SubstituteTypeAliasInTy(*instAliasedTy, needSubstituteGeneric, customMapping);

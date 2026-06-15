@@ -83,3 +83,12 @@ void IOS_CJNATIVE::GenerateLinkOptions(Tool& tool)
         tool.AppendArg(FileUtil::JoinPath(cangjieLibPath, "libclang_rt.ios.a"));
     }
 }
+
+std::string IOS_CJNATIVE::GetClangRTProfileLibraryName() const
+{
+    if (driverOptions.target.env == Triple::Environment::SIMULATOR) {
+        return "libclang_rt.profile_iossim.a";
+    } else {
+        return "libclang_rt.profile_ios.a";
+    }
+}

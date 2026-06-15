@@ -378,6 +378,13 @@ void TypeChecker::TypeCheckerImpl::AddDefaultCtor(InheritableDecl& decl) const
         return;
     }
 
+    // Do not add default constructor to Java mirrors / registry companion / mirror wrapper declarations
+    // because it requires explicitly added one.
+    if (decl.TestAnyAttr(Attribute::JAVA_MIRROR, Attribute::JAVA_MIRROR_SYNTHETIC_WRAPPER,
+        Attribute::JAVA_IMPL_REGISTRY_COMPANION)) {
+            return;
+    }
+
     // Do not add default constructor to common class(struct) because
     // it requires explicitly added one
     // Do not add default constructor to specific class(struct) because it
@@ -389,7 +396,7 @@ void TypeChecker::TypeCheckerImpl::AddDefaultCtor(InheritableDecl& decl) const
         }
     } else if (decl.astKind == ASTKind::CLASS_DECL) {
         auto classDecl = StaticAs<ASTKind::CLASS_DECL>(&decl);
-        if (!classDecl->TestAnyAttr(Attribute::COMMON, Attribute::JAVA_MIRROR)) {
+        if (!classDecl->TestAttr(Attribute::COMMON)) {
             classDecl->body->decls.push_back(CreateDefaultCtor(decl));
         }
     }
@@ -505,18 +512,18 @@ void TypeChecker::TypeCheckerImpl::CheckValueTypeRecursiveDFSSwitch(Ptr<Decl> ro
     if (root->astKind != ASTKind::STRUCT_DECL && root->astKind != ASTKind::ENUM_DECL) {
         return;
     }
-    if (root->ty != nullptr && root->ty->IsEnum() && DynamicCast<RefEnumTy*>(root->ty)) {
+    if (root->GetTy() != nullptr && root->GetTy()->IsEnum() && DynamicCast<RefEnumTy*>(root->GetTy())) {
         return;
     }
     auto checkField = [this, &path](const Decl& decl) {
-        if (decl.ty->IsEnum() && DynamicCast<RefEnumTy*>(decl.ty)) {
+        if (decl.GetTy()->IsEnum() && DynamicCast<RefEnumTy*>(decl.GetTy())) {
             return;
         }
-        auto needCheckElemTy = Is<TupleTy*>(decl.ty) || Is<VArrayTy*>(decl.ty);
+        auto needCheckElemTy = Is<TupleTy*>(decl.GetTy()) || Is<VArrayTy*>(decl.GetTy());
         if (!needCheckElemTy) {
-            return CheckValueTypeRecursiveDFS(Ty::GetDeclOfTy(decl.ty), path);
+            return CheckValueTypeRecursiveDFS(Ty::GetDeclOfTy(decl.GetTy()), path);
         }
-        for (auto elementTy : decl.ty->typeArgs) {
+        for (auto elementTy : decl.GetTy()->typeArgs) {
             CheckValueTypeRecursiveDFS(Ty::GetDeclOfTy(elementTy), path);
         }
     };

@@ -15,21 +15,16 @@ using namespace Utils;
 using namespace InvokeRuntime;
 
 #ifdef _WIN32
-#ifdef UNICODE
-#define LoadLibrary LoadLibraryW
-#else
-#define LoadLibrary LoadLibraryA
-#endif
-
 HANDLE InvokeRuntime::OpenSymbolTable(const std::string& libPath)
 {
-    HANDLE handle = LoadLibrary(libPath.c_str());
+    HANDLE handle = LoadLibraryA(libPath.c_str());
     // Judge load dynamic lib correctly or not.
     if (!handle) {
         Errorln("could not load the dynamic library: ", libPath);
     }
     return handle;
 }
+
 #elif defined(__linux__) || defined(__APPLE__)
 HANDLE InvokeRuntime::OpenSymbolTable(const std::string& libPath, int dlopenMode)
 {
@@ -75,6 +70,20 @@ int InvokeRuntime::CloseSymbolTable(HANDLE handle)
     return retCode;
 }
 
+HANDLE InvokeRuntime::OpenSymbolTableSafely(const std::string& path)
+{
+    HANDLE handle = nullptr;
+#ifdef _WIN32
+    handle = InvokeRuntime::OpenSymbolTable(path);
+#elif defined(__linux__) || defined(__APPLE__)
+    handle = InvokeRuntime::OpenSymbolTable(path, RTLD_NOW | RTLD_LOCAL);
+#endif
+    if (handle != nullptr) {
+        SetOpenedLibHandles(handle);
+    }
+    return handle;
+}
+
 RuntimeInit& RuntimeInit::GetInstance()
 {
     static RuntimeInit runtimeInit;
@@ -109,12 +118,12 @@ void RuntimeInit::CloseRuntime()
             InvokeRuntime::FinishRuntime(handle);
             initRuntime = false;
         }
-#ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
+#if defined(CANGJIE_CODEGEN_CJNATIVE_BACKEND) && !defined(__ohos__)
         InvokeRuntime::CloseSymbolTable(handle);
 #endif
         handle = nullptr;
     }
-#ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
+#if defined(CANGJIE_CODEGEN_CJNATIVE_BACKEND) && !defined(__ohos__)
     // close macro dynamic library
     CloseMacroDynamicLibrary();
 #endif

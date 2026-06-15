@@ -11,10 +11,10 @@ using namespace Cangjie;
 
 Ptr<Value> Translator::Visit(const AST::UnaryExpr& unaryExpr)
 {
-    auto chirType = TranslateType(*unaryExpr.ty);
+    auto chirType = TranslateType(*unaryExpr.GetTy());
     ExprKind kd = ExprKind::INVALID;
     if (unaryExpr.op == Cangjie::TokenKind::NOT) {
-        kd = unaryExpr.ty->IsBoolean() ? ExprKind::NOT : ExprKind::BITNOT;
+        kd = unaryExpr.GetTy()->IsBoolean() ? ExprKind::NOT : ExprKind::BITNOT;
     } else if (unaryExpr.op == Cangjie::TokenKind::SUB) {
         kd = ExprKind::NEG;
     } else {

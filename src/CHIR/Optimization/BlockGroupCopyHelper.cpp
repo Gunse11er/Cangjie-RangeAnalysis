@@ -20,25 +20,28 @@
 #include "cangjie/CHIR/IR/Type/PrivateTypeConverter.h"
 
 namespace Cangjie::CHIR {
-std::pair<BlockGroup*, LocalVar*> BlockGroupCopyHelper::CloneBlockGroup(
-    const BlockGroup& other, Func& parentFunc)
+std::pair<std::vector<Block*>, LocalVar*> BlockGroupCopyHelper::CloneBlockGroup(
+    const BlockGroup& oldBG, BlockGroup& newBG)
 {
-    auto newGroup = other.Clone(builder, parentFunc);
-    InstBlockGroup(newGroup);
+    std::vector<Block*> newBlocks;
+    for (auto block : oldBG.GetBlocks()) {
+        newBlocks.emplace_back(block->Clone(builder, newBG));
+    }
+    InstBlockGroup(newBlocks);
     // including local var and param
     std::unordered_map<Value*, Value*> valueMap;
     std::unordered_set<Expression*> newDebugs;
-    CollectValueMap(other, *newGroup, valueMap, newDebugs);
-    ReplaceExprOperands(*newGroup, valueMap);
+    CollectValueMap(oldBG, newBlocks, valueMap, newDebugs);
+    ReplaceExprOperands(newBlocks, valueMap);
     for (auto dbg : newDebugs) {
         dbg->RemoveSelfFromBlock();
     }
 
     LocalVar* newBlockGroupRetValue = nullptr;
     LocalVar* oldFuncRetValue = nullptr;
-    if (auto func = other.GetOwnerFunc()) {
+    if (auto func = oldBG.GetOwnerFunc()) {
         oldFuncRetValue = func->GetReturnValue();
-    } else if (auto lambda = DynamicCast<Lambda*>(other.GetOwnerExpression())) {
+    } else if (auto lambda = DynamicCast<Lambda*>(oldBG.GetOwnerExpression())) {
         oldFuncRetValue = lambda->GetReturnValue();
     }
     // some functions don't have return value, such as `init`
@@ -48,12 +51,7 @@ std::pair<BlockGroup*, LocalVar*> BlockGroupCopyHelper::CloneBlockGroup(
         CJC_ASSERT(it != valueMap.end());
         newBlockGroupRetValue = StaticCast<LocalVar*>(it->second);
     }
-    return {newGroup, newBlockGroupRetValue};
-}
-
-void BlockGroupCopyHelper::SubstituteValue(Ptr<BlockGroup> block, std::unordered_map<Value*, Value*>& valueMap)
-{
-    ReplaceExprOperands(*block, valueMap);
+    return {newBlocks, newBlockGroupRetValue};
 }
 
 void BlockGroupCopyHelper::CollectValueMap(const Lambda& oldLambda, const Lambda& newLambda,
@@ -65,14 +63,16 @@ void BlockGroupCopyHelper::CollectValueMap(const Lambda& oldLambda, const Lambda
     for (size_t i = 0; i < oldParams.size(); ++i) {
         valueMap.emplace(oldParams[i], newParams[i]);
     }
-    CollectValueMap(*oldLambda.GetBody(), *newLambda.GetBody(), valueMap, newDebugs);
+    auto newBlocks = newLambda.GetBody()->GetBlocks();
+    CollectValueMap(*oldLambda.GetBody(), newBlocks, valueMap, newDebugs);
 }
 
-void BlockGroupCopyHelper::CollectValueMap(const Block& oldBlk, const Block& newBlk,
+void BlockGroupCopyHelper::CollectValueMap(Block& oldBlk, Block& newBlk,
     std::unordered_map<Value*, Value*>& valueMap, std::unordered_set<Expression*>& newDebugs)
 {
     auto oldExprs = oldBlk.GetExpressions();
     auto newExprs = newBlk.GetExpressions();
+    valueMap.emplace(&oldBlk, &newBlk);
     CJC_ASSERT(oldExprs.size() == newExprs.size());
     for (size_t i = 0; i < oldExprs.size(); ++i) {
         auto oldExpr = oldExprs[i];
@@ -93,47 +93,53 @@ void BlockGroupCopyHelper::CollectValueMap(const Block& oldBlk, const Block& new
     }
 }
 
-void BlockGroupCopyHelper::CollectValueMap(const BlockGroup& oldBG, const BlockGroup& newBG,
+void BlockGroupCopyHelper::CollectValueMap(const BlockGroup& oldBG, std::vector<Block*>& newBlocks,
     std::unordered_map<Value*, Value*>& valueMap, std::unordered_set<Expression*>& newDebugs)
 {
     auto oldBlocks = oldBG.GetBlocks();
-    auto newBlocks = newBG.GetBlocks();
     CJC_ASSERT(oldBlocks.size() == newBlocks.size());
     for (size_t i = 0; i < oldBlocks.size(); ++i) {
         CollectValueMap(*oldBlocks[i], *newBlocks[i], valueMap, newDebugs);
     }
 }
 
-void BlockGroupCopyHelper::ReplaceExprOperands(const Block& block, const std::unordered_map<Value*, Value*>& valueMap)
+void BlockGroupCopyHelper::ReplaceExprOperands(
+    std::vector<Block*>& blocks, const std::unordered_map<Value*, Value*>& valueMap)
 {
-    for (auto expr : block.GetExpressions()) {
+    auto preVisit = [&valueMap](Expression& e) {
         // note: a hack here, remove later
-        if (expr->GetExprKind() == ExprKind::DEBUGEXPR) {
-            continue;
+        if (e.GetExprKind() == ExprKind::DEBUGEXPR) {
+            return VisitResult::CONTINUE;
         }
-        for (auto op : expr->GetOperands()) {
+        auto operands = e.GetOperands();
+        for (size_t i = 0; i < operands.size(); ++i) {
+            auto op = operands[i];
             auto it = valueMap.find(op);
             if (it == valueMap.end()) {
                 continue;
             }
-            expr->ReplaceOperand(op, it->second);
+            e.ReplaceOperand(i, it->second);
         }
-        if (expr->GetExprKind() == ExprKind::LAMBDA) {
-            auto lambda = StaticCast<Lambda*>(expr);
-            ReplaceExprOperands(*lambda->GetBody(), valueMap);
+        if (e.IsTerminator()) {
+            auto& terminator = StaticCast<Terminator&>(e);
+            auto successors = terminator.GetSuccessors();
+            for (size_t i = 0; i < successors.size(); ++i) {
+                auto successor = successors[i];
+                auto it = valueMap.find(successor);
+                if (it == valueMap.end()) {
+                    continue;
+                }
+                terminator.ReplaceSuccessor(i, *StaticCast<Block*>(it->second));
+            }
         }
+        return VisitResult::CONTINUE;
+    };
+    for (auto block : blocks) {
+        Visitor::Visit(*block, preVisit);
     }
 }
 
-void BlockGroupCopyHelper::ReplaceExprOperands(
-    const BlockGroup& bg, const std::unordered_map<Value*, Value*>& valueMap)
-{
-    for (auto block : bg.GetBlocks()) {
-        ReplaceExprOperands(*block, valueMap);
-    }
-}
-
-void BlockGroupCopyHelper::GetInstMapFromApply(const Apply& apply, const FuncBase* newBodyOuterFunction)
+void BlockGroupCopyHelper::GetInstMapFromApply(const Apply& apply, const Function* newBodyOuterFunction)
 {
     if (apply.GetCallee()->IsLocalVar()) {
         auto lambda = DynamicCast<Lambda*>(StaticCast<LocalVar*>(apply.GetCallee())->GetExpr());
@@ -146,7 +152,7 @@ void BlockGroupCopyHelper::GetInstMapFromApply(const Apply& apply, const FuncBas
         }
         thisType = builder.GetType<ThisType>();
     } else {
-        auto func = VirtualCast<FuncBase*>(apply.GetCallee());
+        auto func = StaticCast<Function*>(apply.GetCallee());
         auto customDef = func->GetParentCustomTypeDef();
         if (customDef && customDef->IsGenericDef()) {
             // 1. get customType where function in.
@@ -172,9 +178,9 @@ void BlockGroupCopyHelper::GetInstMapFromApply(const Apply& apply, const FuncBas
             ++index;
         }
         // 4. set this type if needed
-        auto outerFunc = newBodyOuterFunction ? newBodyOuterFunction : apply.GetTopLevelFunc();
-        auto outerDef = outerFunc->GetParentCustomTypeDef();
-        if (customDef && outerDef && outerDef == customDef && outerFunc->TestAttr(Attribute::STATIC)) {
+        auto outerDef = newBodyOuterFunction ? newBodyOuterFunction->GetParentCustomTypeDef()
+            : apply.GetTopLevelFunc()->GetParentCustomTypeDef();
+        if (customDef && outerDef && outerDef == customDef) {
             // keep this type if same custom type between callee and caller
             thisType = builder.GetType<ThisType>();
         } else {
@@ -183,7 +189,7 @@ void BlockGroupCopyHelper::GetInstMapFromApply(const Apply& apply, const FuncBas
     }
 }
 
-void BlockGroupCopyHelper::InstBlockGroup(Ptr<BlockGroup> group)
+void BlockGroupCopyHelper::InstBlockGroup(std::vector<Block*>& blocks)
 {
     GenericTypeConvertor gConverter(instMap, builder);
     ConvertTypeFunc convertFunc = [&gConverter, this](Type& type) {
@@ -199,10 +205,12 @@ void BlockGroupCopyHelper::InstBlockGroup(Ptr<BlockGroup> group)
         converter.VisitExpr(e);
         return VisitResult::CONTINUE;
     };
-    Visitor::Visit(*group, preVisit);
+    for (auto block : blocks) {
+        Visitor::Visit(*block, preVisit);
+    }
 }
 
-void FixCastProblemAfterInst(Ptr<BlockGroup> group, CHIRBuilder& builder)
+void FixCastProblemAfterInst(std::vector<Block*>& blocks, CHIRBuilder& builder)
 {
     auto preVisit = [&builder](Expression& e) {
         if (e.GetExprKind() == ExprKind::INSTANCEOF) {
@@ -294,6 +302,8 @@ void FixCastProblemAfterInst(Ptr<BlockGroup> group, CHIRBuilder& builder)
         }
         return VisitResult::CONTINUE;
     };
-    Visitor::Visit(*group, preVisit);
+    for (auto block : blocks) {
+        Visitor::Visit(*block, preVisit);
+    }
 }
 }  // namespace Cangjie::CHIR

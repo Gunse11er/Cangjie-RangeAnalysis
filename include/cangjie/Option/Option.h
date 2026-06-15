@@ -104,8 +104,8 @@ enum class BackendType : uint8_t {
 enum class ArchType : uint8_t {
     X86_64 = 0,
     AARCH64,
-    ARM32,
     ARM64,
+    ARM32,
     UNKNOWN,
 };
 
@@ -204,6 +204,11 @@ struct Info {
     inline bool IsMacOS() const
     {
         return vendor == Vendor::APPLE && (os == OSType::DARWIN || os == OSType::IOS);
+    }
+
+    inline bool IsArm32() const
+    {
+        return arch == ArchType::ARM32;
     }
 
     /**
@@ -317,7 +322,7 @@ public:
     Triple::Info host = {
 #ifdef __aarch64__
         Triple::ArchType::AARCH64,
-#elif __x86_64__
+#elif defined(__x86_64__)
         Triple::ArchType::X86_64,
 #else
         Triple::ArchType::UNKNOWN,
@@ -336,6 +341,8 @@ public:
 #endif
 #ifdef __APPLE__
         Triple::Environment::NOT_AVAILABLE,
+#elif defined(__ohos__)
+        Triple::Environment::OHOS,
 #else
         Triple::Environment::GNU,
 #endif
@@ -466,11 +473,15 @@ public:
 
     std::optional<std::string> outputJavaGenDir = std::nullopt;
 
+    std::string outputObjCGenDir = "";
+
     std::vector<std::string> importPaths; /**< .cjo search paths */
 #ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
     std::vector<std::string> pluginPaths; /**< meta-transform plugins */
 #endif
-    std::optional<std::string> commonPartCjo = std::nullopt; /**< .cjo path for common part of package */
+    std::vector<std::string> commonPartCjos; /**< .cjo path for parent source sets (common to currently compiled) */
+
+    std::vector<std::string> commonPartChirs; /**< .chir files for parent source sets */
 
     // enable incremental compilation
     bool enIncrementalCompilation = false;
@@ -505,8 +516,6 @@ public:
 
     std::string inputCjoFile; /**< .cjo files to scan */
 
-    std::vector<std::string> inputChirFiles; /**< .chir files to complete compilation */
-
     std::vector<std::string> inputPdbaFiles; /**< cbc import libraries, which used to import cbclib */
 
     // Built-in package dependencies which analysed by Frontend and used by Driver.
@@ -522,7 +531,10 @@ public:
 
     std::vector<std::string> removedPathPrefix; /**< The removed path prefix of debug info. */
 
+    // .bc input files.
     std::vector<std::string> bcInputFiles;
+    // package names of .bc input files
+    std::vector<std::string> bcPackageNames;
 
     // Mark the input files and their input order.
     std::vector<std::tuple<std::string, uint64_t>> inputFileOrder;
@@ -651,6 +663,7 @@ public:
     enum class LTOMode : uint8_t { FULL_LTO, THIN_LTO, NO_LTO };
     LTOMode ltoMod = LTOMode::NO_LTO;
     bool enableCompileAsExe = false;
+    bool ltoHideAllPkgs = false;
 
     /**
      * @brief Checks whether LTO is enabled.
@@ -662,9 +675,44 @@ public:
         return ltoMod != LTOMode::NO_LTO;
     }
 
-     bool IsCompileAsExeEnabled() const 
+    /**
+     * @brief Checks whether --compile-as-exe is enabled.
+     *
+     * @return bool Returns true if LTO is enabled, otherwise returns false.
+     */
+    bool IsCompileAsExeEnabled() const 
     {
         return enableCompileAsExe;
+    }
+
+    /**
+     * @brief Checks whether --lto-keep-pkg-visibility is enabled.
+     *
+     * @return bool Returns true if LTO is enabled, otherwise returns false.
+     */
+    bool IsLTOPkgVisibilityEnabled() const
+    {
+        return !ltoVisiblePkgs.empty() || ltoHideAllPkgs;
+    }
+
+    /**
+     * @brief Gets the visible packages for LTO.
+     *
+     * @return const std::vector<std::string>& The visible packages list.
+     */
+    const std::vector<std::string>& GetLtoVisiblePkgs() const
+    {
+        return ltoVisiblePkgs;
+    }
+
+    /**
+     * @brief Adds a package to the LTO visible packages list.
+     *
+     * @param pkg The package name to add.
+     */
+    void AddLtoVisiblePkg(const std::string& pkg)
+    {
+        ltoVisiblePkgs.emplace_back(pkg);
     }
 
     /**
@@ -803,9 +851,6 @@ public:
     bool chirDeserialize = false;
     std::string chirDeserializePath;
 
-#ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
-    bool disableInstantiation = true;
-#endif
     bool disableSemaVic = false;
     bool enableChirRGetOrThrowE = false;
     bool disableChirUselessImportElimination = false;
@@ -830,7 +875,7 @@ public:
     bool cjdbMode = false; /** whether the option used in cjdb */
 
     std::string interopCJPackageConfigPath = "./"; /**< cjinterop .toml package config file paths */
-    
+
     enum class SanitizerType : uint8_t {
         NONE,
         ADDRESS,
@@ -856,7 +901,7 @@ public:
      */
     bool CompileExecutable() const
     {
-        return (outputMode == GlobalOptions::OutputMode::EXECUTABLE) ||
+        return outputMode == GlobalOptions::OutputMode::EXECUTABLE ||
             (outputMode == GlobalOptions::OutputMode::OBJ && compileTarget == CompileTarget::EXECUTABLE);
     }
 
@@ -1091,8 +1136,16 @@ public:
      * @param notFoundError A reference to the diagnostic kind used to generate the error message.
      * @return std::optional<std::string> The optional valid file path.
      */
-    std::optional<std::string> ValidateInputFilePath(
-        const std::string& path, const DiagKindRefactor notFoundError) const;
+    static std::optional<std::string> ValidateInputFilePath(
+        const std::string& path, const DiagKindRefactor notFoundError);
+    /**
+     * @brief Validates the input file path.
+     *
+     * Functionally equivalent to the other ValidateInputFilePath, but with a diagnostic engine.
+     * Used by checkcjd.
+     */
+    static std::optional<std::string> ValidateInputFilePath(
+        const std::string& path, const DiagKindRefactor notFoundError, DiagnosticEngine& diag);
 
     /**
      * @brief Sets the frontend mode.
@@ -1144,7 +1197,7 @@ public:
 
     bool IsCompilingCJMPSpecific() const
     {
-        return inputChirFiles.size() > 0;
+        return commonPartChirs.size() > 0;
     }
 
     bool IsCompilingCJMP() const
@@ -1175,17 +1228,20 @@ private:
     bool CheckLtoOptions() const;
     bool CheckOutputModeOptions();
     bool CheckCompileAsExeOptions() const;
+    bool CheckLTOPkgVisibilityOptions() const;
     bool CheckPgoOptions() const;
     bool CheckCompileMacro() const;
+    bool CheckCJMPOptions() const;
     void RefactJobs();
     void RefactAggressiveParallelCompileOption();
     void DisableStaticStdForOhos();
+    bool VerifyFileExtension(const std::string& file, const std::string& fullPath, const std::string& extension,
+        DiagnosticEngine& diag) const;
 
     bool ProcessInputs(const std::vector<std::string>& inputs);
     bool HandleArchiveExtension(DiagnosticEngine& diag, const std::string& value);
     bool HandleCJOExtension(DiagnosticEngine& diag, const std::string& value);
     bool HandleCJExtension(DiagnosticEngine& diag, const std::string& value);
-    bool HandleCHIRExtension(DiagnosticEngine& diag, const std::string& value);
     bool HandleCJDExtension(DiagnosticEngine& diag, const std::string& value);
     bool HandleBCExtension(DiagnosticEngine& diag, const std::string& value);
     bool HandleNoExtension(DiagnosticEngine& diag, const std::string& value);
@@ -1206,6 +1262,8 @@ private:
     std::string OverflowStrategyToSerializedString() const;
     std::string SanitizerTypeToSerializedString() const;
     void CollectOrderedInputFiles(ArgInstance& arg, uint64_t idx);
+
+    std::vector<std::string> ltoVisiblePkgs;
 };
 
 extern const std::unordered_map<GlobalOptions::OptimizationLevel, std::string> OPTIMIZATION_LEVEL_TO_BACKEND_OPTION;

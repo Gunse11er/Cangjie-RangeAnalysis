@@ -45,7 +45,7 @@ inline const std::string MANGLE_GENERIC_PREFIX = "$g";
  * @return std::string The mangled virtual function signature.
  */
 std::string GenerateVirtualFuncMangleName(
-    const Cangjie::CHIR::FuncBase* rawFunc, const Cangjie::CHIR::CustomTypeDef& customTypeDef,
+    const Cangjie::CHIR::Function* rawFunc, const Cangjie::CHIR::CustomTypeDef& customTypeDef,
     const Cangjie::CHIR::ClassType* parentTy, bool isVirtual);
 /**
  * @brief Generate mangled name for instantiate function.
@@ -63,7 +63,7 @@ std::string GenerateInstantiateFuncMangleName(const std::string& baseName,
  * @param counter The lambda wrapper index.
  * @return std::string The mangled lambda signature.
  */
-std::string GenerateLambdaFuncMangleName(const Cangjie::CHIR::Func& baseFunc, size_t counter);
+std::string GenerateLambdaFuncMangleName(const Cangjie::CHIR::Function& baseFunc, size_t counter);
 /**
  * @brief Overflow strategy to mangled name.
  *
@@ -111,7 +111,7 @@ std::string GenerateInstantiatedBaseClassMangleName(const Cangjie::CHIR::FuncTyp
  * @param func The function in closure conversion.
  * @return std::string The mangled signature.
  */
-std::string GenerateGlobalImplClassMangleName(const Cangjie::CHIR::FuncBase& func);
+std::string GenerateGlobalImplClassMangleName(const Cangjie::CHIR::Function& func);
 /**
  * @brief Generate mangled name for lambda implement class.
  *
@@ -147,14 +147,14 @@ std::string GenerateInstantiatedAbstractFuncMangleName(const Cangjie::CHIR::Clas
  * @param func The source function.
  * @return std::string The mangled signature.
  */
-std::string GenerateGenericOverrideFuncMangleName(const Cangjie::CHIR::FuncBase &func);
+std::string GenerateGenericOverrideFuncMangleName(const Cangjie::CHIR::Function &func);
 /**
  * @brief Generate mangled name for instantiate override function.
  *
  * @param func The source function.
  * @return std::string The mangled signature.
  */
-std::string GenerateInstOverrideFuncMangleName(const Cangjie::CHIR::FuncBase &func);
+std::string GenerateInstOverrideFuncMangleName(const Cangjie::CHIR::Function &func);
 /**
  * @brief Generate mangled name for wrapper class generic override function.
  *

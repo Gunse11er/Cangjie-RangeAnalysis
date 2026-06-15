@@ -12,6 +12,7 @@
 #define CANGJIE_SEMA_MPTYPECHECKER_IMPL_H
 
 #include "ScopeManager.h"
+#include "cangjie/AST/Node.h"
 #include "cangjie/Basic/DiagnosticEngine.h"
 #include "cangjie/Frontend/CompilerInstance.h"
 #include "cangjie/Sema/CommonTypeAlias.h"
@@ -60,6 +61,9 @@ private:
     bool MatchEnumFuncTypes(const AST::FuncDecl& specific, const AST::FuncDecl& common);
     bool MatchCJMPEnumConstructor(AST::Decl& specificDecl, AST::Decl& commonDecl);
     bool MatchCJMPFunction(AST::FuncDecl& specificFunc, AST::FuncDecl& commonFunc);
+    bool MatchCJMPFunctionGenerics(AST::FuncDecl& specificFunc, AST::FuncDecl& commonFunc);
+    bool MatchCJMPFunctionParameters(AST::FuncParamList& specificParams, AST::FuncParamList& commonParams);
+    bool MatchCJMPFunctionParameters(AST::FuncDecl& specificFunc, AST::FuncDecl& commonFunc);
     bool MatchCJMPProp(AST::PropDecl& specificProp, AST::PropDecl& commonProp);
     bool MatchCJMPVar(AST::VarDecl& specificVar, AST::VarDecl& commonVar);
     bool TryMatchVarWithPatternWithVarDecls(
@@ -70,8 +74,13 @@ private:
         const std::vector<AST::Attribute>& attrs, const AST::Decl& common, const AST::Decl& specific) const;
     bool MatchCJMPDeclAnnotations(const AST::Decl& common, AST::Decl& specific) const;
     void PropagateCJMPDeclAnnotations(const AST::Decl& common, AST::Decl& specific) const;
+    void PropagateDefaultArguments(const AST::FuncParamList& commonParams, const AST::FuncParamList& specificParams,
+        const AST::FuncDecl& specificFunc) const;
+    void PropagateDefaultArguments(const AST::FuncDecl& commonFunc, const AST::FuncDecl& specificFunc) const;
 
     bool TrySetSpecificImpl(AST::Decl& specificDecl, AST::Decl& commonDecl, const std::string& kind);
+    /// Returns `true` if there is not platform declaration,
+    /// in other cases check that common can me matched with platform(e.g. modifiers conform)
     bool MatchCommonNominalDeclWithSpecific(const AST::InheritableDecl& commonDecl);
     void CheckCommonSpecificGenericMatch(const AST::Decl& specificDecl, const AST::Decl& commonDecl);
 
@@ -86,16 +95,17 @@ public:
      *
      * @param inheritedTypes The list of inherited types to process
      * @param hasSpecificImpl Whether the current declaration has a specific implementation
-     * @param compileSpecific Whether we are currently compiling specific code
+     * @param compilePlatform Whether we are currently compiling specific code
      */
     static void GetInheritedTypesWithSpecificImpl(
-        std::vector<OwnedPtr<AST::Type>>& inheritedTypes, bool hasSpecificImpl, bool compileSpecific);
+        std::vector<OwnedPtr<AST::Type>>& inheritedTypes, bool hasSpecificImpl, bool compilePlatform);
 
 private:
     TypeManager& typeManager;
     DiagnosticEngine& diag;
     bool compileCommon{false};   // true if compiling common part
-    bool compileSpecific{false}; // true if compiling specific part
+    bool compilePlatform{false}; // true if compiling platform part
+    bool severalParents{false};  // true if there is more then one incomparable parent source sets
 #endif
 };
 } // namespace Cangjie

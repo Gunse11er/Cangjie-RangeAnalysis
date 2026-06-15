@@ -554,7 +554,8 @@ llvm::Value* GenerateGenericTypeCast(IRBuilder2& irBuilder, const CGValue& cgSrc
         auto tmp = irBuilder.CreateEntryAlloca(*targetCGType);
         auto dataPtr = irBuilder.GetPayloadFromObject(srcValue);
         if (IsTypeContainsRef(targetCGType->GetLLVMType())) {
-            irBuilder.CallGCReadAgg({tmp, srcValue, dataPtr, irBuilder.GetLayoutSize_64(targetTy)});
+            irBuilder.CallGCReadAgg(targetCGType->GetLayoutType(),
+                {tmp, srcValue, dataPtr, irBuilder.GetLayoutSize_64(targetTy)});
         } else {
             llvm::MaybeAlign align{};
             irBuilder.CreateMemCpy(tmp, align, dataPtr, align, irBuilder.GetLayoutSize_32(targetTy));
@@ -577,23 +578,6 @@ llvm::Value* GenerateGenericTypeCast(IRBuilder2& irBuilder, const CGValue& cgSrc
         auto srcPayload =
             irBuilder.CreateBitCast(irBuilder.GetPayloadFromObject(srcValue), elementType->getPointerTo(1U));
         return irBuilder.CreateLoad(elementType, srcPayload);
-    } else if (targetIsOptionLike && srcIsOptionLike && StaticCast<CGEnumType*>(targetCGType)->IsOptionLikeT() &&
-        (StaticCast<CGEnumType*>(srcCGType)->IsOptionLikeRef() ||
-            StaticCast<CGEnumType*>(srcCGType)->IsOptionLikeNonRef())) {
-        // 1. allocate memory
-        auto typeInfoOfSrc = irBuilder.CreateTypeInfo(srcTy);
-        llvm::Value* temp =
-            irBuilder.CallClassIntrinsicAlloc({typeInfoOfSrc, irBuilder.GetLayoutSize_32(*DeRef(srcTy))});
-        // 2. store srcValue to temp
-        auto payloadPtr = irBuilder.GetPayloadFromObject(temp);
-        auto addr = irBuilder.CreateBitCast(payloadPtr,
-            srcTy.IsRef() ? srcCGType->GetPointerElementType()->GetLLVMType()->getPointerTo(1U)
-                          : srcCGType->GetLLVMType()->getPointerTo(1U));
-        auto addrType = CGType::GetOrCreate(cgMod,
-            srcTy.IsRef() ? &srcTy : CGType::GetRefTypeOf(cgMod.GetCGContext().GetCHIRBuilder(), srcTy),
-            CGType::TypeExtraInfo(1U));
-        (void)irBuilder.CreateStore(cgSrcValue, CGValue(addr, addrType));
-        return temp;
     } else {
         return nullptr;
     }

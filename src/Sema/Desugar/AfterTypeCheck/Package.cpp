@@ -44,7 +44,7 @@ bool ShouldInsertReturnUnit(const FuncBody& fb)
 
     // If a function or lambda's return type is ANNOTATED as Unit, then insert return ().
     // A trick: after type checking, if no error is reported, then e : Unit is a fact. So the check here is not needed.
-    if (fb.retType && fb.retType->ty && fb.retType->ty->IsUnit()) {
+    if (fb.retType && fb.retType->GetTy() && fb.retType->GetTy()->IsUnit()) {
         Ptr<Node> last = fb.body->body.back().get();
         while (last && last->astKind == ASTKind::PAREN_EXPR) {
             last = StaticAs<ASTKind::PAREN_EXPR>(last)->expr.get();
@@ -76,7 +76,7 @@ void InsertUnitForFuncBody(FuncBody& fb, bool enableCoverage)
     ue->curFile = fb.curFile;
     auto re = CreateReturnExpr(std::move(ue));
     re->curFile = fb.curFile;
-    re->ty = TypeManager::GetNothingTy();
+    re->SetTy(TypeManager::GetNothingTy());
     re->refFuncBody = &fb;
     bool notHaveRightCurlPos = fb.funcDecl && fb.body->rightCurlPos.IsZero();
     // If compiled with `--coverage`, the inserted `return ()` should contain the line no of funcDecl,
@@ -118,8 +118,8 @@ void MakeLastNodeReturn(FuncBody& funcBody)
         auto lastExpr = OwnedPtr<Expr>(StaticAs<ASTKind::EXPR>(lastNode->release()));
         auto re = CreateReturnExpr(std::move(lastExpr));
         CopyBasicInfo(e, re.get());
-        re->ty = TypeManager::GetNothingTy();
-        funcBody.body->ty = TypeManager::GetNothingTy();
+        re->SetTy(TypeManager::GetNothingTy());
+        funcBody.body->SetTy(TypeManager::GetNothingTy());
         re->refFuncBody = &funcBody;
         AddCurFile(*re, funcBody.curFile);
         *lastNode = std::move(re);
@@ -130,7 +130,7 @@ inline void AddReturnExprForFuncBody(FuncBody& fb, bool enableCoverage)
 {
     if (ShouldInsertReturnUnit(fb)) {
         InsertUnitForFuncBody(fb, enableCoverage);
-    } else if (Ty::IsTyCorrect(fb.ty)) {
+    } else if (Ty::IsTyCorrect(fb.GetTy())) {
         MakeLastNodeReturn(fb);
     }
 }
@@ -146,7 +146,7 @@ void InsertStaticInitCall(InheritableDecl& decl, FuncDecl& staticInit)
     std::vector<OwnedPtr<FuncArg>> args;
     auto initializer = CreateCallExpr(CreateRefExpr(staticInit), std::move(args), &staticInit, unitTy);
     initializer->begin = decl.begin;
-    auto initVar = CreateVarDecl(STATIC_INIT_VAR, std::move(initializer));
+    auto initVar = CreateVarDecl(std::string(STATIC_INIT_VAR), std::move(initializer));
     initVar->fullPackageName = decl.fullPackageName;
     initVar->outerDecl = &decl;
     initVar->EnableAttr(Attribute::STATIC, Attribute::PRIVATE);

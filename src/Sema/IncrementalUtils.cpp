@@ -84,13 +84,13 @@ std::unordered_set<Ptr<const StructTy>> CollectChangedStructTypes(
         if (decl->astKind != ASTKind::STRUCT_DECL || decl->TestAttr(Attribute::GENERIC)) {
             continue;
         }
-        if (auto structTy = DynamicCast<StructTy*>(decl->ty)) {
+        if (auto structTy = DynamicCast<StructTy*>(decl->GetTy())) {
             (void)tys.emplace(structTy);
         }
     }
     for (auto& it : pkg.genericInstantiatedDecls) {
         if (it->toBeCompiled && it->astKind == ASTKind::STRUCT_DECL) {
-            (void)tys.emplace(StaticCast<StructTy*>(it->ty));
+            (void)tys.emplace(StaticCast<StructTy*>(it->GetTy()));
         }
     }
     return tys;
@@ -175,7 +175,7 @@ std::string GetRawMangleOfBoxedType(const InheritableDecl& cd)
     for (auto& member : cd.GetMemberDecls()) {
         if (auto vd = DynamicCast<VarDecl>(member.get())) {
             CJC_ASSERT(vd->identifier == "$value");
-            return GetTypeRawMangleName(*vd->ty);
+            return GetTypeRawMangleName(*vd->GetTy());
         }
     }
     InternalError("Found incorrect base box class: " + cd.identifier);
@@ -222,10 +222,10 @@ namespace {
 void CollectAllNoninstantiatedDeclsOfTypeArgs(
     const Cangjie::AST::Decl& genericDecl, std::set<Ptr<const Decl>>& nonInsTypeDecls)
 {
-    if (genericDecl.ty == nullptr) {
+    if (genericDecl.GetTy() == nullptr) {
         return;
     }
-    for (auto& tyArg : genericDecl.ty->typeArgs) {
+    for (auto& tyArg : genericDecl.GetTy()->typeArgs) {
         auto tyDecl = Ty::GetDeclOfTy(tyArg);
         if (tyDecl == nullptr) {
             continue;

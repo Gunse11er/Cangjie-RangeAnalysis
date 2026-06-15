@@ -7,6 +7,7 @@
 #ifndef CANGJIE_CHIR_DESERIALIZER_IMPL_H
 #define CANGJIE_CHIR_DESERIALIZER_IMPL_H
 
+#include "cangjie/CHIR/IR/Value/LiteralValue.h"
 #if defined(__clang__)
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wfloat-equal"
@@ -54,12 +55,15 @@ public:
     template <typename T, typename FBT> void Config(const FBT* buffer, T& obj);
 
     void Run(const PackageFormat::CHIRPackage* package);
-    explicit CHIRDeserializerImpl(CHIRBuilder& chirBuilder, bool compileSpecific = false)
-        : builder(chirBuilder), compileSpecific(compileSpecific){};
+    explicit CHIRDeserializerImpl(CHIRBuilder& chirBuilder, bool compilePlatform = false)
+        : builder(chirBuilder), compilePlatform(compilePlatform){};
+
+private:
+    Constant* DeserializeConstant(Type& resultTy, LiteralValue& val, Block& parent);
 
 private:
     Cangjie::CHIR::CHIRBuilder& builder;
-    bool compileSpecific = false;
+    bool compilePlatform = false;
     const PackageFormat::CHIRPackage* pool{};
 
     // Package object maps
@@ -70,9 +74,6 @@ private:
 
     // lazy GenericType config
     std::vector<std::pair<GenericType*, const PackageFormat::GenericType*>> genericTypeConfig;
-
-    void ResetImportedValuesUnderPackage();
-    void ResetImportedDefsUnderPackage();
 };
 }
 #endif

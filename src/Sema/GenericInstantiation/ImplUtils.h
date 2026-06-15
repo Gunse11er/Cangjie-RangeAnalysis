@@ -21,9 +21,9 @@ namespace Cangjie {
 /** Get @p decl 's sema type. If decl is extend decl, get it's extended sema type. */
 inline Ptr<AST::Ty> GetDeclTy(const AST::Decl& decl)
 {
-    auto ty = decl.ty;
+    auto ty = decl.GetTy();
     if (decl.astKind == AST::ASTKind::EXTEND_DECL) {
-        ty = static_cast<const AST::ExtendDecl&>(decl).extendedType->ty;
+        ty = static_cast<const AST::ExtendDecl&>(decl).extendedType->GetTy();
     }
     return ty;
 }

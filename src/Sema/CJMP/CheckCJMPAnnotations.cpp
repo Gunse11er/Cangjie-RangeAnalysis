@@ -26,10 +26,8 @@
 #include "cangjie/AST/Types.h"
 #include "cangjie/AST/Walker.h"
 #include "cangjie/Basic/DiagnosticEngine.h"
-#include "cangjie/Basic/Position.h"
 #include "cangjie/Parse/Parser.h"
 #include "cangjie/Utils/CastingTemplate.h"
-#include "cangjie/Utils/CheckUtils.h"
 #include "cangjie/Utils/SafePointer.h"
 #include <algorithm>
 #include <unordered_set>
@@ -41,16 +39,19 @@ using namespace TypeCheckUtil;
 namespace {
 // Annotations not serialized in AST are matched via their corresponding attributes
 // Annotations with parameters MUST be serialized for common/specific matching
-const std::unordered_map<AnnotationKind, Attribute> NON_SERIALIZED_ANNOTATIONS = {
+const std::unordered_map<AnnotationKind, Attribute> NonSerializedAnnotations = {
     {AnnotationKind::C, Attribute::C},
     {AnnotationKind::JAVA_MIRROR, Attribute::JAVA_MIRROR},
     {AnnotationKind::JAVA_HAS_DEFAULT, Attribute::JAVA_HAS_DEFAULT},
     {AnnotationKind::OBJ_C_MIRROR, Attribute::OBJ_C_MIRROR},
+    {AnnotationKind::OBJ_C_INIT, Attribute::OBJ_C_INIT},
+    {AnnotationKind::OBJ_C_OPTIONAL, Attribute::OBJ_C_OPTIONAL},
 };
 
 // Annotations not supported on common/specific (neither serialized nor have attributes)
-const std::unordered_set<AnnotationKind> UNSUPPORTED_ANNOTATIONS = {AnnotationKind::JAVA, AnnotationKind::CALLING_CONV,
-    AnnotationKind::CONSTSAFE, AnnotationKind::ENSURE_PREPARED_TO_MOCK, AnnotationKind::UNKNOWN};
+const std::unordered_set<AnnotationKind> UnsupportedAnnotations = {AnnotationKind::JAVA, AnnotationKind::CALLING_CONV,
+    AnnotationKind::FOREIGN_GETTER_NAME, AnnotationKind::FOREIGN_SETTER_NAME, AnnotationKind::CONSTSAFE,
+    AnnotationKind::ENSURE_PREPARED_TO_MOCK, AnnotationKind::NON_PRODUCT, AnnotationKind::UNKNOWN};
 
 bool PostCheckDeprecatedAnnotation(const AST::Decl& specific, DiagnosticEngine& diag)
 {
@@ -173,7 +174,7 @@ bool PostCheckNonSerializedAnnotations(const AST::Decl& common, const AST::Decl&
     bool result = true;
 
     // Iterate over all non-serialized annotations and check attribute consistency
-    for (const auto& [annoKind, attr] : NON_SERIALIZED_ANNOTATIONS) {
+    for (const auto& [annoKind, attr] : NonSerializedAnnotations) {
         if (common.TestAttr(attr) != specific.TestAttr(attr)) {
             // Find the specific annotation for this type to use in diagnostic
             auto specificAnno = FindFirstAnnotation(specific, annoKind);
@@ -198,8 +199,8 @@ bool PostCheckNonSerializedAnnotations(const AST::Decl& common, const AST::Decl&
 bool IsSpecialHandledAnnotation(const Annotation& anno)
 {
     return anno.kind == AnnotationKind::DEPRECATED || anno.kind == AnnotationKind::ATTRIBUTE ||
-        NON_SERIALIZED_ANNOTATIONS.find(anno.kind) != NON_SERIALIZED_ANNOTATIONS.end() ||
-        UNSUPPORTED_ANNOTATIONS.find(anno.kind) != UNSUPPORTED_ANNOTATIONS.end();
+        NonSerializedAnnotations.find(anno.kind) != NonSerializedAnnotations.end() ||
+        UnsupportedAnnotations.find(anno.kind) != UnsupportedAnnotations.end();
 }
 
 /**
@@ -294,7 +295,7 @@ bool IsCommonOrSpecific(const Node& node)
 
 bool IsUnsupported(const Annotation& anno)
 {
-    return UNSUPPORTED_ANNOTATIONS.count(anno.kind);
+    return UnsupportedAnnotations.count(anno.kind);
 }
 } // namespace
 

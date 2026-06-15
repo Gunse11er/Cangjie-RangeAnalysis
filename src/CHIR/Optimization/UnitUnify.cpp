@@ -38,12 +38,12 @@ UnitUnify::UnitUnify(CHIRBuilder& builder) : builder(builder)
 
 void UnitUnify::RunOnPackage(const Ptr<const Package>& package, bool isDebug)
 {
-    for (auto func : package->GetGlobalFuncs()) {
+    for (auto func : package->GetGlobalFuncsWithBody()) {
         RunOnFunc(func, isDebug);
     }
 }
 
-void UnitUnify::RunOnFunc(const Ptr<Func>& func, bool isDebug)
+void UnitUnify::RunOnFunc(const Ptr<Function>& func, bool isDebug)
 {
     Ptr<Constant> optUnit;
     auto preAcation = [this, isDebug, &optUnit](Expression& expr) {

@@ -12,10 +12,11 @@
 #include "cangjie/Utils/ICEUtil.h"
 #include "cangjie/Utils/Signal.h"
 
-#ifdef __unix__
+#ifndef _WIN32
 #include <cstdlib>
+#include <sys/wait.h>
 #include <unistd.h>
-#elif _WIN32
+#else
 #include <windows.h>
 #endif
 
@@ -34,11 +35,11 @@ const std::string PRPJECT_PATH = PROJECT_SOURCE_DIR;
 const std::string PRPJECT_PATH = "..";
 #endif
 
-#ifdef __unix__
+#ifndef _WIN32
 const int STACK_OVERFLOW_RETURN_CODE = SIGSEGV + 128;
 const std::unordered_map<std::string, int> signalStringValueMap = {{"SIGABRT", SIGABRT}, {"SIGFPE", SIGFPE},
     {"SIGSEGV", SIGSEGV}, {"SIGILL", SIGILL}, {"SIGTRAP", SIGTRAP}, {"SIGBUS", SIGBUS}};
-#elif _WIN32
+#else
 const DWORD STACK_OVERFLOW_RETURN_CODE = EXCEPTION_STACK_OVERFLOW;
 const std::unordered_map<std::string, int> signalStringValueMap = {
     {"SIGABRT", SIGABRT}, {"SIGFPE", SIGFPE}, {"SIGSEGV", SIGSEGV}, {"SIGILL", SIGILL}};
@@ -97,9 +98,9 @@ std::string GetSignalString(std::string& signalValue, std::string& module)
     std::string result2 =
         Cangjie::SIGNAL_MSG_PART_TWO + Cangjie::ICE::MSG_PART_TWO + std::to_string(moduleStr->second) + "\n";
     if (signalValue == "StackOverflow") {
-#ifdef __unix__
+#ifndef _WIN32
         return CANGJIE_COMPILER_VERSION + "\n" + result1 + std::to_string(SIGSEGV) + result2;
-#elif _WIN32
+#else
         return CANGJIE_COMPILER_VERSION + "\n" + result1 + std::to_string(STACK_OVERFLOW_RETURN_CODE) + result2;
 #endif
     }
@@ -146,7 +147,7 @@ void VerifyErrorOutput(std::string signalValue, std::string module)
     VerifyDeleteTempFile();
 }
 
-#ifdef __unix__
+#ifndef _WIN32
 
 #define MAX_PATH 4096
 
@@ -184,7 +185,7 @@ int ExecuteProcess(std::string signalValue, std::string triggerPoint)
     return -1;
 }
 
-#elif _WIN32
+#else
 DWORD ExecuteProcess(std::string signalValue, std::string triggerPoint)
 {
     char buffer[MAX_PATH];
@@ -231,7 +232,7 @@ CT(SIGABRT, main)
 CT(SIGFPE, main)
 CT(SIGSEGV, main)
 CT(SIGILL, main)
-#if __unix__
+#ifndef _WIN32
 CT(SIGTRAP, main)
 CT(SIGBUS, main)
 #endif
@@ -241,7 +242,7 @@ CT(SIGABRT, parser)
 CT(SIGFPE, parser)
 CT(SIGSEGV, parser)
 CT(SIGILL, parser)
-#if __unix__
+#ifndef _WIN32
 CT(SIGTRAP, parser)
 CT(SIGBUS, parser)
 #endif

@@ -40,7 +40,11 @@ void Android_CJNATIVE::InitializeLibraryPaths()
             }
         }
         if (!selectedClangPath.empty()) {
-            AddLibraryPath(FileUtil::JoinPath(selectedClangPath, "lib/linux/aarch64"));
+            if (driverOptions.target.arch == Triple::ArchType::ARM32) {
+                AddLibraryPath(FileUtil::JoinPath(selectedClangPath, "lib/linux/arm"));
+            } else {
+                AddLibraryPath(FileUtil::JoinPath(selectedClangPath, "lib/linux/aarch64"));
+            }
             AddLibraryPath(FileUtil::JoinPath(selectedClangPath, "lib/linux"));
         }
     };
@@ -58,7 +62,12 @@ void Android_CJNATIVE::InitializeLibraryPaths()
     }
     // 2. Deduce libs path from sysroot.
     if (!sysroot.empty()) {
-        std::string tripleDirectory = "usr/lib/" + driverOptions.target.ArchToString() + "-linux-android/";
+        std::string tripleDirectory = "usr/lib/" + driverOptions.target.ArchToString();
+        if (driverOptions.target.arch == Triple::ArchType::ARM32) {
+            tripleDirectory += "-linux-androideabi/";
+        } else {
+            tripleDirectory += "-linux-android/";
+        }
         AddLibraryPath(FileUtil::JoinPath(sysroot, tripleDirectory + driverOptions.target.apiLevel));
         AddLibraryPath(FileUtil::JoinPath(sysroot, tripleDirectory));
         AddLibraryPath(sysroot);
@@ -68,10 +77,21 @@ void Android_CJNATIVE::InitializeLibraryPaths()
 
 void Android_CJNATIVE::AddCRuntimeLibraryPaths()
 {
-    std::string tripleDirectory = "usr/lib/" + driverOptions.target.ArchToString() + "-linux-android/";
-    AddCRuntimeLibraryPath(FileUtil::JoinPath(sysroot, tripleDirectory + driverOptions.target.apiLevel));
-}
+    const auto& target = driverOptions.target;
+    const std::string& arch = target.ArchToString();
 
+    using namespace std::literals;
+    std::string_view suffix = (target.arch == Triple::ArchType::ARM32) ? "-linux-androideabi/"sv : "-linux-android/"sv;
+    std::string_view prefix = "usr/lib/"sv;
+
+    std::string tripleDirectory;
+    tripleDirectory.reserve(prefix.size() + arch.size() + suffix.size() + target.apiLevel.size());
+
+    tripleDirectory.append(prefix).append(arch).append(suffix).append(target.apiLevel);
+
+    AddCRuntimeLibraryPath(FileUtil::JoinPath(sysroot, std::move(tripleDirectory)));
+}
+ 
 bool Android_CJNATIVE::PrepareDependencyPath()
 {
     if ((objcopyPath = FindCangjieLLVMToolPath(g_toolList.at(ToolID::LLVM_OBJCOPY).name)).empty()) {
@@ -136,7 +156,11 @@ void Android_CJNATIVE::GenerateLinkOptions(Tool& tool)
     tool.AppendArg(LINUX_CJNATIVE_LINK_OPTIONS);
     tool.AppendArg("-lclang_rt.builtins-" + driverOptions.target.ArchToString() + "-android");
     tool.AppendArg("-ldl");
-    tool.AppendArg("-z", "max-page-size=4096");
+    if (driverOptions.target.arch == Triple::ArchType::ARM32) {
+        tool.AppendArg("-z", "max-page-size=4096");
+    } else {
+        tool.AppendArg("-z", "max-page-size=16384");
+    }
 }
 
 void Android_CJNATIVE::HandleSanitizerDependencies(Tool& tool)

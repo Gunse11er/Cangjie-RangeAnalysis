@@ -119,7 +119,7 @@ public:
      * @param func function to analyse.
      * @param ctorInitInfo extra info for init function check.
      */
-    MaybeUninitAnalysis(const Func* func, const ConstructorInitInfo* ctorInitInfo);
+    MaybeUninitAnalysis(const Function* func, const ConstructorInitInfo* ctorInitInfo);
 
     /// maybe not init analysis destructor.
     ~MaybeUninitAnalysis() final

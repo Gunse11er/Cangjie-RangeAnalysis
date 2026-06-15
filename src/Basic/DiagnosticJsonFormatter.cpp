@@ -227,11 +227,13 @@ std::string DiagnosticJsonFormatter::FormatDiagnosticToJson(const Diagnostic& d,
     diagsJsonStr += Whitespace(deep * INDENT_WIDTH) + "\"DiagKind\": \"";
     if (d.isRefactor && !d.isConvertedToRefactor) {
         if (static_cast<size_t>(d.rKind) < RE_DIAG_KIND_STR_SIZE) {
-            diagsJsonStr += StringConvertor::EscapeToJsonString(RE_DIAG_KIND_STR[static_cast<size_t>(d.rKind)]);
+            diagsJsonStr +=
+                StringConvertor::EscapeToJsonString(std::string(RE_DIAG_KIND_STR[static_cast<size_t>(d.rKind)]));
         }
     } else {
         if ((static_cast<size_t>(d.kind) < DIAG_KIND_STR_SIZE)) {
-            diagsJsonStr += StringConvertor::EscapeToJsonString(DIAG_KIND_STR[static_cast<size_t>(d.kind)]);
+            diagsJsonStr +=
+                StringConvertor::EscapeToJsonString(std::string(DIAG_KIND_STR[static_cast<size_t>(d.kind)]));
         }
     }
 
@@ -250,7 +252,8 @@ std::string DiagnosticJsonFormatter::FormatDiagnosticToJson(const Diagnostic& d,
         diagsJsonStr += "ungrouped";
     } else {
         CJC_ASSERT(static_cast<unsigned>(d.warnGroup) < WARN_GROUP_DESCRS_SIZE);
-        diagsJsonStr += StringConvertor::EscapeToJsonString(warnGroupDescrs[static_cast<unsigned>(d.warnGroup)]);
+        diagsJsonStr +=
+            StringConvertor::EscapeToJsonString(std::string(warnGroupDescrs[static_cast<unsigned>(d.warnGroup)]));
     }
 
     diagsJsonStr += "\",\n" + Whitespace(deep * INDENT_WIDTH) + "\"DiagCategory\": \"";

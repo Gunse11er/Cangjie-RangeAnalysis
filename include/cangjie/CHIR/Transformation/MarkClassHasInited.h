@@ -25,10 +25,10 @@ public:
      * 2. Sets `hasInited = false` at the beginning of each constructor
      * 3. Sets `hasInited = true` at all exit points of each constructor
      * 4. Adds a guard in the finalizer to prevent execution if `hasInited` is false
-     *
+     * 
      * This prevents use-before-initialization issues by ensuring finalizers
      * only execute for properly initialized objects.
-     *
+     * 
      * @param package The package to process
      */
     void RunOnPackage(const Package& package);
@@ -36,8 +36,8 @@ public:
 private:
     void AddHasInitedFlagToClassDef(ClassDef& classDef);
     void AddGuardToFinalizer(ClassDef& classDef);
-    void AssignHasInitedFlagToFalseInConstructorHead(Func& constructor);
-    void AssignHasInitedFlagToTrueInConstructorExit(Func& constructor);
+    void AssignHasInitedFlagToFalseInConstructorHead(Function& constructor);
+    void AssignHasInitedFlagToTrueInConstructorExit(Function& constructor);
 
 private:
     CHIRBuilder& builder;

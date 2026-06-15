@@ -12,6 +12,8 @@
 
 #include "cangjie/Mangle/CHIRManglingUtils.h"
 
+#include <sstream>
+
 #include "cangjie/CHIR/Utils/CHIRCasting.h"
 #include "cangjie/CHIR/IR/Type/ClassDef.h"
 #include "cangjie/CHIR/IR/Type/CustomTypeDef.h"
@@ -20,7 +22,6 @@
 #include "cangjie/Utils/CastingTemplate.h"
 #include "cangjie/Mangle/BaseMangler.h"
 #include "cangjie/Mangle/CHIRTypeManglingUtils.h"
-#include <sstream>
 
 using namespace Cangjie::CHIR;
 using namespace Cangjie::MangleUtils;
@@ -38,7 +39,7 @@ std::string ReplaceManglePrefixWith(const std::string& mangledName, const std::s
 } // namespace
 namespace Cangjie::CHIRMangling {
 std::string GenerateVirtualFuncMangleName(
-    const FuncBase* rawFunc, const CustomTypeDef& customTypeDef, const ClassType* parentTy, bool isVirtual)
+    const Function* rawFunc, const CustomTypeDef& customTypeDef, const ClassType* parentTy, bool isVirtual)
 {
     std::stringstream ss;
     // "_CV" represents function wrapper for virtual functions. "_CM" represents function wrapper for mutable functions.
@@ -83,7 +84,7 @@ std::string GenerateInstantiateFuncMangleName(const std::string& baseName, const
     return ss.str();
 }
 
-std::string GenerateLambdaFuncMangleName(const Func& baseFunc, size_t counter)
+std::string GenerateLambdaFuncMangleName(const Function& baseFunc, size_t counter)
 {
     std::stringstream ss;
     // "_CL" represents for compiler generated anonymous functions (lambdas).
@@ -145,7 +146,7 @@ std::string GenerateInstantiatedBaseClassMangleName(const FuncType& funcType)
     return ss.str();
 }
 
-std::string GenerateGlobalImplClassMangleName(const FuncBase& func)
+std::string GenerateGlobalImplClassMangleName(const Function& func)
 {
     std::stringstream ss;
     ss << ReplaceManglePrefixWith(func.GetIdentifierWithoutPrefix(), MANGLE_CLOSURE_FUNC_PREFIX);
@@ -179,12 +180,12 @@ std::string GenerateInstantiatedAbstractFuncMangleName(const ClassDef &def)
     return MANGLE_FUNC_PREFIX + def.GetIdentifier() + MANGLE_ABSTRACT_INSTANTIATED_PREFIX;
 }
 
-std::string GenerateGenericOverrideFuncMangleName(const FuncBase &func)
+std::string GenerateGenericOverrideFuncMangleName(const Function &func)
 {
     return ReplaceManglePrefixWith(func.GetIdentifierWithoutPrefix(), MANGLE_FUNC_PREFIX) + MANGLE_GENERIC_PREFIX;
 }
 
-std::string GenerateInstOverrideFuncMangleName(const FuncBase &func)
+std::string GenerateInstOverrideFuncMangleName(const Function &func)
 {
     return ReplaceManglePrefixWith(func.GetIdentifierWithoutPrefix(), MANGLE_FUNC_PREFIX) +
         MANGLE_ABSTRACT_INST_PREFIX;

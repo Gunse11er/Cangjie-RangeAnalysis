@@ -15,27 +15,28 @@ using namespace AST;
 // The desugar of a `SpawnArg` is the form `arg.getSchedulerHandle()`
 void TypeChecker::TypeCheckerImpl::DesugarSpawnArgExpr(const ASTContext& ctx, const AST::SpawnExpr& se)
 {
-    if (!Ty::IsTyCorrect(se.ty) || se.arg->desugarExpr) {
+    if (!Ty::IsTyCorrect(se.GetTy()) || se.arg->desugarExpr) {
         return;
     }
     Ptr<Expr> arg = se.arg.get();
-    CJC_ASSERT(arg && Ty::IsTyCorrect(arg->ty) && arg->ty->IsClassLike());
+    CJC_ASSERT(arg && Ty::IsTyCorrect(arg->GetTy()) && arg->GetTy()->IsClassLike());
     // Get `getSchedulerHandle` method from spawn argument, whose signature is `()->CPointer<Unit>`.
-    auto classLikeTy = StaticCast<ClassLikeTy*>(arg->ty);
+    auto classLikeTy = StaticCast<ClassLikeTy*>(arg->GetTy());
     auto retTy = typeManager.GetPointerTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT));
     auto funcTy = typeManager.GetFunctionTy({}, retTy);
     const auto fieldName = "getSchedulerHandle";
     auto decls = FieldLookup(ctx, classLikeTy->commonDecl, fieldName, {.file = se.curFile});
     CJC_ASSERT(decls.size() == 1); // `getSchedulerHandle(): CPointer<Unit>` is the private method.
     auto decl = decls.front();
-    CJC_ASSERT(Ty::IsTyCorrect(decl->ty) && decl->ty->IsFunc() && typeManager.IsSubtype(decl->ty, funcTy));
+    CJC_ASSERT(
+        Ty::IsTyCorrect(decl->GetTy()) && decl->GetTy()->IsFunc() && typeManager.IsSubtype(decl->GetTy(), funcTy));
     auto ma = CreateMemberAccess(ASTCloner::Clone(arg), fieldName);
     CopyBasicInfo(arg, ma.get());
     auto ce = CreateCallExpr(std::move(ma), {});
     CopyBasicInfo(arg, ce.get());
     ce->callKind = CallKind::CALL_DECLARED_FUNCTION;
     ce->resolvedFunction = StaticCast<FuncDecl*>(decl);
-    ce->ty = retTy;
+    ce->SetTy(retTy);
     AddCurFile(*ce, se.curFile);
     arg->desugarExpr = std::move(ce);
 }
@@ -44,15 +45,15 @@ void TypeChecker::TypeCheckerImpl::DesugarSpawnArgExpr(const ASTContext& ctx, co
 // NOTE: This syntax sugar is stored in `futureObj` rather than `desugarExpr`.
 void TypeChecker::TypeCheckerImpl::DesugarSpawnExpr(const ASTContext& ctx, AST::SpawnExpr& se)
 {
-    if (!Ty::IsTyCorrect(se.ty) || se.futureObj) {
+    if (!Ty::IsTyCorrect(se.GetTy()) || se.futureObj) {
         return;
     }
     Ptr<Expr> task = se.task.get();
-    CJC_ASSERT(task && Ty::IsTyCorrect(task->ty) && task->ty->IsFunc());
-    Ptr<FuncTy> taskTy = RawStaticCast<FuncTy*>(task->ty);
-    CJC_ASSERT(se.ty->IsClass());
-    Ptr<ClassDecl> futureClass = RawStaticCast<ClassTy*>(se.ty)->declPtr;
-    CJC_ASSERT(Ty::IsTyCorrect(futureClass->ty) && futureClass->ty->typeArgs.size() == 1);
+    CJC_ASSERT(task && Ty::IsTyCorrect(task->GetTy()) && task->GetTy()->IsFunc());
+    Ptr<FuncTy> taskTy = RawStaticCast<FuncTy*>(task->GetTy());
+    CJC_ASSERT(se.GetTy()->IsClass());
+    Ptr<ClassDecl> futureClass = RawStaticCast<ClassTy*>(se.GetTy())->declPtr;
+    CJC_ASSERT(Ty::IsTyCorrect(futureClass->GetTy()) && futureClass->GetTy()->typeArgs.size() == 1);
     std::vector<Ptr<FuncDecl>> inits;
     for (auto& decl : futureClass->GetMemberDecls()) {
         CJC_NULLPTR_CHECK(decl);
@@ -62,27 +63,27 @@ void TypeChecker::TypeCheckerImpl::DesugarSpawnExpr(const ASTContext& ctx, AST::
     }
     CJC_ASSERT(inits.size() == 1); // `init(fn: ()->T)` is the only constructor for `Future`
     auto initDecl = inits.front();
-    CJC_ASSERT(Ty::IsTyCorrect(initDecl->ty) && initDecl->ty->IsFunc());
+    CJC_ASSERT(Ty::IsTyCorrect(initDecl->GetTy()) && initDecl->GetTy()->IsFunc());
     // Prepare the `baseFunc` of the `Future` function call.
     auto re = CreateRefExprInCore("Future");
     re->isAlone = false;
     re->ref.target = initDecl;
     re->instTys.emplace_back(taskTy->retTy);
-    re->ty = typeManager.GetInstantiatedTy(
-        initDecl->ty, {{StaticCast<GenericsTy*>(futureClass->ty->typeArgs.front()), taskTy->retTy}});
+    re->SetTy(typeManager.GetInstantiatedTy(
+        initDecl->GetTy(), {{StaticCast<GenericsTy*>(futureClass->GetTy()->typeArgs.front()), taskTy->retTy}}));
     CopyBasicInfo(task, re.get());
     // Prepare the arguments of the `CallExpr`.
     std::vector<OwnedPtr<FuncArg>> callArgs;
     auto fa = CreateFuncArg(std::move(se.task));
     CopyBasicInfo(task, fa.get());
-    fa->ty = task->ty;
+    fa->SetTy(task->GetTy());
     callArgs.emplace_back(std::move(fa));
     // Create the `CallExpr`.
     auto ce = CreateCallExpr(std::move(re), std::move(callArgs));
     CopyBasicInfo(task, ce.get());
     ce->callKind = CallKind::CALL_OBJECT_CREATION;
     ce->resolvedFunction = initDecl;
-    ce->ty = se.ty;
+    ce->SetTy(se.GetTy());
 
     auto futureObj = CreateVarDecl("futureObj", std::move(ce));
     CopyBasicInfo(task, futureObj.get());

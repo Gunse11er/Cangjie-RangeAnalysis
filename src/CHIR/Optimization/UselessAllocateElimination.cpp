@@ -14,12 +14,12 @@ using namespace Cangjie::CHIR;
 
 void UselessAllocateElimination::RunOnPackage(const Package& package, bool isDebug)
 {
-    for (auto func : package.GetGlobalFuncs()) {
+    for (auto func : package.GetGlobalFuncsWithBody()) {
         RunOnFunc(*func, isDebug);
     }
 }
 
-void UselessAllocateElimination::RunOnFunc(const Func& func, bool isDebug)
+void UselessAllocateElimination::RunOnFunc(const Function& func, bool isDebug)
 {
     for (auto block : func.GetBody()->GetBlocks()) {
         for (auto expr : block->GetExpressions()) {

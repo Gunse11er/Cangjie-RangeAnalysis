@@ -477,7 +477,7 @@ size_t DeCompression<T>::ForwardArrayType(T& mangled, size_t& cnt, size_t idx)
 
 // Forward generic type, G<identifier-length><identifier>.
 template<typename T>
-size_t DeCompression<T>::ForwardGenericType(T& mangled, size_t& cnt, size_t idx)
+size_t DeCompression<T>::ForwardGenericType(T& mangled, [[maybe_unused]] size_t& cnt, size_t idx)
 {
     size_t nextIdx = ForwardNumber(mangled, idx + MANGLE_CHAR_LEN);
     if (nextIdx != idx + MANGLE_CHAR_LEN) {
@@ -891,8 +891,9 @@ size_t DeCompression<T>::UpdateCompressedName(T& compressed, size_t sid, size_t 
     return 0;
 }
 
-template<typename T>
-size_t DeCompression<T>::TryExtendPath(T& mangled, size_t& count, size_t idx, size_t entityId, T& curMangled)
+template <typename T>
+size_t DeCompression<T>::TryExtendPath(
+    T& mangled, size_t& count, size_t idx, size_t entityId, [[maybe_unused]] T& curMangled)
 {
     bool isPush = false;
     T mangledCopy = mangled;
@@ -944,9 +945,9 @@ size_t DeCompression<T>::TryLambdaPath(T& mangled, size_t& count, size_t idx, si
     return nextIdx;
 }
 
-template<typename T>
-size_t DeCompression<T>::TryGenericPrefixPath(T& mangled, size_t& count, T& curMangled,
-    std::tuple<size_t, size_t, size_t> rParams)
+template <typename T>
+size_t DeCompression<T>::TryGenericPrefixPath(
+    T& mangled, size_t& count, [[maybe_unused]] T& curMangled, std::tuple<size_t, size_t, size_t> rParams)
 {
     T mangledCopy = mangled;
     size_t idx = std::get<0>(rParams);
@@ -1010,8 +1011,8 @@ size_t DeCompression<T>::TryNamePrefixPath(T& mangled, size_t& count, T& curMang
             }
             nextIdx = nextIdx == nameIdx + 1 ? nameIdx : nextIdx;
         } else if (mangled[nextIdx] == MANGLE_GENERIC_PREFIX) {
-            std::tuple<size_t, size_t, size_t> rParams{idx, entityId, nextIdx};
-            nextIdx = TryGenericPrefixPath(mangled, count, curMangled, rParams);
+            std::tuple<size_t, size_t, size_t> genericParams{idx, entityId, nextIdx};
+            nextIdx = TryGenericPrefixPath(mangled, count, curMangled, genericParams);
         } else if (mangled[nextIdx] == MANGLE_FUNCTION_PREFIX) {
             nextIdx = ForwardTypes(mangled, count, nameIdx + MANGLE_CHAR_LEN);
             if (nextIdx < mangled.Length() && mangled[nextIdx] == END) {

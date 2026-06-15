@@ -68,7 +68,7 @@ git apply --reject --whitespace=fix ../llvmPatch.diff
 ```shell
 mkdir -p third_party/llvm-project
 cd third_party/llvm-project
-git clone -b main --depth 1 https://gitcode.com/Cangjie/llvm-project.git ./
+git clone -b dev --depth 1 https://gitcode.com/Cangjie/llvm-project.git ./
 ```
 
 构建项目时，则直接使用 third_party/llvm-project 目录源码进行构建。
@@ -87,4 +87,4 @@ git clone -b main --depth 1 https://gitcode.com/Cangjie/llvm-project.git ./
 
 当编译目标平台为 Windows 时，需要依赖该开源软件。
 
-该开源软件需在构建编译器之前完成，并且构建编译器时，需指定其编译产物路径。MinGW-w64 的详细构建流程请参阅 [构建指导书](https://gitcode.com/Cangjie/cangjie_build/blob/main/docs/linux_cross_windows_zh.md#23-%E7%BC%96%E8%AF%91mingw-w64%E5%8F%8A%E9%85%8D%E5%A5%97%E5%B7%A5%E5%85%B7%E9%93%BE-%E5%85%B3%E9%94%AE%E6%AD%A5%E9%AA%A4)。
+该开源软件需在构建编译器之前完成，并且构建编译器时，需指定其编译产物路径。MinGW-w64 的详细构建流程请参阅 [构建指导书](https://gitcode.com/Cangjie/cangjie_build/blob/main/docs/linux_cross_windows.md#23-%E7%BC%96%E8%AF%91mingw-w64%E5%8F%8A%E9%85%8D%E5%A5%97%E5%B7%A5%E5%85%B7%E9%93%BE)。

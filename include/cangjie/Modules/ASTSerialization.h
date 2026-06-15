@@ -19,6 +19,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "cangjie/Option/Option.h"
 #include "flatbuffers/ModuleFormat_generated.h"
 
 #include "cangjie/AST/Node.h"
@@ -47,6 +48,7 @@ public:
 
     // Add for cjmp
     void SetSerializingCommon();
+    void SaveOptions(bool debug, GlobalOptions::OptimizationLevel level);
 
     /** Export external decls of a package AST to a buffer. */
     void ExportAST(const AST::PackageDecl& package) const;
@@ -83,8 +85,7 @@ public:
     void SetImportSourceCode(bool enable) const;
     const std::vector<std::string> GetDependentPackageNames() const;
     // Add for cjmp
-    void PreloadCommonPartOfPackage(AST::Package& pkg) const;
-    std::string PreReadAndSetPackageName();
+    bool PreloadCommonPartOfPackage(AST::Package& pkg) const;
     std::vector<std::string> ReadFileNames() const;
 
     Ptr<AST::Ty> LoadType(FormattedIndex type) const;

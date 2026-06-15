@@ -11,6 +11,7 @@
  */
 
 #include "cangjie/AST/Node.h"
+#include "cangjie/AST/Types.h"
 
 #include <algorithm>
 #include <iomanip>
@@ -63,54 +64,18 @@ std::ostream& operator<<(std::ostream& out, Span const& span)
     return out;
 }
 
-/**
- * @brief Get the end position of a token in *.macrocall file by the same token's position in curfile.
- * @param key: the Hash value of line and column about token's end position in curfile.
- * @param first: the Hash value of line and column about token's begin position in curfile.
- * @param second: the begin position of the same token in *.macrocall file.
- * @return the end position in *.macrocall file.
- */
-Position GetMacroCallEndPos(bool isCurFile, uint32_t key, uint32_t first, const Position second)
+template <typename T>
+std::string JoinNodeStrings(const std::vector<OwnedPtr<T>>& nodes, const std::string& separator)
 {
-    auto end = second;
-    if (!isCurFile) {
-        // key and first are only column.
-        auto columnOffset = (key > first) ? (key - first) : 0;
-        return end + columnOffset;
+    std::string ret;
+    for (size_t i = 0; i < nodes.size(); ++i) {
+        if (i > 0) {
+            ret += separator;
+        }
+        CJC_NULLPTR_CHECK(nodes[i]);
+        ret += nodes[i]->ToString();
     }
-    // key and first are the Hash value of line and column that created by Position.Hash32().
-    auto keyPos = Position::RestorePosFromHash(key);
-    auto firstPos = Position::RestorePosFromHash(first);
-    auto lineOffset = (keyPos.first > firstPos.first) ? (keyPos.first - firstPos.first) : 0;
-    if (lineOffset > 0) {
-        end.line += lineOffset;
-        end.column = keyPos.second;
-        return end;
-    }
-    auto columnOffset = (key > first) ? (key - first) : 0;
-    return end + columnOffset;
-}
-
-/**
- * @brief Get the end position of a token for LSP using new2originPosMap.
- * @param newPos: the Hash value of line and column about token's end position in curfile.
- * @param first: the Hash value of line and column about token's begin position in curfile.
- * @return the end position in *.macrocall file.
- */
-Position GetMacroCallEndPosforLsp(uint32_t newPos, uint32_t first, const Position second)
-{
-    auto end = second;
-    // newPos and first are the Hash value of line and column that created by Position.Hash32().
-    auto keyPos = Position::RestorePosFromHash(newPos);
-    auto firstPos = Position::RestorePosFromHash(first);
-    auto lineOffset = (keyPos.first > firstPos.first) ? (keyPos.first - firstPos.first) : 0;
-    if (lineOffset > 0) {
-        end.line += lineOffset;
-        end.column = keyPos.second;
-        return end;
-    }
-    auto columnOffset = (newPos > first) ? (newPos - first) : 0;
-    return end + columnOffset;
+    return ret;
 }
 
 /**
@@ -121,45 +86,7 @@ Position GetMacroCallEndPosforLsp(uint32_t newPos, uint32_t first, const Positio
  */
 Position GetMacroSourcePos(const MacroInvocation& invocation, const Position& pos, bool isLowerBound = false)
 {
-    auto key = invocation.isCurFile ? pos.Hash32() : static_cast<const uint32_t>(pos.column);
-    if (isLowerBound) {
-        // Get end position.
-        if (invocation.isForLSP) { // For lsp.
-            auto posIt = invocation.new2originPosMap.find(pos.Hash32());
-            if (posIt != invocation.new2originPosMap.end()) {
-                ++posIt;
-            }
-            if (posIt == invocation.new2originPosMap.end()) {
-                posIt = invocation.new2originPosMap.lower_bound(pos.Hash32());
-            }
-            if (posIt == invocation.new2originPosMap.end()) {
-                return pos;
-            }
-            auto sourcePos = GetMacroCallEndPosforLsp(pos.Hash32(), posIt->first, posIt->second);
-            if (sourcePos.isCurFile) {
-                return sourcePos;
-            }
-        }
-        auto posIt = invocation.new2macroCallPosMap.lower_bound(key);
-        if (posIt != invocation.new2macroCallPosMap.end()) {
-            return GetMacroCallEndPos(invocation.isCurFile, key, posIt->first, posIt->second);
-        }
-        return pos;
-    }
-    // Get begin/identifier/field position.
-    if (invocation.isForLSP) { // For lsp.
-        if (invocation.new2originPosMap.find(pos.Hash32()) == invocation.new2originPosMap.end()) {
-            return pos;
-        }
-        auto sourcePos = invocation.new2originPosMap.at(pos.Hash32());
-        if (sourcePos.isCurFile) {
-            return sourcePos;
-        }
-    }
-    if (invocation.new2macroCallPosMap.find(key) != invocation.new2macroCallPosMap.end()) {
-        return invocation.new2macroCallPosMap.at(key);
-    }
-    return pos;
+    return invocation.macroCallDiagInfo.MapPos(pos, isLowerBound);
 }
 } // namespace
 
@@ -226,21 +153,25 @@ std::string EnumPattern::GetIdentifier() const
 
 std::string CallExpr::ToString() const
 {
-    if (baseFunc == nullptr) {
-        return "";
-    }
     std::stringstream ss;
-    Position curSpanBegin = baseFunc->begin;
-    ss << NextSpan(baseFunc->ToString(), curSpanBegin, baseFunc->end);
-    curSpanBegin = baseFunc->end;
-    ss << NextSpan("(", curSpanBegin, leftParenPos, 1);
-    curSpanBegin = leftParenPos + Position{0, 0, 1};
-    for (auto& arg : args) {
-        ss << NextSpan(arg->ToString(), curSpanBegin, arg->end);
-        curSpanBegin = arg->end;
-        if (arg->commaPos != INVALID_POSITION) {
-            ss << NextSpan(",", curSpanBegin, arg->commaPos, 1);
-            curSpanBegin = arg->commaPos + Position{0, 0, 1};
+    Position curSpanBegin;
+    if (baseFunc != nullptr) {
+        curSpanBegin = baseFunc->begin;
+        ss << NextSpan(baseFunc->ToString(), curSpanBegin, baseFunc->end);
+        curSpanBegin = baseFunc->end;
+        ss << NextSpan("(", curSpanBegin, leftParenPos, 1);
+        curSpanBegin = leftParenPos + Position{0, 0, 1};
+    } else {
+        ss << "(";
+        curSpanBegin = Position{0, 0, 1};
+    }
+    for (size_t i = 0; i < args.size(); ++i) {
+        CJC_ASSERT(args[i] != nullptr);
+        ss << NextSpan(args[i]->ToString(), curSpanBegin, args[i]->end);
+        curSpanBegin = args[i]->end;
+        if (i + 1 < args.size() && args[i]->commaPos != INVALID_POSITION) {
+            ss << NextSpan(",", curSpanBegin, args[i]->commaPos, 1);
+            curSpanBegin = args[i]->commaPos + Position{0, 0, 1};
         }
     }
     ss << NextSpan(")", curSpanBegin, rightParenPos, 1);
@@ -261,9 +192,12 @@ void CallExpr::Clear() noexcept
 
 std::string FuncArg::ToString() const
 {
-    if (expr == nullptr) {
-        return "";
+    // In null-safety scenarios we may build an incomplete FuncArg (name set, expr absent).
+    // Returning a compact fallback avoids emitting artificial newlines/spaces from sparse positions.
+    if (!name.Empty() && expr == nullptr) {
+        return name.Val() + ":";
     }
+
     std::stringstream ss;
     Position curSpanBegin = begin;
     if (!name.Empty()) {
@@ -272,27 +206,33 @@ std::string FuncArg::ToString() const
         curSpanBegin += Position{0, 0, static_cast<int>(name.Length())};
         ss << NextSpan(":", curSpanBegin, colonPos, 1);
         curSpanBegin += Position{0, 0, 1};
-    } else {
-        curSpanBegin = expr->begin;
     }
-    if (withInout) {
-        ss << "inout ";
+    if (expr != nullptr) {
+        if (withInout) {
+            ss << "inout ";
+        }
+        ss << NextSpan(expr->ToString(), curSpanBegin, expr->end);
+    } else if (!name.Empty()) {
+        // If name is set but expr is null, return "name:"
+        // curSpanBegin is already at the position after colon
     }
-    ss << NextSpan(expr->ToString(), curSpanBegin, expr->end);
     return ss.str();
 }
 
 std::string MemberAccess::ToString() const
 {
-    if (baseExpr == nullptr) {
-        return "";
-    }
     std::stringstream ss;
-    Position curSpanBegin = baseExpr->begin;
-    ss << NextSpan(baseExpr->ToString(), curSpanBegin, baseExpr->end);
-    curSpanBegin = baseExpr->end;
-    ss << NextSpan(".", curSpanBegin, dotPos, 1);
-    curSpanBegin = dotPos + Position{0, 0, 1};
+    Position curSpanBegin;
+    if (baseExpr != nullptr) {
+        curSpanBegin = baseExpr->begin;
+        ss << NextSpan(baseExpr->ToString(), curSpanBegin, baseExpr->end);
+        curSpanBegin = baseExpr->end;
+        if (Is<OptionalExpr>(baseExpr.get())) {
+            curSpanBegin += Position{0, 0, 1};
+        }
+        ss << NextSpan(".", curSpanBegin, dotPos, 1);
+        curSpanBegin = dotPos + Position{0, 0, 1};
+    }
     ss << NextSpan(field, curSpanBegin, field.Begin(), static_cast<int>(field.Length()));
     return ss.str();
 }
@@ -374,9 +314,10 @@ std::string RefType::ToString() const
     if (!typeArguments.empty()) {
         ss << NextSpan("<", curSpanBegin, leftAnglePos, 1);
         curSpanBegin = leftAnglePos + Position{0, 0, 1};
-        for (auto& typeArgument : typeArguments) {
-            ss << NextSpan(typeArgument->ToString(), curSpanBegin, typeArgument->end);
-            curSpanBegin = typeArgument->end;
+        for (size_t i = 0; i < typeArguments.size(); ++i) {
+            CJC_ASSERT(typeArguments[i] != nullptr);
+            ss << NextSpan(typeArguments[i]->ToString(), curSpanBegin, typeArguments[i]->end);
+            curSpanBegin = typeArguments[i]->end;
         }
         ss << NextSpan(">", curSpanBegin, rightAnglePos, 1);
     }
@@ -393,15 +334,14 @@ std::string ArrayLit::ToString() const
     std::stringstream ss;
     ss << "[";
     Position curSpanBegin = begin + Position{0, 0, 1};
-    size_t i = 0;
-    for (auto& child : children) {
-        ss << NextSpan(child->ToString(), curSpanBegin, child->end);
-        curSpanBegin = child->end;
-        if (i < commaPosVector.size()) {
+    for (size_t i = 0; i < children.size(); ++i) {
+        CJC_ASSERT(children[i] != nullptr);
+        ss << NextSpan(children[i]->ToString(), curSpanBegin, children[i]->end);
+        curSpanBegin = children[i]->end;
+        if (i + 1 < children.size() && i < commaPosVector.size()) {
             ss << NextSpan(",", curSpanBegin, commaPosVector[i], 1);
             curSpanBegin = commaPosVector[i] + Position{0, 0, 1};
         }
-        i++;
     }
     ss << NextSpan("]", curSpanBegin, rightSquarePos, 1);
     return ss.str();
@@ -410,15 +350,23 @@ std::string ArrayLit::ToString() const
 std::string ArrayExpr::ToString() const
 {
     std::stringstream ss;
-    Position curSpanBegin = begin;
-    ss << NextSpan(type->ToString(), curSpanBegin, type->end);
-    curSpanBegin = type->end;
-    ss << NextSpan("(", curSpanBegin, leftParenPos, 1);
-    curSpanBegin = leftParenPos + Position{0, 0, 1};
+    Position curSpanBegin;
+    if (type != nullptr) {
+        curSpanBegin = begin;
+        ss << NextSpan(type->ToString(), curSpanBegin, type->end);
+        curSpanBegin = type->end;
+        ss << NextSpan("(", curSpanBegin, leftParenPos, 1);
+        curSpanBegin = leftParenPos + Position{0, 0, 1};
+    } else {
+        ss << "(";
+        curSpanBegin = Position{0, 0, 1};
+    }
+
     for (size_t i = 0; i < args.size(); ++i) {
+        CJC_ASSERT(args[i] != nullptr);
         ss << NextSpan(args[i]->ToString(), curSpanBegin, args[i]->end);
         curSpanBegin = args[i]->end;
-        if (i < commaPosVector.size()) {
+        if (i + 1 < args.size() && i < commaPosVector.size()) {
             ss << NextSpan(",", curSpanBegin, commaPosVector[i], 1);
             curSpanBegin = commaPosVector[i] + Position{0, 0, 1};
         }
@@ -436,8 +384,9 @@ std::string PointerExpr::ToString() const
     ss << NextSpan(expr, curSpanBegin, curSpanEnd);
 
     curSpanBegin = curSpanEnd;
-    if (ty && !ty->typeArgs.empty()) {
-        expr = Ty::ToString(ty->typeArgs[0]);
+    auto pointeeTy = GetTy();
+    if (pointeeTy && !pointeeTy->typeArgs.empty()) {
+        expr = Ty::ToString(pointeeTy->typeArgs[0]);
         curSpanEnd = curSpanBegin + Position{0, 0, static_cast<int>(expr.size())};
         ss << NextSpan(expr, curSpanBegin, curSpanEnd);
     }
@@ -540,11 +489,12 @@ void BinaryExpr::Clear() noexcept
 {
     RecoverToBinaryExpr(*this);
     Expr::Clear();
-    if (leftExpr == nullptr || rightExpr == nullptr) {
-        return;
+    if (leftExpr) {
+        leftExpr->Clear();
     }
-    leftExpr->Clear();
-    rightExpr->Clear();
+    if (rightExpr) {
+        rightExpr->Clear();
+    }
 }
 
 void ParenExpr::Clear() noexcept
@@ -568,8 +518,8 @@ std::set<Ptr<InterfaceTy>> InheritableDecl::GetSuperInterfaceTys() const
 {
     std::set<Ptr<InterfaceTy>> ret;
     for (auto& types : inheritedTypes) {
-        if (types && types->ty && types->ty->kind == TypeKind::TYPE_INTERFACE) {
-            ret.insert(RawStaticCast<InterfaceTy*>(types->ty));
+        if (types && types->GetTy() && types->TyKind() == TypeKind::TYPE_INTERFACE) {
+            ret.insert(RawStaticCast<InterfaceTy*>(types->GetTy()));
         }
     }
     return ret;
@@ -581,8 +531,8 @@ std::vector<Ptr<InterfaceTy>> InheritableDecl::GetStableSuperInterfaceTys() cons
 
     std::set<Ptr<InterfaceTy>, decltype(cmp)> ret(cmp);
     for (auto& types : inheritedTypes) {
-        if (types && types->ty && types->ty->kind == TypeKind::TYPE_INTERFACE) {
-            ret.emplace(RawStaticCast<InterfaceTy*>(types->ty));
+        if (types && types->GetTy() && types->TyKind() == TypeKind::TYPE_INTERFACE) {
+            ret.emplace(RawStaticCast<InterfaceTy*>(types->GetTy()));
         }
     }
     return std::vector<Ptr<InterfaceTy>>(ret.begin(), ret.end());
@@ -602,12 +552,12 @@ std::vector<Ptr<ClassLikeDecl>> InheritableDecl::GetAllSuperDecls()
         auto curDecl = workList.front();
         workList.pop();
         for (auto& it : curDecl->inheritedTypes) {
-            if (auto clsTy = DynamicCast<ClassTy*>(it->ty); clsTy && visited.count(clsTy->declPtr) == 0) {
+            if (auto clsTy = DynamicCast<ClassTy*>(it->GetTy()); clsTy && visited.count(clsTy->declPtr) == 0) {
                 workList.push(clsTy->declPtr);
                 visited.emplace(clsTy->declPtr);
                 ret.emplace_back(clsTy->declPtr);
-            } else if (auto interfaceTy = DynamicCast<InterfaceTy*>(it->ty);
-                       interfaceTy && visited.count(interfaceTy->declPtr) == 0) {
+            } else if (auto interfaceTy = DynamicCast<InterfaceTy*>(it->GetTy());
+                interfaceTy && visited.count(interfaceTy->declPtr) == 0) {
                 workList.push(interfaceTy->declPtr);
                 visited.emplace(interfaceTy->declPtr);
                 ret.emplace_back(interfaceTy->declPtr);
@@ -758,7 +708,7 @@ Ptr<const MacroInvocation> Node::GetConstInvocation() const
 
 bool MacroInvocation::IsIfAvailable() const
 {
-    return fullName == IF_AVAILABLE;
+    return macroCallDiagInfo.fullName == IF_AVAILABLE;
 }
 
 Ptr<FuncArg> MacroExpandExpr::GetNamedArg() const
@@ -828,14 +778,15 @@ Position Node::GetMacroCallNewPos(const Position& originPos)
         }
         pInvocation = tempNode->GetInvocation();
     }
-    if (!pInvocation || pInvocation->originPosMap.empty() || pInvocation->origin2newPosMap.empty()) {
+    if (!pInvocation || pInvocation->macroCallDiagInfo.originPosMap.empty() || pInvocation->origin2newPosMap.empty()) {
         return INVALID_POSITION;
     }
     auto key = static_cast<unsigned int>(originPos.Hash32());
-    if (pInvocation->originPosMap.lower_bound(key) == pInvocation->originPosMap.end()) {
+    if (pInvocation->macroCallDiagInfo.originPosMap.lower_bound(key) ==
+        pInvocation->macroCallDiagInfo.originPosMap.end()) {
         return INVALID_POSITION;
     }
-    auto newkey = pInvocation->originPosMap.lower_bound(key)->second.Hash64();
+    auto newkey = pInvocation->macroCallDiagInfo.originPosMap.lower_bound(key)->second.Hash64();
     if (pInvocation->origin2newPosMap.find(newkey) != pInvocation->origin2newPosMap.cend()) {
         return pInvocation->origin2newPosMap.at(newkey);
     }
@@ -850,6 +801,10 @@ Position Node::GetMacroCallNewPos(const Position& originPos)
 Position Node::GetMacroCallPos(Position originPos, bool isLowerBound) const
 {
     if (this->curMacroCall) {
+        // If originPos is not from macro expansion, return it.
+        if (originPos.line != this->curMacroCall->begin.line) {
+            return originPos;
+        }
         auto pInvocation = this->curMacroCall->GetConstInvocation();
         if (pInvocation && !IsPureAnnotation(*pInvocation)) {
             return GetMacroSourcePos(*pInvocation, originPos, isLowerBound);
@@ -1020,6 +975,22 @@ bool Decl::IsCommonMatchedWithSpecific() const
 }
 
 /**
+ * For a generic declaration finds generic parameters and returns them
+ * @return the number of generic parameters or 0 if not applicable.
+ */
+size_t Decl::GetGenericsCount() const
+{
+    if (!TestAttr(Attribute::GENERIC)) { // fast path
+        return 0;
+    }
+    auto genericNode = GetGeneric();
+    if (!genericNode) {
+        return 0;
+    }
+    return genericNode->typeParameters.size();
+}
+
+/**
  * For debug, get the original Position of the node if it is from MacroCall in curfile, curPos otherwise.
  */
 Position Node::GetDebugPos(const Position& curPos) const
@@ -1037,10 +1008,10 @@ Position Node::GetDebugPos(const Position& curPos) const
         }
     }
     auto key = static_cast<unsigned int>(curPos.column);
-    if (pInvocation->macroDebugMap.lower_bound(key) == pInvocation->macroDebugMap.end()) {
+    if (pInvocation->macroDebugMap.find(key) == pInvocation->macroDebugMap.end()) {
         return curPos;
     }
-    return pInvocation->macroDebugMap.lower_bound(key)->second;
+    return pInvocation->macroDebugMap.find(key)->second;
 }
 
 const std::string& Node::GetFullPackageName() const
@@ -1129,6 +1100,40 @@ std::string ImportContent::GetImportedPackageNameWithIsDecl() const
     return ss.str();
 }
 
+std::vector<std::string> ImportContent::GetPossiblePackageNames() const
+{
+    // Multi-imports are desugared after parser which should not be used for get package name.
+    CJC_ASSERT(kind != ImportKind::IMPORT_MULTI);
+    if (prefixPaths.empty()) {
+        return {identifier};
+    }
+    std::stringstream ss;
+    for (size_t i{0}; i < prefixPaths.size(); ++i) {
+        ss << prefixPaths[i];
+        // do not add . if this is the last of import xxx.*, because * is not part of package name
+        if (i + 1 == prefixPaths.size()) {
+            continue;
+        }
+        if (i == 0 && hasDoubleColon) {
+            ss << TOKENS[static_cast<int>(TokenKind::DOUBLE_COLON)];
+        } else {
+            ss << TOKENS[static_cast<int>(TokenKind::DOT)];
+        }
+    }
+    if (kind == ImportKind::IMPORT_ALL) {
+        return {ss.str()};
+    }
+    if (hasDoubleColon && prefixPaths.size() == 1) {
+        ss << TOKENS[static_cast<int>(TokenKind::DOUBLE_COLON)] << identifier.Val();
+        return {ss.str()};
+    }
+    if (prefixPaths.empty()) {
+        return {identifier.Val()};
+    }
+    // this order is important for resolving imported names
+    return {ss.str() + std::string{TOKENS[static_cast<int>(TokenKind::DOT)]} + identifier.Val(), ss.str()};
+}
+
 std::string ImportContent::ToString() const
 {
     std::function<void(std::stringstream&, const ImportContent&)> toString = [](auto& ss, auto& content) {
@@ -1188,7 +1193,7 @@ bool ExtendDecl::IsExportedDecl() const
             }
         }
     }
-    auto extendedDecl = Ty::GetDeclPtrOfTy<InheritableDecl>(ty);
+    auto extendedDecl = Ty::GetDeclPtrOfTy<InheritableDecl>(GetTy());
     bool isInSamePkg = extendedDecl && extendedDecl->fullPackageName == fullPackageName;
     auto isUpperBoundExport = [this]() {
         bool isUpperboundAllExported = true;
@@ -1255,7 +1260,7 @@ bool PropDecl::IsExportedDecl() const
         return Decl::IsExportedDecl();
     }
     auto extend = StaticCast<ExtendDecl>(outerDecl);
-    auto extendedDecl = Ty::GetDeclPtrOfTy(extend->ty);
+    auto extendedDecl = Ty::GetDeclPtrOfTy(extend->GetTy());
     // If extend and extended decleration in same package, all member of extend will be exported.
     if (!extendedDecl || extendedDecl->fullPackageName == extend->fullPackageName) {
         return Decl::IsExportedDecl();
@@ -1273,7 +1278,7 @@ bool FuncDecl::IsExportedDecl() const
         return Decl::IsExportedDecl();
     }
     auto extend = StaticCast<ExtendDecl>(outerDecl);
-    auto extendedDecl = Ty::GetDeclPtrOfTy(extend->ty);
+    auto extendedDecl = Ty::GetDeclPtrOfTy(extend->GetTy());
     // If extend and extended decleration in same package, all member of extend will be exported.
     if (!extendedDecl || extendedDecl->fullPackageName == extend->fullPackageName) {
         return Decl::IsExportedDecl();
@@ -1305,6 +1310,757 @@ bool PropDecl::IsOpen() const noexcept
         return true;
     }
     return !TestAttr(AST::Attribute::IMPORTED) && getters.empty() && setters.empty();
+}
+
+std::string PrimitiveType::ToString() const
+{
+    if (!str.empty()) {
+        return str;
+    }
+    return Ty::KindName(kind);
+}
+
+std::string ParenType::ToString() const
+{
+    CJC_ASSERT(type != nullptr);
+    return "(" + type->ToString() + ")";
+}
+
+std::string QualifiedType::ToString() const
+{
+    std::string ret;
+    CJC_ASSERT(baseType != nullptr);
+    ret = baseType->ToString();
+    ret += ".";
+    ret += field.GetRawText();
+
+    if (!typeArguments.empty()) {
+        ret += "<";
+        for (size_t i = 0; i < typeArguments.size(); ++i) {
+            if (i > 0) {
+                ret += ", ";
+            }
+            auto arg = typeArguments[i].get();
+            CJC_ASSERT(arg != nullptr);
+            ret += arg->ToString();
+        }
+        ret += ">";
+    }
+    return ret;
+}
+
+std::string OptionType::ToString() const
+{
+    std::string ret;
+    size_t count = (questNum > 0) ? questNum : questVector.size();
+    for (size_t i = 0; i < count; ++i) {
+        ret += "?";
+    }
+    CJC_ASSERT(componentType != nullptr);
+    ret += componentType->ToString();
+    return ret;
+}
+
+std::string ConstantType::ToString() const
+{
+    CJC_ASSERT(constantExpr != nullptr);
+    return "$" + constantExpr->ToString();
+}
+
+std::string VArrayType::ToString() const
+{
+    std::string ret = "VArray<";
+    CJC_ASSERT(typeArgument != nullptr);
+    ret += typeArgument->ToString();
+    if (constantType != nullptr) {
+        ret += ", " + constantType->ToString();
+    }
+    ret += ">";
+    return ret;
+}
+
+std::string FuncType::ToString() const
+{
+    std::string ret = "(";
+    for (size_t i = 0; i < paramTypes.size(); ++i) {
+        if (i > 0) {
+            ret += ", ";
+        }
+        CJC_ASSERT(paramTypes[i] != nullptr);
+        ret += paramTypes[i]->ToString();
+    }
+    ret += ")";
+    if (retType != nullptr) {
+        ret += " -> " + retType->ToString();
+    }
+    return ret;
+}
+
+std::string TupleType::ToString() const
+{
+    std::string ret = "(";
+    for (size_t i = 0; i < fieldTypes.size(); ++i) {
+        if (i > 0) {
+            ret += ", ";
+        }
+        CJC_ASSERT(fieldTypes[i] != nullptr);
+        ret += fieldTypes[i]->ToString();
+    }
+    ret += ")";
+    return ret;
+}
+
+std::string ThisType::ToString() const
+{
+    return TOKENS[static_cast<int>(TokenKind::THISTYPE)];
+}
+
+std::string ParenExpr::ToString() const
+{
+    CJC_ASSERT(expr != nullptr);
+    return "(" + expr->ToString() + ")";
+}
+
+std::string AsExpr::ToString() const
+{
+    CJC_ASSERT(leftExpr != nullptr);
+    CJC_ASSERT(asType != nullptr);
+    return leftExpr->ToString() + " as " + asType->ToString();
+}
+
+std::string IsExpr::ToString() const
+{
+    CJC_ASSERT(leftExpr != nullptr);
+    CJC_ASSERT(isType != nullptr);
+    return leftExpr->ToString() + " is " + isType->ToString();
+}
+
+std::string TypeConvExpr::ToString() const
+{
+    CJC_ASSERT(type != nullptr);
+    CJC_ASSERT(expr != nullptr);
+    return type->ToString() + "(" + expr->ToString() + ")";
+}
+
+std::string OptionalExpr::ToString() const
+{
+    CJC_ASSERT(baseExpr != nullptr);
+    return baseExpr->ToString() + "?";
+}
+
+std::string OptionalChainExpr::ToString() const
+{
+    CJC_ASSERT(expr != nullptr);
+    return expr->ToString();
+}
+
+std::string PrimitiveTypeExpr::ToString() const
+{
+    return Ty::KindName(typeKind);
+}
+
+std::string WildcardPattern::ToString() const
+{
+    return "_";
+}
+
+std::string ConstPattern::ToString() const
+{
+    CJC_NULLPTR_CHECK(literal);
+    return literal->ToString();
+}
+
+std::string VarPattern::ToString() const
+{
+    if (varDecl) {
+        return varDecl->identifier.Val();
+    }
+    return "";
+}
+
+std::string TuplePattern::ToString() const
+{
+    return "(" + JoinNodeStrings(patterns, ", ") + ")";
+}
+
+std::string TypePattern::ToString() const
+{
+    CJC_NULLPTR_CHECK(pattern);
+    CJC_NULLPTR_CHECK(type);
+    std::string ret = pattern->ToString();
+    if (!ret.empty()) {
+        ret += ": ";
+    }
+    ret += type->ToString();
+    return ret;
+}
+
+std::string EnumPattern::ToString() const
+{
+    CJC_NULLPTR_CHECK(constructor);
+    std::string ret = constructor->ToString();
+    if (!patterns.empty()) {
+        ret += "(" + JoinNodeStrings(patterns, ", ") + ")";
+    }
+    return ret;
+}
+
+std::string VarOrEnumPattern::ToString() const
+{
+    if (pattern) {
+        return pattern->ToString();
+    }
+    return identifier.Val();
+}
+
+std::string ExceptTypePattern::ToString() const
+{
+    CJC_NULLPTR_CHECK(pattern);
+    std::string ret = pattern->ToString();
+    if (!types.empty()) {
+        if (!ret.empty()) {
+            ret += ": ";
+        }
+        ret += JoinNodeStrings(types, " | ");
+    }
+    return ret;
+}
+
+std::string CommandTypePattern::ToString() const
+{
+    CJC_NULLPTR_CHECK(pattern);
+    std::string ret = pattern->ToString();
+    if (!types.empty()) {
+        if (!ret.empty()) {
+            ret += ": ";
+        }
+        ret += JoinNodeStrings(types, " | ");
+    }
+    return ret;
+}
+
+std::string LetPatternDestructor::ToString() const
+{
+    std::string ret = "let ";
+    ret += JoinNodeStrings(patterns, " | ");
+    ret += " <- ";
+    CJC_NULLPTR_CHECK(initializer);
+    ret += initializer->ToString();
+    return ret;
+}
+
+std::string Block::ToString() const
+{
+    std::string ret = "{";
+    for (size_t i = 0; i < body.size(); ++i) {
+        CJC_NULLPTR_CHECK(body[i]);
+        ret += "\n" + body[i]->ToString();
+    }
+    if (!body.empty()) {
+        ret += "\n";
+    }
+    ret += "}";
+    return ret;
+}
+
+std::string JumpExpr::ToString() const
+{
+    return isBreak ? "break" : "continue";
+}
+
+std::string ReturnExpr::ToString() const
+{
+    if (expr) {
+        return "return " + expr->ToString();
+    }
+    return "return";
+}
+
+std::string ThrowExpr::ToString() const
+{
+    CJC_NULLPTR_CHECK(expr);
+    return "throw " + expr->ToString();
+}
+
+std::string PerformExpr::ToString() const
+{
+    CJC_NULLPTR_CHECK(expr);
+    return "perform " + expr->ToString();
+}
+
+std::string ResumeExpr::ToString() const
+{
+    std::string ret = "resume";
+    if (withExpr) {
+        ret += " with " + withExpr->ToString();
+    }
+    if (throwingExpr) {
+        ret += " throwing " + throwingExpr->ToString();
+    }
+    return ret;
+}
+
+std::string IfExpr::ToString() const
+{
+    std::string ret = "if (";
+    CJC_NULLPTR_CHECK(condExpr);
+    ret += condExpr->ToString();
+    ret += ") ";
+    CJC_NULLPTR_CHECK(thenBody);
+    ret += thenBody->ToString();
+    if (elseBody) {
+        ret += " else " + elseBody->ToString();
+    }
+    return ret;
+}
+
+std::string WhileExpr::ToString() const
+{
+    CJC_NULLPTR_CHECK(condExpr);
+    CJC_NULLPTR_CHECK(body);
+    return "while (" + condExpr->ToString() + ") " + body->ToString();
+}
+
+std::string DoWhileExpr::ToString() const
+{
+    CJC_NULLPTR_CHECK(body);
+    CJC_NULLPTR_CHECK(condExpr);
+    return "do " + body->ToString() + " while (" + condExpr->ToString() + ")";
+}
+
+std::string ForInExpr::ToString() const
+{
+    CJC_NULLPTR_CHECK(pattern);
+    CJC_NULLPTR_CHECK(inExpression);
+    std::string ret = "for (" + pattern->ToString() + " in " + inExpression->ToString();
+    if (patternGuard) {
+        ret += " where " + patternGuard->ToString();
+    }
+    ret += ") ";
+    CJC_NULLPTR_CHECK(body);
+    ret += body->ToString();
+    return ret;
+}
+
+std::string MatchCase::ToString() const
+{
+    std::string ret = "case " + JoinNodeStrings(patterns, " | ");
+    if (patternGuard) {
+        ret += " where " + patternGuard->ToString();
+    }
+    CJC_NULLPTR_CHECK(exprOrDecls);
+    ret += " => " + exprOrDecls->ToString();
+    return ret;
+}
+
+std::string MatchCaseOther::ToString() const
+{
+    CJC_NULLPTR_CHECK(matchExpr);
+    CJC_NULLPTR_CHECK(exprOrDecls);
+    return "case " + matchExpr->ToString() + " => " + exprOrDecls->ToString();
+}
+
+std::string MatchExpr::ToString() const
+{
+    std::string ret = "match (";
+    CJC_NULLPTR_CHECK(selector);
+    ret += selector->ToString();
+    ret += ") {";
+    for (auto& mc : matchCases) {
+        CJC_NULLPTR_CHECK(mc);
+        ret += "\n" + mc->ToString();
+    }
+    for (auto& mco : matchCaseOthers) {
+        CJC_NULLPTR_CHECK(mco);
+        ret += "\n" + mco->ToString();
+    }
+    if (!matchCases.empty() || !matchCaseOthers.empty()) {
+        ret += "\n";
+    }
+    ret += "}";
+    return ret;
+}
+
+std::string TryExpr::ToString() const
+{
+    std::string ret = "try ";
+    if (!resourceSpec.empty()) {
+        ret += "(" + JoinNodeStrings(resourceSpec, ", ") + ") ";
+    }
+    CJC_NULLPTR_CHECK(tryBlock);
+    ret += tryBlock->ToString();
+    for (size_t i = 0; i < catchBlocks.size(); ++i) {
+        ret += " catch(";
+        if (i < catchPatterns.size() && catchPatterns[i]) {
+            ret += catchPatterns[i]->ToString();
+        }
+        ret += ") ";
+        CJC_NULLPTR_CHECK(catchBlocks[i]);
+        ret += catchBlocks[i]->ToString();
+    }
+    for (auto& handler : handlers) {
+        ret += " handle(";
+        if (handler.commandPattern) {
+            ret += handler.commandPattern->ToString();
+        }
+        ret += ") ";
+        if (handler.block) {
+            ret += handler.block->ToString();
+        }
+    }
+    if (finallyBlock) {
+        ret += " finally " + finallyBlock->ToString();
+    }
+    return ret;
+}
+
+std::string SpawnExpr::ToString() const
+{
+    std::string ret = "spawn";
+    if (arg) {
+        ret += "(" + arg->ToString() + ")";
+    }
+    CJC_NULLPTR_CHECK(task);
+    ret += " " + task->ToString();
+    return ret;
+}
+
+std::string SynchronizedExpr::ToString() const
+{
+    CJC_NULLPTR_CHECK(mutex);
+    CJC_NULLPTR_CHECK(body);
+    return "synchronized (" + mutex->ToString() + ") " + body->ToString();
+}
+
+std::string GenericParamDecl::ToString() const
+{
+    return identifier.Val();
+}
+
+std::string GenericConstraint::ToString() const
+{
+    CJC_NULLPTR_CHECK(type);
+    std::string ret = type->ToString();
+    if (!upperBounds.empty()) {
+        ret += " <: " + JoinNodeStrings(upperBounds, " & ");
+    }
+    return ret;
+}
+
+std::string Generic::ToString() const
+{
+    if (typeParameters.empty()) {
+        return "";
+    }
+    return "<" + JoinNodeStrings(typeParameters, ", ") + ">";
+}
+
+std::string FuncParam::ToString() const
+{
+    std::string ret = identifier.Val();
+    if (isNamedParam) {
+        ret += "!";
+    }
+    if (type) {
+        ret += ": " + type->ToString();
+    }
+    return ret;
+}
+
+std::string FuncParamList::ToString() const
+{
+    return "(" + JoinNodeStrings(params, ", ") + ")";
+}
+
+std::string FuncBody::ToString() const
+{
+    std::string ret;
+    if (generic) {
+        ret += generic->ToString();
+    }
+    for (size_t i = 0; i < paramLists.size(); ++i) {
+        if (i > 0) {
+            ret += " ";
+        }
+        CJC_NULLPTR_CHECK(paramLists[i]);
+        ret += paramLists[i]->ToString();
+    }
+    if (retType) {
+        if (!colonPos.IsZero()) {
+            ret += ": ";
+        } else if (!doubleArrowPos.IsZero()) {
+            ret += " => ";
+        }
+        ret += retType->ToString();
+    }
+    if (generic && !generic->genericConstraints.empty()) {
+        ret += " where " + JoinNodeStrings(generic->genericConstraints, ", ");
+    }
+    if (body) {
+        ret += " " + body->ToString();
+    }
+    return ret;
+}
+
+std::string FuncDecl::ToString() const
+{
+    std::string ret;
+    for (auto& modifier : modifiers) {
+        auto modStr = modifier.ToString();
+        if (!modStr.empty()) {
+            ret += modStr + " ";
+        }
+    }
+    ret += "func " + identifier.Val();
+    if (funcBody) {
+        ret += funcBody->ToString();
+    }
+    return ret;
+}
+
+std::string LambdaExpr::ToString() const
+{
+    CJC_NULLPTR_CHECK(funcBody);
+    return "{ " + funcBody->ToString() + " }";
+}
+
+std::string TrailingClosureExpr::ToString() const
+{
+    CJC_NULLPTR_CHECK(expr);
+    std::string ret = expr->ToString();
+    if (lambda) {
+        ret += " " + lambda->ToString();
+    }
+    return ret;
+}
+
+std::string ClassBody::ToString() const
+{
+    std::string ret = "{";
+    for (auto& decl : decls) {
+        CJC_NULLPTR_CHECK(decl);
+        ret += "\n" + decl->ToString();
+    }
+    if (!decls.empty()) {
+        ret += "\n";
+    }
+    ret += "}";
+    return ret;
+}
+
+std::string StructBody::ToString() const
+{
+    std::string ret = "{";
+    for (auto& decl : decls) {
+        CJC_NULLPTR_CHECK(decl);
+        ret += "\n" + decl->ToString();
+    }
+    if (!decls.empty()) {
+        ret += "\n";
+    }
+    ret += "}";
+    return ret;
+}
+
+std::string InterfaceBody::ToString() const
+{
+    std::string ret = "{";
+    for (auto& decl : decls) {
+        CJC_NULLPTR_CHECK(decl);
+        ret += "\n" + decl->ToString();
+    }
+    if (!decls.empty()) {
+        ret += "\n";
+    }
+    ret += "}";
+    return ret;
+}
+
+std::string TypeAliasDecl::ToString() const
+{
+    std::string ret;
+    for (auto& modifier : modifiers) {
+        auto modStr = modifier.ToString();
+        if (!modStr.empty()) {
+            ret += modStr + " ";
+        }
+    }
+    ret += "type " + identifier.Val();
+    if (generic) {
+        ret += generic->ToString();
+    }
+    CJC_NULLPTR_CHECK(type);
+    ret += " = " + type->ToString();
+    return ret;
+}
+
+std::string InvalidType::ToString() const
+{
+    return "<invalid>";
+}
+
+std::string InvalidExpr::ToString() const
+{
+    return value.empty() ? std::string("<invalid>") : value;
+}
+
+std::string InvalidDecl::ToString() const
+{
+    return "<invalid>";
+}
+
+std::string InvalidPattern::ToString() const
+{
+    return "<invalid>";
+}
+
+std::string TokenPart::ToString() const
+{
+    std::string ret;
+    for (auto& tok : tokens) {
+        ret += tok.Value();
+    }
+    return ret;
+}
+
+std::string QuoteExpr::ToString() const
+{
+    std::string ret = "quote(";
+    ret += JoinNodeStrings(exprs, ", ");
+    ret += ")";
+    return ret;
+}
+
+std::string InterpolationExpr::ToString() const
+{
+    return rawString;
+}
+
+std::string StrInterpolationExpr::ToString() const
+{
+    return rawString;
+}
+
+std::string MacroExpandExpr::ToString() const
+{
+    std::string ret = "@" + identifier.Val();
+    if (!invocation.attrs.empty()) {
+        ret += "[";
+        for (size_t i = 0; i < invocation.attrs.size(); ++i) {
+            if (i > 0) {
+                ret += ", ";
+            }
+            ret += invocation.attrs[i].Value();
+        }
+        ret += "]";
+    }
+    if (invocation.hasParenthesis) {
+        ret += "(";
+        for (size_t i = 0; i < invocation.args.size(); ++i) {
+            if (i > 0) {
+                ret += ", ";
+            }
+            ret += invocation.args[i].Value();
+        }
+        ret += ")";
+    }
+    if (!invocation.nodes.empty()) {
+        ret += " { ";
+        for (auto& node : invocation.nodes) {
+            if (node) {
+                ret += node->ToString();
+            }
+        }
+        ret += " }";
+    }
+    return ret;
+}
+
+std::string MacroExpandDecl::ToString() const
+{
+    return "@" + identifier.Val();
+}
+
+std::string MacroDecl::ToString() const
+{
+    std::string ret;
+    for (auto& modifier : modifiers) {
+        auto modStr = modifier.ToString();
+        if (!modStr.empty()) {
+            ret += modStr + " ";
+        }
+    }
+    ret += "macro " + identifier.Val();
+    if (funcBody) {
+        ret += funcBody->ToString();
+    }
+    return ret;
+}
+
+std::string MainDecl::ToString() const
+{
+    std::string ret;
+    for (auto& modifier : modifiers) {
+        auto modStr = modifier.ToString();
+        if (!modStr.empty()) {
+            ret += modStr + " ";
+        }
+    }
+    ret += "main";
+    if (funcBody) {
+        ret += funcBody->ToString();
+    }
+    return ret;
+}
+
+std::string ImportSpec::ToString() const
+{
+    std::string ret = "import ";
+    if (modifier) {
+        auto modStr = modifier->ToString();
+        if (!modStr.empty()) {
+            ret += modStr + " ";
+        }
+    }
+    ret += content.ToString();
+    return ret;
+}
+
+std::string PackageSpec::ToString() const
+{
+    return "package " + GetPackageName();
+}
+
+std::string PackageDecl::ToString() const
+{
+    return identifier.Val();
+}
+
+std::string File::ToString() const
+{
+    std::string ret;
+    if (package) {
+        ret += package->ToString() + "\n";
+    }
+    for (auto& imp : imports) {
+        CJC_NULLPTR_CHECK(imp);
+        ret += imp->ToString() + "\n";
+    }
+    for (auto& decl : decls) {
+        CJC_NULLPTR_CHECK(decl);
+        ret += decl->ToString() + "\n";
+    }
+    return ret;
+}
+
+std::string Package::ToString() const
+{
+    std::string ret;
+    for (auto& file : files) {
+        CJC_NULLPTR_CHECK(file);
+        ret += file->ToString();
+    }
+    return ret;
 }
 
 } // namespace Cangjie

@@ -11,6 +11,7 @@
 #include "cangjie/CHIR/IR/Value/Value.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <memory>
 #include <mutex>
 #include <type_traits>
@@ -44,7 +45,7 @@ public:
 
     using Value::ToString;
 
-    std::string ToString() const override;
+    std::string ToString(size_t indent) const override;
 
     /// get static top object.
     static AbstractObject* GetTopObjInstance();
@@ -122,7 +123,7 @@ public:
      * @brief create a bound domain.
      * @param isTop create top is true else bottom.
      */
-    ValueDomain(bool isTop) : kind(isTop ? ValueKind::TOP : ValueKind::BOTTOM), ref(nullptr)
+    ValueDomain(bool isTop) : kind(isTop ? ValueKind::TOP : ValueKind::BOTTOM)
     {
     }
 
@@ -138,8 +139,7 @@ public:
      * @brief create an object domain.
      * @param absVal object to create domain.
      */
-    ValueDomain(std::unique_ptr<AbstractValue> absVal)
-        : kind(ValueKind::VAL), ref(nullptr), absVal(std::move(absVal))
+    ValueDomain(std::unique_ptr<AbstractValue> absVal) : kind(ValueKind::VAL), absVal(std::move(absVal))
     {
     }
 
@@ -173,7 +173,6 @@ public:
     {
         this->kind = rhs.kind;
         this->ref = rhs.ref;
-        rhs.ref = nullptr;
         this->absVal = std::move(rhs.absVal);
     }
     /// move operator.
@@ -181,7 +180,6 @@ public:
     {
         this->kind = rhs.kind;
         this->ref = rhs.ref;
-        rhs.ref = nullptr;
         this->absVal = std::move(rhs.absVal);
         return *this;
     }
@@ -307,6 +305,9 @@ public:
                 return absVal->ToString();
             case ValueKind::TOP:
                 return "TOP";
+            default:
+                CJC_ABORT();
+                break;
         }
     }
 

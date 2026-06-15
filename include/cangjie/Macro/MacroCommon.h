@@ -82,7 +82,7 @@ private:
     int offset;
 
     void PushIntoLines();
-    void LinesToString(bool hasComment);
+    void LinesToString();
 
     bool SeeCurlyBracket(const TokenVector& lineOfTk, const TokenKind& tk) const;
 };

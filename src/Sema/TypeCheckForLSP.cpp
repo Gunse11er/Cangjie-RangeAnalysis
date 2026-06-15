@@ -296,10 +296,10 @@ protected:
         auto instTys = checker.GetTyFromASTType(ctx, re.typeArguments);
         if (ctxExprs.empty()) {
             checker.InferRefExpr(ctx, re);
-            if (Ty::IsTyCorrect(re.ty) &&
+            if (Ty::IsTyCorrect(re.GetTy()) &&
                 (re.isThis || re.isSuper ||
-                    !(Ty::GetDeclPtrOfTy(re.ty) && Ty::GetDeclPtrOfTy(re.ty)->IsNominalDecl()))) {
-                std::unordered_set<Ptr<Ty>> tys{re.ty};
+                    !(Ty::GetDeclPtrOfTy(re.GetTy()) && Ty::GetDeclPtrOfTy(re.GetTy())->IsNominalDecl()))) {
+                std::unordered_set<Ptr<Ty>> tys{re.GetTy()};
                 return SynResult(tys);
             }
         } else {
@@ -314,7 +314,7 @@ protected:
                 std::unordered_set<Ptr<Ty>> tys;
                 for (auto decl : re.ref.targets) {
                     auto typeMapping = TypeCheckUtil::GenerateTypeMapping(*decl, instTys);
-                    tys.emplace(checker.typeManager.GetInstantiatedTy(decl->ty, typeMapping));
+                    tys.emplace(checker.typeManager.GetInstantiatedTy(decl->GetTy(), typeMapping));
                 }
                 // Update current decl status for parent expr when return type result.
                 wasTypeCall = re.callOrPattern && re.ref.target && re.ref.target->IsTypeDecl();
@@ -335,7 +335,7 @@ protected:
         for (auto decl : candidates) {
             auto typeMapping = TypeCheckUtil::GenerateTypeMapping(*decl, typeArgs);
             typeMapping.insert(baseMapping.begin(), baseMapping.end());
-            auto instTy = checker.typeManager.GetInstantiatedTy(decl->ty, typeMapping);
+            auto instTy = checker.typeManager.GetInstantiatedTy(decl->GetTy(), typeMapping);
             if (auto fTy = DynamicCast<FuncTy>(instTy); fTy && Is<ClassThisTy>(fTy->retTy)) {
                 instTy = checker.typeManager.GetFunctionTy(fTy->paramTys, &baseTy);
             }
@@ -354,7 +354,7 @@ protected:
         AddCurFile(*ma, curFile);
         for (auto ty : tys) {
             std::vector<Ptr<Decl>> curTargets;
-            ma->baseExpr->ty = ty;
+            ma->baseExpr->SetTy(ty);
             ma->targets.clear();
             // Set dummy target type to skip inference checking.
             ctx.targetTypeMap[ma.get()] = ty;
@@ -393,10 +393,10 @@ protected:
                 : candidates.insert(candidates.end(), ma.targets.begin(), ma.targets.end());
             CJC_NULLPTR_CHECK(ma.baseExpr);
             // If the 'parentExpr' existed and the 'candidates' is not empty, convert result to tys.
-            if (parentExpr != nullptr && !candidates.empty() && ma.baseExpr->ty) {
+            if (parentExpr != nullptr && !candidates.empty() && ma.baseExpr->GetTy()) {
                 // Update current decl status for parent expr when return type result.
                 wasTypeCall = ma.callOrPattern && ma.target && ma.target->IsTypeDecl();
-                auto tys = GetCandidateTysForMemberAccess(*ma.baseExpr->ty, instTys, candidates);
+                auto tys = GetCandidateTysForMemberAccess(*ma.baseExpr->GetTy(), instTys, candidates);
                 return SynResult(tys);
             }
             return SynResult(candidates);
@@ -405,8 +405,8 @@ protected:
         if (base.value.hasDecl) {
             // Field accessing like 'call().a.b'
             for (auto it : base.value.decls) {
-                if (Ty::IsTyCorrect(it->ty)) {
-                    tys.emplace(it->ty);
+                if (Ty::IsTyCorrect(it->GetTy())) {
+                    tys.emplace(it->GetTy());
                 }
             }
         } else {
@@ -434,7 +434,7 @@ protected:
         if (lce.siExpr || lce.kind == LitConstKind::STRING) {
             auto stringDecl = checker.importManager.GetCoreDecl<InheritableDecl>(STD_LIB_STRING);
             if (stringDecl) {
-                ty = stringDecl->ty;
+                ty = stringDecl->GetTy();
             }
         } else {
             ty = checker.SynLitConstExpr(ctx, lce);
@@ -471,18 +471,18 @@ protected:
         if (base.value.hasDecl) {
             std::unordered_set<Ptr<Ty>> varTys;
             for (auto decl : base.value.decls) {
-                if (!decl || !Ty::IsTyCorrect(decl->ty)) {
+                if (!decl || !Ty::IsTyCorrect(decl->GetTy())) {
                     continue;
                 }
                 if (decl->IsTypeDecl()) {
                     // Handle case of constructor call.
-                    tys.emplace(decl->ty);
-                } else if (auto fTy = DynamicCast<FuncTy*>(decl->ty)) {
+                    tys.emplace(decl->GetTy());
+                } else if (auto fTy = DynamicCast<FuncTy*>(decl->GetTy())) {
                     if (!isInTrailingClosure || IsViableDeclForTrailingClosure(*decl, *fTy)) {
                         tys.emplace(fTy->retTy);
                     }
                 } else {
-                    varTys.emplace(decl->ty);
+                    varTys.emplace(decl->GetTy());
                 }
             }
             // Handle case of operator '()' overloading.
@@ -542,8 +542,8 @@ protected:
         if (base.value.hasDecl) {
             // eg: a[0] -- only can be tuple or user defined type vardecl.
             for (auto decl : base.value.decls) {
-                if (decl && Ty::IsTyCorrect(decl->ty)) {
-                    decl->ty->IsTuple() ? tupleTys.emplace(decl->ty) : baseTys.emplace(decl->ty);
+                if (decl && Ty::IsTyCorrect(decl->GetTy())) {
+                    decl->GetTy()->IsTuple() ? tupleTys.emplace(decl->GetTy()) : baseTys.emplace(decl->GetTy());
                 }
             }
         } else {
@@ -566,8 +566,8 @@ protected:
         auto base = VisitNode(oe.baseExpr.get());
         if (base.value.hasDecl) {
             for (auto decl : base.value.decls) {
-                if (decl && Ty::IsTyCorrect(decl->ty)) {
-                    tys.emplace(decl->ty);
+                if (decl && Ty::IsTyCorrect(decl->GetTy())) {
+                    tys.emplace(decl->GetTy());
                 }
             }
         } else {
@@ -594,9 +594,9 @@ protected:
                     break;
                 }
                 lastTrivialParam = param.get();
-                CJC_NULLPTR_CHECK(lastTrivialParam->ty);
+                CJC_NULLPTR_CHECK(lastTrivialParam->GetTy());
             }
-            return lastTrivialParam && lastTrivialParam->ty->IsFunc();
+            return lastTrivialParam && lastTrivialParam->GetTy()->IsFunc();
         }
         return IsViableTypeForTrailingClosure(funcTy);
     }
@@ -627,7 +627,7 @@ protected:
             auto childResult = VisitNode(child.get()).value;
             Ptr<Ty> childTy = TypeManager::GetInvalidTy();
             if (childResult.hasDecl || !childResult.tys.empty()) {
-                childTy = childResult.hasDecl ? childResult.decls[0]->ty : *childResult.tys.begin();
+                childTy = childResult.hasDecl ? childResult.decls[0]->GetTy() : *childResult.tys.begin();
             }
             if (!Ty::IsTyCorrect(childTy)) {
                 tys.emplace(TypeManager::GetInvalidTy());
@@ -643,12 +643,12 @@ protected:
         auto joinRes =
             JoinAndMeet(checker.typeManager, arrayElemTys, {}, &checker.importManager, al.curFile).JoinAsVisibleTy();
         if (auto ty = std::get_if<Ptr<Ty>>(&joinRes)) {
-            al.ty = checker.typeManager.GetStructTy(*arrayStruct, {*ty});
+            al.SetTy(checker.typeManager.GetStructTy(*arrayStruct, {*ty}));
         } else {
             tys.emplace(TypeManager::GetInvalidTy());
             return SynResult(tys);
         }
-        tys.emplace(al.ty);
+        tys.emplace(al.GetTy());
         return SynResult(tys);
     }
 

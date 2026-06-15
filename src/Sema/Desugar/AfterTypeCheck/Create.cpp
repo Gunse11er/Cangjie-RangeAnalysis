@@ -17,9 +17,9 @@ OwnedPtr<TypePattern> CreateRuntimePreparedTypePattern(
     TypeManager& typeManager, OwnedPtr<Pattern> pattern, OwnedPtr<Type>  type, Expr& selector)
 {
     auto typePattern = CreateTypePattern(std::move(pattern), std::move(type), selector);
-    typePattern->matchBeforeRuntime = typeManager.IsSubtype(selector.ty, typePattern->ty, true, false);
+    typePattern->matchBeforeRuntime = typeManager.IsSubtype(selector.GetTy(), typePattern->GetTy(), true, false);
     typePattern->needRuntimeTypeCheck =
-        !typePattern->matchBeforeRuntime && IsNeedRuntimeCheck(typeManager, *selector.ty, *typePattern->ty);
+        !typePattern->matchBeforeRuntime && IsNeedRuntimeCheck(typeManager, *selector.GetTy(), *typePattern->GetTy());
     return typePattern;
 }
 } // namespace Cangjie::Sema::Desugar::AfterTypeCheck

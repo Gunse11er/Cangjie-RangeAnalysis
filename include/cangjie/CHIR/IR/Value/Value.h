@@ -8,13 +8,13 @@
 #define CANGJIE_CHIR_VALUE_H
 
 #include "cangjie/CHIR/IR/AnnoInfo.h"
-#include "cangjie/CHIR/IR/AttributeInfo.h"
 #include "cangjie/CHIR/IR/Base.h"
 #include "cangjie/CHIR/IR/Type/Type.h"
 #include "cangjie/CHIR/Utils/UserDefinedType.h"
 #include "cangjie/Utils/SafePointer.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -30,8 +30,7 @@ namespace Cangjie::CHIR {
 class Allocate;
 class Expression;
 class Constant;
-class Func;
-class FuncBody;
+class Function;
 class BlockGroup;
 class Terminator;
 class CustomTypeDef;
@@ -59,8 +58,6 @@ public:
         KIND_LITERAL,
         KIND_GLOBALVAR,
         KIND_PARAMETER,
-        KIND_IMP_FUNC,
-        KIND_IMP_VAR,
         KIND_LOCALVAR,
         KIND_FUNC,
         KIND_BLOCK,
@@ -96,7 +93,7 @@ public:
     // 2. global var in current package
     bool IsGlobalVar() const;
 
-    bool IsGlobalVarInCurPackage() const;
+    bool IsGlobalVarWithInitializer() const;
 
     bool IsImportedFunc() const;
     
@@ -128,25 +125,10 @@ public:
     // we replace `this` with `newValue` in `scope`, when `scope` is nullptr, we replace nodes in package scope
     void ReplaceWith(Value& newValue, const BlockGroup* scope = nullptr);
 
-    virtual std::string ToString() const = 0;
+    virtual std::string ToString(size_t indent) const = 0;
     void Dump() const;
 
     bool IsCompileTimeValue() const;
-
-    // ===--------------------------------------------------------------------===//
-    // Attribute
-    // ===--------------------------------------------------------------------===//
-    AttributeInfo GetAttributeInfo() const;
-    void AppendAttributeInfo(const AttributeInfo& info);
-    void DisableAttr(Attribute attr);
-    void EnableAttr(Attribute attr);
-    bool TestAttr(Attribute attr) const;
-
-    // ===--------------------------------------------------------------------===//
-    // Annotation
-    // ===--------------------------------------------------------------------===//
-    const AnnoInfo& GetAnnoInfo() const;
-    void SetAnnoInfo(AnnoInfo&& info);
     
 protected:
     explicit Value(Type* ty, std::string identifier, ValueKind kind);
@@ -165,10 +147,8 @@ protected:
 protected:
     Type* ty;                       // variable type
     std::string identifier;         // variable identifier
-    AttributeInfo attributes;       // variable attribute
     std::vector<Expression*> users; // variable users
     std::mutex userMutex;           // mutex for AddUserOnly and RemoveUserOnly
-    AnnoInfo annoInfo;              // annoInfo, used in struct/class/enum member func
 
 private:
     ValueKind GetValueKind() const;
@@ -187,19 +167,26 @@ public:
     // Base Information
     // ===--------------------------------------------------------------------===//
     std::string GetSrcCodeIdentifier() const override;
-    
-    std::string ToString() const override;
+    void SetSrcCodeIdentifier(const std::string& newName);
+
+    std::string ToString(size_t indent) const override;
 
     // ===--------------------------------------------------------------------===//
     // Parent
     // ===--------------------------------------------------------------------===//
-    Func* GetOwnerFunc() const;
-    void SetOwnerFunc(Func* owner);
+    Function* GetOwnerFunc() const;
+    void SetOwnerFunc(Function* owner);
 
     Lambda* GetOwnerLambda() const;
     void SetOwnerLambda(Lambda* newParent);
 
-    Func* GetTopLevelFunc() const;
+    Function* GetTopLevelFunc() const;
+
+    // ===--------------------------------------------------------------------===//
+    // Annotation
+    // ===--------------------------------------------------------------------===//
+    const AnnoInfo& GetAnnoInfo() const;
+    void SetAnnoInfo(AnnoInfo&& info);
 
     // ===--------------------------------------------------------------------===//
     // Debug Expression
@@ -208,19 +195,21 @@ public:
     Debug* GetDebugExpr() const;
 
 private:
-    Func* ownerFunc = nullptr;
+    Function* ownerFunc = nullptr;
     Lambda* ownerLambda = nullptr;
+    std::string srcCodeIdentifier;
+    AnnoInfo annoInfo;
 
 private:
-    explicit Parameter(Type* ty, const std::string& indexStr, Func* ownerFunc);
-    explicit Parameter(Type* ty, const std::string& indexStr, Lambda& ownerLambda);
+    explicit Parameter(Type* ty, const std::string& id, Function* ownerFunc);
+    explicit Parameter(Type* ty, const std::string& id, Lambda& ownerLambda);
     ~Parameter() override = default;
 };
 
 class LocalVar : public Value {
     friend class CHIRBuilder;
     friend class Expression;
-    friend class Func;
+    friend class Function;
     friend class Lambda;
     friend class CHIRDeserializer;
 
@@ -231,8 +220,9 @@ public:
     Expression* GetExpr() const;
 
     std::string GetSrcCodeIdentifier() const override;
+    void SetSrcCodeIdentifier(const std::string& newName);
 
-    std::string ToString() const override;
+    std::string ToString(size_t indent) const override;
 
     const DebugLocation& GetDebugLocation() const override;
 
@@ -243,7 +233,7 @@ public:
     // ===--------------------------------------------------------------------===//
     BlockGroup* GetOwnerBlockGroup() const;
 
-    Func* GetTopLevelFunc() const;
+    Function* GetTopLevelFunc() const;
 
     // ===--------------------------------------------------------------------===//
     // Debug Expression
@@ -260,74 +250,7 @@ private:
 private:
     Expression* expr;        // The owner of this result value.
     bool isRetValue = false; // If func return value or not
-};
-
-/**
- * this class represent imported/non-imported global var and static member var in Cangjie's source code.
- */
-class GlobalVarBase : public virtual Value {
-    friend class CHIRBuilder;
-    friend class CustomTypeDef;
-    friend class ImportedVar;
-    friend class GlobalVar;
-
-public:
-    // ===--------------------------------------------------------------------===//
-    // Base Information
-    // ===--------------------------------------------------------------------===//
-    std::string GetSrcCodeIdentifier() const override;
-
-    const std::string& GetPackageName() const;
-
-    const std::string& GetRawMangledName() const;
-
-    // ===--------------------------------------------------------------------===//
-    // Parent
-    // ===--------------------------------------------------------------------===//
-    /**
-     * @brief only static member var has declaredParent, others return nullptr
-     */
-    CustomTypeDef* GetParentCustomTypeDef() const;
-
-    void DestroySelf();
-
-protected:
-    std::string packageName; // package where this globalVar defined by user
-    std::string srcCodeIdentifier;                // the name of global variable
-    std::string rawMangledName;                   // rawMangledName, generated by Parser, used by Incremental Compile
-    CustomTypeDef* declaredParent = nullptr; // e.g. class A { static var x = 1 }
-                                                  // `A` is declaredParent of `x`
-
-private:
-    explicit GlobalVarBase(std::string srcCodeIdentifier, std::string rawMangledName, std::string packageName);
-    ~GlobalVarBase() override = default;
-};
-
-class GlobalVar : public GlobalVarBase {
-    friend class CHIRBuilder;
-
-public:
-    // ===--------------------------------------------------------------------===//
-    // Base Information
-    // ===--------------------------------------------------------------------===//
-    LiteralValue* GetInitializer() const;
-    void SetInitializer(LiteralValue& literalValue);
-    
-    Func* GetInitFunc() const;
-    void SetInitFunc(Func& func);
-
-    std::string ToString() const override;
-
-    bool IsLocalConst() const;
-
-protected:
-    LiteralValue* initializer = nullptr;          // the initializer must be a LiteralValue if exist
-    Func* initFunc{};                             // init function of this globalVar, null if initializer is not null
-
-private:
-    explicit GlobalVar(Type* ty, std::string identifier, std::string srcCodeIdentifier, std::string rawMangledName,
-        std::string packageName);
-    ~GlobalVar() override = default;
+    std::string srcCodeIdentifier;
 };
 
 enum FuncKind : uint8_t {
@@ -358,81 +281,6 @@ const std::unordered_map<FuncKind, std::string> FUNCKIND_TO_STRING{{FuncKind::DE
     {FuncKind::ANNOFACTORY_FUNC, "annoFactory"}, {FuncKind::MACRO_FUNC, "macro"},
     {FuncKind::DEFAULT_PARAMETER_FUNC, "defaultParameter"}, {FuncKind::INSTANCEVAR_INIT, "memberVariablesInit"}};
 
-struct AbstractMethodParam {
-    std::string paramName;
-    Type* type = nullptr;
-    AnnoInfo annoInfo;
-
-    std::string ToString();
-};
-
-struct AbstractMethodInfo {
-    std::string methodName;                      // abstract method name
-    Type* methodTy = nullptr;                    // abstract method type
-    std::vector<AbstractMethodParam> paramInfos; // abstract method parameters
-    AttributeInfo attributeInfo;                 // abstract method attribute
-    AnnoInfo annoInfo;                           // abstract method annoInfo
-    std::vector<GenericType*> methodGenericTypeParams; // store `T` of `func foo<T>()`
-    bool hasBody;                                // abstract method in interface may have func body
-    ClassDef* parent = nullptr;
-    AbstractMethodInfo(const std::string& methodName, const std::string& mangledName, Type* methodTy,
-        const std::vector<AbstractMethodParam>& paramInfos, const AttributeInfo& attrInfo, const AnnoInfo& annoInfo,
-        const std::vector<GenericType*>& methodGenericTypeParams, bool hasBody, ClassDef* parent)
-        : methodName(methodName),
-          methodTy(methodTy),
-          paramInfos(paramInfos),
-          attributeInfo(attrInfo),
-          annoInfo(annoInfo),
-          methodGenericTypeParams(methodGenericTypeParams),
-          hasBody(hasBody),
-          parent(parent),
-          mangledName(mangledName)
-          
-    {
-    }
-    bool TestAttr(Attribute attr) const
-    {
-        return attributeInfo.TestAttr(attr);
-    }
-
-    // This function will append ".0" to the original mangledName from AST to avoid backend issues.
-    std::string GetMangledName() const
-    {
-        return mangledName + ".0";
-    }
-
-    std::string GetASTMangledName() const
-    {
-        return mangledName;
-    }
-
-private:
-    std::string mangledName;            // abstract method mangled name
-};
-
-class ImportedValue : public virtual Value {
-    friend class CHIRBuilder;
-    friend class ImportedVar;
-    friend class ImportedFunc;
-
-public:
-    // ===--------------------------------------------------------------------===//
-    // Base Information
-    // ===--------------------------------------------------------------------===//
-    std::string ToString() const override;
-
-    virtual const std::string& GetSourcePackageName() const = 0;
-
-    // ===--------------------------------------------------------------------===//
-    // Modify Self
-    // ===--------------------------------------------------------------------===//
-    virtual void DestroySelf();
-
-private:
-    explicit ImportedValue();
-    ~ImportedValue() override = default;
-};
-
 class Block : public Value {
     friend class CHIRContext;
     friend class CHIRBuilder;
@@ -445,7 +293,7 @@ public:
     // ===--------------------------------------------------------------------===//
     // Base Information
     // ===--------------------------------------------------------------------===//
-    std::string ToString() const override;
+    std::string ToString(size_t indent) const override;
 
     std::vector<Block*> GetSuccessors() const;
     std::vector<Block*> GetPredecessors() const;
@@ -475,7 +323,14 @@ public:
     BlockGroup* GetParentBlockGroup() const;
     void SetParentBlockGroup(BlockGroup* parent);
     
-    Func* GetTopLevelFunc() const;
+    Function* GetTopLevelFunc() const;
+
+    /**
+     * @brief Retrieves the function or lambda body which this block belongs to.
+     *
+     * @return The function or lambda body.
+     */
+    BlockGroup* GetFuncOrLambdaBody() const;
 
     // ===--------------------------------------------------------------------===//
     // Modify Self
@@ -535,7 +390,7 @@ public:
     // Base Information
     // ===--------------------------------------------------------------------===//
     size_t GetExpressionsNum() const;
-    std::string ToString() const override;
+    std::string ToString(size_t indent) const override;
 
     // ===--------------------------------------------------------------------===//
     // Block
@@ -544,7 +399,7 @@ public:
     void AddBlocks(const std::vector<Block*>& newBlocks);
     Block* GetBlockByIdx(size_t idx) const;
     std::vector<Block*> GetBlocks() const;
-
+    std::vector<Block*> GetAllBlocks() const;
     Block* GetEntryBlock() const;
     void SetEntryBlock(Block* block);
 
@@ -557,14 +412,20 @@ public:
      * if this blockGroup belongs to If/Loop/ForIn/Lambda,
      * the method will also continue looking up until ownerFunc is not empty.
      */
-    Func* GetTopLevelFunc() const;
+    Function* GetTopLevelFunc() const;
+    /**
+     * @brief Retrieves the function or lambda body which this block group belongs to.
+     *
+     * @return The function or lambda body.
+     */
+    BlockGroup* GetFuncOrLambdaBody() const;
 
-    Func* GetOwnerFunc() const;
-    void SetOwnerFunc(Func* func);
+    Function* GetOwnerFunc() const;
+    void SetOwnerFunc(Function* func);
 
     Expression* GetOwnerExpression() const;
 
-    BlockGroup* Clone(CHIRBuilder& builder, Func& newFunc) const;
+    BlockGroup* Clone(CHIRBuilder& builder, Function& newFunc) const;
     BlockGroup* Clone(CHIRBuilder& builder, Lambda& newLambda) const;
 private:
     explicit BlockGroup(std::string identifier);
@@ -574,7 +435,7 @@ private:
 
     void ClearBlocksOnly();
 
-    void SetOwnedFuncOnly(Func* newFunc);
+    void SetOwnedFuncOnly(Function* newFunc);
 
     void SetOwnerExpression(Expression& expr);
 
@@ -585,52 +446,84 @@ private:
 private:
     Block* entryBlock = nullptr; // block group entryBlock
     std::vector<Block*> blocks;
-    Func* ownerFunc = nullptr;
+    Function* ownerFunc = nullptr;
     /**< can only be Lambda/ForIn/If/Loop */
     Expression* ownerExpression = nullptr;
 };
 
-/**
- * @brief FuncBody class is an interlayer.
- *
- * FuncBody is used to keep parameters and body of function and lambda
- */
-class FuncBody {
-    friend class Func;
-    friend class Lambda;
-private:
-    BlockGroup* GetBody() const;
-    void RemoveBody();
-    void RemoveParams();
-
-    void AddParam(Parameter& param);
-    Parameter* GetParam(size_t index) const;
-    const std::vector<Parameter*>& GetParams() const;
-
-    LocalVar* GetReturnValue() const;
-    void SetReturnValue(LocalVar& ret);
-    void ClearReturnValueOnly();
-
-    explicit FuncBody();
-
-private:
-    BlockGroup* body = nullptr;
-    std::vector<Parameter*> parameters;
-    LocalVar* retValue = nullptr;
-};
-
-class FuncBase : public virtual Value {
-    friend class TypeConverterForCC;
-    friend class ValueTypeConverter;
+class GlobalValue : public Value {
     friend class CustomTypeDef;
-    friend class ImportedFunc;
-    friend class VirtualMethodInfo;
-    friend class Func;
-
 public:
     // ===--------------------------------------------------------------------===//
     // Base Information
     // ===--------------------------------------------------------------------===//
+    const std::string& GetPackageName() const;
+    std::string GetSrcCodeIdentifier() const override;
+
+    const std::string& GetRawMangledName() const;
+    void SetRawMangledName(const std::string& name);
+
+    const std::set<std::string>& GetFeatures() const;
+    void SetFeatures(const std::set<std::string>& newFeatures);
+
+    // ===--------------------------------------------------------------------===//
+    // Parent
+    // ===--------------------------------------------------------------------===//
+    CustomTypeDef* GetParentCustomTypeDef() const;
+
+    // ===--------------------------------------------------------------------===//
+    // Attribute
+    // ===--------------------------------------------------------------------===//
+    virtual bool IsSrcCodeImported() const = 0;
+
+    // ===--------------------------------------------------------------------===//
+    // Annotation
+    // ===--------------------------------------------------------------------===//
+    const AnnoInfo& GetAnnoInfo() const;
+    void SetAnnoInfo(AnnoInfo&& info);
+
+    // ===--------------------------------------------------------------------===//
+    // Modify Self
+    // ===--------------------------------------------------------------------===//
+    virtual void DestroySelf() = 0;
+
+    // ===--------------------------------------------------------------------===//
+    // Others
+    // ===--------------------------------------------------------------------===//
+    std::string GlobalValueCommentToString() const;
+
+protected:
+    explicit GlobalValue(ValueKind kind, Type* ty, const std::string& identifier,
+        const std::string& srcCodeIdentifier, const std::string& rawMangledName, const std::string& packageName);
+
+private:
+    GlobalValue(const GlobalValue&) = delete;
+    GlobalValue& operator=(const GlobalValue&) = delete;
+
+protected:
+    std::string srcCodeIdentifier;
+    std::string rawMangledName;
+    std::string packageName;
+    CustomTypeDef* declaredParent{nullptr};
+    std::set<std::string> features;
+    AnnoInfo annoInfo;
+};
+
+class Function : public GlobalValue {
+    friend class CHIRContext;
+    friend class CHIRBuilder;
+    friend class CHIRDeserializer;
+    friend class CHIRSerializer;
+    friend class TypeConverterForCC;
+    friend class ValueTypeConverter;
+    friend class BlockGroup;
+    friend class VirtualMethodInfo;
+public:
+    // ===--------------------------------------------------------------------===//
+    // Base Information
+    // ===--------------------------------------------------------------------===//
+    std::string ToString(size_t indent) const override;
+
     bool IsConstructor() const;
     bool IsFinalizer() const;
     bool IsGVInit() const;
@@ -641,15 +534,8 @@ public:
     FuncKind GetFuncKind() const;
     void SetFuncKind(FuncKind kind);
 
-    const std::string& GetPackageName() const;
-
-    std::string GetSrcCodeIdentifier() const override;
-
-    const std::string& GetRawMangledName() const;
-    void SetRawMangledName(const std::string& name);
-
-    FuncBase* GetGenericDecl() const;
-    void SetGenericDecl(FuncBase& decl);
+    Function* GetGenericDecl() const;
+    void SetGenericDecl(Function& decl);
 
     bool IsFastNative() const;
     void SetFastNative(bool fastNative);
@@ -657,9 +543,17 @@ public:
     bool IsCFFIWrapper() const;
     void SetCFFIWrapper(bool isWrapper);
 
-    FuncBase* GetParamDftValHostFunc() const;
-    void SetParamDftValHostFunc(FuncBase& hostFunc);
+    Function* GetParamDftValHostFunc() const;
+    void SetParamDftValHostFunc(Function& hostFunc);
     void ClearParamDftValHostFunc();
+
+    uint64_t GenerateBlockId();
+    uint64_t GenerateBlockGroupId();
+    uint64_t GenerateLocalId();
+    void InheritIDFromFunc(const Function& func);
+
+    const DebugLocation& GetPropLocation() const;
+    void SetPropLocation(const DebugLocation& loc);
 
     // ===--------------------------------------------------------------------===//
     // Signature Infomation
@@ -675,10 +569,30 @@ public:
     const std::vector<GenericType*>& GetGenericTypeParams() const;
 
     // ===--------------------------------------------------------------------===//
+    // Func Body
+    // ===--------------------------------------------------------------------===//
+    BlockGroup* GetBody() const;
+    void InitBody(BlockGroup& newBody);
+    void ReplaceBody(BlockGroup& newBody);
+
+    Block* GetEntryBlock() const;
+
+    void AddParam(Parameter& param);
+    Parameter* GetParam(size_t index) const;
+    const std::vector<Parameter*>& GetParams() const;
+
+    /**
+     * @brief get a `LocalVar` represent the returned value of this Func.
+     */
+    LocalVar* GetReturnValue() const;
+    bool HasReturnValue() const;
+    void SetReturnValue(LocalVar& ret);
+
+    size_t GetExpressionsNum() const;
+
+    // ===--------------------------------------------------------------------===//
     // Parent
     // ===--------------------------------------------------------------------===//
-    CustomTypeDef* GetParentCustomTypeDef() const;
-
     Type* GetParentCustomTypeOrExtendedType() const;
 
     CustomTypeDef* GetOuterDeclaredOrExtendedDef() const;
@@ -707,7 +621,6 @@ public:
      * @brief a method defined within `Extend` scope
      */
     bool IsInExtend() const;
-
     // ===--------------------------------------------------------------------===//
     // Attribute
     // ===--------------------------------------------------------------------===//
@@ -722,11 +635,20 @@ public:
 
     bool IsVirtualFunc() const;
 
+    bool IsPureAbstract() const;
+
+    // including:
+    // 1. declared in imported package, is marked with @Frozen and compiled with O2
+    // 2. declared in imported package, is marked with `const`
+    // 3. a generic function from imported package, is instantiated in current package
+    bool IsSrcCodeImported() const override;
+
     // ===--------------------------------------------------------------------===//
     // Modify Self
     // ===--------------------------------------------------------------------===//
-    virtual void DestroySelf();
+    void DestroySelf() override;
 
+    void DestroyFuncBody();
     /**
      * @brief Replace the return value of this function and update the function type accordingly.
      *
@@ -736,123 +658,24 @@ public:
      *   extracted from `newRet`'s RefType.
      *
      * Note: This is a base class implementation that only updates the function type.
-     * The derived class `Func` overrides this to also update the function body's return value.
+     * The derived class `Function` overrides this to also update the function body's return value.
      *
      * @param newRet The new return value LocalVar. If nullptr, the function will return Void.
      *               Must be a RefType if not nullptr.
      * @param builder The CHIRBuilder used to create or get the updated function type.
      *
-     * @see Func::ReplaceReturnValue for the full implementation that also updates the body.
+     * @see Function::ReplaceReturnValue for the full implementation that also updates the body.
      */
     virtual void ReplaceReturnValue(LocalVar* newRet, CHIRBuilder& builder);
 
-protected:
-    std::string srcCodeIdentifier; // origin name
-    std::string rawMangledName;
-    std::string packageName;
-    CustomTypeDef* declaredParent{nullptr};       // e.g. class A { func foo() {} }
-                                                  //      `class A` is declaredParent of `foo`
-                                                  // e.g. extend A { func goo() {} }
-                                                  //      `extend A` is declaredParent of `goo`
-    FuncBase* genericDecl = nullptr;              // original generic decl from which current instantiated decl derives
-    FuncKind funcKind = FuncKind::DEFAULT;
-    bool isFastNative{};        // is this func is annotated with @FastNative
-    bool isCFFIWrapper = false; // when generated by CFFI wrapper.
-    /** 1. when lambda is lifted to global func, its generic type params and func type may be changed,
-     *  but cjdb need original type to show
-     *  e.g. func foo<T1>() {
-     *      func goo<T2>() {} // this lambda will be lifted to global func
-     *  }
-     *  after being lifted, global func `goo` is as follow:
-     *  func goo<T1, T2>(env: class&) {}
-     */
-    FuncSigInfo originalLambdaInfo;
-    std::vector<GenericType*> genericTypeParams;
-    /** func foo(a !: Bool = true) {}
-     *  param `a` is desugared by sema to global function named `a.0`
-     *  we name `foo` is host function of `a.0`, so `paramDftValHostFunc` of `a.0` is `foo`
-     */
-    FuncBase* paramDftValHostFunc = nullptr;
-
 private:
-    FuncBase(const std::string& srcCodeIdentifier, const std::string& rawMangledName,
-        const std::string& packageName, const std::vector<GenericType*>& genericTypeParams);
-};
+    explicit Function(Type* ty, const std::string& identifier, const std::string& srcCodeIdentifier,
+        const std::string& rawMangledName, const std::string& packageName,
+        const std::vector<GenericType*>& genericTypeParams = {});
+    ~Function() override = default;
+    Function(const Function&) = delete;
+    Function& operator=(const Function&) = delete;
 
-/*
- * @brief Func class in CHIR.
- *
- * Func is an expression with a block group.
- */
-class Func : public FuncBase {
-    friend class BlockGroup;
-    friend class CHIRBuilder;
-    friend class ValueTypeConverter;
-    friend class CHIRSerializer;
-    friend class CHIRDeserializer;
-
-public:
-    // ===--------------------------------------------------------------------===//
-    // Base Information
-    // ===--------------------------------------------------------------------===//
-    std::string ToString() const override;
-
-    uint64_t GenerateBlockId();
-    uint64_t GenerateBlockGroupId();
-    uint64_t GenerateLocalId();
-    void InheritIDFromFunc(const Func& func);
-
-    const DebugLocation& GetPropLocation() const;
-    void SetPropLocation(const DebugLocation& loc);
-
-    // ===--------------------------------------------------------------------===//
-    // Func Body
-    // ===--------------------------------------------------------------------===//
-    BlockGroup* GetBody() const;
-    void InitBody(BlockGroup& newBody);
-    void ReplaceBody(BlockGroup& newBody);
-
-    Block* GetEntryBlock() const;
-
-    void AddParam(Parameter& param);
-    Parameter* GetParam(size_t index) const;
-    const std::vector<Parameter*>& GetParams() const;
-
-    /**
-     * @brief get a `LocalVar` represent the returned value of this Func.
-     */
-    LocalVar* GetReturnValue() const;
-    bool HasReturnValue() const;
-    void SetReturnValue(LocalVar& ret);
-
-    size_t GetExpressionsNum() const;
-
-    // ===--------------------------------------------------------------------===//
-    // Modify Self
-    // ===--------------------------------------------------------------------===//
-    void DestroySelf() override;
-
-    /**
-     * @brief Replace the return value of this function and update both the function type and body.
-     *
-     * This method performs a complete replacement of the function's return value:
-     * 1. Updates the function type's return type (via base class implementation).
-     * 2. Clears the old return value's ret flag if it exists.
-     * 3. Updates the function body's return value:
-     *    - If `newRet` is nullptr, clears the return value (function returns Void).
-     *    - Otherwise, sets `newRet` as the new return value.
-     *
-     * This is typically used during optimization passes, such as when converting
-     * Unit return types to Void (see OptFuncRetType::Unit2Void).
-     *
-     * @param newRet The new return value LocalVar. If nullptr, the function will return Void
-     *               and the body's return value will be cleared. Must be a RefType if not nullptr.
-     * @param builder The CHIRBuilder used to create or get the updated function type.
-     */
-    void ReplaceReturnValue(LocalVar* newRet, CHIRBuilder& builder) override;
-
-private:
-    void DestroyFuncBody();
     void RemoveBody();
     void RemoveParams();
 
@@ -861,57 +684,66 @@ private:
     void SetBlockGroupId(uint64_t id);
 
 private:
-    explicit Func(Type* ty, const std::string& identifier, const std::string& srcCodeIdentifier,
-        const std::string& rawMangledName, const std::string& packageName,
-        const std::vector<GenericType*>& genericTypeParams = {});
-
-    ~Func() override = default;
-
-    FuncBody body;
-    std::string parentName;    // a hack, if parent is extend decl, we store its raw mangled name, only extend decl
-    DebugLocation propLoc;     // when this is setter or getter, it has prop location, needed by cjlint
-    uint64_t localId = 0;      // the local Id in expression
-    uint64_t blockId = 0;      // the id in block
-    uint64_t blockGroupId = 0; // the id in block group
+    std::vector<Parameter*> parameters;
+    std::vector<GenericType*> genericTypeParams;
+    BlockGroup* body{nullptr};
+    LocalVar* retValue{nullptr};
+    uint64_t localId{0};
+    uint64_t blockId{0};
+    uint64_t blockGroupId{0};
+    Function* genericDecl{nullptr};
+    FuncKind funcKind{FuncKind::DEFAULT};
+    bool isFastNative{false};
+    bool isCFFIWrapper{false};
+    FuncSigInfo originalLambdaInfo;
+    Function* paramDftValHostFunc{nullptr};
+    DebugLocation propLoc;
 };
 
-class ImportedFunc : public ImportedValue, public FuncBase {
+class GlobalVar : public GlobalValue {
+    friend class CHIRContext;
     friend class CHIRBuilder;
+    friend class CHIRDeserializer;
+    friend class CHIRSerializer;
+    friend class TypeConverterForCC;
     friend class ValueTypeConverter;
-
 public:
-    const std::vector<AbstractMethodParam>& GetParamInfo() const;
-    void SetParamInfo(std::vector<AbstractMethodParam>&& params);
+    // ===--------------------------------------------------------------------===//
+    // Base Information
+    // ===--------------------------------------------------------------------===//
+    Value* GetInitializerValue() const;
+    
+    LiteralValue* GetInitializer() const;
+    void SetInitializer(LiteralValue& literalValue);
 
-    const std::string& GetSourcePackageName() const override;
+    Function* GetInitFunc() const;
+    void SetInitFunc(Function& func);
 
-    ~ImportedFunc() override = default;
+    std::string ToString(size_t indent) const override;
 
-    std::string ToString() const override;
+    // ===--------------------------------------------------------------------===//
+    // Attribute
+    // ===--------------------------------------------------------------------===//
+    bool IsSrcCodeImported() const override;
+
+    bool IsLocalConst() const;
+
+    // ===--------------------------------------------------------------------===//
+    // Modify Self
+    // ===--------------------------------------------------------------------===//
+    void DestroySelf() override;
+
+    void DestroyInitializer();
 
 private:
-    ImportedFunc(Type* ty, const std::string& identifier, const std::string& srcCodeIdentifier,
-        const std::string& rawMangledName, const std::string& packageName,
-        const std::vector<GenericType*>& genericTypeParams = {});
+    explicit GlobalVar(Type* ty, const std::string& identifier, const std::string& srcCodeIdentifier,
+        const std::string& rawMangledName, const std::string& packageName);
+    ~GlobalVar() override = default;
+    GlobalVar(const GlobalVar&) = delete;
+    GlobalVar& operator=(const GlobalVar&) = delete;
 
 private:
-    // In incremental compilation, non-recompiled funcs will be represented as an `importedValue`,
-    // in this case, we need to record more information
-    // Note: some of this is overlapped with other meta-datas, and we should have this not only for
-    // incremental compilation, but all cases
-    std::vector<AbstractMethodParam> paramInfo; // abstract method parameters
-};
-
-class ImportedVar : public ImportedValue, public GlobalVarBase {
-    friend class CHIRBuilder;
-
-public:
-    const std::string& GetSourcePackageName() const override;
-
-private:
-    explicit ImportedVar(Type* ty, std::string identifier, std::string srcCodeIdentifier, std::string rawMangledName,
-        std::string packageName);
-    ~ImportedVar() override = default;
+    Value* initializer{nullptr};
 };
 } // namespace Cangjie::CHIR
 

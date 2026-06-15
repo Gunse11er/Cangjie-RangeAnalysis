@@ -23,12 +23,10 @@
 #include "cangjie/CHIR/Analysis/ConstAnalysisWrapper.h"
 #include "cangjie/CHIR/Analysis/TypeAnalysis.h"
 #include "cangjie/CHIR/IR/CHIRBuilder.h"
+#include "cangjie/CHIR/Transformation/MetaTransform.h"
 #include "cangjie/Frontend/CompileStrategy.h"
 #include "cangjie/Frontend/CompilerInvocation.h"
 #include "cangjie/IncrementalCompilation/IncrementalScopeAnalysis.h"
-#ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
-#include "cangjie/MetaTransformation/MetaTransform.h"
-#endif
 #include "cangjie/Modules/ImportManager.h"
 
 namespace Cangjie {
@@ -75,26 +73,31 @@ public:
     std::vector<CHIR::Package*> GetAllCHIRPackages() const;
     CHIR::Package* GetCurrentCHIRPackage() const;
 
-    void SetImplicitFuncs(const std::unordered_map<std::string, CHIR::FuncBase*>& funcs);
-    std::unordered_map<std::string, CHIR::FuncBase*> GetImplicitFuncs() const;
+    void SetImplicitFuncs(const std::unordered_map<std::string, CHIR::Function*>& funcs);
+    std::unordered_map<std::string, CHIR::Function*> GetImplicitFuncs() const;
 
-    void SetConstVarInitFuncs(const std::vector<CHIR::FuncBase*>& funcs);
-    std::vector<CHIR::FuncBase*> GetConstVarInitFuncs() const;
+    void SetConstVarInitFuncs(const std::vector<CHIR::Function*>& funcs);
+    std::vector<CHIR::Function*> GetConstVarInitFuncs() const;
 
     CHIR::ConstAnalysisWrapper& GetConstAnalysisResultRef();
     const CHIR::ConstAnalysisWrapper& GetConstAnalysisResult() const;
+
+    /**
+     * @brief Manually destruct constAnalysisWrapper
+     */
+    void FreeConstAnalysisWrapper();
 
 private:
     CHIR::CHIRContext cctx;
     std::vector<CHIR::Package*> chirPkgs;
     // used by codegen
-    std::unordered_map<std::string, CHIR::FuncBase*> implicitFuncs;
+    std::unordered_map<std::string, CHIR::Function*> implicitFuncs;
     // used by interpreter
-    std::vector<CHIR::FuncBase*> initFuncsForConstVar;
+    std::vector<CHIR::Function*> initFuncsForConstVar;
     // only for AnalysisWrapper
     CHIR::CHIRBuilder builder{cctx, 0};
     // provide the capability and results of constant analysis, used by cjlint
-    CHIR::ConstAnalysisWrapper constAnalysisWrapper{builder};
+    std::unique_ptr<CHIR::ConstAnalysisWrapper> constAnalysisWrapper;
 };
 #endif
 
@@ -113,6 +116,14 @@ class CompilerInstance {
 public:
     CompilerInstance(CompilerInvocation& invocation, DiagnosticEngine& diag);
     virtual ~CompilerInstance();
+    /**
+     * @brief Destroy AST related resources in a safe order.
+     *
+     * This method will release `srcPkgs`, `pkgCtxMap` and delete managers
+     * such as `typeChecker`, `testManager`, `gim`, `packageManager` etc in
+     * a safe, dependency-aware order. It is idempotent.
+     */
+    void DestroyASTResources();
 
     /**
      * Set different CompileStrategy to do the real compile jobs.
@@ -133,9 +144,11 @@ public:
      * Perform compile to some @p stage.
      */
     virtual bool Compile(CompileStage stage = CompileStage::CHIR);
-#ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
+
     bool PerformPluginLoad();
-#endif
+
+    bool RegisterCppPlugin();
+    bool RegisterCjPlugin();
 
     /**
      * Perform parse.
@@ -162,6 +175,13 @@ public:
      * Perform macro expand.
      */
     virtual bool PerformMacroExpand();
+
+    /**
+     * Expand macros for a single decl node.
+     * @param decl The decl node to expand. If it's a MacroExpandDecl, it will be expanded.
+     * @return A vector of expanded decl nodes.
+     */
+    std::vector<OwnedPtr<AST::Decl>> ExpandDecl(OwnedPtr<AST::Decl> decl);
 
     /**
      * Perform AST diff to get incremental compilation scope.
@@ -316,33 +336,6 @@ public:
 
     bool UpdateAndWriteCachedInfoToDisk();
 
-#ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
-    /**
-     * Record the handle for compiler plugin
-     */
-    void AddPluginHandle(HANDLE handle)
-    {
-        (void)pluginHandles.emplace_back(handle);
-    }
-
-    /**
-     * Unload the handles for all compiler plugins
-     */
-    bool UnloadPluginHandle()
-    {
-        metaTransformPluginBuilder = {};
-        // plugins should be unloaded after metaTransformPluginBuilder deconstruction.
-        for (auto& handle : pluginHandles) {
-            if (InvokeRuntime::CloseSymbolTable(handle) != 0) {
-                Errorln("close plugin dynamic library failed.");
-                return false;
-            }
-        }
-        pluginHandles.clear();
-        return true;
-    }
-#endif
-
     /**
      * Infomation written to cached file and needed by incremental compiling
      */
@@ -360,9 +353,8 @@ public:
         VarInitDepMap varInitDepMap;
     };
     CHIRInfo chirInfo;
-#ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
-    MetaTransformPluginBuilder metaTransformPluginBuilder;
-#endif
+    CHIR::MetaTransformPluginBuilder metaTransformPluginBuilder;
+    std::vector<void*> pluginHandles;
     /**
      * CompilerInvocation, storing anything external the Instance needs.
      */
@@ -406,7 +398,7 @@ public:
     /**
      * ImportManager hold all import related information for TypeCheck.
      */
-    ImportManager importManager;
+    ImportManager* importManager = nullptr;
 
     /**
      * TestManager provides test specific functionality which should be reflected in the compiler logic.
@@ -535,9 +527,14 @@ public:
     std::vector<OwnedPtr<AST::Package>> srcPkgs;
 
 #ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
-    CHIRData chirData;
+    std::unique_ptr<CHIRData> chirData;
     // we need to remove this later
     std::unordered_map<Ptr<AST::Package>, Ptr<CHIR::Package>> astPkg2chirPkgMap;
+
+    /**
+     * @brief Manually destruct chirData
+     */
+    void FreeCHIRData();
 #endif
     bool HasTypeChecker() const
     {
@@ -586,13 +583,13 @@ private:
 
     std::vector<std::string> depPackageInfo;
 
+    // Guard for ensuring AST resources are destroyed only once.
+    bool astResourcesDestroyed = false;
+    std::future<void> destroyFut;
+
     virtual void UpdateCachedInfo();
     bool WriteCachedInfo();
     bool ShouldWriteCacheFile() const;
-
-#ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
-    std::vector<HANDLE> pluginHandles;
-#endif
 };
 } // namespace Cangjie
 #endif // CANGJIE_FRONTEND_COMPILERINSTANCE_H

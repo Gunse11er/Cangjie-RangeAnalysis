@@ -14,6 +14,7 @@
 #include "cangjie/Utils/CheckUtils.h"
 #include "cangjie/Utils/FileUtil.h"
 #include "cangjie/Utils/SafePointer.h"
+#include <optional>
 
 using namespace Cangjie;
 
@@ -65,72 +66,74 @@ Source::Source(unsigned int fileID, std::string path, std::string buffer, uint64
     }
 }
 
-void SourceManager::SaveSourceFile(
-    unsigned int fileID,
-    std::string normalizedPath,
-    std::string buffer,
+unsigned int SourceManager::GetFileId(
+    const std::string& normalizedPath,
+    const std::string& buffer,
     uint64_t fileHash,
-    std::optional<std::string> packageName)
+    std::optional<std::string> packageName,
+    bool isCjmpFile,
+    bool updateBuffer)
 {
-    sources.emplace_back(fileID, normalizedPath, buffer, fileHash, packageName);
-    filePathToFileIDMap.emplace(normalizedPath, fileID);
-}
+    auto existed = filePathToFileIDMap.find(normalizedPath);
+    if (existed != filePathToFileIDMap.end()) {
+        auto newBuffer = buffer;
+        auto fileID = existed->second;
+        CJC_ASSERT_WITH_MSG(sources.count(fileID), "No source buffer found for a fileID");
+        if (updateBuffer) {
+            newBuffer = sources.at(fileID).buffer + buffer;
+        }
+        sources.at(fileID) =
+            Source{fileID, normalizedPath, newBuffer, fileHash, packageName};
+        return fileID;
+    } else {
+        auto fileID = static_cast<unsigned int>(sources.size());
+        if (isCjmpFile) {
+            // CJMP files can not have incremental file IDs,
+            // because 1) Some IDs may already be used for parent source set files
+            // 2) Or in neighbour source set.
+            // So IDs need to be evaluated based path.
+            std::hash<std::string> hasher;
+            size_t hashValue = hasher(normalizedPath);
+            fileID = static_cast<unsigned int>(hashValue);
+        }
 
-void SourceManager::ReserveCommonPartSources(std::vector<std::string> files)
-{
-    for (size_t i = 0; i < files.size(); i++) {
-        auto file = files.at(i);
-        uint64_t fileHash = 0;
-        SaveSourceFile(static_cast<unsigned int>(i + 1), files.at(i), "", fileHash);
-        filePathToFileIDMap.emplace(file, i + 1);
+        sources.emplace(fileID, Source(fileID, normalizedPath, buffer, fileHash, packageName));
+        filePathToFileIDMap.emplace(normalizedPath, fileID);
+        return fileID;
     }
 }
 
 unsigned int SourceManager::AddSource(
-    const std::string& path, const std::string& buffer, std::optional<std::string> packageName)
+    const std::string& path, const std::string& buffer, std::optional<std::string> packageName, bool isCjmpFile)
 {
     // path canonicalize
     std::string normalizePath = FileUtil::Normalize(path);
     // Change fileHash from content hash to path hash.
     uint64_t fileHash = Utils::GetHash(normalizePath);
-    auto existed = filePathToFileIDMap.find(normalizePath);
-    if (existed != filePathToFileIDMap.end()) {
-        unsigned int fileID = static_cast<unsigned int>(existed->second);
-        CJC_ASSERT(static_cast<size_t>(fileID) < sources.size());
-        sources[fileID] = Source{fileID, normalizePath, buffer, fileHash, packageName};
-        return fileID;
-    } else {
-        auto fileID = static_cast<unsigned int>(sources.size());
-        SaveSourceFile(fileID, normalizePath, buffer, fileHash, packageName);
-        return fileID;
-    }
+    return GetFileId(normalizePath, buffer, fileHash, packageName, isCjmpFile, false);
 }
 
-unsigned int SourceManager::AppendSource(const std::string& path, const std::string& buffer)
+unsigned int SourceManager::AppendSource(const std::string& path, const std::string& buffer, bool isCjmpFile)
 {
     // path canonicalize
     std::string normalizePath = FileUtil::Normalize(path);
     uint64_t fileHash = Utils::GetHash(normalizePath);
-    auto existed = filePathToFileIDMap.find(normalizePath);
-    if (existed != filePathToFileIDMap.end()) {
-        unsigned int fileID = static_cast<unsigned int>(existed->second);
-        CJC_ASSERT(static_cast<size_t>(fileID) < sources.size());
-        auto newBuffer = sources[fileID].buffer + buffer;
-        sources[fileID] = Source{fileID, normalizePath, newBuffer, fileHash};
-        return fileID;
-    } else {
-        auto fileID = static_cast<unsigned int>(sources.size());
-        sources.emplace_back(fileID, normalizePath, buffer, fileHash);
-        filePathToFileIDMap.emplace(normalizePath, fileID);
-        return fileID;
+    return GetFileId(normalizePath, buffer, fileHash, std::nullopt, isCjmpFile, true);
+}
+
+bool SourceManager::IsInMacroCallSourceFile(const Position& pos) const
+{
+    if (pos.fileID == 0 || pos.fileID >= sources.size()) {
+        return false;
     }
+    return FileUtil::GetFileExtension(sources.at(pos.fileID).path) == "macrocall";
 }
 
 bool SourceManager::IsSourceFileExist(const unsigned int id)
 {
     // Check whether the *.macrocall exists or not.
-    if (id < sources.size()) {
-        auto path = sources[id].path;
+    if (sources.count(id)) {
+        auto path = sources.at(id).path;
         if (!path.empty() && FileUtil::GetFileExtension(path) != "cj") {
             return FileUtil::FileExist(path);
         }
@@ -140,19 +143,23 @@ bool SourceManager::IsSourceFileExist(const unsigned int id)
 
 int SourceManager::GetLineEnd(const Position& pos)
 {
-    if (pos.fileID >= sources.size()) {
-        return 0;
-    }
-    auto buffer = sources[pos.fileID].buffer;
-    auto sourceSplited = Utils::SplitLines(buffer);
-    if (pos.line > static_cast<int>(sourceSplited.size())) {
-        return 0;
-    }
     CJC_ASSERT(pos.line > 0);
     if (pos.line <= 0) {
         return 0;
     }
-    return static_cast<int>(sourceSplited[static_cast<size_t>(pos.line - 1)].size());
+
+    auto found = sources.find(pos.fileID);
+    if (found == sources.end()) {
+        return 0;
+    }
+
+    auto buffer = found->second.buffer;
+    auto sourceSplitted = Utils::SplitLines(buffer);
+    if (pos.line > static_cast<int>(sourceSplitted.size())) {
+        return 0;
+    }
+
+    return static_cast<int>(sourceSplitted[static_cast<size_t>(pos.line - 1)].size());
 }
 
 std::string SourceManager::GetContentBetween(
@@ -170,7 +177,7 @@ std::string SourceManager::GetContentBetween(
 
     CJC_ASSERT(INVALID_POSITION < begin && begin <= end);
     CJC_ASSERT(!sources.empty());
-    auto& sourceWithFileID = fileID >= sources.size() ? sources.at(0) : sources.at(fileID);
+    auto& sourceWithFileID = sources.count(fileID) ? sources.at(fileID) : sources.at(0);
 
     // Use OwnedPtr for temporary Source to avoid mixed return types in ternary operator (? tempObj : ref).
     // This helps compiler optimization by having consistent pointer types
@@ -198,8 +205,7 @@ std::string SourceManager::GetContentBetween(
 void SourceManager::AddComments(const TokenVecMap& commentsMap)
 {
     for (const auto& it : commentsMap) {
-        CJC_ASSERT(it.first < sources.size());
-        auto& source = sources[it.first];
+        auto& source = sources.at(it.first);
         for (auto tok : it.second) {
             (void)source.offsetCommentsMap.insert_or_assign(source.PosToOffset(tok.Begin()), tok);
         }

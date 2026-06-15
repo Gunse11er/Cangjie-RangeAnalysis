@@ -98,7 +98,7 @@ TEST_F(SourceManagerTest, GetContentBetweenTest)
     code = sm.GetContentBetween(fileID1, Position(14, 9), Position(15, std::numeric_limits<int>::max()));
     EXPECT_EQ(code, "let a = 1\r\n        print(\"PageRankList${a}\\n\");\r\n");
 
-#elif __unix__
+#elif defined(__unix__)
     auto code = sm.GetContentBetween(fileID1, Position(16, 9), Position(16, 14));
     EXPECT_EQ(code, "let a");
 

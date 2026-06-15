@@ -99,7 +99,11 @@ public:
      * @param begin The string starting position.
      * @return int Return the index of the first match, or -1 if no match is found.
      */
-    int Find(const char* pattern, size_t begin = 0) const { return this->find(pattern, begin); }
+    int Find(const char* pattern, size_t begin = 0) const
+    {
+        size_t pos = this->find(pattern, begin);
+        return pos == npos ? -1 : static_cast<int>(pos);
+    }
 
     /**
      * @brief Search for the first occurrence of the specified character in the string starting from
@@ -109,7 +113,11 @@ public:
      * @param begin The string starting position.
      * @return int Return the index of the first match, or -1 if no match is found.
      */
-    int Find(const char pattern, size_t begin = 0) const { return this->find(pattern, begin); }
+    int Find(const char pattern, size_t begin = 0) const
+    {
+        size_t pos = this->find(pattern, begin);
+        return pos == npos ? -1 : static_cast<int>(pos);
+    }
 
     /**
      * @brief Return a substring starting from the specified index.

@@ -135,10 +135,10 @@ Ptr<Node> GetConstraintNodeByIndex(size_t index, Generic& generic)
 {
     CJC_ASSERT(index < generic.typeParameters.size());
     CJC_NULLPTR_CHECK(generic.typeParameters[index]);
-    auto gTy = generic.typeParameters[index]->ty;
+    auto gTy = generic.typeParameters[index]->GetTy();
     for (auto& constraint : generic.genericConstraints) {
         CJC_NULLPTR_CHECK(constraint->type);
-        if (constraint->type->ty == gTy) {
+        if (constraint->type->GetTy() == gTy) {
             return constraint.get();
         }
     }
@@ -164,7 +164,11 @@ void DiagWeakVisibility(DiagnosticEngine& diag, const Decl& parent, const Decl& 
     auto childRange = MakeRangeForDeclIdentifier(child);
     std::string childHint =
         "the visibility of the deriving '" + child.identifier + "' is '" + visibilityToString(child) + "'";
-    auto builder = diag.DiagnoseRefactor(DiagKindRefactor::sema_weak_visibility, MakeRangeForDeclIdentifier(diagNode));
+    auto range = MakeRangeForDeclIdentifier(diagNode);
+    auto builder = diag.DiagnoseRefactor(DiagKindRefactor::sema_weak_visibility, range);
+    if (diagNode.curMacroCall) {
+        diag.AddMacroCallNote(builder.diagnostic, diagNode, range.begin);
+    }
     if (&child == &diagNode) {
         builder.AddMainHintArguments(childHint);
     } else { // child is inherited from other parent
@@ -188,7 +192,7 @@ bool NeedRecheck(InheritableDecl& id)
     std::vector<Ptr<ClassLikeDecl>> extendDecls;
     if (id.astKind == ASTKind::EXTEND_DECL) {
         auto ed = RawStaticCast<ExtendDecl*>(&id);
-        if (auto decl = Ty::GetDeclPtrOfTy(ed->extendedType->ty); decl && decl->IsNominalDecl()) {
+        if (auto decl = Ty::GetDeclPtrOfTy(ed->extendedType->GetTy()); decl && decl->IsNominalDecl()) {
             // extend in common part for specific decl.
             if (decl->TestAttr(Attribute::SPECIFIC)) {
                 return true;
@@ -243,7 +247,7 @@ std::vector<std::unordered_set<Ptr<Ty>>> GetAllGenericUpperBounds(TypeManager& t
     }
     std::vector<std::unordered_set<Ptr<Ty>>> allUpperBounds;
     for (auto& type : generic->typeParameters) {
-        auto genericTy = DynamicCast<GenericsTy*>(type->ty);
+        auto genericTy = DynamicCast<GenericsTy*>(type->GetTy());
         if (!genericTy) {
             continue;
         }
@@ -317,7 +321,7 @@ void StructInheritanceChecker::Check()
             return VisitAction::WALK_CHILDREN;
         }
         // Optimized: early filter for broken or invalid type declarations during collection.
-        if (node->TestAttr(Attribute::IS_BROKEN) || !Ty::IsTyCorrect(node->ty)) {
+        if (node->TestAttr(Attribute::IS_BROKEN) || !Ty::IsTyCorrect(node->GetTy())) {
             return VisitAction::SKIP_CHILDREN;
         }
         if (node->astKind == ASTKind::EXTEND_DECL) {
@@ -338,7 +342,7 @@ void StructInheritanceChecker::Check()
         extendDecls.reserve(extendDecls.size() + sortedExtends.size());
         for (auto extendDecl : sortedExtends) {
             // Optimized: filter broken, invalid type, or invisible extends during insertion.
-            if (!extendDecl->TestAttr(Attribute::IS_BROKEN) && Ty::IsTyCorrect(extendDecl->ty) &&
+            if (!extendDecl->TestAttr(Attribute::IS_BROKEN) && Ty::IsTyCorrect(extendDecl->GetTy()) &&
                 IsExtendVisibleInCurpkg(*extendDecl)) {
                 extendDecls.emplace_back(extendDecl);
             }
@@ -370,19 +374,20 @@ void StructInheritanceChecker::CheckMembersWithInheritedDecls(const InheritableD
     auto [visibleExtendMembers, invisibleMembers] = GetVisibleExtendMembersForExtend(decl);
     // 0. Merge inherited members for extend decl. Must merge 'instanceMembers' to 'visibleExtendMembers'.
     // 'instanceMembers' will replace any interface members in 'visibleExtendMembers'.
-    MergeInheritedMembers(visibleExtendMembers, instanceMembers, *decl.ty);
+    MergeInheritedMembers(visibleExtendMembers, instanceMembers, *decl.GetTy());
     // Spec check: "The exported extension cannot indirectly export the functions of the non-exported extension."
     for (auto& interface : interfaceMembers) {
         CheckExtendExportDependence(decl, interface.second, visibleExtendMembers);
     }
     // 1. Merge & check members inherited in from super class or extended type of extend decl first.
     for (auto& member : decl.GetMemberDecls()) {
-        if (!Ty::IsTyCorrect(member->ty) || !member->outerDecl || member->TestAttr(Attribute::CONSTRUCTOR)) {
+        if (!Ty::IsTyCorrect(member->GetTy()) || !member->outerDecl || member->TestAttr(Attribute::CONSTRUCTOR)) {
             continue;
         }
         std::pair<MemberMap::const_iterator, MemberMap::const_iterator> inherited =
             visibleExtendMembers.equal_range(member->identifier);
-        MemberSignature memberSig{member, member->ty, decl.ty, nullptr, GetAllGenericUpperBounds(typeManager, *member)};
+        MemberSignature memberSig{
+            member, member->GetTy(), decl.GetTy(), nullptr, GetAllGenericUpperBounds(typeManager, *member)};
         for (auto it = inherited.first; it != inherited.second; ++it) {
             DiagnoseForInheritedMember(it->second, memberSig);
         }
@@ -400,7 +405,7 @@ void StructInheritanceChecker::CheckMembersWithInheritedDecls(const InheritableD
         DiagnoseForInheritedInterfaces(interface.second, visibleExtendMembers);
     }
     // 3. Merge final inherited members. 'visibleExtendMembers' is merged to 'interfaceMembers'.
-    MergeInheritedMembers(interfaceMembers, visibleExtendMembers, *decl.ty);
+    MergeInheritedMembers(interfaceMembers, visibleExtendMembers, *decl.GetTy());
     for (const auto& memberSig : std::as_const(interfaceMembers)) {
         DiagnoseForOverriddenMember(memberSig.second);
     }
@@ -424,13 +429,13 @@ MemberMap StructInheritanceChecker::GetAndCheckInheritedInterfaces(const Inherit
 {
     std::set<Ptr<Ty>, CmpTyByName> interfaceTys;
     for (auto& type : decl.inheritedTypes) {
-        auto baseDecl = Ty::GetDeclPtrOfTy<InheritableDecl>(type->ty);
+        auto baseDecl = Ty::GetDeclPtrOfTy<InheritableDecl>(type->GetTy());
         if (!baseDecl || baseDecl->astKind != ASTKind::INTERFACE_DECL ||
             baseDecl->TestAttr(Attribute::IN_REFERENCE_CYCLE)) {
             continue;
         }
         CheckMembersWithInheritedDecls(*baseDecl);
-        interfaceTys.emplace(type->ty);
+        interfaceTys.emplace(type->GetTy());
     }
     MemberMap members;
     // Merge inherited interfaces' members.
@@ -462,7 +467,7 @@ MemberMap StructInheritanceChecker::GetInheritedSuperMembers(
     auto extends = typeManager.GetDeclExtends(decl);
     std::set<Ptr<ExtendDecl>, CmpNodeByPos> ordered(extends.begin(), extends.end());
     for (auto extend : ordered) {
-        if (!extend->extendedType || !Ty::IsTyCorrect(extend->extendedType->ty)) {
+        if (!extend->extendedType || !Ty::IsTyCorrect(extend->extendedType->GetTy())) {
             continue;
         }
         if (!importManager.IsExtendAccessible(curFile, *extend)) {
@@ -484,7 +489,7 @@ MemberMap StructInheritanceChecker::GetInheritedSuperMembers(
  */
 MemberMap StructInheritanceChecker::GetAndCheckInheritedMembers(const InheritableDecl& decl)
 {
-    if (!Ty::IsTyCorrect(decl.ty)) {
+    if (!Ty::IsTyCorrect(decl.GetTy())) {
         return {};
     }
     Ptr<InheritableDecl> baseDecl = nullptr;
@@ -492,12 +497,12 @@ MemberMap StructInheritanceChecker::GetAndCheckInheritedMembers(const Inheritabl
     if (decl.astKind == ASTKind::CLASS_DECL) {
         auto& cd = static_cast<const ClassDecl&>(decl);
         baseDecl = cd.GetSuperClassDecl();
-        baseTy = RawStaticCast<ClassTy*>(cd.ty)->GetSuperClassTy();
+        baseTy = RawStaticCast<ClassTy*>(cd.GetTy())->GetSuperClassTy();
     } else if (decl.astKind == ASTKind::EXTEND_DECL) {
         auto& ed = static_cast<const ExtendDecl&>(decl);
         if (ed.extendedType) {
-            baseDecl = Ty::GetDeclPtrOfTy<InheritableDecl>(ed.extendedType->ty);
-            baseTy = ed.extendedType->ty;
+            baseDecl = Ty::GetDeclPtrOfTy<InheritableDecl>(ed.extendedType->GetTy());
+            baseTy = ed.extendedType->GetTy();
         }
     }
     if (!baseDecl || !Ty::IsTyCorrect(baseTy) || baseDecl->TestAttr(Attribute::IN_REFERENCE_CYCLE)) {
@@ -535,7 +540,7 @@ MemberMap StructInheritanceChecker::GetAndCheckInheritedMembers(const Inheritabl
 void StructInheritanceChecker::CollectExtendByInterfaceInherit(const std::set<Ptr<ExtendDecl>>& otherExtends,
     const ExtendDecl& curDecl, std::set<Ptr<ExtendDecl>, CmpNodeByPos>& ordered)
 {
-    auto extendedDecl = Ty::GetDeclPtrOfTy(curDecl.ty);
+    auto extendedDecl = Ty::GetDeclPtrOfTy(curDecl.GetTy());
     if (auto rt = DynamicCast<RefType>(curDecl.extendedType.get()); rt && rt->GetTarget() && !extendedDecl) {
         // For Built-in generic type 'CPointer<T>'.
         extendedDecl = rt->GetTarget();
@@ -570,14 +575,14 @@ std::optional<bool> StructInheritanceChecker::DeterminingSkipExtendByInheritance
     std::optional<bool> skipExtend = std::nullopt;
     std::pair<Ptr<Ty>, Ptr<Ty>> lastInherTy;
     auto mappingOfExtended2Ed =
-        extendedDecl ? GenerateTypeMapping(*extendedDecl, ed.extendedType->ty->typeArgs) : TypeSubst();
+        extendedDecl ? GenerateTypeMapping(*extendedDecl, ed.extendedType->GetTy()->typeArgs) : TypeSubst();
     auto mappingOfExtended2CurExtend =
-        extendedDecl ? GenerateTypeMapping(*extendedDecl, curDecl.extendedType->ty->typeArgs) : TypeSubst();
+        extendedDecl ? GenerateTypeMapping(*extendedDecl, curDecl.extendedType->GetTy()->typeArgs) : TypeSubst();
     for (auto& curDeclSuper : std::as_const(curDecl.inheritedTypes)) {
         Ptr<Ty> hasSubImpl = nullptr;
         Ptr<Ty> hasSuperImpl = nullptr;
-        Ptr<Ty> curDeclSuperInsTy = curDeclSuper->ty;
-        auto typeArgs = extendedDecl ? extendedDecl->ty->typeArgs : std::vector<Ptr<Ty>>();
+        Ptr<Ty> curDeclSuperInsTy = curDeclSuper->GetTy();
+        auto typeArgs = extendedDecl ? extendedDecl->GetTy()->typeArgs : std::vector<Ptr<Ty>>();
         for (auto typeArg : typeArgs) {
             auto tyArgGen = StaticCast<GenericsTy*>(typeArg);
             auto mappingOfCurExtend2Extend =
@@ -585,18 +590,18 @@ std::optional<bool> StructInheritanceChecker::DeterminingSkipExtendByInheritance
             curDeclSuperInsTy = typeManager.GetInstantiatedTy(curDeclSuperInsTy, mappingOfCurExtend2Extend);
         }
         Cangjie::MPTypeCheckerImpl::GetInheritedTypesWithSpecificImpl(
-            ed.inheritedTypes, ed.specificImplementation != nullptr, opts.commonPartCjo != std::nullopt);
+            ed.inheritedTypes, ed.specificImplementation != nullptr, !opts.commonPartCjos.empty());
         for (auto& edSuper : ed.inheritedTypes) {
-            if (edSuper->ty == curDeclSuperInsTy) {
+            if (edSuper->GetTy() == curDeclSuperInsTy) {
                 continue;
             }
             // Whether at least one extension's interface is the current sub-interface.
-            if (typeManager.IsSubtype(edSuper->ty, curDeclSuperInsTy)) {
-                hasSubImpl = edSuper->ty;
+            if (typeManager.IsSubtype(edSuper->GetTy(), curDeclSuperInsTy)) {
+                hasSubImpl = edSuper->GetTy();
             }
             // Whether at least one extension's interface is the current super-interface.
-            if (typeManager.IsSubtype(curDeclSuperInsTy, edSuper->ty)) {
-                hasSuperImpl = edSuper->ty;
+            if (typeManager.IsSubtype(curDeclSuperInsTy, edSuper->GetTy())) {
+                hasSuperImpl = edSuper->GetTy();
             }
         }
         // Another extension implement sub-interface and super-interface of current extension interface at same
@@ -663,7 +668,7 @@ std::pair<MemberMap, MemberMap> StructInheritanceChecker::GetVisibleExtendMember
         return {};
     }
     auto ed = RawStaticCast<const ExtendDecl*>(&decl);
-    if (!ed->extendedType || !Ty::IsTyCorrect(ed->extendedType->ty)) {
+    if (!ed->extendedType || !Ty::IsTyCorrect(ed->extendedType->GetTy())) {
         return {};
     }
     MemberMap interfaceMembers;
@@ -671,42 +676,42 @@ std::pair<MemberMap, MemberMap> StructInheritanceChecker::GetVisibleExtendMember
     MemberMap invisibleInterfaceMembers;
     MemberMap invisibleExtendMembers;
     MultiTypeSubst mts;
-    typeManager.GenerateGenericMapping(mts, *ed->extendedType->ty);
-    auto extends = typeManager.GetAllExtendsByTy(*ed->extendedType->ty);
+    typeManager.GenerateGenericMapping(mts, *ed->extendedType->GetTy());
+    auto extends = typeManager.GetAllExtendsByTy(*ed->extendedType->GetTy());
     std::set<Ptr<ExtendDecl>, CmpNodeByPos> ordered;
     CollectExtendByInterfaceInherit(extends, *ed, ordered);
     for (auto extend : ordered) {
-        if (!extend->extendedType || !Ty::IsTyCorrect(extend->extendedType->ty) || extend == ed) {
+        if (!extend->extendedType || !Ty::IsTyCorrect(extend->extendedType->GetTy()) || extend == ed) {
             continue;
         }
         if (decl.fullPackageName != extend->fullPackageName && !extend->TestAttr(Attribute::PUBLIC)) {
             continue;
         }
         // Check if the 'extend' is visible from current decl. Store visible and invisble members in different maps.
-        bool visibleExtend = typeManager.CheckGenericDeclInstantiation(extend, ed->extendedType->ty->typeArgs);
+        bool visibleExtend = typeManager.CheckGenericDeclInstantiation(extend, ed->extendedType->GetTy()->typeArgs);
         if (!visibleExtend) {
             // Invisible extend's MultiTypeSubst will not be generated by 'GenerateGenericMapping'. Generate here.
-            typeManager.GenerateStructDeclGenericMapping(mts, *extend, *ed->extendedType->ty);
+            typeManager.GenerateStructDeclGenericMapping(mts, *extend, *ed->extendedType->GetTy());
         }
         auto& interfaceMap = visibleExtend ? interfaceMembers : invisibleInterfaceMembers;
         auto& extendMap = visibleExtend ? extendMembers : invisibleExtendMembers;
         auto curInterfaceMap = GetAndCheckInheritedInterfaces(*extend);
         std::for_each(
             curInterfaceMap.begin(), curInterfaceMap.end(), [&extend](auto& m) { m.second.extendDecl = extend; });
-        MergeInheritedMembers(interfaceMap, curInterfaceMap, *ed->extendedType->ty);
+        MergeInheritedMembers(interfaceMap, curInterfaceMap, *ed->extendedType->GetTy());
         auto typeMapping = MultiTypeSubstToTypeSubst(mts);
         for (auto& edMember : extend->GetMemberDecls()) {
-            if (!Ty::IsTyCorrect(edMember->ty) || IsInvisibleMember(*edMember, decl.fullPackageName)) {
+            if (!Ty::IsTyCorrect(edMember->GetTy()) || IsInvisibleMember(*edMember, decl.fullPackageName)) {
                 continue;
             }
-            auto memberTy = typeManager.GetInstantiatedTy(edMember->ty, typeMapping);
-            auto structTy = typeManager.GetInstantiatedTy(extend->ty, typeMapping);
+            auto memberTy = typeManager.GetInstantiatedTy(edMember->GetTy(), typeMapping);
+            auto structTy = typeManager.GetInstantiatedTy(extend->GetTy(), typeMapping);
             MemberSignature sig{edMember, memberTy, structTy, extend, GetAllGenericUpperBounds(typeManager, *edMember)};
             (void)UpdateInheritedMemberIfNeeded(extendMap, sig);
         }
     }
-    MergeInheritedMembers(interfaceMembers, extendMembers, *ed->extendedType->ty);
-    MergeInheritedMembers(invisibleInterfaceMembers, invisibleExtendMembers, *ed->extendedType->ty);
+    MergeInheritedMembers(interfaceMembers, extendMembers, *ed->extendedType->GetTy());
+    MergeInheritedMembers(invisibleInterfaceMembers, invisibleExtendMembers, *ed->extendedType->GetTy());
     // Remove if member is abstract;
     auto isAbstract = [](auto it) { return it.second.decl->TestAttr(Attribute::ABSTRACT); };
     Utils::EraseIf(interfaceMembers, isAbstract);
@@ -829,7 +834,7 @@ void StructInheritanceChecker::CheckIncompleteOverrideOrImplOfExtend(
         if (checkingDecls[0] == childOuterDecl) {
             return true;
         }
-        auto allChildExtends = typeManager.GetAllExtendsByTy(*childOuterDecl->ty);
+        auto allChildExtends = typeManager.GetAllExtendsByTy(*childOuterDecl->GetTy());
         for (auto extend : allChildExtends) {
             if (extend == checkingDecls[0]) {
                 return true;
@@ -837,16 +842,16 @@ void StructInheritanceChecker::CheckIncompleteOverrideOrImplOfExtend(
         }
         return false;
     };
-    if (!childOuterDecl || !childOuterDecl->ty->HasGeneric() || isChildInCheckingDecl()) {
+    if (!childOuterDecl || !childOuterDecl->GetTy()->HasGeneric() || isChildInCheckingDecl()) {
         return;
     }
-    auto curClassTy = DynamicCast<ClassTy>(checkingDecls[0]->ty);
+    auto curClassTy = DynamicCast<ClassTy>(checkingDecls[0]->GetTy());
     if (!curClassTy || childOuterDecl->astKind != ASTKind::CLASS_DECL) {
         return;
     }
     MultiTypeSubst m;
     typeManager.GenerateGenericMapping(m, *curClassTy);
-    auto instSupers = typeManager.GetInstantiatedTys(childOuterDecl->ty, m);
+    auto instSupers = typeManager.GetInstantiatedTys(childOuterDecl->GetTy(), m);
     auto diagForIncompleteOverrideOrImplement = [this, &interface, &child, &childOuterDecl]() {
         std::string funcOrProp = child.decl->astKind == ASTKind::FUNC_DECL ? "function" : "prop";
         std::string memberStr = funcOrProp + " '" + child.decl->identifier.Val() + "' in '" +
@@ -860,7 +865,8 @@ void StructInheritanceChecker::CheckIncompleteOverrideOrImplOfExtend(
         } else {
             std::string prefix = checkingDecls[0]->astKind == ASTKind::EXTEND_DECL ? "extend " : "";
             std::string classNameOverride = prefix +
-                (checkingDecls[0]->ty->IsNominal() ? checkingDecls[0]->ty->name : checkingDecls[0]->ty->String());
+                (checkingDecls[0]->GetTy()->IsNominal() ? checkingDecls[0]->GetTy()->name
+                                                        : checkingDecls[0]->GetTy()->String());
             auto builder =
                 diag.Diagnose(*checkingDecls[0], DiagKind::sema_interface_member_must_be_implemented_in_struct,
                     funcOrProp, child.decl->identifier.Val(), classNameOverride);
@@ -939,12 +945,15 @@ void StructInheritanceChecker::DiagnoseForUnimplementedInterfaces(const MemberMa
     // Do not check unimplemented function for:
     // 1. Foreign struct.
     // 2. Mirror struct.
+    // 3. Wrapper classes generated for java interop (corresponding members are generated after typecheck).
     if (structDecl.TestAttr(Attribute::FOREIGN) ||
-        structDecl.TestAnyAttr(Attribute::OBJ_C_MIRROR, Attribute::OBJ_C_MIRROR_SYNTHETIC_WRAPPER)) {
+        structDecl.TestAnyAttr(Attribute::OBJ_C_MIRROR, Attribute::OBJ_C_MIRROR_SYNTHETIC_WRAPPER) ||
+        structDecl.TestAttr(Attribute::JAVA_MIRROR_SYNTHETIC_WRAPPER)) {
         return;
     }
     std::string prefix = structDecl.astKind == ASTKind::EXTEND_DECL ? "extend " : "";
-    std::string structName = prefix + (structDecl.ty->IsNominal() ? structDecl.ty->name : structDecl.ty->String());
+    std::string structName =
+        prefix + (structDecl.GetTy()->IsNominal() ? structDecl.GetTy()->name : structDecl.GetTy()->String());
     std::multimap<Ptr<Decl>, const MemberSignature*> unImplementedDecl;
     std::vector<Ptr<const MemberSignature>> unImplementedMembers;
     for (auto& [identifier, member] : members) {
@@ -1003,7 +1012,7 @@ void StructInheritanceChecker::DiagnoseForUnimplementedInterfaces(const MemberMa
         } else {
             kind = DiagKindRefactor::sema_need_member_implementation;
         }
-        DiagnosticBuilder builder = diag.DiagnoseRefactor(kind, structDecl.begin, structName);
+        DiagnosticBuilder builder = diag.DiagnoseRefactor(kind, structDecl, structName);
         std::stable_sort(unImplementedMembers.begin(), unImplementedMembers.end(), CompMemberSignatureByPosAndTy);
         for (auto member : unImplementedMembers) {
             std::string identifierName;
@@ -1016,7 +1025,7 @@ void StructInheritanceChecker::DiagnoseForUnimplementedInterfaces(const MemberMa
                 member->decl->outerDecl->astKind == ASTKind::CLASS_DECL ? "abstract" : "interface";
             std::string note =
                 "unimplemented " + abstractType + " " + DeclKindToString(*member->decl) + " " + identifierName;
-            builder.AddNote(member->decl->GetBegin(), note);
+            builder.AddNote(*member->decl, note);
         }
     }
 }
@@ -1031,7 +1040,7 @@ bool StructInheritanceChecker::IsExtendedDefaultImpl(const MemberSignature& pare
         child.outerDecl->astKind == ASTKind::EXTEND_DECL) {
         return false;
     }
-    return typeManager.HasExtensionRelation(*child.outerDecl->ty, *parent.decl->outerDecl->ty);
+    return typeManager.HasExtensionRelation(*child.outerDecl->GetTy(), *parent.decl->outerDecl->GetTy());
 }
 
 /**
@@ -1050,7 +1059,7 @@ bool StructInheritanceChecker::CheckExtendMemberValid(const MemberSignature& par
             child.TestAttr(Attribute::IN_EXTEND)) {
             return true;
         }
-        auto structTy = child.outerDecl->ty;
+        auto structTy = child.outerDecl->GetTy();
         std::string typeName = "extend " + (structTy->IsNominal() ? structTy->name : structTy->String());
         diag.DiagnoseRefactor(
             DiagKindRefactor::sema_extend_member_cannot_shadow, child, childRange, child.identifier, typeName);
@@ -1068,8 +1077,8 @@ bool StructInheritanceChecker::CheckExtendMemberValid(const MemberSignature& par
         auto parentRange = parent.decl->identifier.Empty() ? MakeRange(parent.decl->begin, parent.decl->end)
                                                            : MakeRange(parent.decl->identifier);
         auto ed = RawStaticCast<ExtendDecl*>(child.outerDecl);
-        auto diagnose = diag.DiagnoseRefactor(
-            DiagKindRefactor::sema_extend_member_cannot_shadow, child, childRange, child.identifier, ed->ty->String());
+        auto diagnose = diag.DiagnoseRefactor(DiagKindRefactor::sema_extend_member_cannot_shadow, child, childRange,
+            child.identifier, ed->GetTy()->String());
         diagnose.AddNote(*parent.decl, parentRange, "shadowed definition of '" + child.identifier + "' is here");
     } else {
         return true;
@@ -1206,21 +1215,12 @@ void StructInheritanceChecker::CheckAccessVisibility(const Decl& parent, const D
     }
 }
 
-static size_t GenericsCount(const Decl& decl)
-{
-    auto generic = decl.GetGeneric();
-    if (!generic) {
-        return 0;
-    }
-    return generic->typeParameters.size();
-}
-
 namespace Cangjie {
 void CheckGenericTypeBoundsMapped(const Decl& parent, const Decl& child,
     std::vector<std::unordered_set<Ptr<Ty>>> parentBounds, std::vector<std::unordered_set<Ptr<Ty>>> childBounds,
     DiagnosticEngine& diag, TypeManager& typeManager)
 {
-    if (GenericsCount(parent) != GenericsCount(child)) {
+    if (parent.GetGenericsCount() != child.GetGenericsCount()) {
         diag.Diagnose(child, DiagKind::sema_generic_member_type_argument_different, child.identifier.Val());
         return;
     }
@@ -1311,7 +1311,7 @@ void StructInheritanceChecker::CheckPropertyInheritance(const MemberSignature& p
         return;
     }
 
-    if (parent.ty != child.ty || !parent.inconsistentTypes.empty()) {
+    if (parent.ty != child.GetTy() || !parent.inconsistentTypes.empty()) {
         diag.Diagnose(child, DiagKind::sema_property_override_implement_type_diff);
     }
     auto parentProp = RawStaticCast<PropDecl*>(parentDecl);
@@ -1436,7 +1436,7 @@ void StructInheritanceChecker::CheckMutModifierCompatible(const MemberSignature&
     }
     // Only function in structure declaration or extend of struct needs to checking 'mut' attribute.
     if (auto ed = DynamicCast<ExtendDecl*>(child.outerDecl); ed) {
-        if (!ed->ty->IsStruct()) {
+        if (!ed->GetTy()->IsStruct()) {
             return;
         }
     } else if (child.outerDecl->astKind != ASTKind::STRUCT_DECL) {

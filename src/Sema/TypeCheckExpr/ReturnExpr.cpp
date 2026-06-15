@@ -18,16 +18,16 @@ bool TypeChecker::TypeCheckerImpl::ChkReturnExpr(ASTContext& ctx, ReturnExpr& re
 Ptr<Ty> TypeChecker::TypeCheckerImpl::SynReturnExpr(ASTContext& ctx, ReturnExpr& re)
 {
     if (!re.refFuncBody || !re.refFuncBody->retType) {
-        re.ty = TypeManager::GetInvalidTy();
-        return re.ty;
+        re.SetTy(TypeManager::GetInvalidTy());
+        return re.GetTy();
     }
 
     CJC_ASSERT(re.expr);
     bool isWellTyped = true;
-    re.ty = TypeManager::GetInvalidTy();
+    re.SetTy(TypeManager::GetInvalidTy());
 
     // Analyse re.expr.
-    auto retTy = re.refFuncBody->retType->ty;
+    auto retTy = re.refFuncBody->retType->GetTy();
     if (Ty::IsTyCorrect(retTy) && !retTy->IsQuest()) {
         bool isInConstructor = re.refFuncBody->funcDecl && IsInstanceConstructor(*re.refFuncBody->funcDecl);
         if (isInConstructor) {
@@ -36,27 +36,27 @@ Ptr<Ty> TypeChecker::TypeCheckerImpl::SynReturnExpr(ASTContext& ctx, ReturnExpr&
             isWellTyped = Check(ctx, retTy, re.expr.get());
         }
         if (isWellTyped) {
-            ctx.targetTypeMap[re.expr.get()] = re.expr->ty;
+            ctx.targetTypeMap[re.expr.get()] = re.expr->GetTy();
         }
     } else {
-        isWellTyped = Synthesize(ctx, re.expr.get()) && ReplaceIdealTy(*re.expr);
+        isWellTyped = Synthesize({ctx, SynPos::EXPR_ARG}, re.expr.get()) && ReplaceIdealTy(*re.expr);
     }
 
     // Replace ClassThisTy to ClassTy when the function's outer declaration is not Class or Extend which extends class.
     if (!Is<ClassDecl>(re.refFuncBody->parentClassLike)) {
-        if (auto ctt = DynamicCast<ClassThisTy*>(re.expr->ty); ctt && ctt->decl) {
-            re.expr->ty = ctt->decl->ty;
+        if (auto ctt = DynamicCast<ClassThisTy*>(re.expr->GetTy()); ctt && ctt->decl) {
+            re.expr->SetTy(ctt->decl->GetTy());
         }
     }
 
     // Generic decls imported from foreign code and created by auto-sdk have no body, no need to check return.
     if (!isWellTyped && NeedCheckBodyReturn(*re.refFuncBody)) {
-        re.ty = TypeManager::GetInvalidTy();
+        re.SetTy(TypeManager::GetInvalidTy());
     } else {
-        re.ty = TypeManager::GetNothingTy();
+        re.SetTy(TypeManager::GetNothingTy());
     }
 
-    return re.ty;
+    return re.GetTy();
 }
 
 bool TypeChecker::TypeCheckerImpl::CheckReturnInConstructors(ASTContext& ctx, const ReturnExpr& re)

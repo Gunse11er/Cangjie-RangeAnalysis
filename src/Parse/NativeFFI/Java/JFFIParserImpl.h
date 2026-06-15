@@ -53,6 +53,8 @@ private:
         const std::string& p0, const std::string& p1, const std::string& p2, const std::string& p3) const;
 private:
     ParserImpl& p;
+    bool compileCommon{false}; // true if compiling common part
+    bool compilePlatform{false}; // true if compiling specific part
 };
 
 } // namespace Cangjie

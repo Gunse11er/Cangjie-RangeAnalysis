@@ -224,8 +224,7 @@ bool IsThisArgOfStructMethod(const CHIR::Value& chirValue);
 #ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
 inline bool IsAtomicIntrinsic(const CHIR::IntrinsicKind& intrinsicKind)
 {
-    return intrinsicKind >= CHIR::IntrinsicKind::ATOMIC_LOAD &&
-        intrinsicKind <= CHIR::IntrinsicKind::ATOMIC_FETCH_XOR;
+    return intrinsicKind >= CHIR::IntrinsicKind::ATOMIC_LOAD && intrinsicKind <= CHIR::IntrinsicKind::ATOMIC_FETCH_XOR;
 }
 
 int64_t GetIntMaxOrMin(IRBuilder2& irBuilder, const CHIR::IntType& ty, bool isMax);
@@ -439,6 +438,9 @@ inline bool IsExternalDefinedType(const CHIR::Type& type)
 bool IsModifiableClass(const CHIR::Type& chirTy);
 bool IsSizeTrustedInCompileUnit(CGModule& cgMod, const CHIR::Type& chirTy);
 void ReplaceDelimiterAfterOrgName(std::string& packageName);
+
+std::vector<std::pair<CHIR::Function*, CHIR::FuncType*>> GetInstAbstractMethodTypes(
+    const CHIR::ClassType& interfaceTy, CHIR::CHIRBuilder& builder);
 } // namespace CodeGen
 } // namespace Cangjie
 

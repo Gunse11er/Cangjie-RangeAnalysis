@@ -27,14 +27,14 @@ namespace Cangjie::Sema::Desugar::AfterTypeCheck {
  * */
 void DesugarIsExpr(TypeManager& typeManager, IsExpr& ie)
 {
-    if (!Ty::IsTyCorrect(ie.ty) || !ie.ty->IsBoolean() || ie.desugarExpr) {
+    if (!Ty::IsTyCorrect(ie.GetTy()) || !ie.GetTy()->IsBoolean() || ie.desugarExpr) {
         return;
     }
     CJC_NULLPTR_CHECK(ie.leftExpr);
     CJC_NULLPTR_CHECK(ie.isType);
-    CJC_NULLPTR_CHECK(ie.leftExpr->ty);
-    CJC_NULLPTR_CHECK(ie.isType->ty);
-    auto boolTy = ie.ty;
+    CJC_NULLPTR_CHECK(ie.leftExpr->GetTy());
+    CJC_NULLPTR_CHECK(ie.isType->GetTy());
+    auto boolTy = ie.GetTy();
     std::vector<OwnedPtr<MatchCase>> matchCases;
     auto trueExpr = CreateLitConstExpr(LitConstKind::BOOL, "true", boolTy);
     auto falseExpr = CreateLitConstExpr(LitConstKind::BOOL, "false", boolTy);
@@ -46,7 +46,7 @@ void DesugarIsExpr(TypeManager& typeManager, IsExpr& ie)
         ),
         std::move(trueExpr)));
     auto wildcard = MakeOwnedNode<WildcardPattern>();
-    wildcard->ty = ie.leftExpr->ty;
+    wildcard->SetTy(ie.leftExpr->GetTy());
     matchCases.emplace_back(
         CreateMatchCase(std::move(wildcard), std::move(falseExpr)));
     ie.desugarExpr = CreateMatchExpr(std::move(ie.leftExpr), std::move(matchCases), boolTy, Expr::SugarKind::IS);

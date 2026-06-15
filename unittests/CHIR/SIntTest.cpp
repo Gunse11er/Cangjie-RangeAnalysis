@@ -263,8 +263,7 @@ TEST(SIntTest, SaturatingOps)
 
     // Signed multiply saturating
     EXPECT_EQ(SInt(IntWidth::I64, 1000).SMulSat(SInt(IntWidth::I64, 2)), SInt(IntWidth::I64, 2000));
-    EXPECT_EQ(SInt(IntWidth::I64,
-        (int64_t)0x4000000000000000ull).SMulSat(SInt(IntWidth::I64, 4)), SInt::SMaxValue(IntWidth::I64));
+    EXPECT_EQ(SInt(IntWidth::I64, (int64_t)0x4000000000000000ull).SMulSat(SInt(IntWidth::I64, 4)), SInt::SMaxValue(IntWidth::I64));
 
     // Unsigned multiply saturating
     EXPECT_EQ(SInt(IntWidth::I64, 2).UMulSat(SInt(IntWidth::I64, 3)), SInt(IntWidth::I64, 6));

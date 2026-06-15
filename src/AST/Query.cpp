@@ -154,7 +154,7 @@ std::unique_ptr<Query> QueryParser::ParsePositionTerm()
             DiagKindRefactor::parse_query_position_illegal_file_id, LookAhead().Begin());
         return nullptr;
     }
-    pos->pos.fileID = static_cast<unsigned int>(getNumber(LookAhead().Value()));
+    pos->pos.fileID = Stoui(LookAhead().Value()).value_or(0);
     if (!Skip(TokenKind::COMMA)) {
         GetDiagnosticEngine().DiagnoseRefactor(
             DiagKindRefactor::parse_query_position_comma_required, LookAhead().Begin());

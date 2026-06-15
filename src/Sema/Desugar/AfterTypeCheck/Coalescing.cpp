@@ -19,34 +19,34 @@ OwnedPtr<MatchCase> GetValueMatchCase(
     OwnedPtr<RefExpr> ctor, OwnedPtr<Block> someExpr, RefExpr& someVar, Expr& selector)
 {
     auto valMatchCase = MakeOwnedNode<MatchCase>();
-    CJC_ASSERT(selector.ty->IsCoreOptionType()); // Caller guarantees.
-    auto innerTy = selector.ty->typeArgs[0];
+    CJC_ASSERT(selector.GetTy()->IsCoreOptionType()); // Caller guarantees.
+    auto innerTy = selector.GetTy()->typeArgs[0];
     CopyBasicInfo(&selector, valMatchCase.get());
 
     // 'x' in 'Some(x)'.
     auto someArg = MakeOwned<VarPattern>(someVar.ref.identifier, INVALID_POSITION);
-    someArg->ty = innerTy;
-    someArg->varDecl->ty = innerTy;
-    
+    someArg->SetTy(innerTy);
+    someArg->varDecl->SetTy(innerTy);
+
     someArg->EnableAttr(Attribute::COMPILER_ADD);
     // 'x' in '=> x'.
     someVar.ref.target = someArg->varDecl.get();
-    someVar.ty = someVar.ref.target->ty;
+    someVar.SetTy(someVar.ref.target->GetTy());
     // Enum pattern 'Some(x)'.
     auto enumPattern = MakeOwnedNode<EnumPattern>();
     CopyBasicInfo(someExpr.get(), enumPattern.get());
     enumPattern->constructor = std::move(ctor);
     enumPattern->patterns.emplace_back(std::move(someArg));
-    enumPattern->ty = selector.ty;
+    enumPattern->SetTy(selector.GetTy());
     // Case body of '=> x'.
-    someExpr->ty = innerTy;
+    someExpr->SetTy(innerTy);
     someExpr->curFile = selector.curFile;
     // Entire case expression 'case Some(x) => x'.
     valMatchCase->patterns.emplace_back(std::move(enumPattern));
     valMatchCase->SetCtxExprForPatterns(&selector);
     valMatchCase->patternGuard = nullptr;
     valMatchCase->exprOrDecls = std::move(someExpr);
-    valMatchCase->ty = valMatchCase->exprOrDecls->ty;
+    valMatchCase->SetTy(valMatchCase->exprOrDecls->GetTy());
     return valMatchCase;
 }
 }
@@ -65,7 +65,7 @@ OwnedPtr<Expr> TypeChecker::TypeCheckerImpl::ConstructOptionMatch(OwnedPtr<Expr>
 {
     Ptr<FuncDecl> ctorDecl = nullptr;
     // Caller guarantees seletor is enum option type.
-    auto enumTy = StaticCast<EnumTy*>(selector->ty);
+    auto enumTy = StaticCast<EnumTy*>(selector->GetTy());
     for (auto& it : enumTy->declPtr->constructors) {
         if (it->identifier == OPTION_VALUE_CTOR) {
             ctorDecl = StaticCast<FuncDecl*>(it.get());
@@ -93,7 +93,7 @@ OwnedPtr<Expr> TypeChecker::TypeCheckerImpl::ConstructOptionMatch(OwnedPtr<Expr>
     wildMatchCase->SetCtxExprForPatterns(matchExpr->selector.get());
     wildMatchCase->patternGuard = nullptr;
     wildMatchCase->exprOrDecls = std::move(otherExpr);
-    wildMatchCase->ty = wildMatchCase->exprOrDecls->ty;
+    wildMatchCase->SetTy(wildMatchCase->exprOrDecls->GetTy());
     CopyBasicInfo(matchExpr->selector.get(), wildMatchCase.get());
     matchExpr->matchCases.emplace_back(std::move(wildMatchCase));
     return matchExpr;
@@ -116,7 +116,7 @@ void TypeChecker::TypeCheckerImpl::DesugarForCoalescing(BinaryExpr& binaryExpr) 
 {
     // Caller guarantees the 'binaryExpr.desugarExpr' is not existed.
     CJC_ASSERT(binaryExpr.rightExpr && binaryExpr.leftExpr);
-    auto leftTy = binaryExpr.leftExpr->ty;
+    auto leftTy = binaryExpr.leftExpr->GetTy();
     if (!leftTy->IsCoreOptionType()) {
         return;
     }
@@ -127,15 +127,15 @@ void TypeChecker::TypeCheckerImpl::DesugarForCoalescing(BinaryExpr& binaryExpr) 
     caseBody->body.emplace_back(std::move(expr));
     // Case body 'case _ => rightExpr of binaryExpr'
     auto wildBody = MakeOwnedNode<Block>();
-    auto rightTy = binaryExpr.rightExpr->ty;
+    auto rightTy = binaryExpr.rightExpr->GetTy();
     (void)wildBody->body.emplace_back(std::move(binaryExpr.rightExpr));
-    wildBody->ty = rightTy;
+    wildBody->SetTy(rightTy);
 
     auto someTy = typeManager.GetFunctionTy({leftTy->typeArgs[0]}, leftTy);
     auto desugarExpr = ConstructOptionMatch(
         std::move(binaryExpr.leftExpr), std::move(caseBody), std::move(wildBody), refExpr, someTy);
     if (desugarExpr != nullptr) {
-        desugarExpr->ty = binaryExpr.ty;
+        desugarExpr->SetTy(binaryExpr.GetTy());
         binaryExpr.desugarExpr = std::move(desugarExpr);
         AddCurFile(*binaryExpr.desugarExpr, binaryExpr.curFile);
     }

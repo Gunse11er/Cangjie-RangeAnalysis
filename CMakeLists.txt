@@ -30,12 +30,6 @@ if(CMAKE_BUILD_TYPE AND NOT ("${uppercase_CMAKE_BUILD_TYPE}" MATCHES "^(DEBUG|RE
     message(FATAL_ERROR "Invalid value for CMAKE_BUILD_TYPE: ${CMAKE_BUILD_TYPE}")
 endif()
 
-if(CMAKE_BUILD_TYPE
-   AND ("${uppercase_CMAKE_BUILD_TYPE}" MATCHES "^(RELEASE)$")
-   AND NOT CMAKE_ENABLE_ASSERT)
-    add_compile_definitions(CANGJIE_CHIR_WFC_OFF)
-endif()
-
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Because stdlib is currently compiled very slowly, add this to avoid recompiling stdlib when install.
 set(CMAKE_SKIP_INSTALL_ALL_DEPENDENCY TRUE)
@@ -219,6 +213,7 @@ endif()
 
 if(MINGW)
     set(TRIPLE x86_64-w64-mingw32)
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-Wa,-mbig-obj>)
 endif()
 
 if(NOT TARGET_TRIPLE_DIRECTORY_PREFIX)
@@ -251,6 +246,10 @@ if(MACOS)
     set(CANGJIE_DISABLE_STACK_GROW_FEATURE ON)
 endif()
 
+if(ANDROID AND NOT (CMAKE_SYSTEM_PROCESSOR MATCHES "^arm"))
+    add_link_options("-Wl,-z,max-page-size=16384")
+endif()
+
 if(CANGJIE_INCLUDE)
     foreach(include_path ${CANGJIE_INCLUDE})
         include_directories(${include_path})
@@ -264,7 +263,6 @@ endif()
 if(CMAKE_BUILD_TYPE MATCHES Release)
     add_definitions(-DRELEASE)
 endif()
-
 # BUILD_GCC_TOOLCHAIN specifies toolchain for cjc, stdlib and BE at the same time, which means
 # that it is used for both targets for HOST (e.g. cjc, llc) and targets for TARGET
 # (e.g. stdlib, runtime). In the case that we need to build a cjc for a host which is not a target,
@@ -318,12 +316,13 @@ if(CANGJIE_CODEGEN_CJNATIVE_BACKEND AND CANGJIE_BUILD_CJC)
     set(CANGJIE_DEMANGLER_CMAKE_ARGS
         -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
         -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+        -DCANGJIE_TARGET_TOOLCHAIN=${CANGJIE_TARGET_TOOLCHAIN}
         -DCMAKE_SYSROOT=${CMAKE_SYSROOT}
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON
         -DBUILD_GCC_TOOLCHAIN=${BUILD_GCC_TOOLCHAIN}
         -DCMAKE_INSTALL_PREFIX=${CMAKE_BINARY_DIR}/cangjie-demangler
         -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
         -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE})
-
     set(CANGJIE_DEMANGLER_CONFIGURE_COMMAND
         ${CMAKE_COMMAND} <SOURCE_DIR> -G${CMAKE_GENERATOR} ${CANGJIE_DEMANGLER_CMAKE_ARGS})
     ExternalProject_Add(
@@ -346,10 +345,18 @@ if(CANGJIE_CODEGEN_CJNATIVE_BACKEND)
                 runtime/lib/${TARGET_TRIPLE_DIRECTORY_PREFIX}_${CJNATIVE_BACKEND}${SANITIZER_SUBPATH} # LIBRARY includes shared libraries except DLLs.
     )
     install(TARGETS boundscheck-static DESTINATION lib/${TARGET_TRIPLE_DIRECTORY_PREFIX}_${CJNATIVE_BACKEND}${SANITIZER_SUBPATH})
+    set(LIB_FOLDER_NAME lib)
+    if(WIN32)
+        set(LIB_FOLDER_NAME bin)
+    endif()
+    install(
+        FILES ${CMAKE_BINARY_DIR}/${LIB_FOLDER_NAME}/libboundscheck${CMAKE_SHARED_LIBRARY_SUFFIX}
+        DESTINATION runtime/lib/${TARGET_TRIPLE_DIRECTORY_PREFIX}_${CJNATIVE_BACKEND}${SANITIZER_SUBPATH}
+        RENAME libsecurec${CMAKE_SHARED_LIBRARY_SUFFIX}
+    )
     if(WIN32 AND CANGJIE_BUILD_CJDB)
         install(TARGETS boundscheck RUNTIME DESTINATION third_party/llvm/bin)
     endif()
-    install(FILES include/cangjie/MetaTransformation/MetaTransform.h DESTINATION include/)
 endif()
 
 add_subdirectory(third_party)

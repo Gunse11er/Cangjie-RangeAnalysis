@@ -11,14 +11,13 @@
 
 namespace Cangjie {
 namespace CHIR {
-class Func;
-class ImportedFunc;
+class Function;
 } // namespace CHIR
 
 namespace CodeGen {
 class CGModule;
-void EmitFunctionIR(CGModule& cgMod, const std::vector<CHIR::Func*>& chirFuncs);
-void EmitImportedCFuncIR(CGModule& cgMod, const std::vector<CHIR::ImportedFunc*>& importedCFuncs);
+void EmitFunctionIR(CGModule& cgMod, const std::vector<CHIR::Function*>& chirFuncs);
+void EmitImportedCFuncIR(CGModule& cgMod, const std::vector<CHIR::Function*>& importedCFuncs);
 } // namespace CodeGen
 } // namespace Cangjie
 

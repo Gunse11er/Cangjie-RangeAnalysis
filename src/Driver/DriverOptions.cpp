@@ -333,6 +333,7 @@ bool DriverOptions::CheckStaticOption()
         DiagnosticEngine diag;
         diag.DiagnoseRefactor(DiagKindRefactor::driver_warning_no_support_static, DEFAULT_POSITION, tripleString);
     }
+    
     return true;
 }
 

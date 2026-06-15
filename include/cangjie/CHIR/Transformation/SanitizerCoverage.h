@@ -8,7 +8,7 @@
 #define CANGJIE_CHIR_TRANSFORMATION_SANITIZER_COVERAGE_H
 
 #include "cangjie/CHIR/IR/CHIRBuilder.h"
-#include "cangjie/CHIR/Utils/DiagAdapter.h"
+#include "cangjie/Basic/DiagnosticEngine.h"
 #include "cangjie/CHIR/IR/Expression/Terminator.h"
 #include "cangjie/CHIR/IR/Package.h"
 #include "cangjie/CHIR/IR/Value/Value.h"
@@ -34,11 +34,11 @@ public:
      * @param isDebug flag whether print debug log.
      * @return flag whether error happens in package.
      */
-    bool RunOnPackage(const Ptr<const Package>& package, DiagAdapter& diag, bool isDebug);
+    bool RunOnPackage(const Ptr<const Package>& package, DiagnosticEngine& diag, bool isDebug);
 
 private:
-    void RunOnFunc(const Ptr<Func>& func, bool isDebug);
-    bool CheckSancovOption(DiagAdapter& diag) const;
+    void RunOnFunc(const Ptr<Function>& func, bool isDebug);
+    bool CheckSancovOption(DiagnosticEngine& diag) const;
 
     // entry for different sanitizer coverage option
     void InjectTraceForCmp(BinaryExpression& binary, bool isDebug);
@@ -70,16 +70,16 @@ private:
     // create imported function or global var
     GlobalVar* GenerateGlobalVar(const std::string& globalVarName, const DebugLocation& loc, Type& globalType);
     GlobalVar* GetGlobalVar(const std::string& globalVarName);
-    ImportedValue* GenerateForeignFunc(
-        const std::string& globalFuncName, const DebugLocation& loc, Type& funcType, const std::string& packName = "");
-    ImportedValue* GetImportedFunc(const std::string& mangledName);
-    Func* CreateInitFunc(const std::string& name, FuncType& funcType, const DebugLocation& loc);
+    Function* GenerateForeignFunc(const std::string& globalFuncName,
+        const DebugLocation& loc, FuncType& funcType, const std::string& packName = "");
+    Function* GetImportedFunc(const std::string& mangledName);
+    Function* CreateInitFunc(const std::string& name, FuncType& funcType, const DebugLocation& loc);
 
     // create init func
-    void GenerateInitFunc(const Func& globalInitFunc, bool isDebug);
-    void CreateTopLevelInitFunc(const std::vector<Func*>& initFuncs, const Func& globalInitFunc);
-    Func* CreateArrayInitFunc(const std::string& initItemName, Type& initType);
-    Func* CreatePCTableInitFunc();
+    void GenerateInitFunc(const Function& globalInitFunc, bool isDebug);
+    void CreateTopLevelInitFunc(const std::vector<Function*>& initFuncs, const Function& globalInitFunc);
+    Function* CreateArrayInitFunc(const std::string& initItemName, Type& initType);
+    Function* CreatePCTableInitFunc();
     Intrinsic* CreateRawDataAcquire(Type& type, const std::vector<Value*>& list, Value& size, Block& block);
 
     void InitFuncBag(const Package& package);
@@ -89,7 +89,7 @@ private:
     // a list for pc table array
     std::vector<std::pair<std::string, DebugLocation>> pcArray;
     // function Bag imported from package for fuzz
-    std::unordered_map<std::string, ImportedValue*> funcBag;
+    std::unordered_map<std::string, Function*> funcBag;
     // global var Bag imported needed by fuzz
     std::unordered_map<std::string, GlobalVar*> globalVarBag;
     // bb counter overall package

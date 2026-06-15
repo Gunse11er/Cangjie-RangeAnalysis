@@ -98,23 +98,139 @@ void ClearLineInfoAfterSema(Package& pkg)
         Walker(decl, clearGenericInst).Walk();
     }
 }
+
+void IterateTyWithArgs(Ptr<Ty> ty, const std::function<void(Ptr<Ty>)>& func)
+{
+    if (!Ty::IsTyCorrect(ty)) {
+        return;
+    }
+    func(ty);
+    for (auto& tyArg : ty->typeArgs) {
+        IterateTyWithArgs(tyArg, func);
+    }
+}
 } // namespace
+
+VisitAction TypeChecker::TypeCheckerImpl::MarkUsedDecl(Ptr<Decl> decl, unsigned walkerId)
+{
+    // Used generic instantiated declarations and it's original generic declaration should be marked as used.
+    if (decl->TestAttr(Attribute::GENERIC_INSTANTIATED) && decl->genericDecl &&
+        decl->genericDecl->TestAttr(Attribute::IMPORTED)) {
+        MarkUsedNode(decl->genericDecl, walkerId);
+    }
+    // Imported declarations should be marked as used.
+    if (!decl->TestAttr(Attribute::IMPORTED)) {
+        return VisitAction::WALK_CHILDREN;
+    }
+    // Already marked declarations should be skipped to avoid infinite loop.
+    if (decl->isUsedImports) {
+        return VisitAction::SKIP_CHILDREN;
+    }
+    decl->isUsedImports = true;
+    // Property declarations of function declarations should be marked as used.
+    if (auto fd = DynamicCast<FuncDecl>(decl); fd && fd->propDecl) {
+        fd->propDecl->isUsedImports = true;
+    }
+    // If a member is used, then it's enclosing type should be marked as used.
+    if (decl->outerDecl) {
+        MarkUsedNode(decl->outerDecl, walkerId);
+    }
+    if (!decl->IsNominalDecl()) {
+        return VisitAction::WALK_CHILDREN;
+    }
+    // Extends of nominal types should be marked as used.
+    auto extends = typeManager.GetAllExtendsByTy(*decl->GetTy());
+    for (auto extend : extends) {
+        if (extend == decl || !extend->TestAttr(Attribute::IMPORTED)) {
+            continue;
+        }
+        MarkUsedNode(extend, walkerId);
+    }
+    return VisitAction::WALK_CHILDREN;
+}
+
+void TypeChecker::TypeCheckerImpl::MarkUsedNode(Ptr<Node> node, unsigned walkerId)
+{
+    std::function<VisitAction(Ptr<Node>)> collectUsed = [this, &walkerId, &collectUsed](Ptr<Node> node) -> VisitAction {
+        auto procTy = [&walkerId, &collectUsed](Ptr<Ty> ty) {
+            if (auto decl = Ty::GetDeclOfTy(ty)) {
+                Walker(decl, walkerId, collectUsed).Walk();
+            }
+        };
+        IterateTyWithArgs(node->GetTy(), procTy);
+        if (auto type = DynamicCast<Type>(node); type && !Ty::IsInitialTy(type->aliasTy)) {
+            IterateTyWithArgs(type->aliasTy, procTy);
+        } else if (auto decl = DynamicCast<Decl>(node)) {
+            return MarkUsedDecl(decl, walkerId);
+        } else if (auto ae = DynamicCast<ArrayExpr>(node); ae && ae->initFunc) {
+            Walker(ae->initFunc, walkerId, collectUsed).Walk();
+        }
+        Ptr<Decl> target = node->GetTarget();
+        if (auto ce = DynamicCast<CallExpr>(node); ce && ce->resolvedFunction) {
+            target = ce->resolvedFunction;
+        }
+        if (!target) {
+            return VisitAction::WALK_CHILDREN;
+        }
+        Walker(target, walkerId, collectUsed).Walk();
+        return VisitAction::WALK_CHILDREN;
+    };
+    Walker(node, walkerId, collectUsed).Walk();
+}
+/*
+ * Mark used declarations of imported package.
+ * 1. Uesd global variables.
+ * 2. Uesd global functions.
+ * 3. Uesd custom type and all members.
+ * 4. Uesd custom type's extends and all members.
+ * 5. Built-in type's extends and all members.
+ * 6. Uesd type alias decl and it's target.
+ *
+ * All imported declarations without 'Attribute::USED_IMPORTS' will be ignored on mangling and chir.
+ */
+void TypeChecker::TypeCheckerImpl::MarkUsedPackageInFile(Ptr<Package> pkg)
+{
+    const std::unordered_set<std::string_view> implicitUsedDecls = {"CJ_CORE_ExecAtexitCallbacks", "getCommandLineArgs",
+        "eprintln", "handleException", "NegativeArraySizeException", "createOverflowExceptionMsg",
+        "createArithmeticExceptionMsg", "SpawnException"};
+    unsigned walkerId = Walker::GetNextWalkerID();
+    // Step 1: Mark implicit used declarations.
+    for (auto implicitUsedDecl : implicitUsedDecls) {
+        auto decl = importManager.GetCoreDecl(std::string(implicitUsedDecl));
+        MarkUsedNode(decl, walkerId);
+    }
+    // Step 2: Mark used extend of builtin types.
+    for (auto& [_, builtinExtends] : typeManager.builtinTyToExtendMap) {
+        for (auto& extend : builtinExtends) {
+            MarkUsedNode(extend, walkerId);
+        }
+    }
+    // Step 3: Mark used declarations in files.
+    for (auto& file : pkg->files) {
+        MarkUsedNode(file.get(), walkerId);
+    }
+    // Step 4: Mark used declarations of generic instantiated declarations and it's dependencies.
+    for (auto& instDecl : pkg->genericInstantiatedDecls) {
+        MarkUsedNode(instDecl.get(), walkerId);
+    }
+    // Delete unused imported declarations.
+    auto isUnusedDecls = [](Ptr<Decl> decl) { return !decl->isUsedImports; };
+    Utils::EraseIf(pkg->srcImportedNonGenericDecls, isUnusedDecls);
+    Utils::EraseIf(pkg->inlineFuncDecls, isUnusedDecls);
+}
 
 void TypeChecker::TypeCheckerImpl::PerformDesugarAfterInstantiation([[maybe_unused]] ASTContext& ctx, Package& pkg)
 {
     if (pkg.files.empty()) {
         return;
     }
-#ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
-    if (!ci->invocation.globalOptions.disableReflection) {
-        PerformToAnyInsertion(pkg);
-    }
-#endif
     PerformRecursiveTypesElimination();
     UpdateDeclAttributes(pkg, ci->invocation.globalOptions.exportForTest);
     if (ci->invocation.globalOptions.enableCoverage) {
         ClearLineInfoAfterSema(pkg);
     }
+    Utils::ProfileRecorder markUnusedRecord("PerformDesugarAfterInstantiation", "MarkUsedPackageInFile");
+    MarkUsedPackageInFile(&pkg);
 }
 
 bool AutoBoxing::NeedBoxOption(Ty& child, Ty& target)
@@ -141,7 +257,7 @@ bool AutoBoxing::NeedBoxOption(Ty& child, Ty& target)
 // Option Box happens twice before and after instantiation, and must before extend box.
 void AutoBoxing::TryOptionBox(EnumTy& target, Expr& expr)
 {
-    if (expr.ty && target.typeArgs[0] && NeedBoxOption(*expr.ty, *target.typeArgs[0])) {
+    if (expr.GetTy() && target.typeArgs[0] && NeedBoxOption(*expr.GetTy(), *target.typeArgs[0])) {
         TryOptionBox(*StaticCast<EnumTy*>(target.typeArgs[0]), expr);
     }
     auto ed = target.decl;
@@ -159,7 +275,7 @@ void AutoBoxing::TryOptionBox(EnumTy& target, Expr& expr)
     auto baseFunc = CreateRefExpr(OPTION_VALUE_CTOR);
     baseFunc->EnableAttr(Attribute::IMPLICIT_ADD);
     baseFunc->ref.target = optionDecl;
-    baseFunc->ty = typeManager.GetInstantiatedTy(optionDecl->ty, GenerateTypeMapping(*ed, target.typeArgs));
+    baseFunc->SetTy(typeManager.GetInstantiatedTy(optionDecl->GetTy(), GenerateTypeMapping(*ed, target.typeArgs)));
 
     std::vector<OwnedPtr<FuncArg>> arg;
     if (expr.desugarExpr) {
@@ -170,19 +286,19 @@ void AutoBoxing::TryOptionBox(EnumTy& target, Expr& expr)
 
     auto ce = CreateCallExpr(std::move(baseFunc), std::move(arg));
     ce->callKind = AST::CallKind::CALL_DECLARED_FUNCTION;
-    ce->ty = &target;
+    ce->SetTy(&target);
     ce->resolvedFunction = optionDecl;
     if (expr.astKind == ASTKind::BLOCK) {
         // For correct deserialization, we need to keep type of block.
         auto b = MakeOwnedNode<Block>();
-        b->ty = ce->ty;
+        b->SetTy(ce->GetTy());
         b->body.emplace_back(std::move(ce));
         expr.desugarExpr = std::move(b);
     } else {
         expr.desugarExpr = std::move(ce);
     }
     AddCurFile(*expr.desugarExpr, expr.curFile);
-    expr.ty = expr.desugarExpr->ty;
+    expr.SetTy(expr.desugarExpr->GetTy());
 }
 
 /**
@@ -210,13 +326,13 @@ void AutoBoxing::AddOptionBox(Package& pkg)
 
 VisitAction AutoBoxing::AddOptionBoxHandleTupleList(const TupleLit& tl)
 { // Tuple literal allows element been boxed.
-    auto tupleTy = DynamicCast<TupleTy*>(tl.ty);
+    auto tupleTy = DynamicCast<TupleTy*>(tl.GetTy());
     if (tupleTy == nullptr) {
         return VisitAction::WALK_CHILDREN;
     }
     auto typeArgs = tupleTy->typeArgs;
     for (size_t i = 0; i < typeArgs.size(); ++i) {
-        if (tl.children[i]->ty && typeArgs[i] && NeedBoxOption(*tl.children[i]->ty, *typeArgs[i])) {
+        if (tl.children[i]->GetTy() && typeArgs[i] && NeedBoxOption(*tl.children[i]->GetTy(), *typeArgs[i])) {
             TryOptionBox(*StaticCast<EnumTy*>(typeArgs[i]), *tl.children[i]);
         }
     }
@@ -226,27 +342,27 @@ VisitAction AutoBoxing::AddOptionBoxHandleTupleList(const TupleLit& tl)
 VisitAction AutoBoxing::AddOptionBoxHandleMatchExpr(MatchExpr& me)
 {
     for (auto& single : me.matchCases) {
-        CJC_ASSERT(me.ty && single->exprOrDecls);
-        AddOptionBoxHandleBlock(*single->exprOrDecls, *me.ty);
+        CJC_ASSERT(me.GetTy() && single->exprOrDecls);
+        AddOptionBoxHandleBlock(*single->exprOrDecls, *me.GetTy());
     }
     for (auto& caseOther : me.matchCaseOthers) {
-        CJC_ASSERT(me.ty && caseOther->exprOrDecls);
-        AddOptionBoxHandleBlock(*caseOther->exprOrDecls, *me.ty);
+        CJC_ASSERT(me.GetTy() && caseOther->exprOrDecls);
+        AddOptionBoxHandleBlock(*caseOther->exprOrDecls, *me.GetTy());
     }
     return VisitAction::WALK_CHILDREN;
 }
 
 VisitAction AutoBoxing::AddOptionBoxHandleArrayLit(ArrayLit& lit)
 {
-    if (Ty::IsInitialTy(lit.ty) || !lit.ty->IsStructArray()) {
+    if (Ty::IsInitialTy(lit.GetTy()) || !lit.GetTy()->IsStructArray()) {
         return VisitAction::WALK_CHILDREN;
     }
 
-    if (lit.ty->typeArgs.size() == 1) {
-        auto targetTy = lit.ty->typeArgs[0];
+    if (lit.GetTy()->typeArgs.size() == 1) {
+        auto targetTy = lit.GetTy()->typeArgs[0];
         CJC_NULLPTR_CHECK(targetTy);
         for (auto& child : lit.children) {
-            if (child->ty && NeedBoxOption(*child->ty, *targetTy)) {
+            if (child->GetTy() && NeedBoxOption(*child->GetTy(), *targetTy)) {
                 TryOptionBox(*StaticCast<EnumTy*>(targetTy), *child);
             }
         }
@@ -256,17 +372,17 @@ VisitAction AutoBoxing::AddOptionBoxHandleArrayLit(ArrayLit& lit)
 
 VisitAction AutoBoxing::AddOptionBoxHandleIfExpr(const IfExpr& ie)
 {
-    if (!Ty::IsTyCorrect(ie.ty) || ie.ty->IsUnitOrNothing() || !ie.thenBody) {
+    if (!Ty::IsTyCorrect(ie.GetTy()) || ie.GetTy()->IsUnitOrNothing() || !ie.thenBody) {
         return VisitAction::WALK_CHILDREN;
     }
-    AddOptionBoxHandleBlock(*ie.thenBody, *ie.ty);
+    AddOptionBoxHandleBlock(*ie.thenBody, *ie.GetTy());
     if (ie.hasElse && ie.elseBody) {
         if (auto block = DynamicCast<Block*>(ie.elseBody.get()); block) {
-            AddOptionBoxHandleBlock(*block, *ie.ty);
+            AddOptionBoxHandleBlock(*block, *ie.GetTy());
         } else if (auto elseIfExpr = DynamicCast<IfExpr*>(ie.elseBody.get());
-            elseIfExpr && Ty::IsTyCorrect(elseIfExpr->ty) && NeedBoxOption(*elseIfExpr->ty, *ie.ty)) {
-            TryOptionBox(*StaticCast<EnumTy*>(ie.ty), *elseIfExpr);
-            elseIfExpr->ty = ie.ty;
+            elseIfExpr && Ty::IsTyCorrect(elseIfExpr->GetTy()) && NeedBoxOption(*elseIfExpr->GetTy(), *ie.GetTy())) {
+            TryOptionBox(*StaticCast<EnumTy*>(ie.GetTy()), *elseIfExpr);
+            elseIfExpr->SetTy(ie.GetTy());
         }
     }
     return VisitAction::WALK_CHILDREN;
@@ -279,7 +395,7 @@ void AutoBoxing::AddOptionBoxHandleBlock(Block& block, Ty& ty)
     auto lastExprOrDecl = block.GetLastExprOrDecl();
     Ptr<Ty> lastTy = TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT);
     if (auto expr = DynamicCast<Expr*>(lastExprOrDecl)) {
-        lastTy = expr->ty;
+        lastTy = expr->GetTy();
     }
     if (!lastTy || !NeedBoxOption(*lastTy, ty)) {
         return;
@@ -294,31 +410,31 @@ void AutoBoxing::AddOptionBoxHandleBlock(Block& block, Ty& ty)
 
     if (auto lastExpr = DynamicCast<Expr*>(lastExprOrDecl)) {
         TryOptionBox(StaticCast<EnumTy&>(ty), *lastExpr);
-        block.ty = lastExpr->ty;
+        block.SetTy(lastExpr->GetTy());
     }
 }
 
 VisitAction AutoBoxing::AddOptionBoxHandleTryExpr(TryExpr& te)
 {
-    if (!Ty::IsTyCorrect(te.ty)) {
+    if (!Ty::IsTyCorrect(te.GetTy())) {
         return VisitAction::WALK_CHILDREN;
     }
     if (te.tryBlock) {
-        AddOptionBoxHandleBlock(*te.tryBlock, *te.ty);
+        AddOptionBoxHandleBlock(*te.tryBlock, *te.GetTy());
     }
     for (auto& ce : te.catchBlocks) {
-        AddOptionBoxHandleBlock(*ce, *te.ty);
+        AddOptionBoxHandleBlock(*ce, *te.GetTy());
     }
     return VisitAction::WALK_CHILDREN;
 }
 
 VisitAction AutoBoxing::AddOptionBoxHandleArrayExpr(ArrayExpr& ae)
 {
-    bool ignore = !Ty::IsTyCorrect(ae.ty) || ae.initFunc || ae.args.size() < 1;
+    bool ignore = !Ty::IsTyCorrect(ae.GetTy()) || ae.initFunc || ae.args.size() < 1;
     if (ignore) {
         return VisitAction::WALK_CHILDREN;
     }
-    auto targetTy = typeManager.GetTypeArgs(*ae.ty)[0];
+    auto targetTy = typeManager.GetTypeArgs(*ae.GetTy())[0];
 
     Ptr<FuncArg> arg = nullptr;
     if (ae.isValueArray) {
@@ -328,20 +444,20 @@ VisitAction AutoBoxing::AddOptionBoxHandleArrayExpr(ArrayExpr& ae)
         // For RawArray(size, item:T) boxing argIndex is 1, only this case may need option box.
         arg = ae.args[1].get();
     }
-    if (arg && arg->expr && arg->expr->ty && targetTy && NeedBoxOption(*arg->expr->ty, *targetTy)) {
+    if (arg && arg->expr && arg->expr->GetTy() && targetTy && NeedBoxOption(*arg->expr->GetTy(), *targetTy)) {
         TryOptionBox(*StaticCast<EnumTy*>(targetTy), *arg->expr);
-        arg->ty = arg->expr->ty;
+        arg->SetTy(arg->expr->GetTy());
     }
     return VisitAction::WALK_CHILDREN;
 }
 
 VisitAction AutoBoxing::AddOptionBoxHandleCallExpr(CallExpr& ce)
 {
-    bool ignored = !ce.baseFunc || !ce.baseFunc->ty || ce.baseFunc->ty->kind != TypeKind::TYPE_FUNC;
+    bool ignored = !ce.baseFunc || !ce.baseFunc->GetTy() || ce.baseFunc->TyKind() != TypeKind::TYPE_FUNC;
     if (ignored) {
         return VisitAction::WALK_CHILDREN;
     }
-    auto funcTy = RawStaticCast<FuncTy*>(ce.baseFunc->ty);
+    auto funcTy = RawStaticCast<FuncTy*>(ce.baseFunc->GetTy());
     unsigned count = 0;
     auto callCheck = [&count, &funcTy, this](auto begin, auto end) {
         for (auto it = begin; it != end; ++it) {
@@ -350,9 +466,9 @@ VisitAction AutoBoxing::AddOptionBoxHandleCallExpr(CallExpr& ce)
             }
             auto paramTy = funcTy->paramTys[count];
             // It's possible that childs have different box type, so does not break after match.
-            if ((*it)->expr && (*it)->expr->ty && paramTy && NeedBoxOption(*(*it)->expr->ty, *paramTy)) {
+            if ((*it)->expr && (*it)->expr->GetTy() && paramTy && NeedBoxOption(*(*it)->expr->GetTy(), *paramTy)) {
                 TryOptionBox(*StaticCast<EnumTy*>(paramTy), *(*it)->expr);
-                (*it)->ty = (*it)->expr->ty;
+                (*it)->SetTy((*it)->expr->GetTy());
             }
             ++count;
         }
@@ -370,25 +486,27 @@ VisitAction AutoBoxing::AddOptionBoxHandleAssignExpr(const AssignExpr& ae)
     if (ae.desugarExpr) {
         return VisitAction::WALK_CHILDREN;
     }
-    if (ae.rightExpr->ty && ae.leftValue->ty && NeedBoxOption(*ae.rightExpr->ty, *ae.leftValue->ty)) {
-        TryOptionBox(*StaticCast<EnumTy*>(ae.leftValue->ty), *ae.rightExpr);
+    if (ae.rightExpr->GetTy() && ae.leftValue->GetTy() &&
+        NeedBoxOption(*ae.rightExpr->GetTy(), *ae.leftValue->GetTy())) {
+        TryOptionBox(*StaticCast<EnumTy*>(ae.leftValue->GetTy()), *ae.rightExpr);
     }
     return VisitAction::WALK_CHILDREN;
 }
 
 VisitAction AutoBoxing::AddOptionBoxHandleVarDecl(const VarDecl& vd)
 {
-    if (vd.initializer && vd.initializer->ty && vd.ty && NeedBoxOption(*vd.initializer->ty, *vd.ty)) {
-        TryOptionBox(*StaticCast<EnumTy*>(vd.ty), *vd.initializer);
+    if (vd.initializer && vd.initializer->GetTy() && vd.GetTy() &&
+        NeedBoxOption(*vd.initializer->GetTy(), *vd.GetTy())) {
+        TryOptionBox(*StaticCast<EnumTy*>(vd.GetTy()), *vd.initializer);
     }
     return VisitAction::WALK_CHILDREN;
 }
 
 VisitAction AutoBoxing::AddOptionBoxHandleReturnExpr(const ReturnExpr& re)
 {
-    if (re.expr && re.refFuncBody && re.refFuncBody->ty && re.refFuncBody->ty->kind == TypeKind::TYPE_FUNC) {
-        auto funcTy = RawStaticCast<FuncTy*>(re.refFuncBody->ty);
-        if (re.expr->ty && funcTy->retTy && NeedBoxOption(*re.expr->ty, *funcTy->retTy)) {
+    if (re.expr && re.refFuncBody && re.refFuncBody->GetTy() && re.refFuncBody->TyKind() == TypeKind::TYPE_FUNC) {
+        auto funcTy = RawStaticCast<FuncTy*>(re.refFuncBody->GetTy());
+        if (re.expr->GetTy() && funcTy->retTy && NeedBoxOption(*re.expr->GetTy(), *funcTy->retTy)) {
             auto expr = re.desugarExpr ? re.desugarExpr.get() : re.expr.get();
             TryOptionBox(*StaticCast<EnumTy*>(funcTy->retTy), *expr);
         }

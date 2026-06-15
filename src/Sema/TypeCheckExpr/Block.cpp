@@ -12,7 +12,7 @@
 using namespace Cangjie;
 using namespace Sema;
 
-bool TypeChecker::TypeCheckerImpl::SynthesizeAndReplaceIdealTy(ASTContext& ctx, Node& node)
+bool TypeChecker::TypeCheckerImpl::SynthesizeAndReplaceIdealTy(const CheckerContext& ctx, Node& node)
 {
     // Call `Synthesize` on declares containing invalid types may return valid types.
     // Therefore, we need to know if there are any errors during the inference process.
@@ -22,39 +22,41 @@ bool TypeChecker::TypeCheckerImpl::SynthesizeAndReplaceIdealTy(ASTContext& ctx, 
     return valid;
 }
 
-Ptr<Ty> TypeChecker::TypeCheckerImpl::SynBlock(ASTContext& ctx, Block& b)
+Ptr<Ty> TypeChecker::TypeCheckerImpl::SynBlock(const CheckerContext& ctx, Block& b)
 {
     if (b.body.empty()) {
-        b.ty = TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT);
+        b.SetTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT));
     } else {
         bool existInvalid = false;
-        for (auto& node : b.body) {
-            existInvalid = !SynthesizeAndReplaceIdealTy(ctx, *node) || existInvalid;
+        for (size_t i = 0; i < b.body.size(); i++) {
+            auto& node = b.body[i];
+            auto exprPos = i == b.body.size() - 1 && ctx.SynthPos() != SynPos::UNUSED ? SynPos::IMPLICIT_RETURN : SynPos::UNUSED;
+            existInvalid = !SynthesizeAndReplaceIdealTy(ctx.With(exprPos), *node) || existInvalid;
         }
         Ptr<Node> lastNode = b.body[b.body.size() - 1].get();
         CJC_ASSERT(lastNode != nullptr);
         if (existInvalid) {
-            b.ty = TypeManager::GetInvalidTy();
+            b.SetTy(TypeManager::GetInvalidTy());
         } else if (lastNode->IsDecl()) {
-            b.ty = TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT);
+            b.SetTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT));
         } else {
-            b.ty = lastNode->ty;
+            b.SetTy(lastNode->GetTy());
         }
     }
-    return b.ty;
+    return b.GetTy();
 }
 
 bool TypeChecker::TypeCheckerImpl::ChkBlock(ASTContext& ctx, Ty& target, Block& b)
 {
     Ptr<Ty> unitTy = TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT);
     if (b.body.empty()) {
-        b.ty = unitTy;
+        b.SetTy(unitTy);
         // NOTE: This function may return false, the caller should handle diagnostics.
         // Only unsafe block is allowed to exist on its own, and needs to diagnose here.
-        auto ret = typeManager.IsSubtype(b.ty, &target);
+        auto ret = typeManager.IsSubtype(b.GetTy(), &target);
         if (!ret && b.TestAttr(Attribute::UNSAFE)) {
             auto builder = diag.DiagnoseRefactor(DiagKindRefactor::sema_mismatched_types, b);
-            builder.AddMainHintArguments(target.String(), b.ty->String());
+            builder.AddMainHintArguments(target.String(), b.GetTy()->String());
         }
         return ret;
     }
@@ -62,7 +64,7 @@ bool TypeChecker::TypeCheckerImpl::ChkBlock(ASTContext& ctx, Ty& target, Block& 
     bool isWellTyped = true;
     for (size_t i = 0; i < b.body.size() - 1; i++) {
         CJC_ASSERT(b.body[i]);
-        isWellTyped = SynthesizeAndReplaceIdealTy(ctx, *b.body[i]) && isWellTyped;
+        isWellTyped = SynthesizeAndReplaceIdealTy({ctx, SynPos::UNUSED}, *b.body[i]) && isWellTyped;
     }
     Ptr<Node> lastNode = b.body[b.body.size() - 1].get();
     CJC_ASSERT(lastNode != nullptr);
@@ -73,12 +75,12 @@ bool TypeChecker::TypeCheckerImpl::ChkBlock(ASTContext& ctx, Ty& target, Block& 
     }
     if (lastNode->IsDecl()) {
         bool typeMatched = typeManager.IsSubtype(unitTy, &target);
-        isWellTyped = SynthesizeAndReplaceIdealTy(ctx, *lastNode) && typeMatched && isWellTyped;
+        isWellTyped = SynthesizeAndReplaceIdealTy({ctx, SynPos::IMPLICIT_RETURN}, *lastNode) && typeMatched && isWellTyped;
         if (isWellTyped) {
-            b.ty = unitTy;
+            b.SetTy(unitTy);
             return true;
         } else {
-            b.ty = TypeManager::GetInvalidTy();
+            b.SetTy(TypeManager::GetInvalidTy());
             if (!typeMatched) {
                 DiagMismatchedTypesWithFoundTy(
                     diag, *lastNode, target, *unitTy, "definitions and declarations are always of type 'Unit'");
@@ -88,10 +90,10 @@ bool TypeChecker::TypeCheckerImpl::ChkBlock(ASTContext& ctx, Ty& target, Block& 
     } else {
         isWellTyped = Check(ctx, &target, lastNode) && isWellTyped;
         if (isWellTyped) {
-            b.ty = lastNode->ty;
+            b.SetTy(lastNode->GetTy());
             return true;
         }
-        b.ty = TypeManager::GetInvalidTy();
+        b.SetTy(TypeManager::GetInvalidTy());
         return false;
     }
 }

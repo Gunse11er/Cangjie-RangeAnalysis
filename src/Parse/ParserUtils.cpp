@@ -313,15 +313,6 @@ void ParserImpl::ParseZeroOrMoreSepTrailing(std::function<void(const Position&)>
     }
 }
 
-void ParserImpl::ParseZeroOrMoreWithSeparator(TokenKind separator,
-    const std::function<void(const Position)>& storeSeparator, const std::function<void()>& parseElement,
-    TokenKind terminator)
-{
-    if (!Seeing(terminator)) {
-        ParseOneOrMoreWithSeparator(separator, storeSeparator, parseElement);
-    }
-}
-
 bool ParserImpl::CanMatchBracketInStack()
 {
     TokenKind matchingBracket = LookupMatchingOpenBracket(lookahead.kind);

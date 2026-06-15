@@ -66,7 +66,7 @@ public:
      * @return result of analysis per function
      */
     template <typename... Args>
-    std::unique_ptr<Results<TDomain>> RunOnFunc(const Func* func, bool isDebug, Args&&... args)
+    std::unique_ptr<Results<TDomain>> RunOnFunc(const Function* func, bool isDebug, Args&&... args)
     {
         auto analysis = std::make_unique<TAnalysis>(func, builder, isDebug, std::forward<Args>(args)...);
         auto engine = Engine<TDomain>(func, std::move(analysis));
@@ -78,7 +78,7 @@ public:
      * @param func function to return analysis result
      * @return analysis result
      */
-    Results<TDomain>* CheckFuncResult(const Func* func)
+    Results<TDomain>* CheckFuncResult(const Function* func)
     {
         if (auto it = resultsMap.find(func); it != resultsMap.end()) {
             return it->second.get();
@@ -100,7 +100,7 @@ public:
      * @param func function to clear analysis result
      * @return whether clear is happened
      */
-    bool InvalidateAnalysisResult(const Func* func)
+    bool InvalidateAnalysisResult(const Function* func)
     {
         if (auto it = resultsMap.find(func); it != resultsMap.end()) {
             resultsMap.erase(it);
@@ -117,7 +117,7 @@ private:
         if constexpr (IsValueAnalysis<TAnalysis>::value) {
             SetUpGlobalVarState(*package, isDebug, std::forward<Args>(args)...);
         }
-        for (auto func : package->GetGlobalFuncs()) {
+        for (auto func : package->GetGlobalFuncsWithBody()) {
             if (ShouldBeAnalysed(*func)) {
                 if (auto res = RunOnFunc(func, isDebug, std::forward<Args>(args)...)) {
                     resultsMap.emplace(func, std::move(res));
@@ -135,7 +135,7 @@ private:
         Utils::TaskQueue taskQueue(threadNum);
         using ResTy = std::unique_ptr<Results<TDomain>>;
         std::vector<Cangjie::Utils::TaskResult<ResTy>> results;
-        for (auto func : package->GetGlobalFuncs()) {
+        for (auto func : package->GetGlobalFuncsWithBody()) {
             if (ShouldBeAnalysed(*func)) {
                 results.emplace_back(taskQueue.AddTask<ResTy>(
                     [func, isDebug, &args..., this]() { return RunOnFunc(func, isDebug, std::forward<Args>(args)...); },
@@ -153,7 +153,7 @@ private:
         }
     }
 
-    bool ShouldBeAnalysed(const Func& func)
+    bool ShouldBeAnalysed(const Function& func)
     {
         if constexpr (IsValueAnalysis<TAnalysis>::value) {
             if (resultsMap.find(&func) != resultsMap.end()) {
@@ -166,7 +166,7 @@ private:
     template <typename... Args> void SetUpGlobalVarState(const Package& package, bool isDebug, Args&&... args)
     {
         TAnalysis::InitialiseLetGVState(package, builder);
-        for (auto gv : package.GetGlobalVars()) {
+        for (auto gv : package.GetGlobalVarsWithInit()) {
             if (auto init = gv->GetInitFunc();
                 gv->TestAttr(Attribute::READONLY) && init && resultsMap.find(init) == resultsMap.end()) {
                 // Multiple global vars may be initialised in the same function.
@@ -176,7 +176,7 @@ private:
         }
     }
 
-    std::unordered_map<const Func*, std::unique_ptr<Results<TDomain>>> resultsMap;
+    std::unordered_map<const Function*, std::unique_ptr<Results<TDomain>>> resultsMap;
     CHIRBuilder& builder;
 };
 

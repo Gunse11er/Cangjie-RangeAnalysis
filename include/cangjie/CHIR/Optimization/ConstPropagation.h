@@ -44,7 +44,7 @@ public:
      * @param isDebug flag whether print debug log.
      * @param isCJLint flag whether CJLint is enabled.
      */
-    void RunOnFunc(const Ptr<const Func>& func, bool isDebug, bool isCJLint = false);
+    void RunOnFunc(const Ptr<const Function>& func, bool isDebug, bool isCJLint = false);
 
     /**
      * @brief Get effect map after this pass.
@@ -55,7 +55,7 @@ public:
      * @brief Get all funcs need to remove unreachable blocks.
      * @return functions
      */
-    const std::vector<const Func*>& GetFuncsNeedRemoveBlocks() const;
+    const std::vector<const Function*>& GetFuncsNeedRemoveBlocks() const;
 private:
     struct RewriteInfo {
         Expression* oldExpr;
@@ -69,7 +69,7 @@ private:
     };
 
     template <typename TConstDomain>
-    void VisitFunc(const Func& func, bool isDebug, bool isCJLint, Results<TConstDomain>& result);
+    void VisitFunc(const Function& func, bool isDebug, bool isCJLint, Results<TConstDomain>& result);
 
     // ==================== Rewrite Non-terminator Expressions ==================== //
 
@@ -134,14 +134,14 @@ private:
 
     // ==================== Rewrite Terminator Expressions ==================== //
 
-    void RecordEffectMap(const Expression* expr, const Func* func) const;
+    void RecordEffectMap(const Expression* expr, const Function* func) const;
 
 private:
     CHIRBuilder& builder;
     ConstAnalysisWrapper* analysisWrapper;
     const GlobalOptions& opts;
     static OptEffectCHIRMap effectMap;
-    std::vector<const Func*> funcsNeedRemoveBlocks;
+    std::vector<const Function*> funcsNeedRemoveBlocks;
 };
 
 } // namespace Cangjie::CHIR

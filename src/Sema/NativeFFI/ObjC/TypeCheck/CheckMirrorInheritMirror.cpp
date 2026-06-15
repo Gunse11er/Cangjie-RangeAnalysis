@@ -19,7 +19,7 @@ using namespace Cangjie::Interop::ObjC;
 
 void CheckMirrorInheritMirror::HandleImpl(TypeCheckContext& ctx)
 {
-    if (ctx.typeMapper.IsValidObjCMirror(*ctx.target.ty)) {
+    if (ctx.typeMapper.IsValidObjCMirror(*ctx.target.GetTy())) {
         return;
     }
 

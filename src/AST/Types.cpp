@@ -30,7 +30,7 @@ const std::unordered_map<TypeKind, std::string> TYPEKIND_TO_STRING_MAP{
 
 template <typename T1, typename T2> T1 GetGenericTy(T2 decl)
 {
-    return decl && decl->generic ? static_cast<T1>(decl->ty.get()) : nullptr;
+    return decl && decl->generic ? static_cast<T1>(decl->GetTy().get()) : nullptr;
 }
 
 template <typename TypeDeclT> size_t HashNominalTy(const TypeDeclT& ty)
@@ -647,8 +647,8 @@ bool Ty::IsExtendable() const
 {
     if (kind == TypeKind::TYPE) {
         auto typeAliasDecl = RawStaticCast<const TypeAliasTy*>(this)->declPtr;
-        return typeAliasDecl && typeAliasDecl->type && typeAliasDecl->type->ty &&
-            !typeAliasDecl->TestAttr(Attribute::IN_REFERENCE_CYCLE) && typeAliasDecl->type->ty->IsExtendable();
+        return typeAliasDecl && typeAliasDecl->type && typeAliasDecl->type->GetTy() &&
+            !typeAliasDecl->TestAttr(Attribute::IN_REFERENCE_CYCLE) && typeAliasDecl->type->GetTy()->IsExtendable();
     }
     return kind == TypeKind::TYPE_CLASS || kind == TypeKind::TYPE_ENUM || kind == TypeKind::TYPE_STRUCT || IsArray() ||
         IsPointer() || IsPrimitive() || IsCString();
@@ -693,8 +693,8 @@ Ptr<ClassTy> ClassTy::GetSuperClassTy() const
         return nullptr;
     }
     for (auto& types : decl->inheritedTypes) {
-        if (types && types->ty && types->ty->kind == TypeKind::TYPE_CLASS) {
-            return RawStaticCast<ClassTy*>(types->ty);
+        if (types && types->GetTy() && types->TyKind() == TypeKind::TYPE_CLASS) {
+            return RawStaticCast<ClassTy*>(types->GetTy());
         }
     }
     return nullptr;

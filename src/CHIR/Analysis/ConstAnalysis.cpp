@@ -196,8 +196,7 @@ template <> ConstPoolDomain::ChildrenMap ValueAnalysis<ConstValueDomain, ConstAc
 template <> ConstPoolDomain::AllocatedRefMap ValueAnalysis<ConstValueDomain, ConstActivePool>::globalAllocatedRefMap{};
 template <> ConstPoolDomain::AllocatedObjMap ValueAnalysis<ConstValueDomain, ConstActivePool>::globalAllocatedObjMap{};
 template <> std::vector<std::unique_ptr<Ref>> ValueAnalysis<ConstValueDomain, ConstActivePool>::globalRefPool{};
-template <>
-std::vector<std::unique_ptr<AbstractObject>> ValueAnalysis<ConstValueDomain, ConstActivePool>::globalAbsObjPool{};
+template <> std::vector<std::unique_ptr<AbstractObject>> ValueAnalysis<ConstValueDomain, ConstActivePool>::globalAbsObjPool{};
 template <>
 ConstPoolDomain ValueAnalysis<ConstValueDomain, ConstActivePool>::globalState{&globalChildrenMap,
     &globalAllocatedRefMap, nullptr, &globalAllocatedObjMap, &globalRefPool, &globalAbsObjPool};

@@ -19,7 +19,7 @@ using namespace Cangjie::Interop::ObjC;
 
 void CheckMirrorSubtypeAttr::HandleImpl(TypeCheckContext& ctx)
 {
-    auto& ty = *ctx.target.ty;
+    auto& ty = *ctx.target.GetTy();
     if (!ctx.typeMapper.IsValidObjCMirrorSubtype(ty)) {
         return;
     }

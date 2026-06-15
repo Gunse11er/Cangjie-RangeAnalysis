@@ -42,7 +42,7 @@ Ptr<Value> Translator::Visit(const AST::EnumDecl& decl)
     CreateAnnotationInfo<EnumDef>(decl, *enumDef, enumDef);
 
     // step 2: set type
-    auto chirType = StaticCast<EnumType*>(TranslateType(*decl.ty));
+    auto chirType = StaticCast<EnumType*>(TranslateType(*decl.GetTy()));
     enumDef->SetType(*chirType);
     enumDef->Set<LinkTypeInfo>(decl.TestAttr(AST::Attribute::GENERIC_INSTANTIATED) ? Linkage::INTERNAL : decl.linkage);
 
@@ -68,12 +68,12 @@ Ptr<Value> Translator::Visit(const AST::EnumDecl& decl)
             }
             case AST::ASTKind::FUNC_DECL: {
                 std::vector<Type*> paramTypes;
-                CJC_ASSERT(!ctor->ty->typeArgs.empty());
-                for (size_t i = 0; i < ctor->ty->typeArgs.size() - 1; i++) {
-                    if (ctor->ty->typeArgs[i] == decl.ty) {
+                CJC_ASSERT(!ctor->GetTy()->typeArgs.empty());
+                for (size_t i = 0; i < ctor->GetTy()->typeArgs.size() - 1; i++) {
+                    if (ctor->GetTy()->typeArgs[i] == decl.GetTy()) {
                         paramTypes.emplace_back(chirType);
                     } else {
-                        paramTypes.emplace_back(TranslateType(*ctor->ty->typeArgs[i]));
+                        paramTypes.emplace_back(TranslateType(*ctor->GetTy()->typeArgs[i]));
                     }
                 }
                 enumDef->AddCtor({
@@ -114,8 +114,5 @@ Ptr<Value> Translator::Visit(const AST::EnumDecl& decl)
         auto realType = StaticCast<ClassType*>(StaticCast<RefType*>(astType)->GetBaseType());
         enumDef->AddImplementedInterfaceTy(*realType);
     }
-
-    // step 6: collect annotation info of the type and members for annotation target check
-    CollectTypeAnnotation(decl, *def);
     return nullptr;
 }

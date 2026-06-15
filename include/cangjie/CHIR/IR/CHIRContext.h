@@ -197,33 +197,13 @@ public:
     size_t GetAllNodesNum() const
     {
         size_t num = 0;
-        for (auto& ele : allocatedExprs) {
-            (void)ele;
-            num++;
-        }
-        for (auto& ele : allocatedValues) {
-            (void)ele;
-            num++;
-        }
-        for (auto& ele : allocatedBlockGroups) {
-            (void)ele;
-            num++;
-        }
-        for (auto& ele : allocatedBlocks) {
-            (void)ele;
-            num++;
-        }
-        for (auto& ele : allocatedStructs) {
-            (void)ele;
-            num++;
-        }
-        for (auto& ele : allocatedClasses) {
-            (void)ele;
-            num++;
-        }
-        for (auto& ele : allocatedEnums) {
-            (void)ele;
-            num++;
+        num += allocatedValues.size();
+        num += allocatedStructs.size();
+        num += allocatedClasses.size();
+        num += allocatedEnums.size();
+        num += allocatedExtends.size();
+        for (auto& [bg, ptrs] : allocatedPtrInFuncOrLambda) {
+            num += ptrs.size() + 1;
         }
         return num;
     }
@@ -232,24 +212,9 @@ public:
         return dynamicAllocatedTys.size();
     }
 
-    std::vector<Expression*>& GetAllocatedExprs()
-    {
-        return allocatedExprs;
-    }
-
     std::vector<Value*>& GetAllocatedValues()
     {
         return allocatedValues;
-    }
-
-    std::vector<BlockGroup*>& GetAllocatedBlockGroups()
-    {
-        return allocatedBlockGroups;
-    }
-
-    std::vector<Block*>& GetAllocatedBlocks()
-    {
-        return allocatedBlocks;
     }
 
     std::vector<StructDef*>& GetAllocatedStructs()
@@ -274,6 +239,12 @@ public:
 
     void DeleteAllocatedInstance(std::vector<size_t>& idxs);
     void DeleteAllocatedTys();
+    void MergeAllocatedPtrInFuncOrLambda(std::unordered_map<BlockGroup*, std::vector<Base*>>& input);
+    void FreeMemoryInFunc(BlockGroup& funcBody);
+    void FreeWholePackage();
+    void Init();
+    ClassType* SearchObjectTyInPackage() const;
+    ClassType* SearchAnyTyInPackage() const;
 
 private:
     /*
@@ -286,14 +257,13 @@ private:
     /*
      * @brief Cached Pointer of allocated instance in CHIR.
      */
-    std::vector<Expression*> allocatedExprs;
     std::vector<Value*> allocatedValues;
-    std::vector<BlockGroup*> allocatedBlockGroups;
-    std::vector<Block*> allocatedBlocks;
     std::vector<StructDef*> allocatedStructs;
     std::vector<ClassDef*> allocatedClasses;
     std::vector<EnumDef*> allocatedEnums;
     std::vector<ExtendDef*> allocatedExtends;
+    std::unordered_set<CustomTypeDef*> allocatedCustomDefs;
+    std::unordered_map<BlockGroup*, std::vector<Base*>> allocatedPtrInFuncOrLambda;
 
     static std::mutex allocatedListMtx;
     UnitType* unitTy{nullptr};
@@ -310,6 +280,22 @@ private:
     static std::mutex dynamicAllocatedTysMtx;
 
     size_t threadsNum;
+
+    template <typename T> static void SafeDelete(T* p) noexcept
+    {
+        if (p == nullptr) {
+            return;
+        }
+#ifndef CANGJIE_ENABLE_GCOV
+        try {
+#endif
+            delete p;
+#ifndef CANGJIE_ENABLE_GCOV
+        } catch (...) {
+            // Destructors should not throw; continue releasing other resources.
+        }
+#endif
+    }
 };
 } // namespace Cangjie::CHIR
 #endif // CANGJIE_CHIR_CHIRCONTEXT_H

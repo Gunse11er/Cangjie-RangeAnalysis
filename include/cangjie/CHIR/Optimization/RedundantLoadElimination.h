@@ -29,7 +29,7 @@ public:
     void RunOnPackage(const Ptr<const Package>& package, bool isDebug) const;
 
 private:
-    void RunOnFunc(const Ptr<const Func>& func, bool isDebug) const;
+    void RunOnFunc(const Ptr<const Function>& func, bool isDebug) const;
 };
 } // namespace Cangjie::CHIR
 

@@ -14,51 +14,53 @@ using namespace Sema;
 Ptr<Ty> TypeChecker::TypeCheckerImpl::SynSpawnExpr(ASTContext& ctx, SpawnExpr& se)
 {
     bool isWellTyped = !se.arg ||
-        (Ty::IsTyCorrect(Synthesize(ctx, se.arg.get())) && CheckSpawnArgValid(ctx, *se.arg));
+        (Ty::IsTyCorrect(Synthesize({ctx, SynPos::EXPR_ARG}, se.arg.get())) &&
+            CheckSpawnArgValid(ctx, *se.arg));
     CJC_NULLPTR_CHECK(se.task);
-    isWellTyped = Ty::IsTyCorrect(Synthesize(ctx, se.task.get())) && isWellTyped;
+    isWellTyped = Ty::IsTyCorrect(Synthesize({ctx, SynPos::EXPR_ARG}, se.task.get())) && isWellTyped;
     if (!isWellTyped) {
-        se.ty = TypeManager::GetInvalidTy();
-        return se.ty;
+        se.SetTy(TypeManager::GetInvalidTy());
+        return se.GetTy();
     }
     auto futureClass = importManager.GetCoreDecl<ClassDecl>("Future");
     if (futureClass == nullptr) {
         diag.Diagnose(se, DiagKind::sema_no_core_object);
-        se.ty = TypeManager::GetInvalidTy();
-        return se.ty;
+        se.SetTy(TypeManager::GetInvalidTy());
+        return se.GetTy();
     }
-    CJC_ASSERT(Ty::IsTyCorrect(se.task->ty) && se.task->ty->IsFunc());
-    CJC_ASSERT(!se.arg || (Ty::IsTyCorrect(se.arg->ty) && se.arg->ty->IsClassLike()));
-    CJC_ASSERT(Ty::IsTyCorrect(futureClass->ty) && futureClass->ty->typeArgs.size() == 1);
-    se.ty = typeManager.GetInstantiatedTy(futureClass->ty,
-        {{StaticCast<GenericsTy*>(futureClass->ty->typeArgs.front()), RawStaticCast<FuncTy*>(se.task->ty)->retTy}});
-    return se.ty;
+    CJC_ASSERT(Ty::IsTyCorrect(se.task->GetTy()) && se.task->GetTy()->IsFunc());
+    CJC_ASSERT(!se.arg || (Ty::IsTyCorrect(se.arg->GetTy()) && se.arg->GetTy()->IsClassLike()));
+    CJC_ASSERT(Ty::IsTyCorrect(futureClass->GetTy()) && futureClass->GetTy()->typeArgs.size() == 1);
+    se.SetTy(typeManager.GetInstantiatedTy(futureClass->GetTy(),
+        {{StaticCast<GenericsTy*>(futureClass->GetTy()->typeArgs.front()),
+            RawStaticCast<FuncTy*>(se.task->GetTy())->retTy}}));
+    return se.GetTy();
 }
 
 bool TypeChecker::TypeCheckerImpl::CheckSpawnArgValid(const ASTContext& ctx, const Expr& arg)
 {
-    CJC_ASSERT(arg.ty != nullptr);
-    CJC_ASSERT(Ty::IsTyCorrect(arg.ty));
+    CJC_ASSERT(arg.GetTy() != nullptr);
+    CJC_ASSERT(Ty::IsTyCorrect(arg.GetTy()));
     // Check the ty of spawn argument is `ThreadContext` which from package `core`.
     auto threadContextInterface = importManager.GetCoreDecl<InterfaceDecl>("ThreadContext");
     if (threadContextInterface == nullptr) {
         (void)diag.Diagnose(arg, DiagKind::sema_no_core_object);
         return false;
     }
-    if (arg.ty->IsNothing() || !arg.ty->IsClassLike() ||
-        !typeManager.IsSubtype(arg.ty, threadContextInterface->ty)) {
-        DiagMismatchedTypes(diag, arg, *threadContextInterface->ty);
+    if (arg.GetTy()->IsNothing() || !arg.GetTy()->IsClassLike() ||
+        !typeManager.IsSubtype(arg.GetTy(), threadContextInterface->GetTy())) {
+        DiagMismatchedTypes(diag, arg, *threadContextInterface->GetTy());
         return false;
     }
     // Check The spawn argument whether have `getSchedulerHandle` method,
     // whose signature is `()->CPointer<Unit>`. If not, just prompts that the type is invalid.
-    auto classLikeTy = StaticCast<ClassLikeTy*>(arg.ty);
+    auto classLikeTy = StaticCast<ClassLikeTy*>(arg.GetTy());
     auto retTy = typeManager.GetPointerTy(TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT));
     auto funcTy = typeManager.GetFunctionTy({}, retTy);
     CJC_NULLPTR_CHECK(arg.curFile);
     auto decls = FieldLookup(ctx, classLikeTy->commonDecl, "getSchedulerHandle", {.file = arg.curFile});
     if (decls.size() != 1 || decls[0]->astKind != ASTKind::FUNC_DECL ||
-        !typeManager.IsSubtype(decls[0]->ty, funcTy)) {
+        !typeManager.IsSubtype(decls[0]->GetTy(), funcTy)) {
         (void)diag.DiagnoseRefactor(DiagKindRefactor::sema_spawn_arg_invalid, arg);
         return false;
     }
@@ -67,12 +69,12 @@ bool TypeChecker::TypeCheckerImpl::CheckSpawnArgValid(const ASTContext& ctx, con
 
 bool TypeChecker::TypeCheckerImpl::ChkSpawnExprSimple(ASTContext& ctx, Ty& tgtTy, SpawnExpr& se)
 {
-    if (Ty::IsTyCorrect(Synthesize(ctx, &se))) {
-        if (typeManager.IsSubtype(se.ty, &tgtTy)) {
+    if (Ty::IsTyCorrect(Synthesize({ctx, SynPos::EXPR_ARG}, &se))) {
+        if (typeManager.IsSubtype(se.GetTy(), &tgtTy)) {
             return true;
         } else {
             DiagMismatchedTypes(diag, se, tgtTy);
-            se.ty = TypeManager::GetInvalidTy();
+            se.SetTy(TypeManager::GetInvalidTy());
             return false;
         }
     }
@@ -90,7 +92,7 @@ bool TypeChecker::TypeCheckerImpl::ChkSpawnExpr(ASTContext& ctx, Ty& tgtTy, Spaw
             diag.Diagnose(se, DiagKind::sema_no_core_object);
             return false;
         }
-        auto fuTys = promotion.Downgrade(*futureClass->ty, tgtTy);
+        auto fuTys = promotion.Downgrade(*futureClass->GetTy(), tgtTy);
         if (fuTys.empty()) {
             return ChkSpawnExprSimple(ctx, tgtTy, se);
         }
@@ -98,12 +100,13 @@ bool TypeChecker::TypeCheckerImpl::ChkSpawnExpr(ASTContext& ctx, Ty& tgtTy, Spaw
     }
     auto funcTy = typeManager.GetFunctionTy({}, fuTy->typeArgs.front());
     bool isWellTyped = !se.arg ||
-        (Ty::IsTyCorrect(Synthesize(ctx, se.arg.get())) && CheckSpawnArgValid(ctx, *se.arg));
+        (Ty::IsTyCorrect(Synthesize({ctx, SynPos::EXPR_ARG}, se.arg.get())) &&
+            CheckSpawnArgValid(ctx, *se.arg));
     isWellTyped = Check(ctx, funcTy, se.task.get()) && isWellTyped;
     if (!isWellTyped) {
-        se.ty = TypeManager::GetInvalidTy();
+        se.SetTy(TypeManager::GetInvalidTy());
         return false;
     }
-    se.ty = fuTy;
+    se.SetTy(fuTy);
     return true;
 }

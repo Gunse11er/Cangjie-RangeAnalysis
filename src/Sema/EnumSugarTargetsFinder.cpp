@@ -122,14 +122,15 @@ std::optional<Ptr<AST::Ty>> EnumSugarTargetsFinder::RefineTargetTy(
     }
     CJC_ASSERT(target->outerDecl);
     // When target type is enum implemented interface type, directly return current enum type.
-    if (auto currentInterfaceTy = DynamicCast<InterfaceTy*>(currentTy); currentInterfaceTy && target->outerDecl->ty) {
-        auto allInterfaceTys = typeManager.GetAllSuperTys(*target->outerDecl->ty);
+    if (auto currentInterfaceTy = DynamicCast<InterfaceTy*>(currentTy);
+        currentInterfaceTy && target->outerDecl->GetTy()) {
+        auto allInterfaceTys = typeManager.GetAllSuperTys(*target->outerDecl->GetTy());
         if (allInterfaceTys.count(currentInterfaceTy) > 0) {
-            return target->outerDecl->ty;
+            return target->outerDecl->GetTy();
         }
         for (auto ty : allInterfaceTys) {
             if (auto iTy = DynamicCast<InterfaceTy*>(ty); iTy && iTy->declPtr == currentInterfaceTy->declPtr) {
-                return target->outerDecl->ty;
+                return target->outerDecl->GetTy();
             }
         }
     }

@@ -31,9 +31,9 @@ void UnitifyBlock(const Expr& posSrc, Block& b, Ty& unitTy)
     unitExpr->begin = posSrc.begin;
     unitExpr->begin.Mark(PositionStatus::IGNORE);
     unitExpr->end = posSrc.end;
-    unitExpr->ty = &unitTy;
+    unitExpr->SetTy(&unitTy);
     b.body.push_back(std::move(unitExpr));
-    b.ty = &unitTy;
+    b.SetTy(&unitTy);
 }
 
 void RearrangeRefLoop(const Expr& src, Expr& dst, Ptr<Node> loopBody)

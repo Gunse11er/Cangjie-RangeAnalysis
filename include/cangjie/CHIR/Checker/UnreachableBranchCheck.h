@@ -10,7 +10,7 @@
 #include "cangjie/CHIR/Analysis/ConstAnalysisWrapper.h"
 #include "cangjie/CHIR/Analysis/ConstAnalysis.h"
 #include "cangjie/CHIR/Analysis/Utils.h"
-#include "cangjie/CHIR/Utils/DiagAdapter.h"
+#include "cangjie/Basic/DiagnosticEngine.h"
 #include "cangjie/CHIR/IR/Package.h"
 #include "cangjie/Utils/TaskQueue.h"
 
@@ -19,11 +19,11 @@ namespace Cangjie::CHIR {
 class UnreachableBranchCheck {
 public:
     explicit UnreachableBranchCheck(
-        ConstAnalysisWrapper* constAnalysisWrapper, DiagAdapter& diag, const std::string& packageName);
+        ConstAnalysisWrapper* constAnalysisWrapper, DiagnosticEngine& diag, const std::string& packageName);
 
     void RunOnPackage(const Package& package, size_t threadNum);
 
-    void RunOnFunc(const Ptr<Func> func);
+    void RunOnFunc(const Ptr<Function> func);
 
 private:
     void PrintWarning(const Terminator& node, Block& block, std::set<Block*>& hasProcessed, bool isRecursive = false);
@@ -31,7 +31,7 @@ private:
     template <typename TConstDomain>
     void VisitFunc(Results<TConstDomain>& result);
 
-    DiagAdapter& diag;
+    DiagnosticEngine& diag;
     ConstAnalysisWrapper* analysisWrapper;
 
     const std::string& currentPackageName;

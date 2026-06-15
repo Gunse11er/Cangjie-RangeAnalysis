@@ -60,7 +60,7 @@ private:
     static std::string GenerateParamLists(const std::vector<OwnedPtr<FuncParamList>>& paramLists,
         const std::function<std::string(const OwnedPtr<FuncParam>& ptr)>& transform);
 
-    Decl* decl = nullptr;
+    Decl* decl;
     std::set<std::string> imports;
     const std::string cjLibName;
     const BaseMangler& mangler;

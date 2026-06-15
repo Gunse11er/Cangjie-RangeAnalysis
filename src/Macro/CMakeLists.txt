@@ -9,6 +9,10 @@ set(AST_SERIALIZATION_SRC NodeSerialization.cpp ExprSerialization.cpp TokenSeria
 add_library(CangjieAstSerialization OBJECT ${AST_SERIALIZATION_SRC})
 add_dependencies(CangjieAstSerialization CangjieFlatbuffersHeaders)
 target_include_directories(CangjieAstSerialization PRIVATE ${FLATBUFFERS_INCLUDE_DIR})
+if(CANGJIE_ENABLE_GCOV)
+    target_compile_options(CangjieAstSerialization PUBLIC "-fno-exceptions")
+endif()
+target_compile_options(CangjieAstSerialization PRIVATE ${CJC_EXTRA_WARNINGS})
 
 if(CANGJIE_BUILD_CJC)
     set(MACRO_SRC
@@ -33,4 +37,7 @@ if(CANGJIE_BUILD_CJC)
     target_include_directories(CangjieMacro PRIVATE ${LLVM_INCLUDE_DIRS})
     target_include_directories(CangjieMacro PRIVATE ${BOUNDSCHECK}/include)
     target_compile_options(CangjieMacro PRIVATE ${CJC_EXTRA_WARNINGS})
+    if(CANGJIE_ENABLE_GCOV)
+        target_compile_options(CangjieMacro PUBLIC "-fno-exceptions")
+    endif()
 endif()

@@ -36,8 +36,8 @@ std::string GetAnnoValue(Ptr<Annotation> anno)
     return litExpr->stringValue;
 }
 
-void DiagConflictingAnnotation(DiagnosticEngine& diag, const Decl& declWithAnno, const Decl& otherDecl,
-    const Decl& checkingDecl, AnnotationKind annotationKind)
+void DiagConflictingAnnotation(
+    DiagnosticEngine& diag, const Decl& declWithAnno, const Decl& otherDecl, const Decl& checkingDecl, AnnotationKind annotationKind)
 {
     auto anno = GetAnnotation(declWithAnno, annotationKind);
     CJC_ASSERT(anno);
@@ -49,24 +49,23 @@ void DiagConflictingAnnotation(DiagnosticEngine& diag, const Decl& declWithAnno,
                 declWithAnnoRange, declWithAnno.identifier, anno->identifier);
         } else {
             return diag.DiagnoseRefactor(DiagKindRefactor::sema_foreign_name_conflicting_derived_annotation,
-                declWithAnno, MakeRange(declWithAnno.identifier), declWithAnno.identifier, anno->identifier,
-                GetAnnoValue(anno));
+                declWithAnno, MakeRange(declWithAnno.identifier), declWithAnno.identifier, anno->identifier, GetAnnoValue(anno));
         }
     }();
 
     auto otherAnno = GetForeignNameAnnotation(otherDecl);
     if (otherAnno && !otherAnno->TestAttr(Attribute::COMPILER_ADD)) {
         auto otherDeclRange = MakeRange(otherAnno->GetBegin(), otherDecl.identifier.End());
-        builder.AddNote(otherDecl, otherDeclRange,
-            "Other declaration '" + otherDecl.identifier + "' has a different @" + anno->identifier);
+        builder.AddNote(
+            otherDecl, otherDeclRange, "Other declaration '" + otherDecl.identifier + "' has a different @" + anno->identifier);
     } else if (otherAnno) {
         builder.AddNote(otherDecl, MakeRange(otherDecl.identifier),
             "Other declaration '" + otherDecl.identifier + "' has a different derived @" + anno->identifier + " '" +
                 GetAnnoValue(otherAnno) + "'");
     } else {
         auto otherDeclRange = MakeRange(otherDecl.identifier);
-        builder.AddNote(otherDecl, otherDeclRange,
-            "Other declaration '" + otherDecl.identifier + "' doesn't have a @" + anno->identifier);
+        builder.AddNote(
+            otherDecl, otherDeclRange, "Other declaration '" + otherDecl.identifier + "' doesn't have a @" + anno->identifier);
     }
 
     builder.AddNote(checkingDecl, MakeRange(checkingDecl.identifier),
@@ -97,11 +96,9 @@ bool NeedCheckForeignName(const MemberSignature& parent, const MemberSignature& 
     return true;
 }
 
-bool IsForeignNameLikeAnnotation(AnnotationKind annotationKind)
-{
-    return annotationKind == AnnotationKind::FOREIGN_NAME ||
-        annotationKind == AST::AnnotationKind::FOREIGN_GETTER_NAME ||
-        annotationKind == AST::AnnotationKind::FOREIGN_SETTER_NAME;
+bool IsForeignNameLikeAnnotation(AnnotationKind annotationKind) {
+    return annotationKind == AnnotationKind::FOREIGN_NAME || annotationKind == AST::AnnotationKind::FOREIGN_GETTER_NAME
+        || annotationKind == AST::AnnotationKind::FOREIGN_SETTER_NAME;
 }
 
 } // namespace
@@ -124,8 +121,7 @@ void CheckAnnotation(DiagnosticEngine& diag, TypeManager& typeManager, Annotatio
             DiagConflictingAnnotation(diag, *parent.decl, *child.decl, checkingDecl, annotationKind);
         } else if (!parentAnno && childAnno) {
             DiagConflictingAnnotation(diag, *child.decl, *parent.decl, checkingDecl, annotationKind);
-        } else if (IsForeignNameLikeAnnotation(annotationKind) &&
-            (GetAnnoValue(childAnno) != GetAnnoValue(parentAnno))) {
+        } else if (IsForeignNameLikeAnnotation(annotationKind) && (GetAnnoValue(childAnno) != GetAnnoValue(parentAnno))) {
             DiagConflictingAnnotation(diag, *parent.decl, *child.decl, checkingDecl, annotationKind);
         }
         return;
@@ -133,8 +129,7 @@ void CheckAnnotation(DiagnosticEngine& diag, TypeManager& typeManager, Annotatio
 
     if (childAnno && !childAnno->TestAttr(Attribute::COMPILER_ADD)) {
         auto range = MakeRange(childAnno->GetBegin(), child.decl->identifier.End());
-        diag.DiagnoseRefactor(
-            DiagKindRefactor::sema_foreign_name_appeared_in_child, *child.decl, range, childAnno->identifier);
+        diag.DiagnoseRefactor(DiagKindRefactor::sema_foreign_name_appeared_in_child, *child.decl, range, childAnno->identifier);
     } else if (childAnno && !parentAnno) {
         DiagConflictingAnnotation(diag, *child.decl, *parent.decl, checkingDecl, annotationKind);
     } else if (!childAnno && parentAnno && child.replaceOther) {

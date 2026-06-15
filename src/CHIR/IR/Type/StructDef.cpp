@@ -33,12 +33,7 @@ StructType* StructDef::GetType() const
     return StaticCast<StructType>(type);
 }
 
-void StructDef::PrintComment(std::stringstream& ss) const
+std::string StructDef::AddExtraComment() const
 {
-    CustomTypeDef::PrintComment(ss);
-    AddCommaOrNot(ss);
-    if (ss.str().empty()) {
-        ss << " // ";
-    }
-    ss << "isC: " << BoolToString(isC);
+    return isC ? "isCStruct" : "";
 }

@@ -99,6 +99,33 @@ enum class MatchResult {
     NONE, UNIQUE, AMBIGUOUS
 };
 
+enum class LambdaSource {
+    USER, SPAWN, TRY_HANDLE
+};
+
+/// Mark the position of the synthesized expr/decl. It currently has not effect on decl.
+enum class SynPos {
+    NONE,            // when the context is not considered, e.g. for Decl, type, pattern, and import.
+    EXPR_ARG,        // when the expr is used as an argument of another expr, e.g. function arg, returned expr, throwed
+                     // expr, spawn arg, initializer of var decl, block of if/else, etc.
+    IMPLICIT_RETURN, // as the implicit return value of a function, or the last expr of a block or lambda
+    LEFT_VALUE,      // when the expr is used as a left value of an assignment expression
+    UNUSED,          // when the expr is not used, i.e. in a block but not implicit return
+};
+struct CheckerContext {
+    CheckerContext(ASTContext& ctx, SynPos synthesizePos) : astContext(ctx), synthesizePos(synthesizePos)
+    {
+    }
+
+    ASTContext& Ctx() const { return astContext; }
+    SynPos SynthPos() const { return synthesizePos; }
+    CheckerContext With(SynPos newPos) const { return {astContext, newPos}; }
+
+private:
+    ASTContext& astContext; // a cache for ast info, not real context
+    SynPos synthesizePos;
+};
+
 class TypeChecker::TypeCheckerImpl {
 public:
     explicit TypeCheckerImpl(CompilerInstance* ci);
@@ -142,9 +169,10 @@ public:
 private:
     /**
      * Main entry of the synthesis mode of the type checking.
+     * Context is read from ctx.SynthesizePos(). Use ctx.WithSynthesizePos() before calling.
      */
-    Ptr<AST::Ty> Synthesize(ASTContext& ctx, Ptr<AST::Node> node);
-    bool SynthesizeAndReplaceIdealTy(ASTContext& ctx, AST::Node& node);
+    Ptr<AST::Ty> Synthesize(const CheckerContext& ctx, Ptr<AST::Node> node);
+    bool SynthesizeAndReplaceIdealTy(const CheckerContext& ctx, AST::Node& node);
     /**
      * Main entry of the check mode of the type checking.
      */
@@ -164,7 +192,7 @@ private:
      * the affected entries must be cleared. Currently, this could happen when allocating
      * new nodes during DesugarInTypeCheck, and checking lambda with omitted param type.
      */
-    Ptr<AST::Ty> SynthesizeWithCache(ASTContext& ctx, Ptr<AST::Node> node);
+    Ptr<AST::Ty> SynthesizeWithCache(const CheckerContext& ctx, Ptr<AST::Node> node);
     bool CheckWithCache(ASTContext& ctx, Ptr<AST::Ty> target, Ptr<AST::Node> node);
     /**
      * Cahched version of Synthesize and Check. But only cache failed results.
@@ -172,7 +200,7 @@ private:
      * because this procedure lacks a post-check phase and will stop on success,
      * thus the successful check will always need to fully execute.
      * */
-    Ptr<AST::Ty> SynthesizeWithNegCache(ASTContext& ctx, Ptr<AST::Node> node);
+    Ptr<AST::Ty> SynthesizeWithNegCache(const CheckerContext& ctx, Ptr<AST::Node> node);
     bool CheckWithNegCache(ASTContext& ctx, Ptr<AST::Ty> target, Ptr<AST::Node> node);
     /*
      * Use cached version of Synthesize and Check only when the same key was used
@@ -180,9 +208,9 @@ private:
      * Also, it will NOT recover diags.
      * For function call post-check and any execution path that won't reach post-check.
      */
-    Ptr<AST::Ty> SynthesizeWithEffectiveCache(ASTContext& ctx, Ptr<AST::Node> node, bool recoverDiag);
+    Ptr<AST::Ty> SynthesizeWithEffectiveCache(const CheckerContext& ctx, Ptr<AST::Node> node, bool recoverDiag);
     bool CheckWithEffectiveCache(ASTContext& ctx, Ptr<AST::Ty> target, Ptr<AST::Node> node, bool recoverDiag);
-    Ptr<AST::Ty> SynthesizeAndCache(ASTContext& ctx, Ptr<AST::Node> node, const AST::CacheKey& key);
+    Ptr<AST::Ty> SynthesizeAndCache(const CheckerContext& ctx, Ptr<AST::Node> node, const AST::CacheKey& key);
     bool CheckAndCache(ASTContext& ctx, Ptr<AST::Ty> target, Ptr<AST::Node> node, const AST::CacheKey& key);
     /** ======== PreCheck related functions implemented in src/Sema/PreCheck.cpp. ======== */
     /**
@@ -420,7 +448,7 @@ private:
     /**
      * Add Object to all ClassDecls' inheritedTypes if there is no one.
      */
-    void AddSuperClassObjectForClassDecl(ASTContext& ctx);
+    void AddSuperClassObjectForClassDecl(ASTContext& ctx);    
     /**
      * Add super interface to all ClassDecls' inheritedTypes if there is no one.
      */
@@ -436,7 +464,7 @@ private:
     /**
      * CJNative-java interop scenario.
      */
-    bool AddJObjectSuperClassJavaInterop(ASTContext& ctx, AST::ClassDecl& cd);
+    bool AddJObjectSuperClassJavaInterop(ASTContext& ctx, AST::ClassDecl& cd);    
     /**
      * CJNative-objc interop scenario.
      */
@@ -592,9 +620,8 @@ private:
     void EncloseTryLambda(ASTContext& ctx, OwnedPtr<AST::LambdaExpr>& tryLambda);
 
     /* Synthesize specialized for desugar after sema. Will not recover previous desugar results */
-    Ptr<AST::Ty> SynthesizeWithoutRecover(ASTContext& ctx, Ptr<AST::Node> node);
+    Ptr<AST::Ty> SynthesizeWithoutRecover(const CheckerContext& ctx, Ptr<AST::Node> node);
 #ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
-    void PerformToAnyInsertion(AST::Package& pkg);
     OwnedPtr<AST::FuncDecl> CreateToAny(AST::Decl& outerDecl);
 #endif
 
@@ -650,13 +677,13 @@ private:
         ASTContext& ctx, const AST::Decl& structDecl, const std::vector<OwnedPtr<AST::Decl>>& body);
     void CheckVarWithPatternDecl(ASTContext& ctx, AST::VarWithPatternDecl& vpd);
     // T should be VarWithPatternDecl or VarDecl. A way to avoid restructuring the AST.h file.
-    template <typename T> void SynchronizeTypeAndInitializer(ASTContext& ctx, T& vd);
+    template <typename T> void SynchronizeTypeAndInitializer(const CheckerContext& ctx, T& vd);
 
     void CheckVarDecl(ASTContext& ctx, AST::VarDecl& vd);
     void CheckPropDecl(ASTContext& ctx, AST::PropDecl& pd);
     void UpdateMemberVariableTy(const AST::Decl& decl, const AST::EnumTy& eTy);
 
-    Ptr<AST::Ty> SynBlock(ASTContext& ctx, AST::Block& b);
+    Ptr<AST::Ty> SynBlock(const CheckerContext& ctx, AST::Block& b);
     bool ChkBlock(ASTContext& ctx, AST::Ty& target, AST::Block& b);
     /**
      * Arithmetic operator { +, -, *, /, ** }
@@ -720,9 +747,8 @@ private:
     bool ChkLamParamTys(ASTContext& ctx, AST::LambdaExpr& le, const std::vector<Ptr<AST::Ty>>& tgtParamTys,
         std::vector<Ptr<AST::Ty>>& lamParamTys);
     bool ChkLamBody(ASTContext& ctx, AST::FuncBody& lamFb);
-    Ptr<AST::Ty> SynIfExpr(ASTContext& ctx, AST::IfExpr& ie);
+    Ptr<AST::Ty> SynIfExpr(const CheckerContext& ctx, AST::IfExpr& ie);
     bool ChkIfExpr(ASTContext& ctx, AST::Ty& tgtTy, AST::IfExpr& ie);
-    Ptr<AST::Ty> ReplaceThisTy(Ptr<AST::Ty> now);
     bool ChkIfExprNoElse(ASTContext& ctx, AST::Ty& target, AST::IfExpr& ie);
     bool ChkIfExprTwoBranches(ASTContext& ctx, AST::Ty& target, AST::IfExpr& ie);
     /// Check and diagnose conditions in if and while
@@ -753,7 +779,7 @@ private:
     Ptr<AST::Ty> SynUnaryExpr(ASTContext& ctx, AST::UnaryExpr& ue);
     bool ChkUnaryExpr(ASTContext& ctx, AST::Ty& target, AST::UnaryExpr& ue);
     Ptr<AST::Ty> SynBuiltinUnaryExpr(ASTContext& ctx, AST::UnaryExpr& ue);
-    Ptr<AST::Ty> SynParenExpr(ASTContext& ctx, AST::ParenExpr& pe);
+    Ptr<AST::Ty> SynParenExpr(const CheckerContext& ctx, AST::ParenExpr& pe);
     bool ChkParenExpr(ASTContext& ctx, AST::Ty& target, AST::ParenExpr& pe);
     Ptr<AST::Ty> SynAssignExpr(ASTContext& ctx, AST::AssignExpr& ae);
     Ptr<AST::Ty> SynMultipleAssignExpr(ASTContext& ctx, AST::AssignExpr& ae);
@@ -790,7 +816,7 @@ private:
     bool ChkIsExpr(ASTContext& ctx, AST::Ty& target, AST::IsExpr& ie);
     Ptr<AST::Ty> SynAsExpr(ASTContext& ctx, AST::AsExpr& ae);
     bool ChkAsExpr(ASTContext& ctx, AST::Ty& target, AST::AsExpr& ae);
-    Ptr<AST::Ty> SynOptionalChainExpr(ASTContext& ctx, AST::OptionalChainExpr& oce);
+    Ptr<AST::Ty> SynOptionalChainExpr(const CheckerContext& ctx, AST::OptionalChainExpr& oce);
     bool ChkOptionalChainExpr(ASTContext& ctx, AST::Ty& target, AST::OptionalChainExpr& oce);
     /**
      * Checks whether @param target is an auto-boxed Option of @param ty
@@ -1307,8 +1333,8 @@ private:
      * @param pkg The package node which contains structure decls.
      */
     void CheckInheritance(AST::Package& pkg);
-    void CheckLegalUseOfClosure(AST::Expr& e, DiagKind kind) const;
-    void CheckLegalUseOfClosure(const ASTContext& ctx, AST::Node& node) const;
+    void CheckLegalUseOfClosure(AST::Expr& e, DiagKind kind, LambdaSource lambdaSource) const;
+    void CheckLegalUseOfClosure(const ASTContext& ctx, AST::Node& node, LambdaSource lambdaSource) const;
     bool IsCapturedInCFuncLambda(const ASTContext& ctx, const AST::RefExpr& re) const;
     bool IsCapturedCStructOfClosure(const AST::VarDecl& decl) const;
 
@@ -1521,7 +1547,7 @@ private:
         }
         std::vector<Ptr<AST::Ty>> typeArgs;
         for (auto& it : usage.GetTypeArgs()) {
-            typeArgs.push_back(it->ty);
+            typeArgs.push_back(it->GetTy());
         }
         auto target = tad.type->GetTarget();
         if (!target || target->astKind != AST::ASTKind::TYPE_ALIAS_DECL) {
@@ -1668,7 +1694,7 @@ private:
     {
         std::vector<Ptr<AST::Ty>> typeArgs;
         for (auto& it : typeArguments) {
-            typeArgs.push_back(it->ty);
+            typeArgs.push_back(it->GetTy());
         }
         if (!typeArguments.empty()) {
             Ptr<AST::File> file = typeArguments[0]->curFile;
@@ -1677,9 +1703,10 @@ private:
         }
         for (auto& it : type.typeArguments) {
             auto newTypeArg = AST::ASTCloner::Clone(it.get());
-            newTypeArg->ty = newTypeArg->ty ? typeManager.SubstituteTypeAliasInTy(*newTypeArg->ty, true, typeMapping)
-                                            : TypeManager::GetInvalidTy();
-            if (auto ity = DynamicCast<AST::IntersectionTy*>(newTypeArg->ty); ity && ity->tys.empty()) {
+            newTypeArg->SetTy(newTypeArg->GetTy()
+                    ? typeManager.SubstituteTypeAliasInTy(*newTypeArg->GetTy(), true, typeMapping)
+                    : TypeManager::GetInvalidTy());
+            if (auto ity = DynamicCast<AST::IntersectionTy*>(newTypeArg->GetTy()); ity && ity->tys.empty()) {
                 continue;
             }
             newTypeArg->EnableAttr(AST::Attribute::COMPILER_ADD);
@@ -1709,6 +1736,25 @@ private:
     friend class InstCtxScope;
     bool ChkIfAvailableExpr(ASTContext& ctx, AST::Ty& ty, AST::IfAvailableExpr& ie);
     Ptr<AST::Ty> SynIfAvailableExpr(ASTContext& ctx, AST::IfAvailableExpr& iae);
+
+    /**
+     * @brief mark imported declarations depended by the current package as used.
+     * @param pkg the source package to analyze the dependencies.
+     */
+    void MarkUsedPackageInFile(Ptr<AST::Package> pkg);
+    /**
+     * @brief analyze whether Node is being used or recursively analyze its dependencies.
+     * @param node the node to be analyzed.
+     * @param walkerId the current dependency analysis walker ID.
+     */
+    void MarkUsedNode(Ptr<AST::Node> node, unsigned walkerId);
+    /**
+     * @brief analyze whether decl is being used or recursively analyze its dependencies.
+     * @param decl the declaration to be analyzed.
+     * @param walkerId the current dependency analysis walker ID.
+     * @return the visit action to continue the traversal.
+     */
+    AST::VisitAction MarkUsedDecl(Ptr<AST::Decl> decl, unsigned walkerId);
 
     /** Members */
     Promotion promotion;

@@ -60,9 +60,9 @@ public:
 
 private:
     /// reaching status of store expressions.
-    std::vector<FlatSet<const Store>> reachingDefs;
+    std::vector<FlatSet<const Store*>> reachingDefs;
     /// reaching status of load expressions.
-    std::vector<FlatSet<const Load>> reachingLoadDefs;
+    std::vector<FlatSet<const Load*>> reachingLoadDefs;
     /// allocate index map of one function.
     std::unordered_map<const Value*, size_t>* allocateIdxMap;
 };
@@ -83,7 +83,7 @@ public:
      * @brief constructor for reaching definition analysis.
      * @param func function to analyse.
      */
-    explicit ReachingDefinitionAnalysis(const Func* func);
+    explicit ReachingDefinitionAnalysis(const Function* func);
 
     /// reaching definition analysis destructor.
     ~ReachingDefinitionAnalysis() final

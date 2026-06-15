@@ -190,7 +190,7 @@ void ASTContext::RemoveTypeCheckCache(const AST::Node& node)
 void ASTContext::SkipSynForCorrectTyRec(const AST::Node& root)
 {
     AST::ConstWalker enabler(&root, [this](Ptr<const Node> node) {
-        if (Ty::IsTyCorrect(node->ty)) {
+        if (Ty::IsTyCorrect(node->GetTy())) {
             SkipSynForCorrectTy(*node);
         }
         return VisitAction::WALK_CHILDREN;
@@ -200,7 +200,7 @@ void ASTContext::SkipSynForCorrectTyRec(const AST::Node& root)
 
 void ASTContext::SkipSynForCorrectTy(const AST::Node& node)
 {
-    auto key = CacheKey{.target = node.ty, .isDesugared = false, .diagKey = 0};
+    auto key = CacheKey{.target = node.GetTy(), .isDesugared = false, .diagKey = 0};
     if (auto expr = DynamicCast<Expr>(&node); expr && expr->desugarExpr) {
         key.isDesugared = true;
     }

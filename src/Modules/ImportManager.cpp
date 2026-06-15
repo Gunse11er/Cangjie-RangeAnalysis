@@ -232,6 +232,11 @@ void CollectStdDependency(std::map<std::string, std::set<std::string>>& stdDepen
     }
     std::string cjoPath = FileUtil::FindSerializationFile(
         FileUtil::ToPackageName(stdpkg), SERIALIZED_FILE_EXTENSION, importMgr.GetSearchPath());
+    if (cjoPath.empty()) {
+        importMgr.GetDiagnosticEngine().DiagnoseRefactor(DiagKindRefactor::package_search_error, DEFAULT_POSITION,
+            stdpkg);
+        return;
+    }
     if (!cjoManager.LoadPackageHeader(stdpkg, cjoPath)) {
         return;
     }
@@ -307,6 +312,7 @@ void ImportManager::ExportAST(bool saveFileWithAbsPath, std::vector<uint8_t>& as
         writer.PreSaveFullExportDecls(*packageDecl->srcPackage);
     }
     realWriter->ExportAST(*packageDecl);
+    realWriter->SaveOptions(opts.enableCompileDebug, opts.optimizationLevel);
 
     additionalSerializations(*realWriter);
 
@@ -326,6 +332,7 @@ std::vector<uint8_t> ImportManager::ExportASTSignature(const Package& pkg)
     CJC_NULLPTR_CHECK(packageDecl);
     writer.PreSaveFullExportDecls(*packageDecl->srcPackage);
     writer.ExportAST(*packageDecl);
+    writer.SaveOptions(opts.enableCompileDebug, opts.optimizationLevel);
 
     std::vector<uint8_t> astData;
     writer.AST2FB(astData, *packageDecl);
@@ -348,6 +355,7 @@ void ImportManager::ExportDeclsWithContent(bool saveFileWithAbsPath, Package& pa
         writer->SetSerializingCommon();
     }
     writer->PreSaveFullExportDecls(package);
+    writer->SaveOptions(opts.enableCompileDebug, opts.optimizationLevel);
     if (auto [it, success] = astWriters.emplace(&package, writer); !success) {
         delete it->second;
         astWriters[&package] = writer;
@@ -546,7 +554,9 @@ bool ImportManager::ResolveImportedPackages(const std::vector<Ptr<Package>>& pac
         curPackage = pkg;
         // Files of common part need to be loaded in advance,
         // to be able to handle `import`s of common part.
-        cjoManager->LoadFilesOfCommonPart(pkg);
+        if (!cjoManager->LoadFilesOfCommonPart(pkg)) {
+            return false;
+        }
         success = ResolveImportedPackageHeaders(*curPackage, false) && success;
         curPackage->ClearAllDependentStdPkgs();
         for (auto [_, typeWithFullPkgName] : stdDepsMap) {
@@ -776,8 +786,8 @@ std::set<std::string> ImportManager::CollectDirectDepPkg(const Package& package)
 
 namespace {
 
-void ValidateFileFeatureSpec(DiagnosticEngine &diag, const Package& pkg,
-    std::unordered_map<std::string, bool>& refMap, Ptr<File>& refFile, bool& anno)
+void ValidateFileFeatureSpec(DiagnosticEngine& diag, const Package& pkg, std::unordered_map<std::string, bool>& refMap,
+    Ptr<File>& refFile, bool& anno)
 {
     size_t refSize = 0;
     std::unordered_map<std::string, Range> rangeMap;
@@ -810,7 +820,7 @@ void ValidateFileFeatureSpec(DiagnosticEngine &diag, const Package& pkg,
         refMap.emplace(ftr.ToString(), false);
     }
 }
- 
+
 void CollectInvalidFeatureFiles(const Package& pkg, std::vector<Ptr<File>>& invalidFeatures,
     std::unordered_map<std::string, bool>& refMap, bool hasAnno)
 {
@@ -908,7 +918,6 @@ static void CheckPackageSpecsIdentical(DiagnosticEngine& diag, const Package& pk
     }
 }
 } // namespace
-
 
 bool ImportManager::BuildIndex(
     const std::string& cangjieModules, const GlobalOptions& globalOptions, std::vector<Ptr<Package>>& packages)
@@ -1021,6 +1030,9 @@ void ImportManager::UpdateFileNodeImportInfo(Package& package, const File& file,
             (void)newFile->imports.emplace_back(ASTCloner::Clone(import.get()));
         }
     }
+    // Remove stale importSpec->packageName entries before resolving new imports; old ImportSpec pointers
+    // may be reused after the file is replaced, causing GetPackageNameByImport to return wrong package names.
+    cjoManager->RemoveImportedPackageNames(file.imports);
     for (auto& import : newFile->imports) {
         if (import->IsImportMulti()) {
             continue;
@@ -1041,7 +1053,10 @@ void ImportManager::UpdateFileNodeImportInfo(Package& package, const File& file,
     }
     auto index = file.indexOfPackage;
     newFile->indexOfPackage = index;
+    RemoveDeclsImportedByImports(package.fullPackageName, file.imports);
     package.files[index] = std::move(newFile);
+    // Update declsImportedByNodeMap from newFile's imports (stale entries for the old file were removed above).
+    AddImportedDeclsForFile(package, *package.files[index]);
 }
 
 void ImportManager::SetPackageBchirCache(const std::string& fullPackageName, const std::vector<uint8_t>& bchirData)
@@ -1085,66 +1100,90 @@ std::map<std::string, std::set<Ptr<const AST::Decl>, AST::CmpNodeByPos>>& Import
     return fileUsedMacroDeclsMap[file.indexOfPackage];
 }
 
+void ImportManager::RemoveDeclsImportedByImports(
+    const std::string& fullPackageName, const std::vector<OwnedPtr<ImportSpec>>& imports)
+{
+    if (imports.empty()) {
+        return;
+    }
+    auto found = declsImportedByNodeMap.find(fullPackageName);
+    if (found == declsImportedByNodeMap.end()) {
+        return;
+    }
+    std::unordered_set<Ptr<const ImportSpec>> staleImports(imports.begin(), imports.end());
+    for (auto& [decl, importSpecs] : found->second) {
+        (void)decl;
+        importSpecs.erase(std::remove_if(importSpecs.begin(), importSpecs.end(),
+                              [&staleImports](Ptr<const ImportSpec> import) { return staleImports.count(import) > 0; }),
+            importSpecs.end());
+    }
+}
+
 void ImportManager::AddImportedDeclsForSourcePackage(const AST::Package& pkg)
 {
     for (auto& file : pkg.files) {
-        for (auto& import : file->imports) {
-            auto& declMap = import->IsReExport() ? importedDeclsMap : fileImportedDeclsMap[file->fileHash];
-            CJC_NULLPTR_CHECK(import);
-            if (import->IsImportMulti()) {
-                continue;
-            }
-            auto fullPackageName = cjoManager->GetPackageNameByImport(*import);
-            auto pkgDecl = cjoManager->GetPackageDecl(fullPackageName);
-            if (fullPackageName.empty() || !pkgDecl) {
-                continue; // Load package failed.
-            }
-            auto relation = GetPackageRelation(pkg.fullPackageName, fullPackageName);
-            auto importLevel = GetAccessLevel(*import);
-            if (import->content.kind == ImportKind::IMPORT_ALL) {
-                auto members = cjoManager->GetPackageMembers(fullPackageName);
-                for (auto& member : std::as_const(members)) {
-                    auto& targetMap = declMap[member.first];
-                    auto visibleDecls = GetVisibleDeclToMap(member.second, importLevel, relation);
-                    std::for_each(visibleDecls.cbegin(), visibleDecls.cend(), [this, &import, &pkg](auto it) {
-                        declsImportedByNodeMap[pkg.fullPackageName][it].emplace_back(import.get());
-                    });
-                    targetMap.merge(visibleDecls);
-                    std::for_each(member.second.begin(), member.second.end(), [this, member](auto decl) {
-                        if (decl->identifier != member.first) {
-                            declToTypeAlias[decl].emplace(decl->identifier);
-                        }
-                    });
-                }
-                continue;
-            }
-            if (cjoManager->IsImportPackage(*import)) {
-                auto name = import->content.kind == ImportKind::IMPORT_SINGLE
-                    ? Utils::SplitQualifiedName(fullPackageName, true).back()
-                    : import->content.aliasName.Val();
-                declMap[name].emplace(pkgDecl);
-                declsImportedByNodeMap[pkg.fullPackageName][pkgDecl].emplace_back(import.get());
-            } else {
-                auto members = cjoManager->GetPackageMembersByName(fullPackageName, import->content.identifier);
-                const auto& name = import->content.kind == ImportKind::IMPORT_SINGLE ? import->content.identifier.Val()
-                                                                                     : import->content.aliasName.Val();
-                auto& targetMap = declMap[name];
-                auto visibleDecls = GetVisibleDeclToMap(members, importLevel, relation);
-                for (auto member : members) {
-                    if (auto tad = DynamicCast<TypeAliasDecl>(member); tad && tad->type) {
-                        auto originDecl = tad->type->GetTarget();
-                        declToTypeAlias[originDecl].emplace(name);
-                    } else if (member->identifier != name) {
-                        declToTypeAlias[member].emplace(name);
-                        declToTypeAlias[member].emplace(member->identifier);
-                    }
-                }
+        AddImportedDeclsForFile(pkg, *file);
+    }
+}
+
+void ImportManager::AddImportedDeclsForFile(const Package& pkg, const File& file)
+{
+    for (auto& import : file.imports) {
+        auto& declMap = import->IsReExport() ? importedDeclsMap : fileImportedDeclsMap[file.fileHash];
+        CJC_NULLPTR_CHECK(import);
+        if (import->IsImportMulti()) {
+            continue;
+        }
+        auto fullPackageName = cjoManager->GetPackageNameByImport(*import);
+        auto pkgDecl = cjoManager->GetPackageDecl(fullPackageName);
+        if (fullPackageName.empty() || !pkgDecl) {
+            continue; // Load package failed.
+        }
+        auto relation = GetPackageRelation(pkg.fullPackageName, fullPackageName);
+        auto importLevel = GetAccessLevel(*import);
+        if (import->content.kind == ImportKind::IMPORT_ALL) {
+            auto members = cjoManager->GetPackageMembers(fullPackageName);
+            for (auto& member : std::as_const(members)) {
+                auto& targetMap = declMap[member.first];
+                auto visibleDecls = GetVisibleDeclToMap(member.second, importLevel, relation);
                 std::for_each(visibleDecls.cbegin(), visibleDecls.cend(), [this, &import, &pkg](auto it) {
                     declsImportedByNodeMap[pkg.fullPackageName][it].emplace_back(import.get());
                 });
                 targetMap.merge(visibleDecls);
-                import->content.isDecl = true;
+                std::for_each(member.second.begin(), member.second.end(), [this, member](auto decl) {
+                    if (decl->identifier != member.first) {
+                        declToTypeAlias[decl].emplace(decl->identifier);
+                    }
+                });
             }
+            continue;
+        }
+        if (cjoManager->IsImportPackage(*import)) {
+            auto name = import->content.kind == ImportKind::IMPORT_SINGLE
+                ? Utils::SplitQualifiedName(fullPackageName, true).back()
+                : import->content.aliasName.Val();
+            declMap[name].emplace(pkgDecl);
+            declsImportedByNodeMap[pkg.fullPackageName][pkgDecl].emplace_back(import.get());
+        } else {
+            auto members = cjoManager->GetPackageMembersByName(fullPackageName, import->content.identifier);
+            const auto& name = import->content.kind == ImportKind::IMPORT_SINGLE ? import->content.identifier.Val()
+                                                                                 : import->content.aliasName.Val();
+            auto& targetMap = declMap[name];
+            auto visibleDecls = GetVisibleDeclToMap(members, importLevel, relation);
+            for (auto member : members) {
+                if (auto tad = DynamicCast<TypeAliasDecl>(member); tad && tad->type) {
+                    auto originDecl = tad->type->GetTarget();
+                    declToTypeAlias[originDecl].emplace(name);
+                } else if (member->identifier != name) {
+                    declToTypeAlias[member].emplace(name);
+                    declToTypeAlias[member].emplace(member->identifier);
+                }
+            }
+            std::for_each(visibleDecls.cbegin(), visibleDecls.cend(), [this, &import, &pkg](auto it) {
+                declsImportedByNodeMap[pkg.fullPackageName][it].emplace_back(import.get());
+            });
+            targetMap.merge(visibleDecls);
+            import->content.isDecl = true;
         }
     }
 }
@@ -1181,7 +1220,7 @@ std::vector<std::pair<std::string, std::vector<Ptr<Decl>>>> ImportManager::GetIm
         std::vector<Ptr<Decl>> decls(declSet.cbegin(), declSet.cend());
         res.emplace_back(name, std::move(decls));
     }
-    
+
     if (iter != fileImportedDeclsMap.cend()) {
         for (const auto& [name, declSet] : iter->second) {
             std::vector<Ptr<Decl>> decls(declSet.cbegin(), declSet.cend());
@@ -1215,7 +1254,7 @@ const OrderedDeclSet& ImportManager::GetPackageMembersByName(const Package& pack
 }
 
 // For LSP
-AST::OrderedDeclSet ImportManager::GetPackageMembers(
+std::map<std::string, AST::OrderedDeclSet> ImportManager::GetPackageMembers(
     const std::string& srcFullPackageName, const std::string& targetFullPackageName) const
 {
     if (srcFullPackageName == targetFullPackageName) {
@@ -1223,12 +1262,16 @@ AST::OrderedDeclSet ImportManager::GetPackageMembers(
     }
     auto relation = Modules::GetPackageRelation(srcFullPackageName, targetFullPackageName);
     auto members = cjoManager->GetPackageMembers(targetFullPackageName);
-    AST::OrderedDeclSet res;
-    for (auto& [_, decls] : members) {
+    std::map<std::string, AST::OrderedDeclSet> res;
+    for (auto& [name, decls] : members) {
+        AST::OrderedDeclSet visibleDecls;
         for (auto it : decls) {
             if (Modules::IsVisible(*it, relation)) {
-                res.emplace(it.get());
+                visibleDecls.emplace(it.get());
             }
+        }
+        if (!visibleDecls.empty()) {
+            res[name] = std::move(visibleDecls);
         }
     }
     return res;
@@ -1402,7 +1445,7 @@ bool ImportManager::IsExtendAllUpperBoundsImported(
             CJC_NULLPTR_CHECK(ub);
             if (!IsTypeAccessible(file, *ub)) {
                 areAllUpperBoundsImported = false;
-                upperboundsNotImported.emplace(ub->ty->String());
+                upperboundsNotImported.emplace(ub->GetTy()->String());
                 break;
             }
         }
@@ -1428,7 +1471,7 @@ bool ImportManager::IsExtendAccessible(
     bool areAllUpperBoundsImported = IsExtendAllUpperBoundsImported(ed, file, builder);
     bool hasAnyInterfacesImported = false;
     bool isExtendedTypeAccessible = false;
-    auto extendedDecl = Ty::GetDeclPtrOfTy<InheritableDecl>(ed.ty);
+    auto extendedDecl = Ty::GetDeclPtrOfTy<InheritableDecl>(ed.GetTy());
     bool isInSamePkg =
         extendedDecl ? ed.fullPackageName == extendedDecl->fullPackageName : ed.fullPackageName == "std.core";
     if (!isInSamePkg) {
@@ -1456,7 +1499,7 @@ bool ImportManager::IsExtendAccessible(
     // For direct extension, all upperbound (if any) need to be imported.
     // For interface extension, all upperbound (if any) and at lest one interface need to be imported.
     if (!isExtendedTypeAccessible) {
-        AddNoteForExtendExportDiag(builder, MakeRange(ed.begin, ed.end), ed.extendedType->ty->String());
+        AddNoteForExtendExportDiag(builder, MakeRange(ed.begin, ed.end), ed.extendedType->GetTy()->String());
     }
     bool isExtendImported = areAllUpperBoundsImported && hasAnyInterfacesImported && isExtendedTypeAccessible;
     return ed.IsExportedDecl() && isExtendImported;
@@ -1464,7 +1507,7 @@ bool ImportManager::IsExtendAccessible(
 
 const Ptr<Type> ImportManager::FindImplmentInterface(const File& file, const Decl& member, const Ptr<Type>& it) const
 {
-    auto targetDecl = Ty::GetDeclPtrOfTy<InheritableDecl>(it->ty);
+    auto targetDecl = Ty::GetDeclPtrOfTy<InheritableDecl>(it->GetTy());
     if (targetDecl == nullptr) {
         return nullptr;
     }
@@ -1488,12 +1531,12 @@ bool ImportManager::IsExtendMemberImported(
     if (extend->inheritedTypes.empty()) {
         return true;
     }
-    auto extendedDecl = Ty::GetDeclPtrOfTy<InheritableDecl>(extend->ty);
+    auto extendedDecl = Ty::GetDeclPtrOfTy<InheritableDecl>(extend->GetTy());
     bool isInSamePkg =
         extendedDecl ? extend->fullPackageName == extendedDecl->fullPackageName : extend->fullPackageName == "std.core";
     if (isInSamePkg) {
         if (!IsTypeAccessible(file, *extend->extendedType)) {
-            AddNoteForExtendExportDiag(builder, MakeRange(extend->begin, extend->end), extend->ty->String());
+            AddNoteForExtendExportDiag(builder, MakeRange(extend->begin, extend->end), extend->GetTy()->String());
             return false;
         }
         return true;
@@ -1502,7 +1545,8 @@ bool ImportManager::IsExtendMemberImported(
     for (auto& super : extend->inheritedTypes) {
         if (auto implInterface = FindImplmentInterface(file, member, super)) {
             if (!IsTypeAccessible(file, *implInterface)) {
-                AddNoteForExtendExportDiag(builder, MakeRange(extend->begin, extend->end), implInterface->ty->String());
+                AddNoteForExtendExportDiag(
+                    builder, MakeRange(extend->begin, extend->end), implInterface->GetTy()->String());
                 return false;
             }
             return true;
@@ -1574,4 +1618,31 @@ void ImportManager::ClearCachesForRebuild()
     declToTypeAlias.clear();
     // clear for ResolveImports.
     directMacroDeps.clear();
+}
+
+bool ImportManager::AnalyzeDepStdPkgsOfBC(const std::string& fullPackageName)
+{
+    auto existingPkg = cjoManager->GetPackage(fullPackageName);
+    if (existingPkg || (cjoFilePaths.find(fullPackageName) != cjoFilePaths.end())) {
+        return true;
+    }
+
+    std::string cjoPath = FileUtil::FindSerializationFile(fullPackageName, SERIALIZED_FILE_EXTENSION, GetSearchPath());
+    if (cjoPath.empty() || !cjoManager->LoadPackageHeader(fullPackageName, cjoPath)) {
+        diag.DiagnoseRefactor(DiagKindRefactor::bc_cjo_error, DEFAULT_POSITION, fullPackageName);
+        return false;
+    }
+
+    auto package = cjoManager->GetPackage(fullPackageName);
+    CJC_NULLPTR_CHECK(package);
+    for (const auto& depStdPkg : package->GetAllDependentStdPkgs()) {
+        CJC_ASSERT(STANDARD_LIBS.find(depStdPkg) != STANDARD_LIBS.end());
+        if (cjoFilePaths.find(depStdPkg) == cjoFilePaths.end()) {
+            std::string depCjoPath = FileUtil::FindSerializationFile(
+                depStdPkg, SERIALIZED_FILE_EXTENSION, GetSearchPath());
+            // Stdlib deps in separately-handled .bc files are regarded as indirect.
+            HandleStdPackage(depStdPkg, depCjoPath, true);
+        }
+    }
+    return true;
 }

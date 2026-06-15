@@ -63,6 +63,9 @@ std::string MakeOneBlameHint(const Blame& blame)
                 "', should match expected type '" + ub->String() + "'";
         case BlameStyle::CONSTRAINT:
             return "";
+        default:
+            CJC_ABORT();
+            return "";
     }
 }
 
@@ -146,30 +149,33 @@ void MakeBlameMsg(DiagnosticBuilder& builder, const SolvingErrInfo& diagInfo)
             }
         case SolvingErrStyle::DEFAULT:
             break;
+        default:
+            CJC_ABORT();
+            break;
     }
 }
 
 void DiagnoseForCallInference(DiagnosticEngine& diag, const CallExpr& ce, const FuncDecl& fd,
     const SubstPack& maps, const SolvingErrInfo& diagInfo)
 {
-    CJC_ASSERT(fd.ty);
+    CJC_ASSERT(fd.GetTy());
     CJC_NULLPTR_CHECK(ce.baseFunc);
     auto tyVars = GetUnivTyVarsToSolve(maps);
     auto builder = diag.DiagnoseRefactor(DiagKindRefactor::sema_unable_to_infer_generic_func, *ce.baseFunc);
-    std::string typeStr = "'" + fd.ty->String() + "'";
+    std::string typeStr = "'" + fd.GetTy()->String() + "'";
     if (auto ma = DynamicCast<MemberAccess*>(ce.baseFunc.get());
-        ma && ma->baseExpr && Ty::IsTyCorrect(ma->baseExpr->ty)) {
+        ma && ma->baseExpr && Ty::IsTyCorrect(ma->baseExpr->GetTy())) {
         auto reBase = As<ASTKind::REF_EXPR>(ma->baseExpr.get());
         bool isNormalRef = !reBase || (!reBase->isThis && !reBase->isSuper); // Base is not this or super.
         if (isNormalRef) {
-            typeStr += " in context type '" + ma->baseExpr->ty->String() + "'";
+            typeStr += " in context type '" + ma->baseExpr->GetTy()->String() + "'";
         }
     }
     TyVars fdVars;
     auto fdGeneric = fd.GetGeneric();
     if (fdGeneric) {
         for (auto& tyParam : fdGeneric->typeParameters) {
-            fdVars.emplace(StaticCast<TyVar*>(tyParam->ty));
+            fdVars.emplace(StaticCast<TyVar*>(tyParam->GetTy()));
         }
     }
     std::string constraintStr;
@@ -379,7 +385,7 @@ void TryUpdateEnumTyByTarget(const CallExpr& ce, const FuncDecl& fd, Ptr<Ty> ret
         // If target type of enum ctor is given, must not synthesize later. Example: var b: E<Int64> = E.e(1)
         bool updateEnumTy = IsEnumCtorWithoutTypeArgs(*ma, &fd) && Ty::GetDeclPtrOfTy(retTarget) == fd.outerDecl;
         if (updateEnumTy) {
-            ma->baseExpr->ty = retTarget;
+            ma->baseExpr->SetTy(retTarget);
         }
     }
 }
@@ -427,7 +433,7 @@ ErrOrSubst TypeChecker::TypeCheckerImpl::PrepareTyArgsSynthesis(
 {
     auto& [fd, ce, argCombinations, _] = candidate;
     // Guarantees the RawStaticCast<FuncTy*> below.
-    CJC_ASSERT(Ty::IsTyCorrect(fd.ty) && fd.ty->IsFunc());
+    CJC_ASSERT(Ty::IsTyCorrect(fd.GetTy()) && fd.GetTy()->IsFunc());
     DisableBodyInferForArgs(ctx, ce);
     TyArgSynState stat;
     // If args not empty, get argTys. Index 0 is set as current args' types combination.
@@ -436,7 +442,7 @@ ErrOrSubst TypeChecker::TypeCheckerImpl::PrepareTyArgsSynthesis(
         return SolvingErrInfo{};
     }
     if (NeedSynOnUsed(fd)) {
-        Synthesize(ctx, &fd);
+        Synthesize({ctx, SynPos::NONE}, &fd);
     }
     stat.failSet = std::vector<bool>(stat.argTys.size(), true);
     stat.questParamTys = std::vector<Ptr<Ty>>(stat.argTys.size(), nullptr);
@@ -459,7 +465,7 @@ ErrOrSubst TypeChecker::TypeCheckerImpl::PrepareTyArgsSynthesis(
     for (size_t i = 0; i < paramsTyInOrder.size(); ++i) {
         paramsTyInOrder[i] = typeManager.InstOf(paramsTyInOrder[i]);
     }
-    Ptr<Ty> funcRetTy = typeManager.InstOf(RawStaticCast<FuncTy*>(fd.ty)->retTy);
+    Ptr<Ty> funcRetTy = typeManager.InstOf(RawStaticCast<FuncTy*>(fd.GetTy())->retTy);
     LocTyArgSynArgPack argPack;
 
     while (stat.newInfo) {
@@ -470,16 +476,16 @@ ErrOrSubst TypeChecker::TypeCheckerImpl::PrepareTyArgsSynthesis(
                 auto ds2 = DiagSuppressor(diag);
                 ce.args[i]->Clear();
                 CheckWithCache(ctx, stat.questParamTys[i], ce.args[i].get());
-                stat.argTys[i] = ce.args[i]->ty;
+                stat.argTys[i] = ce.args[i]->GetTy();
             } else if (Ty::IsInitialTy(stat.argTys[i])) {
                 // Initially, every arg goes into this branch. If the inference eventually fails,
                 // errors from this synthesize should be reported
-                stat.argTys[i] = SynthesizeWithCache(ctx, ce.args[i].get());
+                stat.argTys[i] = SynthesizeWithCache({ctx, SynPos::EXPR_ARG}, ce.args[i].get());
             } else if (stat.failSet[i] && !stat.lastResortUnused) {
                 // If some arg is a lambda, try to infer its param type from its body,
                 // as a last resort in case no enough contextual info is provided.
                 auto ds3 = DiagSuppressor(diag);
-                stat.argTys[i] = Synthesize(ctx, ce.args[i].get());
+                stat.argTys[i] = Synthesize({ctx, SynPos::EXPR_ARG}, ce.args[i].get());
             }
         }
         // 2. collect valid arg tys & update failSet
@@ -553,7 +559,7 @@ std::vector<SubstPack> TypeChecker::TypeCheckerImpl::GenerateTypeMappingByInfere
 {
     auto& ce = candidate.ce;
     auto& fd = candidate.fd;
-    if (!Ty::IsTyCorrect(fd.ty) || !fd.ty->IsFunc()) {
+    if (!Ty::IsTyCorrect(fd.GetTy()) || !fd.GetTy()->IsFunc()) {
         return {};
     }
     std::vector<SubstPack> typeMappings;
@@ -575,7 +581,7 @@ std::vector<SubstPack> TypeChecker::TypeCheckerImpl::GenerateTypeMappingByInfere
             diagInfo = std::get<SolvingErrInfo>(errOrSubst);
         }
     } while (cbIndex < combinationSize);
-    if (typeMappings.empty() && !Utils::In(ce.args, [](const auto& arg) { return !Ty::IsTyCorrect(arg->ty); })) {
+    if (typeMappings.empty() && !Utils::In(ce.args, [](const auto& arg) { return !Ty::IsTyCorrect(arg->GetTy()); })) {
         DiagnoseForCallInference(diag, ce, fd, typeManager.GetInstMapping(), diagInfo);
     }
     return typeMappings;

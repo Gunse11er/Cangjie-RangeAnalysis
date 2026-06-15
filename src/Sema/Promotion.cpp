@@ -174,26 +174,26 @@ std::set<Ptr<Ty>> Promotion::PromoteHandleNominal(Ty& from, const Ty& target)
     if (from.IsClass()) {
         auto classTy = RawStaticCast<ClassTy*>(&from);
         CJC_ASSERT(classTy->decl);
-        if (classTy->decl->ty) {
-            emplaceElem(classTy->declPtr->ty->typeArgs);
+        if (classTy->decl->GetTy()) {
+            emplaceElem(classTy->declPtr->GetTy()->typeArgs);
         }
     } else if (from.IsInterface()) {
         auto interfaceTy = RawStaticCast<InterfaceTy*>(&from);
         CJC_ASSERT(interfaceTy->decl);
-        if (interfaceTy->decl->ty) {
-            emplaceElem(interfaceTy->declPtr->ty->typeArgs);
+        if (interfaceTy->decl->GetTy()) {
+            emplaceElem(interfaceTy->declPtr->GetTy()->typeArgs);
         }
     } else if (from.IsStruct()) {
         auto structTy = RawStaticCast<StructTy*>(&from);
         CJC_ASSERT(structTy->decl);
-        if (structTy->decl->ty) {
-            emplaceElem(structTy->declPtr->ty->typeArgs);
+        if (structTy->decl->GetTy()) {
+            emplaceElem(structTy->declPtr->GetTy()->typeArgs);
         }
     } else if (from.IsEnum()) {
         auto enumTy = RawStaticCast<EnumTy*>(&from);
         CJC_ASSERT(enumTy->decl);
-        if (enumTy->decl->ty) {
-            emplaceElem(enumTy->declPtr->ty->typeArgs);
+        if (enumTy->decl->GetTy()) {
+            emplaceElem(enumTy->declPtr->GetTy()->typeArgs);
         }
     }
 

@@ -59,7 +59,7 @@ void MarkInvalidInheritanceForNonClassLike(InheritableDecl& id)
 {
     CJC_ASSERT(!id.IsClassLikeDecl());
     for (auto& type : id.inheritedTypes) {
-        if (auto decl = Ty::GetDeclPtrOfTy(type->ty); decl && !decl->IsClassLikeDecl()) {
+        if (auto decl = Ty::GetDeclPtrOfTy(type->GetTy()); decl && !decl->IsClassLikeDecl()) {
             // Non-classlike decl cannot inherit non-classlike decl, add mark avoid invalid type substitution.
             id.EnableAttr(Attribute::IN_REFERENCE_CYCLE);
         }
@@ -165,7 +165,7 @@ bool AreUpperBoundsDirectlyRecursive(std::set<Ptr<GenericsTy>> visitedGenerics, 
 void CreateGenericConstraints(Generic& generic)
 {
     for (auto& param : generic.typeParameters) {
-        auto genericTy = DynamicCast<GenericsTy*>(param->ty);
+        auto genericTy = DynamicCast<GenericsTy*>(param->GetTy());
         if (genericTy == nullptr) {
             continue;
         }
@@ -177,10 +177,10 @@ void CreateGenericConstraints(Generic& generic)
         sortedUpperTys.insert(genericTy->upperBounds.begin(), genericTy->upperBounds.end());
         for (auto& it : sortedUpperTys) {
             auto sub = MakeOwnedNode<RefType>();
-            sub->ty = genericTy;
+            sub->SetTy(genericTy);
             CopyBasicInfo(&generic, sub.get());
             auto upper = MakeOwnedNode<RefType>();
-            upper->ty = it;
+            upper->SetTy(it);
             CopyBasicInfo(&generic, upper.get());
             gc->type = std::move(sub);
             gc->upperBounds.push_back(std::move(upper));
@@ -258,10 +258,12 @@ void TypeChecker::TypeCheckerImpl::CollectDeclMapAndCheckRedefinitionForOneSymbo
         bool privateGlobalInDifferentFile = sym.node->TestAttr(Attribute::GLOBAL, Attribute::PRIVATE) &&
             found.front()->TestAttr(Attribute::GLOBAL, Attribute::PRIVATE) &&
             sym.node->curFile != found.front()->curFile;
-        bool multiPlat =
+        bool oneIsFromCommonPart =
+            sym.node->TestAttr(Attribute::FROM_COMMON_PART) != found.front()->TestAttr(Attribute::FROM_COMMON_PART);
+        bool multiPlat = oneIsFromCommonPart &&
             sym.node->TestAttr(Cangjie::AST::Attribute::COMMON) && found.front()->TestAttr(Attribute::SPECIFIC);
-        multiPlat =
-            multiPlat || (sym.node->TestAttr(Attribute::SPECIFIC) && found.front()->TestAttr(Attribute::COMMON));
+        multiPlat = multiPlat || (oneIsFromCommonPart &&
+          sym.node->TestAttr(Attribute::SPECIFIC) && found.front()->TestAttr(Attribute::COMMON));
         if (!privateGlobalInDifferentFile && !multiPlat) {
             DiagRedefinitionWithFoundNode(diag, StaticCast<Decl>(*sym.node), *found.front());
         }
@@ -330,54 +332,54 @@ Ptr<Ty> TypeChecker::TypeCheckerImpl::GetTyFromASTType(ASTContext& ctx, Ptr<Node
         return TypeManager::GetInvalidTy();
     }
     // If ty is not nullptr, it means this type's ty is already set, no matter whether this type is legal or not.
-    if (!Ty::IsInitialTy(type->ty)) {
-        return type->ty;
+    if (!Ty::IsInitialTy(type->GetTy())) {
+        return type->GetTy();
     }
     switch (type->astKind) {
         case ASTKind::PRIMITIVE_TYPE: {
             auto primitiveType = StaticAs<ASTKind::PRIMITIVE_TYPE>(type);
-            primitiveType->ty = TypeManager::GetPrimitiveTy(primitiveType->kind);
-            return primitiveType->ty;
+            primitiveType->SetTy(TypeManager::GetPrimitiveTy(primitiveType->kind));
+            return primitiveType->GetTy();
         }
         case ASTKind::REF_TYPE: {
             auto refType = StaticAs<ASTKind::REF_TYPE>(type);
-            refType->ty = GetTyFromASTType(ctx, *refType);
-            return refType->ty;
+            refType->SetTy(GetTyFromASTType(ctx, *refType));
+            return refType->GetTy();
         }
         case ASTKind::QUALIFIED_TYPE: {
             auto qualifiedType = StaticAs<ASTKind::QUALIFIED_TYPE>(type);
-            qualifiedType->ty = GetTyFromASTType(ctx, *qualifiedType);
-            return qualifiedType->ty;
+            qualifiedType->SetTy(GetTyFromASTType(ctx, *qualifiedType));
+            return qualifiedType->GetTy();
         }
         case ASTKind::VARRAY_TYPE: {
             auto varrayType = StaticAs<ASTKind::VARRAY_TYPE>(type);
-            varrayType->ty = GetTyFromASTType(ctx, *varrayType);
-            return varrayType->ty;
+            varrayType->SetTy(GetTyFromASTType(ctx, *varrayType));
+            return varrayType->GetTy();
         }
         case ASTKind::TUPLE_TYPE: {
             auto tupleType = StaticAs<ASTKind::TUPLE_TYPE>(type);
-            tupleType->ty = GetTyFromASTType(ctx, *tupleType);
-            return tupleType->ty;
+            tupleType->SetTy(GetTyFromASTType(ctx, *tupleType));
+            return tupleType->GetTy();
         }
         case ASTKind::PAREN_TYPE: {
             auto parenType = StaticAs<ASTKind::PAREN_TYPE>(type);
-            parenType->ty = GetTyFromASTType(ctx, parenType->type.get());
-            return parenType->ty;
+            parenType->SetTy(GetTyFromASTType(ctx, parenType->type.get()));
+            return parenType->GetTy();
         }
         case ASTKind::FUNC_TYPE: {
             auto funcType = StaticAs<ASTKind::FUNC_TYPE>(type);
-            funcType->ty = GetTyFromASTType(ctx, *funcType);
-            return funcType->ty;
+            funcType->SetTy(GetTyFromASTType(ctx, *funcType));
+            return funcType->GetTy();
         }
         case ASTKind::OPTION_TYPE: {
             auto optionType = StaticAs<ASTKind::OPTION_TYPE>(type);
-            optionType->ty = GetTyFromASTType(ctx, *optionType);
-            return optionType->ty;
+            optionType->SetTy(GetTyFromASTType(ctx, *optionType));
+            return optionType->GetTy();
         }
         case ASTKind::INVALID_TYPE: {
             auto invalidType = StaticAs<ASTKind::INVALID_TYPE>(type);
-            invalidType->ty = RawStaticCast<Ty*>(TypeManager::GetInvalidTy());
-            return invalidType->ty;
+            invalidType->SetTy(RawStaticCast<Ty*>(TypeManager::GetInvalidTy()));
+            return invalidType->GetTy();
         }
         case ASTKind::THIS_TYPE:
             CJC_ABORT(); // ThisType should not enter current func.
@@ -390,10 +392,10 @@ Ptr<Ty> TypeChecker::TypeCheckerImpl::GetTyFromASTType(ASTContext& ctx, Ptr<Node
 
 Ptr<Ty> TypeChecker::TypeCheckerImpl::GetTyFromASTType(ASTContext& ctx, RefType& rt)
 {
-    // If rt.ty is nullptr but rt.ref.target is packageDecl, rt is the base of another qualified type and is already
-    // resolved.
-    if ((rt.ref.target && rt.ref.target->astKind == ASTKind::PACKAGE_DECL) || !Ty::IsInitialTy(rt.ty)) {
-        return rt.ty;
+    // If rt.GetTy() is nullptr but rt.ref.target is packageDecl, rt is the base of another qualified type and is
+    // already resolved.
+    if ((rt.ref.target && rt.ref.target->astKind == ASTKind::PACKAGE_DECL) || !Ty::IsInitialTy(rt.GetTy())) {
+        return rt.GetTy();
     }
     // Get scope target.
     auto targets = LookupTopLevel(ctx, rt.ref.identifier, rt.scopeName, rt);
@@ -407,16 +409,16 @@ Ptr<Ty> TypeChecker::TypeCheckerImpl::GetTyFromASTType(ASTContext& ctx, RefType&
 
     std::sort(targets.begin(), targets.end(),
         [](Ptr<const Decl> d1, Ptr<const Decl> d2) {
-        if (d1->scopeLevel > d2->scopeLevel) {
-            return true;
-        } else if (d1->scopeLevel == d2->scopeLevel) {
-            // Ranking overloads also by specific > common
-            if (d1->TestAttr(Attribute::SPECIFIC)) {
+            if (d1->scopeLevel > d2->scopeLevel) {
                 return true;
+            } else if (d1->scopeLevel == d2->scopeLevel) {
+                // Ranking overloads also by specific > common
+                if (d1->TestAttr(Attribute::SPECIFIC)) {
+                    return true;
+                }
             }
-        }
-        return false;
-    });
+            return false;
+        });
 
     Ptr<Decl> target{nullptr};
     if (targets.empty()) {
@@ -448,8 +450,8 @@ Ptr<Ty> TypeChecker::TypeCheckerImpl::GetTyFromASTType(ASTContext& ctx, RefType&
         ReplaceTarget(&rt, target);
         // Get semaTy only by name, no need to check inside.
         auto typeArgs = GetTyFromASTType(ctx, rt.typeArguments);
-        rt.ty = GetTyFromASTType(*target, typeArgs);
-        return rt.ty;
+        rt.SetTy(GetTyFromASTType(*target, typeArgs));
+        return rt.GetTy();
     }
     // If there are more than one targets and the scope are the same then report ambiguous error.
     DiagAmbiguousUse(diag, rt, rt.ref.identifier, targets, importManager);
@@ -471,21 +473,22 @@ Ptr<Ty> TypeChecker::TypeCheckerImpl::GetTyFromASTCFuncType(ASTContext& ctx, Ref
     std::vector<Ptr<Ty>> paramTys;
     for (size_t i{0}; i < funcType->paramTypes.size(); ++i) {
         auto& param = funcType->paramTypes[i];
-        param->ty = GetTyFromASTType(ctx, &*param);
-        paramTys.push_back(param->ty);
+        param->SetTy(GetTyFromASTType(ctx, &*param));
+        paramTys.push_back(param->GetTy());
     }
-    Ptr<Ty> retTy = funcType->retType->ty = GetTyFromASTType(ctx, funcType->retType.get());
-    funcType->ty = GetTyFromASTType(ctx, funcType);
+    funcType->retType->SetTy(GetTyFromASTType(ctx, funcType->retType.get()));
+    Ptr<Ty> retTy = funcType->retType->GetTy();
+    funcType->SetTy(GetTyFromASTType(ctx, funcType));
     return typeManager.GetFunctionTy(std::move(paramTys), retTy, {.isC = true});
 }
 
 Ptr<Ty> TypeChecker::TypeCheckerImpl::GetTyFromASTType(ASTContext& ctx, QualifiedType& qt)
 {
-    // If qt.ty is nullptr but qt.target is packageDecl, qt is the base of another qualified type and is already
+    // If qt.GetTy() is nullptr but qt.target is packageDecl, qt is the base of another qualified type and is already
     // resolved.
-    bool earlyQuit = (qt.target && qt.target->astKind == ASTKind::PACKAGE_DECL) || !Ty::IsInitialTy(qt.ty);
+    bool earlyQuit = (qt.target && qt.target->astKind == ASTKind::PACKAGE_DECL) || !Ty::IsInitialTy(qt.GetTy());
     if (earlyQuit) {
-        return qt.ty;
+        return qt.GetTy();
     }
     Ptr<Type> baseType = qt.baseType.get();
     CJC_ASSERT(baseType != nullptr);
@@ -504,11 +507,11 @@ Ptr<Ty> TypeChecker::TypeCheckerImpl::GetTyFromASTType(ASTContext& ctx, Qualifie
         auto curType = &qt;
         do {
             CJC_NULLPTR_CHECK(curType->baseType);
-            curType->baseType->ty = TypeManager::GetInvalidTy();
+            curType->baseType->SetTy(TypeManager::GetInvalidTy());
             curType = DynamicCast<QualifiedType*>(curType->baseType.get());
         } while (curType != nullptr);
     } else {
-        baseType->ty = GetTyFromASTType(ctx, baseType);
+        baseType->SetTy(GetTyFromASTType(ctx, baseType));
     }
     Ptr<Decl> targetOfBaseType = baseType->GetTarget();
     // Check targetOfBaseType.
@@ -530,13 +533,13 @@ Ptr<Ty> TypeChecker::TypeCheckerImpl::GetTyFromASTType(ASTContext& ctx, Qualifie
     ReplaceTarget(&qt, target);
     // Get semaTy only by name, no need to check inside.
     auto typeArgs = GetTyFromASTType(ctx, qt.typeArguments);
-    qt.ty = GetTyFromASTType(*target, typeArgs);
-    return qt.ty;
+    qt.SetTy(GetTyFromASTType(*target, typeArgs));
+    return qt.GetTy();
 }
 
 Ptr<Ty> TypeChecker::TypeCheckerImpl::GetTyFromASTType(ASTContext& ctx, VArrayType& varrayType)
 {
-    varrayType.typeArgument->ty = GetTyFromASTType(ctx, varrayType.typeArgument.get());
+    varrayType.typeArgument->SetTy(GetTyFromASTType(ctx, varrayType.typeArgument.get()));
     auto expr = StaticAs<ASTKind::CONSTANT_TYPE>(varrayType.constantType.get())->constantExpr.get();
     CJC_ASSERT(expr && expr->astKind == ASTKind::LIT_CONST_EXPR);
     auto le = StaticAs<ASTKind::LIT_CONST_EXPR>(expr);
@@ -552,68 +555,68 @@ Ptr<Ty> TypeChecker::TypeCheckerImpl::GetTyFromASTType(ASTContext& ctx, VArrayTy
 #endif
         return TypeManager::GetInvalidTy();
     }
-    varrayType.ty = typeManager.GetVArrayTy(*varrayType.typeArgument->ty, le->constNumValue.asInt.Int64());
-    return varrayType.ty;
+    varrayType.SetTy(typeManager.GetVArrayTy(*varrayType.typeArgument->GetTy(), le->constNumValue.asInt.Int64()));
+    return varrayType.GetTy();
 }
 
 Ptr<Ty> TypeChecker::TypeCheckerImpl::GetTyFromASTType(ASTContext& ctx, TupleType& tupleType)
 {
-    if (!Ty::IsInitialTy(tupleType.ty)) {
-        return tupleType.ty;
+    if (!Ty::IsInitialTy(tupleType.GetTy())) {
+        return tupleType.GetTy();
     }
     std::vector<Ptr<Ty>> elemTy;
     for (auto& fieldType : tupleType.fieldTypes) {
         if (!fieldType) {
             return TypeManager::GetInvalidTy();
         }
-        fieldType->ty = GetTyFromASTType(ctx, fieldType.get());
-        if (Ty::IsInitialTy(fieldType->ty)) {
+        fieldType->SetTy(GetTyFromASTType(ctx, fieldType.get()));
+        if (Ty::IsInitialTy(fieldType->GetTy())) {
             return TypeManager::GetInvalidTy();
         }
-        elemTy.push_back(fieldType->ty);
+        elemTy.push_back(fieldType->GetTy());
     }
-    tupleType.ty = typeManager.GetTupleTy(elemTy);
-    return tupleType.ty;
+    tupleType.SetTy(typeManager.GetTupleTy(elemTy));
+    return tupleType.GetTy();
 }
 
 Ptr<Ty> TypeChecker::TypeCheckerImpl::GetTyFromASTType(ASTContext& ctx, FuncType& funcType)
 {
-    if (!Ty::IsInitialTy(funcType.ty)) {
-        return funcType.ty;
+    if (!Ty::IsInitialTy(funcType.GetTy())) {
+        return funcType.GetTy();
     }
     std::vector<Ptr<Ty>> paramTys;
     for (auto& paramType : funcType.paramTypes) {
         if (!paramType) {
             return TypeManager::GetInvalidTy();
         }
-        paramType->ty = GetTyFromASTType(ctx, paramType.get());
-        if (Ty::IsInitialTy(paramType->ty)) {
+        paramType->SetTy(GetTyFromASTType(ctx, paramType.get()));
+        if (Ty::IsInitialTy(paramType->GetTy())) {
             return TypeManager::GetInvalidTy();
         }
-        paramTys.push_back(paramType->ty);
+        paramTys.push_back(paramType->GetTy());
     }
     if (!funcType.retType) {
         return TypeManager::GetInvalidTy();
     }
-    funcType.retType->ty = GetTyFromASTType(ctx, funcType.retType.get());
-    if (!funcType.retType->ty) {
+    funcType.retType->SetTy(GetTyFromASTType(ctx, funcType.retType.get()));
+    if (!funcType.retType->GetTy()) {
         return TypeManager::GetInvalidTy();
     }
-    funcType.ty = typeManager.GetFunctionTy(paramTys, funcType.retType->ty, {funcType.isC});
-    return funcType.ty;
+    funcType.SetTy(typeManager.GetFunctionTy(paramTys, funcType.retType->GetTy(), {funcType.isC}));
+    return funcType.GetTy();
 }
 
 Ptr<Ty> TypeChecker::TypeCheckerImpl::GetTyFromASTType(ASTContext& ctx, OptionType& optionType)
 {
     if (optionType.componentType) {
-        optionType.componentType->ty = GetTyFromASTType(ctx, optionType.componentType.get());
+        optionType.componentType->SetTy(GetTyFromASTType(ctx, optionType.componentType.get()));
     }
     if (optionType.desugarType) {
-        optionType.ty = GetTyFromASTType(ctx, *optionType.desugarType);
+        optionType.SetTy(GetTyFromASTType(ctx, *optionType.desugarType));
     } else {
-        optionType.ty = TypeManager::GetInvalidTy();
+        optionType.SetTy(TypeManager::GetInvalidTy());
     }
-    return optionType.ty;
+    return optionType.GetTy();
 }
 
 Ptr<Ty> TypeChecker::TypeCheckerImpl::GetTyFromASTType(Decl& decl, const std::vector<Ptr<Ty>>& typeArgs)
@@ -648,7 +651,7 @@ Ptr<Ty> TypeChecker::TypeCheckerImpl::GetTyFromASTType(Decl& decl, const std::ve
             return GetTyFromBuiltinDecl(*bid, typeArgs);
         }
         default:
-            return decl.ty;
+            return decl.GetTy();
     }
 }
 
@@ -710,10 +713,10 @@ std::vector<Ptr<Ty>> TypeChecker::TypeCheckerImpl::GetTyFromASTType(
 {
     std::vector<Ptr<Ty>> typeArgs;
     for (auto& gpd : typeParameters) {
-        if (Ty::IsInitialTy(gpd->ty)) {
-            gpd->ty = GetTyFromASTType(*gpd, {});
+        if (Ty::IsInitialTy(gpd->GetTy())) {
+            gpd->SetTy(GetTyFromASTType(*gpd, {}));
         }
-        typeArgs.push_back(gpd->ty);
+        typeArgs.push_back(gpd->GetTy());
     }
     return typeArgs;
 }
@@ -723,10 +726,10 @@ std::vector<Ptr<Ty>> TypeChecker::TypeCheckerImpl::GetTyFromASTType(
 {
     std::vector<Ptr<Ty>> typeArgs;
     for (auto& arg : typeArguments) {
-        if (Ty::IsInitialTy(arg->ty)) {
-            arg->ty = GetTyFromASTType(ctx, arg.get());
+        if (Ty::IsInitialTy(arg->GetTy())) {
+            arg->SetTy(GetTyFromASTType(ctx, arg.get()));
         }
-        typeArgs.push_back(arg->ty);
+        typeArgs.push_back(arg->GetTy());
     }
     return typeArgs;
 }
@@ -738,7 +741,7 @@ void TypeChecker::TypeCheckerImpl::SetDeclTy(Decl& decl)
     if (generic) {
         typeArgs = GetTyFromASTType(generic->typeParameters);
     }
-    decl.ty = GetTyFromASTType(decl, typeArgs);
+    decl.SetTy(GetTyFromASTType(decl, typeArgs));
 }
 
 void TypeChecker::TypeCheckerImpl::SetTypeAliasDeclTy(ASTContext& ctx, TypeAliasDecl& tad)
@@ -747,8 +750,8 @@ void TypeChecker::TypeCheckerImpl::SetTypeAliasDeclTy(ASTContext& ctx, TypeAlias
     if (tad.type == nullptr) {
         return;
     }
-    tad.type->ty = GetTyFromASTType(ctx, tad.type.get());
-    if (!Ty::IsTyCorrect(tad.type->ty)) {
+    tad.type->SetTy(GetTyFromASTType(ctx, tad.type.get()));
+    if (!Ty::IsTyCorrect(tad.type->GetTy())) {
         std::string name;
         if (auto rt = DynamicCast<RefType*>(tad.type.get()); rt) {
             name = rt->ref.identifier;
@@ -778,9 +781,9 @@ void TypeChecker::TypeCheckerImpl::ResolveOneDecl(ASTContext& ctx, Decl& decl)
                 diag.Diagnose(decl, DiagKind::sema_c_type_cannot_implement_interface, decl.identifier.Val());
             }
             for (auto& superType : id->inheritedTypes) {
-                superType->ty = GetTyFromASTType(ctx, superType.get());
-                if (auto clt = DynamicCast<ClassLikeTy*>(superType->ty); clt && Ty::IsTyCorrect(id->ty)) {
-                    (void)clt->directSubtypes.emplace(id->ty);
+                superType->SetTy(GetTyFromASTType(ctx, superType.get()));
+                if (auto clt = DynamicCast<ClassLikeTy*>(superType->GetTy()); clt && Ty::IsTyCorrect(id->GetTy())) {
+                    (void)clt->directSubtypes.emplace(id->GetTy());
                 }
             }
             break;
@@ -849,18 +852,18 @@ void TypeChecker::TypeCheckerImpl::ResolveTypeAlias(const std::vector<Ptr<ASTCon
 
 void TypeChecker::TypeCheckerImpl::SetTypeTy(ASTContext& ctx, Type& type)
 {
-    type.ty = GetTyFromASTType(ctx, &type);
+    type.SetTy(GetTyFromASTType(ctx, &type));
     // Set aliasTy for a type reference if refer a type alias. Use to export alias info when export cjo.
-    if (auto target = type.GetTarget(); target && target->ty->kind == TypeKind::TYPE) {
+    if (auto target = type.GetTarget(); target && target->TyKind() == TypeKind::TYPE) {
         std::vector<Ptr<Ty>> typeArgs;
         for (auto typeArg : type.GetTypeArgs()) {
-            typeArgs.emplace_back(typeArg->ty);
+            typeArgs.emplace_back(typeArg->GetTy());
         }
         TypeSubst typeMapping = GenerateTypeMapping(*target, typeArgs);
-        auto instAliasedTy = typeManager.GetInstantiatedTy(target->ty, typeMapping);
+        auto instAliasedTy = typeManager.GetInstantiatedTy(target->GetTy(), typeMapping);
         type.aliasTy = instAliasedTy;
     }
-    type.ty = typeManager.SubstituteTypeAliasInTy(*type.ty);
+    type.SetTy(typeManager.SubstituteTypeAliasInTy(*type.GetTy()));
 }
 
 void TypeChecker::TypeCheckerImpl::SubstituteTypeAliasForAlias(TypeAliasDecl& tad)
@@ -877,8 +880,8 @@ void TypeChecker::TypeCheckerImpl::SubstituteTypeAliasForAlias(TypeAliasDecl& ta
             case ASTKind::FUNC_TYPE:
             case ASTKind::OPTION_TYPE: {
                 auto type = StaticAs<ASTKind::TYPE>(node);
-                CJC_ASSERT(type->ty != nullptr);
-                type->ty = typeManager.SubstituteTypeAliasInTy(*type->ty);
+                CJC_ASSERT(type->GetTy() != nullptr);
+                type->SetTy(typeManager.SubstituteTypeAliasInTy(*type->GetTy()));
                 return VisitAction::WALK_CHILDREN;
             }
             default:
@@ -961,7 +964,7 @@ bool TypeChecker::TypeCheckerImpl::ValidRecursiveConstraintCheck(const Generic& 
 {
     for (auto& it : generic.typeParameters) {
         CJC_NULLPTR_CHECK(it);
-        auto genericTy = DynamicCast<GenericsTy*>(it->ty);
+        auto genericTy = DynamicCast<GenericsTy*>(it->GetTy());
         if (!genericTy) {
             continue;
         }
@@ -993,7 +996,7 @@ bool TypeChecker::TypeCheckerImpl::CheckUpperBoundsLegality(const Generic& gener
 {
     for (auto& gp : generic.typeParameters) {
         CJC_NULLPTR_CHECK(gp);
-        auto genericsTy = DynamicCast<GenericsTy*>(gp->ty);
+        auto genericsTy = DynamicCast<GenericsTy*>(gp->GetTy());
         if (!genericsTy) {
             return false;
         }
@@ -1074,7 +1077,7 @@ void TypeChecker::TypeCheckerImpl::AssumptionSanityCheck(const Generic& generic)
     }
     // Do sanity check recursively according to rule 2-5.
     for (auto& it : generic.typeParameters) {
-        auto genericTy = DynamicCast<GenericsTy*>(it->ty);
+        auto genericTy = DynamicCast<GenericsTy*>(it->GetTy());
         if (!genericTy) {
             continue;
         }
@@ -1107,7 +1110,7 @@ void TypeChecker::TypeCheckerImpl::ExposeGenericUpperBounds(ASTContext& ctx, con
 {
     for (auto& it : generic.typeParameters) {
         CJC_NULLPTR_CHECK(it);
-        auto genericTy = DynamicCast<GenericsTy*>(it->ty);
+        auto genericTy = DynamicCast<GenericsTy*>(it->GetTy());
         if (!genericTy) {
             continue;
         }
@@ -1152,7 +1155,7 @@ void TypeChecker::TypeCheckerImpl::CheckAssumption(ASTContext& ctx, const Decl& 
     }
     CheckGenericConstraints(ctx, *generic);
     if (!CheckUpperBoundsLegality(*generic)) {
-        diag.Diagnose(decl, DiagKind::sema_generic_type_argument_not_match_constraint, decl.ty->String());
+        diag.Diagnose(decl, DiagKind::sema_generic_type_argument_not_match_constraint, decl.GetTy()->String());
     }
     ExposeGenericUpperBounds(ctx, *generic);
     AssumptionSanityCheck(*generic);
@@ -1180,13 +1183,14 @@ void TypeChecker::TypeCheckerImpl::AddSuperClassObjectForClassDecl(ASTContext& c
 
 void TypeChecker::TypeCheckerImpl::AddSuperInterfaceForClassLikeDecl(ASTContext& ctx)
 {
+    // TODO: move it to Interop::ObjC
     std::vector<Symbol*> syms = GetAllDecls(ctx);
     for (auto& sym : syms) {
         CJC_ASSERT(sym && sym->node);
         if (!sym->node->TestAnyAttr(Attribute::OBJ_C_MIRROR, Attribute::OBJ_C_MIRROR_SUBTYPE)) {
             continue;
         }
-
+        
         if (auto classLikeDecl = As<ASTKind::CLASS_LIKE_DECL>(sym->node); classLikeDecl) {
             AddObjCIdSuperInterfaceObjCInterop(ctx, *classLikeDecl);
         }
@@ -1318,7 +1322,7 @@ void TypeChecker::TypeCheckerImpl::StructDeclCircleOrDupCheck(ASTContext& ctx)
 
 void TypeChecker::TypeCheckerImpl::CheckDupInterfaceInStructDecl(InheritableDecl& decl)
 {
-    if (!Ty::IsTyCorrect(decl.ty)) {
+    if (!Ty::IsTyCorrect(decl.GetTy())) {
         return;
     }
     // Do not check for decl's related extend decls in precheck step.
@@ -1348,8 +1352,8 @@ void TypeChecker::TypeCheckerImpl::CheckInheritanceCycleWithExtend(
     std::set<Ptr<ExtendDecl>> extends = typeManager.GetDeclExtends(decl);
     for (auto& extend : extends) {
         for (auto& it : extend->inheritedTypes) {
-            it->ty = GetTyFromASTType(ctx, it.get());
-            auto target = Ty::GetDeclPtrOfTy(it->ty);
+            it->SetTy(GetTyFromASTType(ctx, it.get()));
+            auto target = Ty::GetDeclPtrOfTy(it->GetTy());
             if (auto id = DynamicCast<InterfaceDecl*>(target); id && id->checkFlag != InheritanceVisitStatus::VISITED) {
                 CheckInheritanceCycleDFS(ctx, *id, path, extend);
             } else {
@@ -1372,7 +1376,7 @@ void TypeChecker::TypeCheckerImpl::CheckInheritanceCycleDFS(
 
     if (auto cld = DynamicCast<ClassLikeDecl*>(&decl); cld) {
         for (auto& it : cld->inheritedTypes) {
-            auto target = Ty::GetDeclPtrOfTy(it->ty);
+            auto target = Ty::GetDeclPtrOfTy(it->GetTy());
             if (target && target->IsNominalDecl() && target->checkFlag != InheritanceVisitStatus::VISITED) {
                 CheckInheritanceCycleDFS(ctx, *target, path, extendDecl);
             } else {
@@ -1400,7 +1404,7 @@ void TypeChecker::TypeCheckerImpl::IgnoreAssumptionForTypeAliasDecls(const ASTCo
     for (auto& sym : syms) {
         if (auto tad = AST::As<ASTKind::TYPE_ALIAS_DECL>(sym->node); tad && tad->type && tad->generic) {
             for (auto& tp : tad->generic->typeParameters) {
-                if (auto genTy = DynamicCast<GenericsTy*>(tp->ty)) {
+                if (auto genTy = DynamicCast<GenericsTy*>(tp->GetTy())) {
                     genTy->isAliasParam = true;
                 }
             }
@@ -1425,7 +1429,7 @@ void TypeChecker::TypeCheckerImpl::AddUpperBoundOnTypeParameters(
     TyVarUB& allAssumptionMap, const TypeSubst& typeArgAppliedMap)
 {
     for (auto& typeParameter : generic.typeParameters) {
-        auto genericTy = DynamicCast<GenericsTy*>(typeParameter->ty);
+        auto genericTy = DynamicCast<GenericsTy*>(typeParameter->GetTy());
         if (genericTy == nullptr) {
             continue;
         }
@@ -1435,7 +1439,7 @@ void TypeChecker::TypeCheckerImpl::AddUpperBoundOnTypeParameters(
         }
         auto assumedUpperBounds = aliasedTypeGeneric->assumptionCollection;
         GetAllAssumptions(assumedUpperBounds, allAssumptionMap);
-        auto constraintTys = revTypeMapping[StaticCast<GenericsTy*>(typeParameter->ty)];
+        auto constraintTys = revTypeMapping[StaticCast<GenericsTy*>(typeParameter->GetTy())];
         UpperBounds constraints;
         for (auto it : constraintTys) {
             auto uppers = allAssumptionMap[StaticCast<GenericsTy*>(it)];
@@ -1463,14 +1467,14 @@ void TypeChecker::TypeCheckerImpl::AddAssumptionForType(ASTContext& ctx, const T
         return;
     }
     auto aliasedTypeTarget = type.GetTarget();
-    if (!aliasedTypeTarget || !type.ty || type.ty->typeArgs.empty()) {
+    if (!aliasedTypeTarget || !type.GetTy() || type.GetTy()->typeArgs.empty()) {
         return;
     }
     size_t originalConstraintCount = generic.genericConstraints.size();
     MultiTypeSubst revTypeMapping;
     TyVarUB allAssumptionMap;
-    GetRevTypeMapping(aliasedTypeTarget->ty->typeArgs, type.ty->typeArgs, revTypeMapping);
-    auto typeArgAppliedMap = GetGenericTysToInstTysMapping(*aliasedTypeTarget->ty, *type.ty);
+    GetRevTypeMapping(aliasedTypeTarget->GetTy()->typeArgs, type.GetTy()->typeArgs, revTypeMapping);
+    auto typeArgAppliedMap = GetGenericTysToInstTysMapping(*aliasedTypeTarget->GetTy(), *type.GetTy());
     AddUpperBoundOnTypeParameters(
         ctx, generic, *aliasedTypeTarget, revTypeMapping, allAssumptionMap, typeArgAppliedMap);
     CreateGenericConstraints(generic);
@@ -1528,7 +1532,7 @@ void TypeChecker::TypeCheckerImpl::PreCheckFuncRedefinitionForEnum(const std::ve
         }
         // Function redefinition check is moved to precheck when the ty of function is not set, because the
         // return type need to be inferred in type check stage.
-        auto funcTy = DynamicCast<FuncTy*>(func->ty);
+        auto funcTy = DynamicCast<FuncTy*>(func->GetTy());
         auto paramTys = funcTy ? funcTy->paramTys : GetParamTys(*func);
         if (paramNum.find(paramTys.size()) != paramNum.end()) {
             diag.Diagnose(*func, DiagKind::sema_duplicated_item_in_enum,
@@ -1575,6 +1579,21 @@ void TypeChecker::TypeCheckerImpl::PreCheckFuncStaticConflict(const std::vector<
     }
 }
 
+namespace {
+inline bool IsSamePosition(const Position& pos1, const Position& pos2)
+{
+    return pos1 == pos2 && pos1.fileID == pos2.fileID;
+}
+
+/// When compiling CJMP package, there can be several parent CJO each having the same function.
+/// Both function are deserialized, so it's not duplicate, it's actulayy the same function.
+inline bool IsSameDeserializedFunction(Ptr<FuncDecl> f1, Ptr<FuncDecl> f2)
+{
+    return IsSamePosition(f1->begin, f2->begin) &&
+        (f1->TestAttr(Attribute::ALREADY_LOADED) || f2->TestAttr(Attribute::ALREADY_LOADED));
+}
+}
+
 bool TypeChecker::TypeCheckerImpl::PreCheckFuncRedefinitionWithSameSignature(
     std::vector<Ptr<FuncDecl>> funcs, bool needReportErr)
 {
@@ -1584,8 +1603,8 @@ bool TypeChecker::TypeCheckerImpl::PreCheckFuncRedefinitionWithSameSignature(
         auto it1 = std::partition(it, funcs.end(), [&it, this](Ptr<FuncDecl> fd) {
             // Function redefinition check is moved to PreCheck when the ty of function is not set, because the
             // return type need to be inferred in type check stage.
-            auto funcTy1 = DynamicCast<FuncTy*>((*it)->ty);
-            auto funcTy2 = DynamicCast<FuncTy*>(fd->ty);
+            auto funcTy1 = DynamicCast<FuncTy*>((*it)->GetTy());
+            auto funcTy2 = DynamicCast<FuncTy*>(fd->GetTy());
             auto paramTys1 = funcTy1 ? funcTy1->paramTys : GetParamTys(**it);
             auto paramTys2 = funcTy2 ? funcTy2->paramTys : GetParamTys(*fd);
             // Get substituteMap S = [X11 -> X21, ..., X1n -> X2m]. from '*it' to 'fd' if exists.
@@ -1601,10 +1620,11 @@ bool TypeChecker::TypeCheckerImpl::PreCheckFuncRedefinitionWithSameSignature(
                     visibilityMatch = false;
                 }
             }
-            return typeManager.IsFuncParameterTypesIdentical(paramTys1, paramTys2, substituteMap) &&
+            return visibilityMatch && typeManager.IsFuncParameterTypesIdentical(paramTys1, paramTys2, substituteMap) &&
                 fd->TestAttr(Attribute::STATIC) == (*it)->TestAttr(Attribute::STATIC) &&
                 fd->TestAttr(Attribute::CONSTRUCTOR) == (*it)->TestAttr(Attribute::CONSTRUCTOR) &&
-                fd->TestAttr(Attribute::MAIN_ENTRY) == (*it)->TestAttr(Attribute::MAIN_ENTRY) && visibilityMatch;
+                fd->TestAttr(Attribute::MAIN_ENTRY) == (*it)->TestAttr(Attribute::MAIN_ENTRY) &&
+                !IsSameDeserializedFunction(fd, *it);
         });
         std::vector<Ptr<FuncDecl>> sameSigFuncs;
         std::copy(funcs.begin(), it1, std::back_inserter(sameSigFuncs));
@@ -1696,13 +1716,13 @@ void TypeChecker::TypeCheckerImpl::CheckReturnAndJump(const ASTContext& ctx)
         auto refFuncBody = GetCurFuncBody(ctx, sym->scopeName);
         if (refFuncBody) {
             if (refFuncBody->funcDecl && IsStaticInitializer(*refFuncBody->funcDecl)) {
-                re->ty = TypeManager::GetInvalidTy();
+                re->SetTy(TypeManager::GetInvalidTy());
                 (void)diag.DiagnoseRefactor(DiagKindRefactor::sema_invalid_return_in_static_init, *sym->node);
             } else {
                 re->refFuncBody = refFuncBody;
             }
         } else {
-            re->ty = TypeManager::GetInvalidTy();
+            re->SetTy(TypeManager::GetInvalidTy());
             diag.DiagnoseRefactor(DiagKindRefactor::sema_invalid_return, *sym->node);
         }
     }
@@ -1713,7 +1733,7 @@ void TypeChecker::TypeCheckerImpl::CheckReturnAndJump(const ASTContext& ctx)
         Ptr<ReturnExpr> re = GetDanglingReturn(param);
         if (re != nullptr) {
             re->refFuncBody = nullptr;
-            re->ty = TypeManager::GetInvalidTy();
+            re->SetTy(TypeManager::GetInvalidTy());
             diag.DiagnoseRefactor(DiagKindRefactor::sema_invalid_return, *re);
         }
     }
@@ -1723,7 +1743,7 @@ void TypeChecker::TypeCheckerImpl::CheckReturnAndJump(const ASTContext& ctx)
         CJC_ASSERT(sym && sym->node);
         if (!ScopeManager::GetRefLoopSymbol(ctx, *sym->node)) {
             diag.Diagnose(*sym->node, DiagKind::sema_invalid_loop_control);
-            sym->node->ty = TypeManager::GetInvalidTy();
+            sym->node->SetTy(TypeManager::GetInvalidTy());
         }
     }
 }
@@ -1733,7 +1753,7 @@ void TypeChecker::TypeCheckerImpl::ReplaceThisTypeInFunc(const AST::FuncDecl& fu
     CJC_ASSERT(funcDecl.funcBody);
     // Parser guarantees 'This' only exist on the return type of function decl inside classBody.
     auto cd = DynamicCast<ClassDecl*>(funcDecl.outerDecl);
-    if (cd == nullptr || !Ty::IsTyCorrect(cd->ty)) {
+    if (cd == nullptr || !Ty::IsTyCorrect(cd->GetTy())) {
         return;
     }
     // Replace ThisType to RefType.
@@ -1743,7 +1763,7 @@ void TypeChecker::TypeCheckerImpl::ReplaceThisTypeInFunc(const AST::FuncDecl& fu
         rt->ref.identifier = "This";
         rt->ref.identifier.SetPos(thisType->begin, thisType->begin + std::string_view{"This"}.size());
         CopyBasicInfo(thisType, rt.get());
-        rt->ty = typeManager.GetClassThisTy(*cd, cd->ty->typeArgs);
+        rt->SetTy(typeManager.GetClassThisTy(*cd, cd->GetTy()->typeArgs));
         funcDecl.funcBody->retType = std::move(rt);
     }
 }
@@ -1766,8 +1786,8 @@ void TypeChecker::TypeCheckerImpl::PreSetDeclType(const ASTContext& ctx)
     for (auto sym : syms) {
         CJC_ASSERT(sym && sym->node);
         auto vd = StaticCast<VarDecl*>(sym->node);
-        if (vd->type && Ty::IsTyCorrect(vd->type->ty)) {
-            vd->ty = vd->type->ty;
+        if (vd->type && Ty::IsTyCorrect(vd->type->GetTy())) {
+            vd->SetTy(vd->type->GetTy());
         }
     }
     // 3. Set user defined function parameter's types (must exist), and function return type if written.
@@ -1777,7 +1797,7 @@ void TypeChecker::TypeCheckerImpl::PreSetDeclType(const ASTContext& ctx)
         auto fd = StaticCast<FuncDecl*>(sym->node);
         CJC_NULLPTR_CHECK(fd->funcBody);
         ReplaceThisTypeInFunc(*fd); // Always need to update node of ThisType.
-        if (Ty::IsTyCorrect(fd->ty)) {
+        if (Ty::IsTyCorrect(fd->GetTy())) {
             continue; // Do not replace valid ty.
         }
         auto paramTys = GetFuncBodyParamTys(*fd->funcBody);
@@ -1786,12 +1806,13 @@ void TypeChecker::TypeCheckerImpl::PreSetDeclType(const ASTContext& ctx)
             // Static init has return type of unit. Instance init has return type of current typeDecl.
             retTy = fd->TestAttr(Attribute::STATIC)
                 ? TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT)
-                : (fd->outerDecl && fd->outerDecl->IsNominalDecl() ? fd->outerDecl->ty : TypeManager::GetInvalidTy());
-            fd->ty = typeManager.GetFunctionTy(paramTys, retTy);
+                : (fd->outerDecl && fd->outerDecl->IsNominalDecl() ? fd->outerDecl->GetTy()
+                                                                   : TypeManager::GetInvalidTy());
+            fd->SetTy(typeManager.GetFunctionTy(paramTys, retTy));
             continue;
         }
         if (fd->funcBody->retType) {
-            retTy = fd->funcBody->retType->ty;
+            retTy = fd->funcBody->retType->GetTy();
         } else if (fd->funcBody->body && fd->funcBody->body->body.empty()) {
             retTy = TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT);
         }
@@ -1799,9 +1820,9 @@ void TypeChecker::TypeCheckerImpl::PreSetDeclType(const ASTContext& ctx)
             fd->funcBody->TestAttr(Attribute::C) || (fd->TestAttr(Attribute::FOREIGN) && IsUnsafeBackend(backendType));
         bool hasVariableLenArg = fd->hasVariableLenArg ||
             (!fd->funcBody->paramLists.empty() && fd->funcBody->paramLists[0]->hasVariableLenArg);
-        fd->ty = typeManager.GetFunctionTy(paramTys, retTy, {isCFunc, false, hasVariableLenArg});
+        fd->SetTy(typeManager.GetFunctionTy(paramTys, retTy, {isCFunc, false, hasVariableLenArg}));
         if (fd->TestAttr(Attribute::IS_CHECK_VISITED)) {
-            fd->funcBody->ty = fd->ty;
+            fd->funcBody->SetTy(fd->GetTy());
         }
     }
 }
@@ -1865,7 +1886,7 @@ void TypeChecker::TypeCheckerImpl::PreCheckInvalidInherit(const ASTContext& ctx,
         DiagKind kind = id->astKind == ASTKind::INTERFACE_DECL ? DiagKind::sema_interface_is_not_inheritable
                                                                : DiagKind::sema_interface_is_not_implementable;
         for (auto& it : id->inheritedTypes) {
-            if (it->ty->IsCType()) {
+            if (it->GetTy()->IsCType()) {
                 diag.Diagnose(*it, kind, CTYPE_NAME);
             }
         }
@@ -1889,7 +1910,7 @@ Ptr<Decl> GetTypeDecl(TypeManager& tyMgr, Ptr<Decl> d)
     if (auto ed = DynamicCast<ExtendDecl*>(d)) {
         auto target = ed->extendedType->GetTarget();
         if (!target) {
-            return tyMgr.GetDummyBuiltInDecl(ed->extendedType->ty);
+            return tyMgr.GetDummyBuiltInDecl(ed->extendedType->GetTy());
         }
         return GetRealTarget(target);
     } else {

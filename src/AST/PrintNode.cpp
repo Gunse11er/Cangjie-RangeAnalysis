@@ -28,36 +28,36 @@ using namespace Utils;
 using namespace Meta;
 
 // Local-only ostream printing helpers.
-// Marked static to limit linkage to this translation unit and avoid accidental reuse elsewhere.
+// Anonymous namespace already limits linkage to this translation unit.
 namespace {
-template <typename... Args> static inline void Print(std::ostream& stream, Args&&... args)
+template <typename... Args> inline void Print(std::ostream& stream, Args&&... args)
 {
     ((stream << args << ' '), ...);
 }
 
-template <typename Arg> static inline void Println(std::ostream& stream, Arg&& arg)
+template <typename Arg> inline void Println(std::ostream& stream, Arg&& arg)
 {
     stream << std::forward<Arg>(arg) << std::endl;
 }
 
-template <typename Arg, typename... Args> static inline void Println(std::ostream& stream, Arg&& arg, Args&&... args)
+template <typename Arg, typename... Args> inline void Println(std::ostream& stream, Arg&& arg, Args&&... args)
 {
     stream << std::forward<Arg>(arg);
     ((stream << ' ' << std::forward<Args>(args)), ...);
     stream << std::endl;
 }
 
-template <typename... Args> static inline void PrintNoSplit(std::ostream& stream, Args&&... args)
+template <typename... Args> inline void PrintNoSplit(std::ostream& stream, Args&&... args)
 {
     (stream << ... << args);
 }
 
-static inline void PrintIndentOnly(std::ostream& stream, unsigned indent, unsigned numSpaces = 2)
+inline void PrintIndentOnly(std::ostream& stream, unsigned indent, unsigned numSpaces = 2)
 {
     stream << std::string(indent * numSpaces, ' ');
 }
 
-template <typename... Args> static inline void PrintIndent(std::ostream& stream, unsigned indent, const Args... args)
+template <typename... Args> inline void PrintIndent(std::ostream& stream, unsigned indent, const Args... args)
 {
     PrintIndentOnly(stream, indent);
     Println(stream, args...);
@@ -90,28 +90,52 @@ void PrintTarget(unsigned indent, const Decl& target, std::ostream& stream = std
     }
 }
 
+const char* LinkageToString(Linkage linkage)
+{
+    switch (linkage) {
+        case Linkage::INTERNAL:
+            return "INTERNAL";
+        case Linkage::EXTERNAL:
+            return "EXTERNAL";
+        case Linkage::WEAK_ODR:
+            return "WEAK_ODR";
+        case Linkage::LINKONCE_ODR:
+            return "LINKONCE_ODR";
+        case Linkage::EXTERNAL_WEAK:
+            return "EXTERNAL_WEAK";
+        default:
+            return "UNKNOWN";
+    }
+}
+
 void PrintBasic(unsigned indent, const Node& node, std::ostream& stream = std::cout)
 {
     // Basic info:
     std::string filePath = node.curFile ? node.curFile->filePath : "not in file";
     PrintIndent(stream, indent, "curFile:", filePath);
     PrintIndent(stream, indent, "position:", node.begin.ToString(), node.end.ToString());
-    PrintIndent(stream, indent, "scopeName:", "\"" + node.scopeName + "\"");
-    PrintIndent(stream, indent, "ty:", node.ty->String());
+    if (!node.scopeName.empty()) {
+        PrintIndent(stream, indent, "scopeName:", "\"" + node.scopeName + "\"");
+    }
+    if (!Ty::IsInitialTy(node.GetTy())) {
+        PrintIndent(stream, indent, "ty:", node.GetTy()->String());
+    }
     PrintIndent(stream, indent, "ptr:", &node);
     const auto& fullPkgName = node.GetFullPackageName();
-    if (!fullPkgName.empty()) {
+    if (!fullPkgName.empty() && fullPkgName != "default") {
         PrintIndent(stream, indent, "fullPackageName:", fullPkgName);
-    } else {
-        PrintIndent(stream, indent, "fullPackageName is empty");
     }
     PrintIndent(stream, indent, "attributes:", node.GetAttrs().ToString());
     if (!node.exportId.empty()) {
         PrintIndent(stream, indent, "exportId:", "\"" + node.exportId + "\"");
     }
     if (auto d = DynamicCast<Decl>(&node)) {
-        PrintIndent(
-            stream, indent, "linkage:", static_cast<int>(d->linkage), ", isConst:", static_cast<int>(d->IsConst()));
+        if (d->linkage != Linkage::EXTERNAL) {
+            PrintIndent(stream, indent, "linkage:", LinkageToString(d->linkage));
+        }
+        if (d->IsConst()) {
+            PrintIndent(stream, indent, "isConst: true");
+        }
         if (!d->mangledName.empty()) {
             PrintIndent(stream, indent, "mangledName:", "\"" + d->mangledName + "\"");
         }
@@ -127,7 +151,7 @@ void PrintBasic(unsigned indent, const Node& node, std::ostream& stream = std::c
         }
     }
     if (!node.comments.IsEmpty()) {
-        PrintIndent(stream, indent, "comments: " + node.comments.ToString());
+        PrintIndent(stream, indent, "comments:", node.comments.ToString());
     }
 }
 
@@ -225,7 +249,8 @@ void PrintFile(unsigned indent, const File& file, std::ostream& stream = std::co
 
 void PrintMacroExpandParam(unsigned indent, const AST::MacroExpandParam& macroExpand, std::ostream& stream = std::cout)
 {
-    PrintIndent(stream, indent, "MacroExpandParam:", macroExpand.invocation.fullName, "{");
+    PrintIndent(stream, indent, "MacroExpandParam:", macroExpand.invocation.macroCallDiagInfo.fullName, "{");
+    PrintBasic(indent + ONE_INDENT, macroExpand, stream);
     PrintMacroInvocation(indent, macroExpand.invocation, stream);
     PrintIndent(stream, indent, "}");
 }
@@ -247,7 +272,6 @@ void PrintAnnotation(unsigned indent, const Annotation& anno, std::ostream& stre
         PrintNode(arg.get(), indent + TWO_INDENT, "", stream);
     }
     PrintIndent(stream, indent + ONE_INDENT, "]");
-    PrintIndent(stream, indent + ONE_INDENT, "adAnnotation:", anno.adAnnotation);
     PrintNode(anno.condExpr.get(), indent + ONE_INDENT, "condExpr", stream);
     PrintIndent(stream, indent + ONE_INDENT, "target:", anno.target);
     PrintNode(anno.baseExpr.get(), indent + ONE_INDENT, "baseExpr", stream);
@@ -398,7 +422,7 @@ void PrintPropDecl(unsigned indent, const PropDecl& propDecl, std::ostream& stre
 
 void PrintMacroExpandDecl(unsigned indent, const AST::MacroExpandDecl& macroExpand, std::ostream& stream = std::cout)
 {
-    PrintIndent(stream, indent, "MacroExpand:", macroExpand.invocation.fullName, "{");
+    PrintIndent(stream, indent, "MacroExpand:", macroExpand.invocation.macroCallDiagInfo.fullName, "{");
     PrintBasic(indent + ONE_INDENT, macroExpand, stream);
     PrintMacroInvocation(indent, macroExpand.invocation, stream);
     PrintIndent(stream, indent, "}");
@@ -1184,7 +1208,7 @@ void PrintQuoteExpr(unsigned indent, const AST::QuoteExpr& qe, std::ostream& str
 
 void PrintMacroExpandExpr(unsigned indent, const AST::MacroExpandExpr& expr, std::ostream& stream = std::cout)
 {
-    PrintIndent(stream, indent, "MacroExpand:", expr.invocation.fullName, "{");
+    PrintIndent(stream, indent, "MacroExpand:", expr.invocation.macroCallDiagInfo.fullName, "{");
     PrintBasic(indent + ONE_INDENT, expr, stream);
     PrintMacroInvocation(indent, expr.invocation, stream);
     PrintIndent(stream, indent, "}");
@@ -1535,8 +1559,9 @@ void PrintNode(Ptr<const Node> node, unsigned indent, const std::string& additio
         [&indent, &stream](const OptionalExpr& expr) { PrintOptionalExpr(indent, expr, stream); },
         [&indent, &stream](const OptionalChainExpr& expr) { PrintOptionalChainExpr(indent, expr, stream); },
         [&indent, &stream](const LetPatternDestructor& expr) { PrintLetPatternDestructor(indent, expr, stream); },
-        [&indent, &stream](
-            const PrimitiveTypeExpr& pte) { PrintIndent(stream, indent, "PrimitiveTypeExpr: " + pte.ty->String()); },
+        [&indent, &stream](const PrimitiveTypeExpr& pte) {
+            PrintIndent(stream, indent, "PrimitiveTypeExpr: " + pte.GetTy()->String());
+        },
         [&indent, &stream](const SpawnExpr& expr) { PrintSpawnExpr(indent, expr, stream); },
         [&indent, &stream](const SynchronizedExpr& expr) { PrintSynchronizedExpr(indent, expr, stream); },
         [&indent, &stream](

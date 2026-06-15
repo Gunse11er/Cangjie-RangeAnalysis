@@ -16,7 +16,6 @@
 
 #include "cangjie/Sema/TypeManager.h"
 #include "cangjie/Modules/ImportManager.h"
-#include "cangjie/Mangle/BaseMangler.h"
 
 #include "MockUtils.h"
 
@@ -27,6 +26,7 @@ enum class MockKind : uint8_t;
 class MockManager {
 public:
     explicit MockManager(ImportManager& importManager, TypeManager& typeManager, const Ptr<MockUtils> mockUtils);
+    void LoadMockLibDecls();
 
     struct GeneratedClassResult {
         Ptr<AST::ClassDecl> classDecl;
@@ -34,7 +34,6 @@ public:
     };
     GeneratedClassResult GenerateMockClassIfNeededAndGet(
         AST::ClassLikeDecl& originalDecl, AST::Package& curPkg, MockKind mockKind);
-    void WriteGeneratedClasses();
     void HandleMockAnnotatedLambdaValue(AST::Expr& expr);
     void WrapWithRequireMockObject(AST::Expr& receiverExpr);
 
@@ -58,11 +57,9 @@ private:
     ImportManager& importManager;
     Ptr<MockUtils> mockUtils;
 
-    std::map<std::string, OwnedPtr<AST::ClassDecl>> mockedClassDecls;
-    std::map<Ptr<AST::ClassLikeDecl>, int> instantiationCounters;
-    std::map<Ptr<const AST::FuncDecl>, bool> defaultForTypePresence;
-
-    Ptr<AST::ClassDecl> objectDecl;
+    std::unordered_map<Ptr<AST::ClassLikeDecl>, Ptr<AST::ClassDecl>> mockedClassDecls;
+    std::unordered_map<Ptr<AST::ClassLikeDecl>, int> instantiationCounters;
+    std::unordered_map<Ptr<const AST::FuncDecl>, bool> defaultForTypePresence;
 
     Ptr<AST::InterfaceDecl> callHandlerDecl;
     Ptr<AST::InterfaceDecl> mockedInterfaceDecl;

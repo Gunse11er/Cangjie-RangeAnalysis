@@ -15,6 +15,8 @@
 
 #include "flatbuffers/ModuleFormat_generated.h"
 
+#include <optional>
+
 #include "cangjie/AST/ASTCasting.h"
 #include "cangjie/Modules/ASTSerialization.h"
 
@@ -64,6 +66,7 @@ public:
 
     void SetSerializingCommon();
     void PreSaveFullExportDecls(AST::Package& package);
+    void SaveOptions(bool debug, GlobalOptions::OptimizationLevel level);
     inline bool NeedToExportDecl(Ptr<const AST::Decl> decl);
     void DFSCollectFilesDeclarations(Ptr<AST::File> file,
         std::unordered_set<AST::File*>& alreadyVisitedFiles,
@@ -97,6 +100,7 @@ private:
     std::vector<TTypeOffset> allTypes;
     std::vector<TDeclOffset> allDecls;
     std::vector<TExprOffset> allExprs;
+    std::optional<TCompilationOptions> options;
 
     // Saved packages with indexes, which is used for indexing imported decl.
     std::unordered_map<std::string, FormattedIndex> savedPackageMap;
@@ -132,6 +136,9 @@ private:
     // Save file names and add to savedFileMap.
     void SaveFileInfo(const AST::File& file);
     flatbuffers::Offset<PackageFormat::Imports> SaveFileImports(const AST::File& file);
+
+    TFeatureIdOffset CreateFeatureId(const AST::FeatureId& featureId);
+    TFeaturesDirectiveOffset SaveFeaturesDirective(Ptr<AST::FeaturesDirective> fd);
     /**
      * Save decls, return FormattedIndex and construct savedDeclMap, isTopLevel
      * Indicates saving toplevel decl.

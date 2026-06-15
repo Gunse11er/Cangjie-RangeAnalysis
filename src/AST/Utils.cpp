@@ -194,14 +194,14 @@ FloatTypeInfo GetFloatTypeInfoByKind(AST::TypeKind kind)
 
 void InitializeLitConstValue(LitConstExpr& lce)
 {
-    if (!Ty::IsTyCorrect(lce.ty)) {
+    if (!Ty::IsTyCorrect(lce.GetTy())) {
         return;
     }
     // LitConstExpr is always a const expression.
     lce.isConst = true;
     // We don't need to handle the exception throwing from string-to-number api here,
     // because it's already been done in Parser phase.
-    auto primitiveTy = GetPrimitiveUpperBoundTy(*lce.ty);
+    auto primitiveTy = GetPrimitiveUpperBoundTy(*lce.GetTy());
     if (primitiveTy == nullptr) {
         return;
     }
@@ -531,8 +531,8 @@ void ExtractArgumentsOfDeprecatedAnno(
 
 bool IsValidCFuncConstructorCall(const CallExpr& ce)
 {
-    // ce.ty is correct only when the whole CFunc constructor call is correct
-    if (Ty::IsTyCorrect(ce.ty) && ce.baseFunc && Is<RefExpr>(ce.baseFunc)) {
+    // ce.GetTy() is correct only when the whole CFunc constructor call is correct
+    if (Ty::IsTyCorrect(ce.GetTy()) && ce.baseFunc && Is<RefExpr>(ce.baseFunc)) {
         // if this is a builtin CFunc constructor call, do not check the arguments
         if (auto callee = DynamicCast<BuiltInDecl>(StaticCast<RefExpr>(ce.baseFunc.get())->ref.target);
             callee && callee->type == BuiltInType::CFUNC) {
@@ -716,9 +716,9 @@ void InsertPropConvertedByField(ClassDecl& decl, VarDecl& varDecl, Attribute att
     propDecl->identifier = varDecl.identifier;
     propDecl->colonPos = varDecl.colonPos;
     propDecl->type = std::move(varDecl.type);
-    propDecl->ty = varDecl.ty;
+    propDecl->SetTy(varDecl.GetTy());
     propDecl->CloneAttrs(varDecl);
-    propDecl->EnableAttr(Attribute::DESUGARED_MIRROR_FIELD);
+    propDecl->EnableAttr(Attribute::DESUGARED_MIRROR_FIELD, Attribute::COMPILER_ADD);
     propDecl->modifiers.insert(varDecl.modifiers.begin(), varDecl.modifiers.end());
     propDecl->isVar = varDecl.isVar;
     for (auto& anno : varDecl.annotations) {
@@ -784,6 +784,16 @@ bool IsImpl(const Node& node)
     return !node.TestAttr(Attribute::JAVA_MIRROR) && node.TestAttr(Attribute::JAVA_MIRROR_SUBTYPE);
 }
 
+bool IsImplRegistryCompanion(const Node& node)
+{
+    return node.TestAttr(Attribute::JAVA_IMPL_REGISTRY_COMPANION);
+}
+
+bool IsImplReferenceWrapper(const Node& node)
+{
+    return IsImpl(node);
+}
+
 bool IsJObject(const Decl& decl)
 {
     return IsJObject(decl, decl.fullPackageName);
@@ -808,7 +818,7 @@ bool IsCJMapping(const Node& node)
 
 bool IsObject(const Node& node)
 {
-    return node.ty->IsObject();
+    return node.GetTy()->IsObject();
 }
 
 bool IsFwdClass(const Node& node)
@@ -816,85 +826,6 @@ bool IsFwdClass(const Node& node)
     return node.TestAttr(Attribute::CJ_MIRROR_JAVA_INTERFACE_FWD);
 }
 
-/**
- * public func $getJavaRef(): Java_CFFI_JavaEntity {
- *     return Java_CFFI_JavaEntity()
- * }
- */
-void InsertJavaRefGetterStubWithBody(ClassDecl& decl)
-{
-    std::vector<OwnedPtr<FuncParam>> callParams;
-    std::vector<OwnedPtr<FuncParamList>> paramLists;
-    auto pl = CreateFuncParamList(std::move(callParams));
-    pl->begin = decl.begin;
-    pl->end = decl.end;
-    paramLists.push_back(std::move(pl));
-
-    auto constructor = CreateCallExpr(CreateRefExpr(INTEROPLIB_CFFI_JAVA_ENTITY), {});
-    auto ret = CreateReturnExpr(std::move(constructor));
-    std::vector<OwnedPtr<Node>> nodes;
-    nodes.emplace_back(std::move(ret));
-
-    auto funcBody = CreateFuncBody(
-        std::move(paramLists),
-        CreateRefType(INTEROPLIB_CFFI_JAVA_ENTITY),
-        CreateBlock(std::move(nodes)));
-
-    auto fd = CreateFuncDecl(JAVA_REF_GETTER_FUNC_NAME, std::move(funcBody), nullptr);
-    fd->EnableAttr(Attribute::PUBLIC, Attribute::IN_CLASSLIKE);
-    fd->fullPackageName = decl.fullPackageName;
-    fd->funcBody->funcDecl = fd.get();
-    fd->funcBody->parentClassLike = &decl;
-    fd->outerDecl = &decl;
-
-    decl.body->decls.emplace_back(std::move(fd));
-}
-
-bool IsDeclAppropriateForSyntheticClassGeneration(const Node& node)
-{
-    return IsMirror(node) && (node.IsInterfaceDecl() || node.IsAbstractClass());
-}
-
-std::string GetSyntheticNameFromClassLike(const ClassLikeDecl& cld)
-{
-    return cld.identifier.Val() + "$impl";
-}
-
-// abstract on parser stage, on sema stage abstractness will be removed
-void InsertSyntheticClassDecl(ClassLikeDecl& decl, File& file)
-{
-    auto synthetic = MakeOwned<ClassDecl>();
-    if (decl.TestAttr(Attribute::PUBLIC)) {
-        synthetic->EnableAttr(Attribute::PUBLIC);
-    } else if (decl.TestAttr(Attribute::INTERNAL)) {
-        synthetic->EnableAttr(Attribute::INTERNAL);
-    } else if (decl.TestAttr(Attribute::PROTECTED)) {
-        synthetic->EnableAttr(Attribute::PROTECTED);
-    } else if (decl.TestAttr(Attribute::PRIVATE)) {
-        synthetic->EnableAttr(Attribute::PRIVATE);
-    }
-    synthetic->EnableAttr(Attribute::JAVA_MIRROR, Attribute::JAVA_MIRROR_SUBTYPE,
-        Attribute::JAVA_MIRROR_SYNTHETIC_WRAPPER, Attribute::COMPILER_ADD, Attribute::ABSTRACT);
-    synthetic->identifier = GetSyntheticNameFromClassLike(decl);
-    synthetic->identifier.SetPos(decl.identifier.Begin(), decl.identifier.End());
-
-    if (decl.astKind == ASTKind::INTERFACE_DECL) { // add JObject as supertype
-        auto jobject = CreateRefType(INTEROP_JOBJECT_NAME);
-        SetPositionAndCurFileByProvidedNode(*jobject, decl);
-        synthetic->inheritedTypes.emplace_back(std::move(jobject));
-    }
-    synthetic->inheritedTypes.emplace_back(CreateRefType(decl));
-
-    synthetic->fullPackageName = decl.fullPackageName;
-    SetPositionAndCurFileByProvidedNode(*synthetic, decl);
-
-    synthetic->body = MakeOwned<ClassBody>();
-    SetPositionAndCurFileByProvidedNode(*synthetic->body, *synthetic);
-
-    synthetic->moduleName = ::Cangjie::Utils::GetRootPackageName(decl.fullPackageName);
-
-    file.decls.emplace_back(std::move(synthetic));
-}
 } // namespace Cangjie::Interop::Java
 
 namespace Cangjie::Interop::ObjC {

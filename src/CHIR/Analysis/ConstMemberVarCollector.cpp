@@ -87,7 +87,7 @@ void ConstMemberVarCollector::JudgeIfOnlyDerivedType(
             continue;
         }
         // only analyse constructor.
-        auto func = StaticCast<Func*>(method);
+        auto func = StaticCast<Function*>(method);
         param = func->GetParam(0);
         Visitor::Visit(*func, preVisit);
     }

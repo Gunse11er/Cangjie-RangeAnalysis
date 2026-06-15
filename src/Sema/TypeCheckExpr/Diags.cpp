@@ -17,7 +17,7 @@ void DiagInvalidMultipleAssignExpr(
     DiagnosticEngine& diag, const Node& leftNode, const Expr& rightExpr, const std::string& because)
 {
     auto builder = diag.DiagnoseRefactor(DiagKindRefactor::sema_mismatched_types_multiple_assign, rightExpr);
-    builder.AddMainHintArguments(rightExpr.ty->String());
+    builder.AddMainHintArguments(rightExpr.GetTy()->String());
     builder.AddHint(leftNode, because);
 }
 
@@ -25,29 +25,29 @@ void DiagInvalidBinaryExpr(DiagnosticEngine& diag, const BinaryExpr& be)
 {
     CJC_NULLPTR_CHECK(be.leftExpr);
     CJC_NULLPTR_CHECK(be.rightExpr);
-    CJC_ASSERT(Ty::IsTyCorrect(be.leftExpr->ty));
-    CJC_ASSERT(Ty::IsTyCorrect(be.rightExpr->ty));
+    CJC_ASSERT(Ty::IsTyCorrect(be.leftExpr->GetTy()));
+    CJC_ASSERT(Ty::IsTyCorrect(be.rightExpr->GetTy()));
     const std::string& opStr = TOKENS[static_cast<int>(be.op)];
     auto range = be.operatorPos.IsZero() ? MakeRange(be.begin, be.end) : MakeRange(be.operatorPos, opStr);
     auto builder = diag.DiagnoseRefactor(DiagKindRefactor::sema_invalid_binary_expr, be, range, opStr,
-        be.leftExpr->ty->String(), be.rightExpr->ty->String());
-    if (be.leftExpr->ty->IsFunc() || be.leftExpr->ty->IsCFunc() || be.leftExpr->ty->IsTuple()) {
+        be.leftExpr->GetTy()->String(), be.rightExpr->GetTy()->String());
+    if (be.leftExpr->GetTy()->IsFunc() || be.leftExpr->GetTy()->IsCFunc() || be.leftExpr->GetTy()->IsTuple()) {
         // func and tuple type cannot be extended
         return;
     }
     if (TypeCheckUtil::IsOverloadableOperator(be.op)) {
-        std::string note("you may want to implement 'operator func " + opStr + "(right: " + be.rightExpr->ty->String() +
-            ")' for type '" + be.leftExpr->ty->String() + "'");
+        std::string note("you may want to implement 'operator func " + opStr +
+            "(right: " + be.rightExpr->GetTy()->String() + ")' for type '" + be.leftExpr->GetTy()->String() + "'");
         if (be.op == TokenKind::EXP) {
-            if (be.leftExpr->ty->kind == TypeKind::TYPE_INT64) {
+            if (be.leftExpr->TyKind() == TypeKind::TYPE_INT64) {
                 note += ", or to provide a right operand of type 'UInt64'";
-            } else if (be.leftExpr->ty->kind == TypeKind::TYPE_FLOAT64) {
+            } else if (be.leftExpr->TyKind() == TypeKind::TYPE_FLOAT64) {
                 note += ", or to provide a right operand of type 'Int64' or 'Float64'";
-            } else if (be.rightExpr->ty->kind == TypeKind::TYPE_INT64) {
+            } else if (be.rightExpr->TyKind() == TypeKind::TYPE_INT64) {
                 note += ", or to provide a left operand of type 'Float64'";
-            } else if (be.rightExpr->ty->kind == TypeKind::TYPE_FLOAT64) {
+            } else if (be.rightExpr->TyKind() == TypeKind::TYPE_FLOAT64) {
                 note += ", or to provide a left operand of type 'Float64'";
-            } else if (be.rightExpr->ty->kind == TypeKind::TYPE_UINT64) {
+            } else if (be.rightExpr->TyKind() == TypeKind::TYPE_UINT64) {
                 note += ", or to provide a left operand of type 'Int64'";
             }
         }
@@ -61,12 +61,13 @@ void DiagInvalidUnaryExpr(DiagnosticEngine& diag, const UnaryExpr& ue)
         return;
     }
     CJC_NULLPTR_CHECK(ue.expr);
-    CJC_ASSERT(Ty::IsTyCorrect(ue.expr->ty));
+    CJC_ASSERT(Ty::IsTyCorrect(ue.expr->GetTy()));
     const std::string& opStr = TOKENS[static_cast<int>(ue.op)];
-    auto builder = diag.DiagnoseRefactor(DiagKindRefactor::sema_invalid_unary_expr, ue, opStr, ue.expr->ty->String());
-    if (ue.expr->ty->IsExtendable()) {
+    auto builder =
+        diag.DiagnoseRefactor(DiagKindRefactor::sema_invalid_unary_expr, ue, opStr, ue.expr->GetTy()->String());
+    if (ue.expr->GetTy()->IsExtendable()) {
         builder.AddNote(
-            "you may want to implement 'operator func " + opStr + "()' for type '" + ue.expr->ty->String() + "'");
+            "you may want to implement 'operator func " + opStr + "()' for type '" + ue.expr->GetTy()->String() + "'");
     }
 }
 
@@ -76,11 +77,11 @@ void DiagInvalidUnaryExprWithTarget(DiagnosticEngine& diag, const UnaryExpr& ue,
         return;
     }
     CJC_NULLPTR_CHECK(ue.expr);
-    CJC_ASSERT(Ty::IsTyCorrect(ue.expr->ty));
+    CJC_ASSERT(Ty::IsTyCorrect(ue.expr->GetTy()));
     CJC_ASSERT(Ty::IsTyCorrect(&target));
     const std::string& opStr = TOKENS[static_cast<int>(ue.op)];
     auto builder = diag.DiagnoseRefactor(
-        DiagKindRefactor::sema_invalid_unary_expr_with_target, ue, opStr, ue.expr->ty->String(), target.String());
+        DiagKindRefactor::sema_invalid_unary_expr_with_target, ue, opStr, ue.expr->GetTy()->String(), target.String());
 }
 
 void DiagInvalidSubscriptExpr(

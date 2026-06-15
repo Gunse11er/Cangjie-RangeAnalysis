@@ -73,7 +73,7 @@ list(TRANSFORM LLVM_DEP_LIB_NAMES PREPEND "lib")
 list(TRANSFORM LLVM_DEP_LIB_NAMES APPEND "${LLVM_LIB_SUFFIX}")
 set(LLVM_LINK_FLAGS -lpthread -lm)
 
-if(CANGJIE_BUILD_CJDB AND NOT WIN32)
+if(CANGJIE_BUILD_CJDB AND NOT WIN32 AND NOT OHOS)
     list(APPEND LLVM_LINK_FLAGS -lncurses)
     if(NOT DARWIN)
         list(APPEND LLVM_LINK_FLAGS -ltinfo)
@@ -93,25 +93,29 @@ set(LLVM_INSTALL_PATTERN
         PATTERN "bin" EXCLUDE
 )
 # Only the following binaries are needed. The other unused llvm binaries will not be installed.
-set(LLVM_BIN_INSTALL_PATTERN
+set(LLVM_BIN_PRODUCTS_PERMISSIONS OWNER_EXECUTE OWNER_READ GROUP_EXECUTE GROUP_READ)
+if(OHOS)
+    list(APPEND LLVM_BIN_PRODUCTS_PERMISSIONS WORLD_EXECUTE WORLD_READ)
+endif()
+set(LLVM_BIN_INSTALL_PATTERN 
         # For cjc general compilation
-        REGEX "bin/(opt|llc)" PERMISSIONS OWNER_EXECUTE OWNER_READ GROUP_EXECUTE GROUP_READ
+        REGEX "bin/(opt|llc)" PERMISSIONS ${LLVM_BIN_PRODUCTS_PERMISSIONS}
         # For cjc general compilation (e.g. OHOS) and LTO and lldb related binaries
-        REGEX "bin/(lld|ld64.lld|ld.lld|lld-link)" PERMISSIONS OWNER_EXECUTE OWNER_READ GROUP_EXECUTE GROUP_READ
+        REGEX "bin/(lld|ld64.lld|ld.lld|lld-link)" PERMISSIONS ${LLVM_BIN_PRODUCTS_PERMISSIONS}
         # For cjc general compilation (e.g. OHOS)
-        REGEX "bin/(llvm-ar)" PERMISSIONS OWNER_EXECUTE OWNER_READ GROUP_EXECUTE GROUP_READ
+        REGEX "bin/(llvm-ar)" PERMISSIONS ${LLVM_BIN_PRODUCTS_PERMISSIONS}
         # For LTO
-        REGEX "bin/(llvm-link|llvm-lto|llvm-lto2)" PERMISSIONS OWNER_EXECUTE OWNER_READ GROUP_EXECUTE GROUP_READ
+        REGEX "bin/(llvm-link|llvm-lto|llvm-lto2)" PERMISSIONS ${LLVM_BIN_PRODUCTS_PERMISSIONS}
         # For cjc --coverage feature
-        REGEX "bin/(llvm-cov)" PERMISSIONS OWNER_EXECUTE OWNER_READ GROUP_EXECUTE GROUP_READ
+        REGEX "bin/(llvm-cov)" PERMISSIONS ${LLVM_BIN_PRODUCTS_PERMISSIONS}
         # For PGO
-        REGEX "bin/(llvm-profdata|llvm-profgen)" PERMISSIONS OWNER_EXECUTE OWNER_READ GROUP_EXECUTE GROUP_READ
+        REGEX "bin/(llvm-profdata|llvm-profgen)" PERMISSIONS ${LLVM_BIN_PRODUCTS_PERMISSIONS}
         # For compiler developer debugging
-        REGEX "bin/(llvm-as|llvm-dis)" PERMISSIONS OWNER_EXECUTE OWNER_READ GROUP_EXECUTE GROUP_READ
-        REGEX "bin/(lli)" PERMISSIONS OWNER_EXECUTE OWNER_READ GROUP_EXECUTE GROUP_READ
-        REGEX "bin/(llvm-addr2line|llvm-symbolizer)" PERMISSIONS OWNER_EXECUTE OWNER_READ GROUP_EXECUTE GROUP_READ
-        REGEX "bin/(llvm-otool|llvm-objdump)" PERMISSIONS OWNER_EXECUTE OWNER_READ GROUP_EXECUTE GROUP_READ
-        REGEX "bin/(llvm-objcopy)" PERMISSIONS OWNER_EXECUTE OWNER_READ GROUP_EXECUTE GROUP_READ
+        REGEX "bin/(llvm-as|llvm-dis)" PERMISSIONS ${LLVM_BIN_PRODUCTS_PERMISSIONS}
+        REGEX "bin/(lli)" PERMISSIONS ${LLVM_BIN_PRODUCTS_PERMISSIONS}
+        REGEX "bin/(llvm-addr2line|llvm-symbolizer)" PERMISSIONS ${LLVM_BIN_PRODUCTS_PERMISSIONS}
+        REGEX "bin/(llvm-otool|llvm-objdump)" PERMISSIONS ${LLVM_BIN_PRODUCTS_PERMISSIONS}
+        REGEX "bin/(llvm-objcopy)" PERMISSIONS ${LLVM_BIN_PRODUCTS_PERMISSIONS}
         # For Windows
         REGEX "bin/(libclang\\.dll|libclang-cpp\\.dll)"
         REGEX "bin/(libgcc_s_seh-1\\.dll|libssp-0\\.dll|libstdc\\+\\+-6\\.dll|libwinpthread-1\\.dll)"
@@ -156,7 +160,7 @@ if(CANGJIE_CODEGEN_CJNATIVE_BACKEND) # i.e. "--compile-backend" option
         set(LLVM_TAG master)
     else()
         set(REPOSITORY_PATH "https://gitcode.com/Cangjie/llvm-project.git")
-        set(LLVM_TAG main)
+        set(LLVM_TAG dev)
     endif()
     # llvm
     message(STATUS "Set cjnative REPOSITORY_PATH: ${REPOSITORY_PATH}")
@@ -208,8 +212,16 @@ if(CANGJIE_CODEGEN_CJNATIVE_BACKEND) # i.e. "--compile-backend" option
             -DCMAKE_AR=${CMAKE_AR}
             -DCMAKE_RANLIB=${CMAKE_RANLIB}
             -DCMAKE_CXX_STANDARD=17)
+        if(OHOS)
+            list(APPEND LLVM_CMAKE_ARGS
+                -DOHOS=ON
+                -DLLVM_HOST_TRIPLE=${TRIPLE}
+                -DCANGJIE_TARGET_TOOLCHAIN=${CANGJIE_TARGET_TOOLCHAIN}
+                -DCANGJIE_TARGET_SYSROOT=${CANGJIE_TARGET_SYSROOT}
+                -DCMAKE_TOOLCHAIN_FILE=${CMAKE_CURRENT_SOURCE_DIR}/cmake/${TRIPLE}_toolchain.cmake)
+        endif()
         if(CANGJIE_BUILD_CJDB)
-            if(NOT WIN32)
+            if(NOT WIN32 AND NOT OHOS)
                 list(APPEND LLVM_CMAKE_ARGS ${LLVM_BUILD_ARG}
                     -DLLVM_ENABLE_TERMINFO=1
                     -DCURSES_NEED_NCURSES=1)
@@ -366,14 +378,12 @@ if(CANGJIE_CODEGEN_CJNATIVE_BACKEND) # i.e. "--compile-backend" option
         endif()
         set(CLANG_RT_LIBS)
         # copy the builtin and profile library
-        if(NOT OHOS)
-            if(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "x86_64" OR DARWIN)
-                list(APPEND CLANG_RT_LIBS ${LIB_BUILTINS_PATH})
-            endif()
-            list(APPEND CLANG_RT_LIBS ${LIB_PROFILE_PATH})
-            if(NOT WIN32 AND NOT IOS)
-                list(APPEND CLANG_RT_LIBS ${LIB_FUZZER_NOMAIN_PATH})
-            endif()
+        if(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "x86_64" OR DARWIN)
+            list(APPEND CLANG_RT_LIBS ${LIB_BUILTINS_PATH})
+        endif()
+        list(APPEND CLANG_RT_LIBS ${LIB_PROFILE_PATH})
+        if(NOT WIN32 AND NOT IOS)
+            list(APPEND CLANG_RT_LIBS ${LIB_FUZZER_NOMAIN_PATH})
         endif()
         set(CLANG_RT_TARGET_SUFFIX ${CMAKE_SYSTEM_PROCESSOR}$<$<BOOL:${ANDROID}>:-android>)
         if(CANGJIE_ASAN_SUPPORT)
@@ -531,6 +541,36 @@ if(CANGJIE_CODEGEN_CJNATIVE_BACKEND) # i.e. "--compile-backend" option
     endif()
     if(OHOS)
         include(AddOHOSLibs)
+        if(CANGJIE_BUILD_CJC)
+            install(
+                DIRECTORY ${CMAKE_BINARY_DIR}/${THIRD_PARTY_LLVM}/
+                DESTINATION ${THIRD_PARTY_LLVM}
+                ${LLVM_INSTALL_PATTERN})
+            install(
+                DIRECTORY ${CMAKE_BINARY_DIR}/${THIRD_PARTY_LLVM}/bin
+                DESTINATION ${THIRD_PARTY_LLVM}
+                FILES_MATCHING
+                ${LLVM_BIN_INSTALL_PATTERN}
+                )
+            set(CRT_LIBS_PATH ${CANGJIE_TARGET_SYSROOT}/usr/lib/aarch64-linux-ohos)
+            install(
+                FILES
+                    ${CRT_LIBS_PATH}/crti.o
+                    ${CRT_LIBS_PATH}/crtn.o
+                    ${CRT_LIBS_PATH}/libc.a
+                    ${CRT_LIBS_PATH}/libc.so
+                    ${CRT_LIBS_PATH}/libm.a
+                    ${CRT_LIBS_PATH}/Scrt1.o
+                DESTINATION lib/${TARGET_TRIPLE_DIRECTORY_PREFIX}_cjnative)
+
+            set(LLVM_INCLUDE_DIRS ${CMAKE_BINARY_DIR}/${THIRD_PARTY_LLVM}/include PARENT_SCOPE)
+            # for other targets to use
+            foreach(LIB_NAME ${LLVM_DEP_LIB_NAMES})
+                list(APPEND LLVM_LIBS ${LLVM_LIB_PATH}/${LIB_NAME})
+            endforeach()
+            list(APPEND LLVM_LIBS ${LLVM_LINK_FLAGS})
+            set(LLVM_LIBS ${LLVM_LIBS} PARENT_SCOPE)
+        endif()
     endif()
 
     set(BINARY_TARGET_DEPENDS runtime)

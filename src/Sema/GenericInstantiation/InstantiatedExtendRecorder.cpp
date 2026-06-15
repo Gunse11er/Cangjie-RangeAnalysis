@@ -83,7 +83,7 @@ VisitAction GenericInstantiationManager::InstantiatedExtendRecorder::RecordUsedE
  */
 void GenericInstantiationManager::InstantiatedExtendRecorder::RecordExtendForRefExpr(const RefExpr& re)
 {
-    bool ignored = !Ty::IsTyCorrect(re.ty) || !re.ref.target || re.ref.target->IsBuiltIn() ||
+    bool ignored = !Ty::IsTyCorrect(re.GetTy()) || !re.ref.target || re.ref.target->IsBuiltIn() ||
         !re.ref.target->TestAttr(Attribute::IN_EXTEND);
     if (ignored || gim.structContext.empty()) {
         return;
@@ -93,11 +93,11 @@ void GenericInstantiationManager::InstantiatedExtendRecorder::RecordExtendForRef
     auto structDecl = gim.GetStructDeclByContext();
     CJC_ASSERT(structDecl);
     auto baseTy = GetDeclTy(*structDecl);
-    bool invalid = !Ty::IsTyCorrect(baseTy) || !Ty::IsTyCorrect(extend->ty) || baseTy->HasGeneric();
+    bool invalid = !Ty::IsTyCorrect(baseTy) || !Ty::IsTyCorrect(extend->GetTy()) || baseTy->HasGeneric();
     if (invalid) {
         return;
     }
-    auto promoteRes = promotion.Promote(*baseTy, *extend->ty);
+    auto promoteRes = promotion.Promote(*baseTy, *extend->GetTy());
     if (promoteRes.empty()) {
         InternalError("generic instantiation failed");
         return;
@@ -115,16 +115,16 @@ void GenericInstantiationManager::InstantiatedExtendRecorder::RecordExtendForRef
  */
 void GenericInstantiationManager::InstantiatedExtendRecorder::RecordExtendForMemberAccess(const MemberAccess& ma)
 {
-    auto ignored = !ma.target || !ma.baseExpr || !Ty::IsTyCorrect(ma.baseExpr->ty) || ma.baseExpr->ty->HasGeneric() ||
-        !ma.target->outerDecl;
+    auto ignored = !ma.target || !ma.baseExpr || !Ty::IsTyCorrect(ma.baseExpr->GetTy()) ||
+        ma.baseExpr->GetTy()->HasGeneric() || !ma.target->outerDecl;
     if (ignored) {
         return;
     }
     auto outerDecl = ma.target->outerDecl;
     if (auto fd = DynamicCast<FuncDecl*>(ma.target); fd && outerDecl->astKind == ASTKind::INTERFACE_DECL) {
-        RecordImplExtendDecl(*ma.baseExpr->ty, *fd, ma.matchedParentTy);
+        RecordImplExtendDecl(*ma.baseExpr->GetTy(), *fd, ma.matchedParentTy);
     } else if (outerDecl->astKind == ASTKind::EXTEND_DECL) {
-        auto promoteRes = promotion.Promote(*ma.baseExpr->ty, *outerDecl->ty);
+        auto promoteRes = promotion.Promote(*ma.baseExpr->GetTy(), *outerDecl->GetTy());
         if (promoteRes.empty()) {
             InternalError("generic instantiation failed");
             return;
@@ -155,7 +155,7 @@ void GenericInstantiationManager::InstantiatedExtendRecorder::RecordImplExtendDe
         if (Ty::IsTyCorrect(upperTy)) {
             auto& inheritedTys = RawStaticCast<InheritableDecl*>(baseDecl)->inheritedTypes;
             bool isImplemented = std::any_of(inheritedTys.begin(), inheritedTys.end(),
-                [this, upperTy](auto& type) { return typeManager.IsSubtype(type->ty, upperTy); });
+                [this, upperTy](auto& type) { return typeManager.IsSubtype(type->GetTy(), upperTy); });
             if (isImplemented) {
                 // If interface implementation check passed, store and break;
                 extend = baseDecl;

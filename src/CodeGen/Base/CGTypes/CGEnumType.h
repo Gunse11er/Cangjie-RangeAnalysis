@@ -7,7 +7,11 @@
 #ifndef CANGJIE_CGENUMTYPE_H
 #define CANGJIE_CGENUMTYPE_H
 
+#include <cstdint>
+#include <vector>
+
 #include "Base/CGTypes/CGCustomType.h"
+#include "cangjie/Option/Option.h"
 
 namespace Cangjie {
 namespace CodeGen {
@@ -18,6 +22,12 @@ class CGEnumType : public CGCustomType {
     friend class IRBuilder2;
 
 public:
+    struct AssociatedNonRefLayout {
+        std::vector<uint32_t> offsets;
+        uint32_t size{0};
+        uint32_t align{1};
+    };
+
     enum class CGEnumTypeKind {
         UNKNOWN,        /**< Not a valid kind */
 
@@ -101,11 +111,6 @@ public:
         return IsOptionLikeNonRef() || IsOptionLikeT() || IsZeroSizeEnum() || IsAllAssociatedValuesAreNonRef();
     }
 
-    llvm::StructType* GetLayoutType() const
-    {
-        return layoutType;
-    }
-
     CGEnumTypeKind GetCGEnumTypeKind() const
     {
         return cgEnumTypeKind;
@@ -119,6 +124,19 @@ public:
     }
 
     std::string GetEnumTypeName() const;
+
+    static inline bool NeedAndroidArm32AlignedEnumLayout(const Triple::Info& target)
+    {
+        return target.arch == Triple::ArchType::ARM32 && target.env == Triple::Environment::ANDROID;
+    }
+
+    // Build an LLVM StructType that describes how these fields should be interpreted as a struct layout on
+    // Android ARM32. It is used as a layout model for StructLayout/StructGEP, rather than as the concrete enum type.
+    static llvm::StructType* GetAndroidArm32AssociatedNonRefLayoutType(
+        CGModule& cgMod, const std::vector<CHIR::Type*>& fieldTypes);
+
+    static AssociatedNonRefLayout ComputeAssociatedNonRefLayout(
+        CGModule& cgMod, const std::vector<CHIR::Type*>& fieldTypes);
 
     llvm::Constant* GenFieldsFnsOfTypeTemplateForOptionLikeT(CGModule& cgMod, const std::string& funcPrefixName);
 

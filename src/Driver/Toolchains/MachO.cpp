@@ -60,7 +60,6 @@ void MachO::GenerateArchiveTool(const std::vector<TempFileInfo>& objFiles)
 
     // When we reach here, we must be at the final phase of the compilation,
     // which means that it is the final output.
-    // TempFileKind::O_STATICLIB
     TempFileInfo fileInfo = CreateNewFileInfoWrapper(objFiles, TempFileKind::O_STATICLIB);
     std::string outputFile = fileInfo.filePath;
 
@@ -79,6 +78,7 @@ void MachO::GenerateArchiveTool(const std::vector<TempFileInfo>& objFiles)
             tool->AppendArg(inputObj);
         }
     }
+
     backendCmds.emplace_back(MakeSingleToolBatch({std::move(tool)}));
 }
 

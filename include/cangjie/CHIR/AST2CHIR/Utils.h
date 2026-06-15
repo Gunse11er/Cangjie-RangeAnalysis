@@ -194,7 +194,7 @@ inline typename std::enable_if<std::is_base_of_v<U, T>, T*>::type TryGetFromCach
     return it == cache.end() ? nullptr : dynamic_cast<T*>(it->second);
 }
 
-void SetCompileTimeValueFlagRecursivly(Func& initFunc);
+void SetCompileTimeValueFlagRecursively(Function& initFunc);
 
 /**
  * @brief Retrieves the instantiated member type by given type and name.

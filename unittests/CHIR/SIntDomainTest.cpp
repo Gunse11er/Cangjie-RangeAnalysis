@@ -177,9 +177,10 @@ TEST(SIntDomainTest, DomainLevel)
 	std::unordered_map<unsigned int, std::string> nameMap;
     CHIRContext cctx(&nameMap);
     CHIRBuilder builder(cctx);
+    builder.CreatePackage("default");
     Type* unitTy = builder.GetUnitTy();
     FuncType* funcTy = builder.GetType<FuncType>(std::vector<Type*>{}, unitTy);
-    auto func = builder.CreateFunc({"test.cj", 1, {1, 1}, {1, 1}}, funcTy, "aaa", "bbb", "", "ccc");
+    auto func = builder.CreateFunction(funcTy, "aaa", "bbb", "", "ccc");
     auto body = builder.CreateBlockGroup(*func);
     func->InitBody(*body);
     auto block = builder.CreateBlock(body);

@@ -23,7 +23,7 @@
 #include "cangjie/Basic/Color.h"
 #include "cangjie/Utils/CheckUtils.h"
 
-#if defined(__linux__) || (defined(_WIN32) && defined(__MINGW64__))
+#if defined(__linux__)
 static const int PAGE_SIZE = 4;
 #endif
 

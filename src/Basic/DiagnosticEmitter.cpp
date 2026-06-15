@@ -523,7 +523,7 @@ void DiagnosticEmitterImpl::EmitErrorLocation(const Position& pos)
     auto color = noColor ? NO_COLOR : OTHER_HINT_COLOR;
     prefix += GetColoredString(color, GetLineSymbol());
     prefix += g_spaceOfNum(1);
-    auto source = sm.GetSource(pos.fileID);
+    auto& source = sm.GetSource(pos.fileID);
     std::string path;
     if (source.packageName.has_value()) {
         path = "(package " + source.packageName.value() + ")" + FileUtil::GetFileName(source.path);
@@ -777,12 +777,11 @@ void DiagnosticEmitterImpl::EmitNote()
     });
 
     std::for_each(diag.subDiags.begin(), diag.subDiags.end(), [this](auto& subDiag) {
-        if (diag.curMacroCall && subDiag.subDiagMessage == MACROCALL_CODE) {
-            auto pInvocation = diag.curMacroCall->GetInvocation();
-            if (!pInvocation || pInvocation->hasShownCode) {
+        if (diag.macroDiagInfo && subDiag.subDiagMessage == MACROCALL_CODE) {
+            if (diag.macroDiagInfo->hasShownCode) {
                 return;
             }
-            pInvocation->hasShownCode = true;
+            diag.macroDiagInfo->hasShownCode = true;
         }
         subDiag.IsShowSource() ? EmitSingleNoteWithSource(subDiag) :
                                EmitSingleMessageWithoutSource(subDiag.subDiagMessage, "note");
@@ -886,16 +885,82 @@ bool IsTextOnlyWarning(const WarnGroup& warnGroup)
 {
     return (warnGroup == WarnGroup::DRIVER_ARG || warnGroup == WarnGroup::UNSUPPORT_COMPILE_SOURCE);
 }
+
+/**
+ * @brief Swap error message with note for diagnostics in macro calls.
+ *
+ * This function exchanges the main diagnostic message with sub-diagnostic information
+ * when dealing with macro invocations. It handles two scenarios:
+ * 1. For refactor diagnostics: Replaces the error message with the note from sub-diagnostic,
+ *    and moves the original error message to the sub-diagnostic position.
+ * 2. For regular diagnostics: Inserts a new sub-diagnostic with the original message,
+ *    and replaces the main diagnostic message with the sub-diagnostic's message.
+ *
+ * This is useful for providing clearer error reporting when errors occur within macro expansions,
+ * allowing the actual error location to be highlighted while preserving context.
+ *
+ * @param diagnostic The diagnostic object whose message will be swapped with its note.
+ */
+void SwapErrorMessageWithNote(Diagnostic& diagnostic, const SourceManager& sm)
+{
+    // Check if the diagnostic is a macro call and has sub-diagnostics.
+    if (!diagnostic.macroDiagInfo || diagnostic.subDiags.empty()) {
+        return;
+    }
+    // Check if the diagnostic is in the current file.
+    auto macroDiagInfo = diagnostic.macroDiagInfo;
+    auto mainHint = diagnostic.mainHint;
+    // If any branch below is true, the diagnostic already points to user source, so no message-note swap is needed:
+    // 1) macroDiagInfo && macroDiagInfo->isCurFile:
+    //    tokens are not changed after macro expansion.
+    // 2) mainHint.range.begin.isCurFile:
+    //    refactor-style diagnostic main hint is already in original source file.
+    // 3) diagnostic.start.isCurFile:
+    //    legacy diagnostic start position is already in original source file.
+    // 4) !IsInMacroCallSourceFile(mainHint) || !IsInMacroCallSourceFile(diagnostic.start):
+    //    CHIR-stage positions do not carry isCurFile, so we cannot rely on cases 1–3 alone.
+    //    Use whether the position's fileID maps to a *.macrocall source in SourceManager instead.
+    if ((macroDiagInfo && macroDiagInfo->isCurFile) || mainHint.range.begin.isCurFile ||
+        (diagnostic.start != INVALID_POSITION && diagnostic.start.isCurFile) ||
+        !sm.IsInMacroCallSourceFile(mainHint.range.begin) ||
+        (diagnostic.start != INVALID_POSITION && !sm.IsInMacroCallSourceFile(diagnostic.start))) {
+        return;
+    }
+    // Swap error message with note.
+    auto subDiag = diagnostic.subDiags[0];
+    if (diagnostic.isRefactor) {
+        auto newSubDiag = SubDiagnostic(diagnostic.errorMessage);
+        newSubDiag.AddMainHint(mainHint.range, mainHint.str);
+        newSubDiag.otherHints = diagnostic.otherHints;
+        diagnostic.subDiags[0] = newSubDiag;
+        // Replace error message with note in macro call.
+        diagnostic.errorMessage = subDiag.subDiagMessage;
+        diagnostic.mainHint = IntegratedString(subDiag.mainHint.range, "", mainHint.color);
+        diagnostic.otherHints = subDiag.otherHints;
+    } else {
+        auto newSubDiag = SubDiagnostic(diagnostic.diagMessage);
+        newSubDiag.AddMainHint(MakeRange(diagnostic.start, diagnostic.end), "");
+        (void)diagnostic.subDiags.insert(diagnostic.subDiags.begin(), newSubDiag);
+        // Replace error message with note in macro call.
+        diagnostic.diagMessage = subDiag.subDiagMessage;
+        diagnostic.start = subDiag.mainHint.range.begin;
+        diagnostic.end = subDiag.mainHint.range.end;
+    }
+}
 }
 
-bool DiagnosticEmitterImpl::Emit()
+bool DiagnosticEmitterImpl::Emit(bool enableOnlyHint)
 {
+    // Swap error message with note when dealing with macro calls.
+    SwapErrorMessageWithNote(diag, sm);
     const std::map<DiagSeverity, std::string_view> seveToStr = {
         {DiagSeverity::DS_ERROR, "error"}, {DiagSeverity::DS_WARNING, "warning"},
         {DiagSeverity::DS_NOTE, "note"},
     };
     if (seveToStr.find(diag.diagSeverity) != seveToStr.end()) {
-        EmitErrorMessage(diag.mainHint.color, std::string(seveToStr.at(diag.diagSeverity)), diag.errorMessage);
+        if (!enableOnlyHint) {
+            EmitErrorMessage(diag.mainHint.color, std::string(seveToStr.at(diag.diagSeverity)), diag.errorMessage);
+        }
     } else {
         CJC_ABORT();
     }
@@ -941,8 +1006,8 @@ DiagnosticEmitter::~DiagnosticEmitter()
 {
     delete impl;
 }
-bool DiagnosticEmitter::Emit() const
+bool DiagnosticEmitter::Emit(bool enableOnlyHint) const
 {
-    return impl->Emit();
+    return impl->Emit(enableOnlyHint);
 }
 }

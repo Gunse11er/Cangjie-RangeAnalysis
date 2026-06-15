@@ -228,8 +228,8 @@ bool CheckClass(const Cangjie::AST::ClassDecl& decl, const ClassDef& classDef)
     }
     AST::ClassTy* astSupClsTy = nullptr;
     for (auto& super : decl.inheritedTypes) {
-        if (super->ty->kind == AST::TypeKind::TYPE_CLASS) {
-            astSupClsTy = StaticCast<AST::ClassTy*>(super->ty);
+        if (super->TyKind() == AST::TypeKind::TYPE_CLASS) {
+            astSupClsTy = StaticCast<AST::ClassTy*>(super->GetTy());
         }
     }
     auto chirSupClsTy = classDef.GetSuperClassTy();
@@ -260,9 +260,9 @@ bool CheckInterface(const ClassDef& chirNode)
 
 const CustomTypeDef* GetParentCustomTypeDef(const Value& value)
 {
-    if (auto func = DynamicCast<FuncBase>(&value)) {
+    if (auto func = DynamicCast<Function>(&value)) {
         return func->GetParentCustomTypeDef();
-    } else if (auto var = DynamicCast<GlobalVarBase>(&value)) {
+    } else if (auto var = DynamicCast<GlobalVar>(&value)) {
         return var->GetParentCustomTypeDef();
     }
     return nullptr;
@@ -293,77 +293,21 @@ bool CheckInheritDeclGlobalMember(
     }
     // member func
     if (decl.astKind == Cangjie::AST::ASTKind::FUNC_DECL) {
-        if (StaticCast<const Cangjie::AST::FuncDecl&>(decl).TestAttr(AST::Attribute::CONSTRUCTOR) ||
-            StaticCast<const Cangjie::AST::FuncDecl&>(decl).IsFinalizer()) {
+        if (StaticCast<const Cangjie::AST::FuncDecl&>(decl).TestAttr(AST::Attribute::CONSTRUCTOR) || StaticCast<const Cangjie::AST::FuncDecl&>(decl).IsFinalizer()) {
             return true;
         }
-        if (decl.TestAttr(Cangjie::AST::Attribute::SPECIFIC) && chirNode.TestAttr(Attribute::DESERIALIZED)) {
-            // `platform` function type can be subtype of `common` function type.
-            // We keep origin type in CHIR, however AST type is updated. Thus it's not an error.
-            return true;
-        }
-        if (!decl.TestAttr(Cangjie::AST::Attribute::STATIC) && !CheckMethodType(*decl.ty, *chirCache->GetType())) {
-            Errorln(chirCache->GetIdentifier() + " is expected to be promoted " + Cangjie::AST::Ty::ToString(decl.ty) +
-                ".");
+        if (!decl.TestAttr(Cangjie::AST::Attribute::STATIC) && !CheckMethodType(*decl.GetTy(), *chirCache->GetType())) {
+            Errorln(chirCache->GetIdentifier() + " is expected to be promoted " +
+                Cangjie::AST::Ty::ToString(decl.GetTy()) + ".");
             return false;
         }
-        if (decl.TestAttr(Cangjie::AST::Attribute::STATIC) && !CheckFuncType(*decl.ty, *chirCache->GetType())) {
-            Errorln(chirCache->GetIdentifier() + " is expected to be promoted " + Cangjie::AST::Ty::ToString(decl.ty) +
-                ".");
+        if (decl.TestAttr(Cangjie::AST::Attribute::STATIC) && !CheckFuncType(*decl.GetTy(), *chirCache->GetType())) {
+            Errorln(chirCache->GetIdentifier() + " is expected to be promoted " +
+                Cangjie::AST::Ty::ToString(decl.GetTy()) + ".");
             return false;
         }
     }
     return true;
-}
-
-bool CheckAbstractMethod(const Cangjie::AST::Decl& decl, const CustomTypeDef& chirNode)
-{
-    if (chirNode.GetCustomKind() != CustomDefKind::TYPE_CLASS) {
-        return true;
-    }
-    if (decl.astKind == Cangjie::AST::ASTKind::PROP_DECL) {
-        auto ret = true;
-        auto& propDecl = Cangjie::StaticCast<Cangjie::AST::PropDecl&>(decl);
-        for (auto& itp : propDecl.getters) {
-            ret = CheckAbstractMethod(*itp, chirNode) && ret;
-        }
-        for (auto& itp : propDecl.setters) {
-            ret = CheckAbstractMethod(*itp, chirNode) && ret;
-        }
-        return ret;
-    }
-    auto& classDef = Cangjie::StaticCast<const ClassDef&>(chirNode);
-    for (auto& it : classDef.GetAbstractMethods()) {
-        if (it.GetMangledName() != decl.mangledName + ".0") {
-            continue;
-        }
-        auto res = true;
-        if (it.TestAttr(Attribute::STATIC)) {
-            res = CheckType(*decl.ty, *it.methodTy);
-        } else {
-            auto astTyArgs = decl.ty->typeArgs;
-            auto chirTyArgs = it.methodTy->GetTypeArgs();
-            if (astTyArgs.size() + 1 != chirTyArgs.size()) {
-                res = false;
-            } else {
-                for (size_t i = 0; i < astTyArgs.size(); ++i) {
-                    res = CheckType(*astTyArgs[i], *chirTyArgs[i + 1]) && res;
-                }
-            }
-        }
-        if (!res) {
-            Errorln(it.GetMangledName() + " is expected to be " + Cangjie::AST::Ty::ToString(decl.ty) + " in " +
-                chirNode.GetIdentifier() + ".");
-            return false;
-        }
-        return true;
-    }
-    if (decl.specificImplementation && decl.specificImplementation->TestAttr(AST::Attribute::OPEN)) {
-        // ABSTRACT COMMON was replaced with OPEN SPECIFIC
-        return true;
-    }
-    Errorln("not find abstract method " + decl.mangledName + " in " + chirNode.GetIdentifier() + ".");
-    return false;
 }
 
 bool CheckLocalVar(const Cangjie::AST::Decl& decl, const CustomTypeDef& chirNode)
@@ -377,8 +321,8 @@ bool CheckLocalVar(const Cangjie::AST::Decl& decl, const CustomTypeDef& chirNode
         if (it.name != decl.identifier.Val()) {
             continue;
         }
-        if (!DynamicCast<AST::RefEnumTy*>(decl.ty) && !CheckType(*decl.ty, *it.type)) {
-            Errorln(it.name + " is expected to be " + Cangjie::AST::Ty::ToString(decl.ty) + " in " +
+        if (!DynamicCast<AST::RefEnumTy*>(decl.GetTy()) && !CheckType(*decl.GetTy(), *it.type)) {
+            Errorln(it.name + " is expected to be " + Cangjie::AST::Ty::ToString(decl.GetTy()) + " in " +
                 chirNode.GetIdentifier() + ".");
             return false;
         }
@@ -395,23 +339,6 @@ bool CheckInheritDeclMembers(
     for (auto& it : decl.GetMemberDecls()) {
         // All of call to JArray constructors will be desugared, so we can skip the useless constructor member directly.
         if (it->TestAttr(Cangjie::AST::Attribute::GENERIC)) {
-            continue;
-        }
-        // decl in Interface is abstract method.
-        if (decl.astKind == Cangjie::AST::ASTKind::INTERFACE_DECL) {
-            if (it->astKind != AST::ASTKind::VAR_DECL) {
-                ret = CheckAbstractMethod(*it, chirNode) && ret;
-            }
-            continue;
-        }
-        // abstract method not have a real node
-        if (it->TestAttr(Cangjie::AST::Attribute::ABSTRACT)) {
-            ret = CheckAbstractMethod(*it, chirNode) && ret;
-            continue;
-        }
-        if (decl.astKind == Cangjie::AST::ASTKind::INTERFACE_DECL && !it->TestAttr(Cangjie::AST::Attribute::STATIC) &&
-            (it->astKind == Cangjie::AST::ASTKind::FUNC_DECL || it->astKind == Cangjie::AST::ASTKind::PROP_DECL)) {
-            ret = CheckAbstractMethod(*it, chirNode) && ret;
             continue;
         }
         // local member var not have a real node
@@ -486,7 +413,7 @@ bool CheckStruct(
 
 bool CheckFunc(const Cangjie::AST::FuncDecl& decl, const Value& chirNode)
 {
-    if (!Is<FuncBase>(chirNode)) {
+    if (!Is<Function>(chirNode)) {
         Errorln(chirNode.GetIdentifier() + " is expected to be a func.");
         return false;
     }
@@ -494,7 +421,7 @@ bool CheckFunc(const Cangjie::AST::FuncDecl& decl, const Value& chirNode)
     if (decl.outerDecl != nullptr) {
         return true;
     }
-    auto astTy = decl.ty;
+    auto astTy = decl.GetTy();
     auto chirTy = chirNode.GetType();
     if (!CheckType(*astTy, *chirTy)) {
         bool report = true;
@@ -514,11 +441,11 @@ bool CheckFunc(const Cangjie::AST::FuncDecl& decl, const Value& chirNode)
 
 bool CheckVar(const Cangjie::AST::VarDecl& decl, const Value& chirNode)
 {
-    if (!Is<GlobalVarBase>(chirNode)) {
+    if (!Is<GlobalVar>(chirNode)) {
         Errorln(chirNode.GetIdentifier() + " is expected to be a globalVar.");
         return false;
     }
-    auto astTy = decl.ty;
+    auto astTy = decl.GetTy();
     auto chirTy = chirNode.GetType();
     if (!CheckType(*astTy, *chirTy)) {
         Errorln(chirNode.GetIdentifier() + " is expected to be " + Cangjie::AST::Ty::ToString(astTy) + ".");

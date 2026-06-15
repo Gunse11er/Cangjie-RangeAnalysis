@@ -1,34 +1,63 @@
-// Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+// Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 // This source file is part of the Cangjie project, licensed under Apache-2.0
 // with Runtime Library Exception.
 //
 // See https://cangjie-lang.cn/pages/LICENSE for license information.
 
 #include "JavaDesugarManager.h"
-#include "NativeFFI/Java/JavaCodeGenerator/JavaSourceCodeGenerator.h"
 #include "Utils.h"
 
 #include "cangjie/AST/Create.h"
 #include "cangjie/AST/Match.h"
+#include "cangjie/AST/Node.h"
+#include "cangjie/Utils/CheckUtils.h"
+#include "cangjie/Utils/SafePointer.h"
 
 namespace Cangjie::Interop::Java {
 using namespace Cangjie::Native::FFI;
 
-inline void JavaDesugarManager::PushEnvParams(std::vector<OwnedPtr<FuncParam>>& params, std::string name)
+OwnedPtr<FuncParam> JavaDesugarManager::CreateJniEnvParam(const std::string& name)
 {
-    auto jniEnvPtrDecl = lib.GetJniEnvPtrDecl();
+    static auto jniEnvPtrDecl = lib.GetJniEnvPtrDecl();
+    static auto jniEnvPtrTy = lib.GetJNIEnvPtrTy();
     CJC_NULLPTR_CHECK(jniEnvPtrDecl);
-    params.push_back(CreateFuncParam(name, ASTCloner::Clone(jniEnvPtrDecl->type.get()), nullptr, lib.GetJNIEnvPtrTy()));
+    return CreateFuncParam(name, ASTCloner::Clone(jniEnvPtrDecl->type.get()), nullptr, jniEnvPtrTy);
 }
 
-inline void JavaDesugarManager::PushObjParams(std::vector<OwnedPtr<FuncParam>>& params, std::string name)
+OwnedPtr<FuncParam> JavaDesugarManager::CreateJniJobjectOrJclassParam(const std::string& name)
 {
-    params.push_back(CreateFuncParam(name, lib.CreateJobjectType(), nullptr, lib.GetJobjectTy()));
+    static auto jobjectTy = lib.GetJobjectTy();
+    return CreateFuncParam(name, lib.CreateJobjectType(), nullptr, jobjectTy);
 }
 
-inline void JavaDesugarManager::PushSelfParams(std::vector<OwnedPtr<FuncParam>>& params, std::string name)
+OwnedPtr<FuncParam> JavaDesugarManager::CreateRegistryIdParam(const std::string& name)
 {
-    params.push_back(CreateFuncParam(name, lib.CreateJlongType(), nullptr, lib.GetJlongTy()));
+    static auto registryIdParamTy = lib.GetJlongTy();
+    return CreateFuncParam(name, lib.CreateJlongType(), nullptr, registryIdParamTy);
+}
+
+FuncParam& JavaDesugarManager::PushEnvParams(std::vector<OwnedPtr<FuncParam>>& params, const std::string& name)
+{
+    auto param = CreateJniEnvParam(name);
+    auto& paramRef = *param;
+    params.push_back(std::move(param));
+    return paramRef;
+}
+
+FuncParam& JavaDesugarManager::PushObjParams(std::vector<OwnedPtr<FuncParam>>& params, const std::string& name)
+{
+    auto param = CreateFuncParam(name, lib.CreateJobjectType(), nullptr, lib.GetJobjectTy());
+    auto& paramRef = *param;
+    params.push_back(std::move(param));
+    return paramRef;
+}
+
+FuncParam& JavaDesugarManager::PushSelfParams(std::vector<OwnedPtr<FuncParam>>& params, std::string name)
+{
+    auto param = CreateRegistryIdParam(name);
+    auto& paramRef = *param;
+    params.push_back(std::move(param));
+    return paramRef;
 }
 
 OwnedPtr<CallExpr> JavaDesugarManager::GetFwdClassInstance(OwnedPtr<RefExpr> paramRef, Decl& fwdClassDecl)
@@ -48,7 +77,7 @@ OwnedPtr<CallExpr> JavaDesugarManager::GetFwdClassInstance(OwnedPtr<RefExpr> par
     std::vector<OwnedPtr<FuncArg>> ctorCallArgs;
     ctorCallArgs.push_back(CreateFuncArg(std::move(entity)));
 
-    auto fwdTy = fwdClassDecl.ty;
+    auto fwdTy = fwdClassDecl.GetTy();
     auto fdRef = WithinFile(CreateRefExpr(*ctor), curFile);
     return CreateCallExpr(std::move(fdRef), std::move(ctorCallArgs), ctor, fwdTy, CallKind::CALL_OBJECT_CREATION);
 }
@@ -67,8 +96,8 @@ bool JavaDesugarManager::FillMethodParamsByArg(std::vector<OwnedPtr<FuncParam>>&
     Ptr<Ty> actualTy)
 {
     CJC_NULLPTR_CHECK(funcDecl.curFile);
-    Ptr<Ty> actualArgTy = arg->ty;
-    actualArgTy = (actualTy && arg->ty->HasGeneric()) ? actualTy : arg->ty;
+    Ptr<Ty> actualArgTy = arg->GetTy();
+    actualArgTy = (actualTy && arg->GetTy()->HasGeneric()) ? actualTy : arg->GetTy();
     auto jniArgTy = GetJNITy(actualArgTy);
     OwnedPtr<FuncParam> param = CreateFuncParam(arg->identifier.GetRawText(), nullptr, nullptr, jniArgTy);
     auto classLikeTy = DynamicCast<ClassLikeTy*>(actualArgTy);
@@ -84,18 +113,17 @@ bool JavaDesugarManager::FillMethodParamsByArg(std::vector<OwnedPtr<FuncParam>>&
     } else if (IsImpl(*actualArgTy)) {
         auto entity = lib.CreateJavaEntityJobjectCall(std::move(paramRef));
         methodArg = CreateFuncArg(lib.UnwrapJavaEntity(std::move(entity), actualArgTy, *outerDecl));
-    } else if (actualArgTy->IsCoreOptionType() && IsMirror(*actualArgTy->typeArgs[0])) {
+    } else if (actualArgTy->IsCoreOptionType() && (IsMirror(*actualArgTy->typeArgs[0]) ||
+                                                   IsImpl(*actualArgTy->typeArgs[0]) ||
+                                                   actualArgTy->typeArgs[0]->IsString())) {
         // funcDecl(Java_CFFI_JavaEntity(arg)) // if arg is null (as jobject == 0) -> java entity will preserve it
-        auto entity = lib.CreateJavaEntityJobjectCall(std::move(paramRef));
-        methodArg = CreateFuncArg(lib.UnwrapJavaEntity(std::move(entity), actualArgTy, *outerDecl));
-    } else if (actualArgTy->IsCoreOptionType() && IsImpl(*actualArgTy->typeArgs[0])) {
         auto entity = lib.CreateJavaEntityJobjectCall(std::move(paramRef));
         methodArg = CreateFuncArg(lib.UnwrapJavaEntity(std::move(entity), actualArgTy, *outerDecl));
     } else if (IsCJMapping(*actualArgTy)) {
         auto entity = lib.CreateGetFromRegistryCall(
             WithinFile(CreateRefExpr(jniEnvPtrParam), funcDecl.curFile), std::move(paramRef), actualArgTy);
         methodArg = CreateFuncArg(WithinFile(std::move(entity), funcDecl.curFile));
-    } else if (IsCJMappingInterface(*arg->ty)) {
+    } else if (IsCJMappingInterface(*arg->GetTy())) {
         Ptr<Ty> fwdTy = TypeManager::GetInvalidTy();
         for (auto it : classLikeTy->directSubtypes) {
             if (it->name == classLikeTy->name + JAVA_FWD_CLASS_SUFFIX) {
@@ -125,6 +153,10 @@ bool JavaDesugarManager::FillMethodParamsByArg(std::vector<OwnedPtr<FuncParam>>&
         auto getCjLambdaFd = CheckCjLambdaDeclByTy(actualArgTy);
         auto getCjLambdaCallExpr = CreateCall(getCjLambdaFd, funcDecl.curFile, std::move(paramRef));
         methodArg = CreateFuncArg(std::move(getCjLambdaCallExpr));
+    } else if (actualArgTy->IsString()) {
+        // Convert JNI jobject (jstring) to Cangjie String:
+        // jobject -> JavaEntity -> Struct-String.
+        methodArg = CreateFuncArg(lib.JObjectToString(CreateRefExpr(*param), funcDecl.curFile));
     } else {
         methodArg = CreateFuncArg(std::move(paramRef));
     }
@@ -140,7 +172,7 @@ OwnedPtr<Decl> JavaDesugarManager::GenerateNativeMethod(
     auto curFile = sampleMethod.curFile;
     CJC_NULLPTR_CHECK(curFile);
 
-    Ptr<Ty> retTy = StaticCast<FuncTy*>(sampleMethod.ty)->retTy;
+    Ptr<Ty> retTy = StaticCast<FuncTy*>(sampleMethod.GetTy())->retTy;
     std::vector<OwnedPtr<FuncParam>> params;
     PushEnvParams(params);
     // jobject or jclass
@@ -167,17 +199,17 @@ OwnedPtr<Decl> JavaDesugarManager::GenerateNativeMethod(
     auto retActualTy = retTy->HasGeneric() ? GetGenericInstTy(genericConfig, retTy, typeManager) : retTy;
     CJC_ASSERT_WITH_MSG(!sampleMethod.funcBody->paramLists.empty(), "paramLists cannot be empty");
     for (auto& arg : sampleMethod.funcBody->paramLists[0]->params) {
-        if (!FillMethodParamsByArg(params, methodCallArgs, sampleMethod, arg, jniEnvPtrParam,
-            GetGenericInstTy(genericConfig, arg->ty, typeManager))) {
-                return nullptr;
+        auto genericInstTy = GetGenericInstTy(genericConfig, arg->GetTy(), typeManager);
+        if (!FillMethodParamsByArg(params, methodCallArgs, sampleMethod, arg, jniEnvPtrParam, genericInstTy)) {
+            return nullptr;
         }
     }
     OwnedPtr<MemberAccess> methodAccess;
     if (sampleMethod.TestAttr(Attribute::STATIC)) {
         auto staticRefExpr = CreateRefExpr(decl);
-        if (decl.ty->HasGeneric()) {
+        if (decl.GetTy()->HasGeneric()) {
             staticRefExpr->typeArguments = std::move(actualPrimitiveType);
-            staticRefExpr->ty = instantTy;
+            staticRefExpr->SetTy(instantTy);
         }
         methodAccess = CreateMemberAccess(WithinFile(std::move(staticRefExpr), curFile), sampleMethod);
     } else if (sampleMethod.TestAttr(Attribute::CJ_MIRROR_JAVA_INTERFACE_DEFAULT)) {
@@ -187,14 +219,14 @@ OwnedPtr<Decl> JavaDesugarManager::GenerateNativeMethod(
         methodAccess = CreateMemberAccess(std::move(fwdClassInstance), sampleMethod);
     } else {
         OwnedPtr<CallExpr> reg;
-        if (decl.ty->HasGeneric()) {
+        if (decl.GetTy()->HasGeneric()) {
             reg = lib.CreateGetFromRegistryCall(WithinFile(CreateRefExpr(jniEnvPtrParam), curFile),
                 WithinFile(CreateRefExpr(selfParam), curFile), instantTy);
             methodAccess = CreateMemberAccess(std::move(reg), sampleMethod);
-            methodAccess->ty = typeManager.GetFunctionTy(funcTyParams, retActualTy);
+            methodAccess->SetTy(typeManager.GetFunctionTy(funcTyParams, retActualTy));
         } else {
             reg = lib.CreateGetFromRegistryCall(WithinFile(CreateRefExpr(jniEnvPtrParam), curFile),
-                WithinFile(CreateRefExpr(selfParam), curFile), decl.ty);
+                WithinFile(CreateRefExpr(selfParam), curFile), decl.GetTy());
             methodAccess = CreateMemberAccess(std::move(reg), sampleMethod);
         }
     }
@@ -202,7 +234,7 @@ OwnedPtr<Decl> JavaDesugarManager::GenerateNativeMethod(
     auto methodCall = CreateCallExpr(std::move(methodAccess), std::move(methodCallArgs), Ptr(&sampleMethod),
         retActualTy, CallKind::CALL_DECLARED_FUNCTION);
     auto methodCallRes = CreateTmpVarDecl(nullptr, std::move(methodCall));
-    methodCallRes->ty = retActualTy;
+    methodCallRes->SetTy(retActualTy);
     OwnedPtr<Expr> retExpr;
     auto createCJMappingCall = [&library = this->lib, &jniEnvPtrParam, &curFile, &methodCallRes, &retExpr](
                                    std::string& clazzName, bool needCtorArgs) {
@@ -238,12 +270,22 @@ OwnedPtr<Decl> JavaDesugarManager::GenerateNativeMethod(
             sampleMethod.outerDecl->EnableAttr(Attribute::IS_BROKEN);
             return nullptr;
         }
+    } else if (retActualTy->IsString()) {
+		// Convert Cangjie String to JNI jobject (jstring):
+		// JNI boundary: jstring (represented as jobject / CPointer<Unit>)
+        retExpr = lib.StringToJObject(CreateRefExpr(*methodCallRes), curFile, jniEnvPtrParam, *sampleMethod.outerDecl);
+        retActualTy = lib.GetJobjectTy();
     } else if (retActualTy->IsFunc()) {
         CheckCjLambdaDeclByTy(retActualTy);
         std::string lambdaJavaClassSign =
             NormalizeJavaSignature(sampleMethod.fullPackageName + "." + GetLambdaJavaClassName(retActualTy) + "$Box");
         auto refExpr = WithinFile(CreateRefExpr(*methodCallRes), curFile);
         retExpr = lib.CreateGetJavaLambdaObjectCall(std::move(refExpr), lambdaJavaClassSign, curFile);
+    } else if (IsOptionOfString(retActualTy)) {
+        retExpr = lib.OptionStringToJObject(WithinFile(CreateRefExpr(*methodCallRes), curFile),
+                                            jniEnvPtrParam,
+                                            *sampleMethod.outerDecl);
+        retActualTy = lib.GetJobjectTy();
     } else {
         OwnedPtr<Expr> methodResRef = WithinFile(CreateRefExpr(*methodCallRes), curFile);
         auto entity = lib.WrapJavaEntity(std::move(methodResRef));
@@ -265,15 +307,13 @@ OwnedPtr<Decl> JavaDesugarManager::GenerateNativeMethod(
 void JavaDesugarManager::GenerateFuncParamsForNativeDeleteCjObject(
     Decl& decl, std::vector<OwnedPtr<FuncParam>>& params, FuncParam*& jniEnv, OwnedPtr<Expr>& selfRef)
 {
-    PushEnvParams(params);
+    auto& jniEnvParam = PushEnvParams(params);
     PushObjParams(params);
-    PushSelfParams(params);
+    auto& registryIdParam = PushSelfParams(params);
     CJC_ASSERT_WITH_MSG(!params.empty(), "jniEnv is absent");
-    jniEnv = &(*params[0]);
+    jniEnv = &jniEnvParam;
     CJC_NULLPTR_CHECK(decl.curFile);
-    constexpr int SELF_REF_INDEX = 2;
-    CJC_ASSERT_WITH_MSG(params.size() > SELF_REF_INDEX, "selfRef is absent");
-    selfRef = WithinFile(CreateRefExpr(*params[SELF_REF_INDEX]), decl.curFile);
+    selfRef = WithinFile(CreateRefExpr(registryIdParam), decl.curFile);
 }
 
 OwnedPtr<Decl> JavaDesugarManager::GenerateNativeFuncDeclBylambda(Decl& decl, OwnedPtr<LambdaExpr>& wrappedNodesLambda,
@@ -288,32 +328,20 @@ OwnedPtr<Decl> JavaDesugarManager::GenerateNativeFuncDeclBylambda(OwnedPtr<Lambd
     std::vector<OwnedPtr<FuncParamList>>& paramLists, FuncParam& jniEnvPtrParam, Ptr<Ty>& retTy, std::string funcName,
     Ptr<File>& curFile, std::string moduleName, std::string fullPackageName)
 {
-    auto catchingCall =
-        lib.WrapExceptionHandling(WithinFile(CreateRefExpr(jniEnvPtrParam), curFile), std::move(wrappedNodesLambda));
     //  For ty is CJMapping:
     //  when ty is ArgsTy, we could use the Java_CFFI_getFromRegistry with [id: jlong] to get the cangjie side
     //  struct/class. when ty is RetTy, just use [jobjectTy] for we need JNI to construct the ret object.
     Ptr<Ty> jniRetTy =
         IsCJMapping(*retTy) || IsCJMappingTuple(retTy, tupleConfigs) ? lib.GetJobjectTy() : GetJNITy(retTy);
-    auto block = CreateBlock(Nodes(std::move(catchingCall)), jniRetTy);
-    auto funcBody = CreateFuncBody(std::move(paramLists), nullptr, std::move(block), jniRetTy);
-    std::vector<Ptr<Ty>> funcTyParams;
-    CJC_ASSERT_WITH_MSG(!funcBody->paramLists.empty(), "paramLists cannot be empty");
-    for (auto& param : funcBody->paramLists[0]->params) {
-        funcTyParams.push_back(param->ty);
-    }
-    auto funcTy = typeManager.GetFunctionTy(funcTyParams, jniRetTy, {.isC = true});
-    auto fdecl = CreateFuncDecl(funcName, std::move(funcBody), funcTy);
-    fdecl->funcBody->funcDecl = fdecl.get();
-    fdecl->EnableAttr(Attribute::C);
-    fdecl->EnableAttr(Attribute::GLOBAL);
-    fdecl->EnableAttr(Attribute::PUBLIC);
-    fdecl->EnableAttr(Attribute::NO_MANGLE);
-    fdecl->EnableAttr(Attribute::UNSAFE);
-    fdecl->curFile = curFile;
-    fdecl->moduleName = moduleName;
-    fdecl->fullPackageName = fullPackageName;
 
+    CJC_ASSERT(!paramLists.empty());
+    CJC_NULLPTR_CHECK(curFile);
+    auto fdecl = utils.CreateNativeFunc(funcName,
+        std::move(paramLists[0]->params), jniRetTy, {}, *curFile, moduleName, fullPackageName);
+
+    auto catchingCall =
+        lib.WrapExceptionHandling(WithinFile(CreateRefExpr(jniEnvPtrParam), curFile), std::move(wrappedNodesLambda));
+    fdecl->funcBody->body->body.emplace_back(std::move(catchingCall));
     return std::move(fdecl);
 }
 
@@ -373,9 +401,9 @@ OwnedPtr<Decl> JavaDesugarManager::GenerateNativeInitCjObjectFunc(FuncDecl& ctor
             continue;
         }
 
-        if (!FillMethodParamsByArg(params, ctorCallArgs, ctor, arg, jniEnvPtrParam,
-            GetGenericInstTy(genericConfig, arg->ty, typeManager))) {
-                return nullptr;
+        auto genericInstTy = GetGenericInstTy(genericConfig, arg->GetTy(), typeManager);
+        if (!FillMethodParamsByArg(params, ctorCallArgs, ctor, arg, jniEnvPtrParam, genericInstTy)) {
+            return nullptr;
         }
     }
 
@@ -391,15 +419,15 @@ OwnedPtr<Decl> JavaDesugarManager::GenerateNativeInitCjObjectFunc(FuncDecl& ctor
 
     if (isOpenClass) {
         auto fwdCtorRef = WithinFile(CreateRefExpr(*fwdCtor), curFile);
-        objectCtorCall = CreateCallExpr(std::move(fwdCtorRef), std::move(ctorCallArgs), fwdCtor, fwdCtor->outerDecl->ty,
-            CallKind::CALL_OBJECT_CREATION);
-    } else if (ctor.outerDecl->ty->HasGeneric() && ctor.outerDecl->astKind == ASTKind::ENUM_DECL) {
+        objectCtorCall = CreateCallExpr(std::move(fwdCtorRef), std::move(ctorCallArgs), fwdCtor,
+            fwdCtor->outerDecl->GetTy(), CallKind::CALL_OBJECT_CREATION);
+    } else if (ctor.outerDecl->GetTy()->HasGeneric() && ctor.outerDecl->astKind == ASTKind::ENUM_DECL) {
         auto enumDecl = StaticCast<EnumDecl*>(ctor.outerDecl);
         auto enumRefExpr = WithinFile(CreateRefExpr(*enumDecl), curFile);
         enumRefExpr->typeArguments = std::move(actualPrimitiveType);
         auto enumTy = GetInstantyForGenericTy(*ctor.outerDecl, actualTyArgMap, typeManager);
-        enumRefExpr->ty = enumTy;
-        auto retTy = StaticCast<FuncTy*>(ctor.ty)->retTy;
+        enumRefExpr->SetTy(enumTy);
+        auto retTy = StaticCast<FuncTy*>(ctor.GetTy())->retTy;
         Ptr<FuncTy> funcTy;
         if (retTy->HasGeneric()) {
             funcTy = typeManager.GetFunctionTy(funcTyParams, enumTy, {.isC = true});
@@ -408,12 +436,12 @@ OwnedPtr<Decl> JavaDesugarManager::GenerateNativeInitCjObjectFunc(FuncDecl& ctor
         }
         OwnedPtr<MemberAccess> methodAccess = CreateMemberAccess(std::move(enumRefExpr), ctor);
         methodAccess->curFile = curFile;
-        methodAccess->ty = funcTy;
+        methodAccess->SetTy(funcTy);
         objectCtorCall = CreateCallExpr(
             std::move(methodAccess), std::move(ctorCallArgs), Ptr(&ctor), enumTy, CallKind::CALL_OBJECT_CREATION);
-    } else if (ctor.outerDecl->ty->HasGeneric()) {
+    } else if (ctor.outerDecl->GetTy()->HasGeneric()) {
         auto instantiationRefExpr = CreateRefExpr(ctor);
-        auto retTy = StaticCast<FuncTy*>(ctor.ty)->retTy;
+        auto retTy = StaticCast<FuncTy*>(ctor.GetTy())->retTy;
         Ptr<FuncTy> funcTy;
         auto instantTy = GetInstantyForGenericTy(*ctor.outerDecl, actualTyArgMap, typeManager);
         if (retTy->HasGeneric()) {
@@ -422,13 +450,13 @@ OwnedPtr<Decl> JavaDesugarManager::GenerateNativeInitCjObjectFunc(FuncDecl& ctor
             funcTy = typeManager.GetFunctionTy(funcTyParams, retTy, {.isC = true});
         }
         instantiationRefExpr->typeArguments = std::move(actualPrimitiveType);
-        instantiationRefExpr->ty = funcTy;
+        instantiationRefExpr->SetTy(funcTy);
         objectCtorCall = CreateCallExpr(WithinFile(std::move(instantiationRefExpr), curFile), std::move(ctorCallArgs),
             Ptr(&ctor), instantTy, CallKind::CALL_OBJECT_CREATION);
     } else {
         auto ctorRef = WithinFile(CreateRefExpr(ctor), curFile);
-        objectCtorCall = CreateCallExpr(std::move(ctorRef), std::move(ctorCallArgs), Ptr(&ctor), ctor.outerDecl->ty,
-            CallKind::CALL_OBJECT_CREATION);
+        objectCtorCall = CreateCallExpr(std::move(ctorRef), std::move(ctorCallArgs), Ptr(&ctor),
+            ctor.outerDecl->GetTy(), CallKind::CALL_OBJECT_CREATION);
     }
 
     auto putToRegistryCall = lib.CreatePutToRegistryCall(std::move(objectCtorCall));
@@ -467,6 +495,125 @@ OwnedPtr<Decl> JavaDesugarManager::GenerateNativeInitCjObjectFunc(const Ptr<Tupl
     auto funcName = GetJniInitCjObjectFuncName(tupleTy, pkg);
     return GenerateNativeFuncDeclBylambda(bodyLambda, paramLists, jniEnvPtrParam, jlongTy, funcName, curFile,
         ::Cangjie::Utils::GetRootPackageName(pkg.fullPackageName), pkg.fullPackageName);
+}
+
+/**
+ *  Map Cangjie type to corresponding JNI-level type used in generated native method.
+ */
+Ptr<Ty> JavaDesugarManager::GetJNITy(Ptr<Ty> ty)
+{
+    static auto jobjectTy = lib.GetJobjectTy();
+    static auto jlongTy = lib.GetJlongTy();
+
+    if (!ty) {
+        return nullptr;
+    }
+    if (ty->IsString()) {
+        // String is passed as jobject.
+        return jobjectTy;
+    }
+    if (ty->IsCoreOptionType()) {
+        return jobjectTy;
+    }
+    if (IsMirror(*ty) || IsImpl(*ty) || IsCJMappingInterface(*ty) || ty->IsFunc()) {
+        return jobjectTy;
+    }
+    if (IsCJMapping(*ty)) {
+        return jlongTy;
+    }
+    if (ty->IsTuple()) {
+        return jlongTy;
+    }
+    if (ty->kind == TypeKind::TYPE_GENERICS) {
+        return nullptr;
+    }
+    CJC_ASSERT(ty->IsBuiltin());
+    return ty;
+}
+
+std::string JavaDesugarManager::GetJniMethodName(const FuncDecl& method, const std::string* genericActualName)
+{
+    auto sampleJavaName = GetJavaMemberName(method);
+    std::string fqname = GetJavaFQName(*(method.outerDecl), genericActualName);
+    MangleJNIName(fqname);
+    CJC_ASSERT_WITH_MSG(!method.funcBody->paramLists.empty(), "paramLists cannot be empty");
+    auto mangledFuncName =
+        GetMangledMethodName(mangler, method.funcBody->paramLists[0]->params, sampleJavaName, typeManager);
+    MangleJNIName(mangledFuncName);
+
+    return "Java_" + fqname + "_" + mangledFuncName;
+}
+
+std::string JavaDesugarManager::GetJniTupleItemName(const Ptr<TupleTy>& tupleTy, Package& pkg, size_t index)
+{
+    std::string fqname = pkg.fullPackageName + "." + GetCjMappingTupleName(*tupleTy);
+    MangleJNIName(fqname);
+
+    return "Java_" + fqname + "_" + "item" + std::to_string(index);
+}
+
+std::string JavaDesugarManager::GetJniMethodNameForProp(
+    const PropDecl& propDecl, bool isSet, const std::string* genericActualName) const
+{
+    std::string varDecl = GetJavaMemberName(propDecl);
+    MangleJNIName(varDecl);
+    std::string varDeclSuffix = varDecl;
+    CJC_ASSERT_WITH_MSG(!varDeclSuffix.empty(), "identifier cannot be an empty string");
+    varDeclSuffix[0] = static_cast<char>(toupper(varDeclSuffix[0]));
+    std::string fqname = GetJavaFQName(*(propDecl.outerDecl), genericActualName);
+    MangleJNIName(fqname);
+    return "Java_" + fqname + (isSet ? "_set" : "_get") + varDeclSuffix + "Impl";
+    ;
+}
+
+std::string JavaDesugarManager::GetJniInitCjObjectFuncName(
+    const FuncDecl& ctor, bool isGeneratedCtor, const std::string* genericActualName)
+{
+    std::string fqname = GetJavaFQName(*(ctor.outerDecl), genericActualName);
+    MangleJNIName(fqname);
+    auto mangledFuncName =
+        GetMangledJniInitCjObjectFuncName(mangler, ctor.funcBody->paramLists[0]->params, isGeneratedCtor);
+    MangleJNIName(mangledFuncName);
+
+    if (Is<EnumDecl>(ctor.outerDecl)) {
+        mangledFuncName = ctor.identifier + mangledFuncName;
+    }
+
+    return "Java_" + fqname + "_" + mangledFuncName;
+}
+
+std::string JavaDesugarManager::GetJniInitCjObjectFuncName(const Ptr<TupleTy>& tupleTy, Package& pkg)
+{
+    std::string fqname = pkg.fullPackageName + "." + GetCjMappingTupleName(*tupleTy);
+    MangleJNIName(fqname);
+    std::string mangledFuncName = GetMangledJniInitCjObjectFuncName(mangler, tupleTy->typeArgs);
+    MangleJNIName(mangledFuncName);
+    return "Java_" + fqname + "_" + mangledFuncName;
+}
+
+std::string JavaDesugarManager::GetJniInitCjObjectFuncNameForVarDecl(const AST::VarDecl& ctor) const
+{
+    std::string fqname = GetJavaFQName(*(ctor.outerDecl));
+    MangleJNIName(fqname);
+    auto mangledFuncName = ctor.identifier.Val();
+    MangleJNIName(mangledFuncName);
+    return "Java_" + fqname + "_" + mangledFuncName + "initCJObject";
+}
+
+std::string JavaDesugarManager::GetJniDetachCjObjectFuncName(const Decl& decl) const
+{
+    std::string fqname = GetJavaFQName(decl);
+    MangleJNIName(fqname);
+
+    return "Java_" + fqname + "_detachCJObject";
+}
+
+std::string JavaDesugarManager::GetJniDeleteCjObjectFuncName(const Decl& decl) const
+{
+    std::string fqname = GetJavaFQName(decl);
+    MangleJNIName(fqname);
+
+    return "Java_" + fqname + "_deleteCJObject";
 }
 
 } // namespace Cangjie::Interop::Java

@@ -199,7 +199,7 @@ void MacroFormatter::PushIntoLines()
     return;
 }
 
-void MacroFormatter::LinesToString(bool hasComment)
+void MacroFormatter::LinesToString()
 {
     // Determine the initial indentation.
     if (lines.empty()) {
@@ -215,14 +215,6 @@ void MacroFormatter::LinesToString(bool hasComment)
         if (lines[i].size() == 0) {
             continue;
         }
-        if (hasComment && lines[i].size() > 1) {
-            if (i == 0) {
-                retStr += lines[i][0].Value();
-            } else {
-                retStr += genIndent(initialIndent) + lines[i][0].Value();
-            }
-            (void)lines[i].erase(lines[i].begin());
-        }
         auto lineStr = LineToString(lines[i]);
         if (i == 0) {
             retStr += genIndent(indentation) + lineStr;
@@ -235,14 +227,14 @@ void MacroFormatter::LinesToString(bool hasComment)
         if (!lines[i].empty() && SeeCurlyBracket(lines[i], TokenKind::RCURL)) {
             indentation -= 1; // Left ident when see "}" this line.
         }
-        retStr += genIndent(indentation) + lineStr;
+        retStr += genIndent(initialIndent + indentation) + lineStr;
     }
 }
 
-const std::string MacroFormatter::Produce(bool hasComment)
+const std::string MacroFormatter::Produce([[maybe_unused]] bool hasComment)
 {
     PushIntoLines();
-    LinesToString(hasComment);
+    LinesToString();
     return retStr;
 }
 

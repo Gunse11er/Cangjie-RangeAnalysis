@@ -12,9 +12,6 @@
 
 #include "cangjie/FrontendTool/FrontendTool.h"
 
-#ifdef __linux__
-#include <malloc.h>
-#endif
 #include <memory>
 #include <string>
 #include <vector>
@@ -86,14 +83,14 @@ static bool IsEmptyInputFile(const DefaultCompilerInstance& instance)
         // In code compilation mode, .cj file input or .o file is required or `-p` must be specified (with package path
         // input).
         return !globalOptions.compilePackage && globalOptions.srcFiles.empty() &&
-            globalOptions.inputChirFiles.empty() && globalOptions.inputObjs.empty();
+            globalOptions.commonPartChirs.empty() && globalOptions.inputObjs.empty();
     }
 }
 
 static bool HandleEmptyInputFileSituation(const DefaultCompilerInstance& instance)
 {
     auto& globalOptions = instance.invocation.globalOptions;
-    if (!globalOptions.scanDepPkg && globalOptions.srcFiles.empty() && globalOptions.inputChirFiles.empty() &&
+    if (!globalOptions.scanDepPkg && globalOptions.srcFiles.empty() && globalOptions.commonPartChirs.empty() &&
         globalOptions.inputObjs.empty()) {
         instance.diag.DiagnoseRefactor(DiagKindRefactor::driver_source_file_empty, DEFAULT_POSITION);
         return false;
@@ -257,10 +254,10 @@ bool Cangjie::NeedCreateIncrementalCompilerInstance(const GlobalOptions& opts)
             logger.LogLn("enable coverage, roll back to full compilation");
         } else if (opts.outputMode == GlobalOptions::OutputMode::CHIR) {
             logger.LogLn("enable compile common part mode, roll back to full compilation");
-        } else if (opts.commonPartCjo) {
+        } else if (!opts.commonPartCjos.empty()) {
             logger.LogLn("enable compile platform part mode, roll back to full compilation");
         }
     }
     return opts.enIncrementalCompilation && opts.mock != MockMode::ON && !opts.enableCoverage &&
-        !(opts.outputMode == GlobalOptions::OutputMode::CHIR) && !opts.commonPartCjo;
+        !(opts.outputMode == GlobalOptions::OutputMode::CHIR) && opts.commonPartCjos.size() <= 0;
 }

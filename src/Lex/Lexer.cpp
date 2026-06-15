@@ -1926,7 +1926,7 @@ Token LexerImpl::Scan()
     if (!enableScan) {
         ret = ScanFromTokens();
         if (enableCollectTokenStream) {
-            tokenStream.emplace_back(ret);
+            tokenStream.emplace(ret);
         }
         return ret;
     }
@@ -1942,7 +1942,7 @@ Token LexerImpl::Scan()
         ret = ScanBase();
     }
     if (enableCollectTokenStream) {
-        tokenStream.emplace_back(ret);
+        tokenStream.emplace(ret);
     }
     return ret;
 }

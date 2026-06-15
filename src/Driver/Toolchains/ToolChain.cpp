@@ -164,21 +164,23 @@ void ToolChain::CheckOtherDependeniesOfStaticLib(
         dynamicLibraries.emplace("-ldl");
     } else if (libName == "libcangjie-std-ast.a") {
         if (driverOptions.target.os == Triple::OSType::DARWIN) {
-            otherLibs.emplace("-lcangjie- std-astFFI");
+            otherLibs.emplace("-lcangjie-std-astFFI");
         } else {
             otherLibs.emplace("-l:libcangjie-std-astFFI.a");
         }
-        // std-ast relies on unwind symbols, which supplied by clang or gcc runtime library. Linking some versions of
-        // gcc.a before clang_rt-builtins causes multiple definitions, thus we need to link clang_rt-builtins first.
+        // std-ast relies on unwind symbols from the host runtime. For generic Linux targets we keep
+        // clang_rt-builtins ahead of gcc runtime to avoid duplicate definitions. Android uses its own
+        // arch-specific clang_rt builtins in Android_CJNATIVE::GenerateLinkOptions instead.
         if (driverOptions.target.arch != Triple::ArchType::AARCH64 &&
-            driverOptions.target.os == Triple::OSType::LINUX && driverOptions.target.env != Triple::Environment::OHOS) {
+            driverOptions.target.os == Triple::OSType::LINUX && driverOptions.target.env != Triple::Environment::OHOS &&
+            driverOptions.target.env != Triple::Environment::ANDROID) {
             otherLibs.emplace("-lclang_rt-builtins");
         }
         if (driverOptions.target.os == Triple::OSType::LINUX &&
             driverOptions.target.env == Triple::Environment::ANDROID) {
             otherLibs.emplace("-lc++");
             otherLibs.emplace("-lunwind");
-        } else if (!driverOptions.target.IsMacOS()) {
+        } else if (!driverOptions.target.IsMacOS() && !driverOptions.target.IsMinGW()) {
             dynamicLibraries.emplace("-lgcc_s");
         }
     }

@@ -21,7 +21,6 @@ void CGContextImpl::Clear()
     }
     cgTypePool.clear();
     chirType2CGTypeMap.clear();
-    chirTypeName2CGTypeMap.clear();
 #ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
     valueAndBasePtrMap.clear();
     nullableReference.clear();

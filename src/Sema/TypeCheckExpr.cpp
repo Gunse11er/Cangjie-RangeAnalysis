@@ -33,8 +33,8 @@ bool IsLocalDeclOutOfFuncBody(const Decl& decl, const FuncBody& curFuncBody)
 void TypeChecker::TypeCheckerImpl::UpdateAnyTy()
 {
     auto anyDecl = importManager.GetCoreDecl<InterfaceDecl>("Any");
-    if (anyDecl && Ty::IsTyCorrect(anyDecl->ty)) {
-        typeManager.SetSemaAnyTy(anyDecl->ty);
+    if (anyDecl && Ty::IsTyCorrect(anyDecl->GetTy())) {
+        typeManager.SetSemaAnyTy(anyDecl->GetTy());
     }
 }
 
@@ -44,8 +44,8 @@ void TypeChecker::TypeCheckerImpl::UpdateCTypeTy()
         return;
     }
     auto ctypeDecl = importManager.GetCoreDecl<InterfaceDecl>(CTYPE_NAME);
-    if (ctypeDecl && Ty::IsTyCorrect(ctypeDecl->ty)) {
-        typeManager.SetSemaCTypeTy(ctypeDecl->ty);
+    if (ctypeDecl && Ty::IsTyCorrect(ctypeDecl->GetTy())) {
+        typeManager.SetSemaCTypeTy(ctypeDecl->GetTy());
     }
 }
 
@@ -63,10 +63,10 @@ bool TypeChecker::TypeCheckerImpl::IsLegalAccessFromStaticFunc(
     CJC_NULLPTR_CHECK(symOfCurStruct);
     CJC_NULLPTR_CHECK(re.curFile);
     std::vector<Ptr<Decl>> decls;
-    if (auto typeDecl = Ty::GetDeclPtrOfTy(symOfCurStruct->node->ty)) {
-        decls = FieldLookup(ctx, typeDecl, decl.identifier, {.baseTy = typeDecl->ty, .file = re.curFile});
+    if (auto typeDecl = Ty::GetDeclPtrOfTy(symOfCurStruct->node->GetTy())) {
+        decls = FieldLookup(ctx, typeDecl, decl.identifier, {.baseTy = typeDecl->GetTy(), .file = re.curFile});
     } else {
-        decls = ExtendFieldLookup(ctx, *re.curFile, symOfCurStruct->node->ty, decl.identifier);
+        decls = ExtendFieldLookup(ctx, *re.curFile, symOfCurStruct->node->GetTy(), decl.identifier);
     }
     auto diagForInvalidAccess = [this](const RefExpr& re, const Decl& decl, const FuncBody& curFuncBody) {
         if (curFuncBody.funcDecl) {
@@ -224,7 +224,7 @@ void TypeChecker::TypeCheckerImpl::CheckForbiddenFuncReferenceAccess(
     }
     // Finalizer is only allowed in class.
     // spec rule: this.xx, super.xx or current member (function or property) is forbidden in class finalizer.
-    if (fd.IsFinalizer() && typeManager.IsSubtype(fd.outerDecl->ty, decl.outerDecl->ty)) {
+    if (fd.IsFinalizer() && typeManager.IsSubtype(fd.outerDecl->GetTy(), decl.outerDecl->GetTy())) {
         std::string type = decl.astKind == ASTKind::PROP_DECL ? "property" : "function";
         diag.DiagnoseRefactor(DiagKindRefactor::sema_instance_func_cannot_be_used_in_finalizer, pos, type);
     }
@@ -269,8 +269,8 @@ void TypeChecker::TypeCheckerImpl::SubstituteTypeForTypeAliasTypeMapping(
     // First, create a mapping from type alias parameters to provided type arguments
     TypeSubst aliasParamMapping;
     for (size_t i = 0; i < argsNum; ++i) {
-        if (Ty::IsTyCorrect(tad.generic->typeParameters[i]->ty) && Ty::IsTyCorrect(typeArgs[i])) {
-            if (auto declGenParam = DynamicCast<TyVar*>(tad.generic->typeParameters[i]->ty)) {
+        if (Ty::IsTyCorrect(tad.generic->typeParameters[i]->GetTy()) && Ty::IsTyCorrect(typeArgs[i])) {
+            if (auto declGenParam = DynamicCast<TyVar*>(tad.generic->typeParameters[i]->GetTy())) {
                 aliasParamMapping[declGenParam] = typeArgs[i];
             }
         }
@@ -309,12 +309,12 @@ TypeSubst TypeChecker::TypeCheckerImpl::GenerateTypeMappingForTypeAliasDeclVisit
         visited.emplace(&tad);
     }
     auto target = tad.type->GetTarget();
-    if (!target || !Ty::IsTyCorrect(tad.type->ty)) {
+    if (!target || !Ty::IsTyCorrect(tad.type->GetTy())) {
         return typeMapping;
     }
     if (target->astKind != ASTKind::TYPE_ALIAS_DECL) {
         // For target which is not typealias decl, generate typeMapping from used genericTy to itself.
-        for (auto ty : tad.type->ty->typeArgs) {
+        for (auto ty : tad.type->GetTy()->typeArgs) {
             if (ty->IsGeneric()) {
                 typeMapping[StaticCast<GenericsTy*>(ty)] = ty;
             }
@@ -331,7 +331,7 @@ TypeSubst TypeChecker::TypeCheckerImpl::GenerateTypeMappingForTypeAliasDeclVisit
     //     current tad is B2, target is A1. We need to collect 'Int64 & X' here.
     std::vector<Ptr<AST::Ty>> typeArgs;
     for (auto& it : tad.type->GetTypeArgs()) {
-        typeArgs.push_back(it->ty);
+        typeArgs.push_back(it->GetTy());
     }
     SubstituteTypeForTypeAliasTypeMapping(*targetTad, typeArgs, typeMapping);
     return typeMapping;

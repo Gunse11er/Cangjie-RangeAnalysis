@@ -15,6 +15,7 @@ llvm::Function* GenTypeInfoFns(llvm::FunctionType* fieldFnType, CGModule& cgMod,
     llvm::Function* getTiFn =
         llvm::Function::Create(fieldFnType, llvm::Function::PrivateLinkage, funcName, cgMod.GetLLVMModule());
     getTiFn->addFnAttr("native-interface-fn");
+    getTiFn->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
     auto cgType = CGType::GetOrCreate(cgMod, DeRef(memberType));
     CodeGen::IRBuilder2 irBuilder(cgMod);
     auto entryBB = irBuilder.CreateEntryBasicBlock(getTiFn, "entry");

@@ -156,7 +156,7 @@ public:
     // ===--------------------------------------------------------------------===//
     // BlockGroup API
     // ===--------------------------------------------------------------------===//
-    BlockGroup* CreateBlockGroup(Func& func);
+    BlockGroup* CreateBlockGroup(Function& func);
 
     // ===--------------------------------------------------------------------===//
     // Basic Block API
@@ -174,9 +174,10 @@ public:
         this->allocatedValues.push_back(litVal);
         return litVal;
     }
-    Parameter* CreateParameter(Type* ty, const DebugLocation& loc, Func& parentFunc);
+    Parameter* CreateParameter(Type* ty, const DebugLocation& loc, Function& parentFunc);
     Parameter* CreateParameter(Type* ty, const DebugLocation& loc, Lambda& parentLambda);
-    GlobalVar* CreateGlobalVar(const DebugLocation& loc, RefType* ty, const std::string& mangledName,
+
+    GlobalVar* CreateGlobalVar(Type* ty, const std::string& mangledName,
         const std::string& srcCodeIdentifier, const std::string& rawMangledName, const std::string& packageName);
     // ===--------------------------------------------------------------------===//
     // Expression API
@@ -185,11 +186,11 @@ public:
     template <typename TExpr, typename... Args> TExpr* CreateExpression(Type* resultTy, Args&&... args)
     {
         TExpr* expr = new TExpr(std::forward<Args>(args)...);
-        this->allocatedExprs.push_back(expr);
-        CJC_NULLPTR_CHECK(expr->GetTopLevelFunc());
+        auto bg = expr->GetFuncOrLambdaBody();
+        StoreAllocatedPtrInFuncOrLambda(*bg, expr);
         std::string idStr = "%" + std::to_string(expr->GetTopLevelFunc()->GenerateLocalId());
         LocalVar* res = new LocalVar(resultTy, idStr, expr);
-        this->allocatedValues.push_back(res);
+        StoreAllocatedPtrInFuncOrLambda(*bg, res);
         return expr;
     }
 
@@ -216,7 +217,8 @@ public:
     {
         static_assert(std::is_base_of_v<Terminator, TExpr>);
         TExpr* expr = new TExpr(std::forward<Args>(args)...);
-        this->allocatedExprs.push_back(expr);
+        auto bg = expr->GetFuncOrLambdaBody();
+        StoreAllocatedPtrInFuncOrLambda(*bg, expr);
         return expr;
     }
 
@@ -240,27 +242,32 @@ public:
     template <typename TLitVal, typename... Args>
     Constant* CreateConstantExpression(Type* resultTy, Block* parentBlock, Args&&... args)
     {
+        CJC_NULLPTR_CHECK(resultTy);
+        CJC_NULLPTR_CHECK(parentBlock);
         TLitVal* litVal = CreateLiteralValue<TLitVal>(resultTy, std::forward<Args>(args)...);
         Constant* expr = new Constant(litVal, parentBlock);
-        this->allocatedExprs.push_back(expr);
-        CJC_NULLPTR_CHECK(parentBlock->GetTopLevelFunc());
+        auto bg = expr->GetFuncOrLambdaBody();
+        StoreAllocatedPtrInFuncOrLambda(*bg, expr);
         std::string idStr = "%" + std::to_string(parentBlock->GetTopLevelFunc()->GenerateLocalId());
         LocalVar* res = new LocalVar(resultTy, idStr, expr);
-        this->allocatedValues.push_back(res);
+        StoreAllocatedPtrInFuncOrLambda(*bg, res);
         return expr;
     }
 
     template <typename TLitVal, typename... Args>
     Constant* CreateConstantExpression(const DebugLocation& loc, Type* resultTy, Block* parentBlock, Args&&... args)
     {
+        CJC_NULLPTR_CHECK(resultTy);
+        CJC_NULLPTR_CHECK(parentBlock);
         auto expr = CreateConstantExpression<TLitVal>(resultTy, parentBlock, args...);
         expr->SetDebugLocation(loc);
         return expr;
     }
 
-    Func* CreateFunc(const DebugLocation& loc, FuncType* funcTy, const std::string& mangledName,
+    Function* CreateFunction(FuncType* funcTy, const std::string& mangledName,
         const std::string& srcCodeIdentifier, const std::string& rawMangledName, const std::string& packageName,
         const std::vector<GenericType*>& genericTypeParams = {});
+    
     // ===--------------------------------------------------------------------===//
     // StructDef API
     // ===--------------------------------------------------------------------===//
@@ -289,28 +296,6 @@ public:
     Package* CreatePackage(const std::string& name);
     Package* GetCurPackage() const;
 
-    template <typename T>
-    T* CreateImportedVarOrFunc(Type* ty, const std::string& mangledName, const std::string& srcCodeIdentifier,
-        const std::string& rawMangledName, const std::string& srcPackageName,
-        const std::vector<GenericType*>& genericTypeParams = {}, bool addToIR = true)
-    {
-        T* importDecl = nullptr;
-        if constexpr (std::is_same_v<T, ImportedFunc>) {
-            importDecl = new ImportedFunc(ty, GLOBAL_VALUE_PREFIX + mangledName,
-                srcCodeIdentifier, rawMangledName, srcPackageName, genericTypeParams);
-        } else {
-            importDecl = new ImportedVar(ty, GLOBAL_VALUE_PREFIX + mangledName,
-                srcCodeIdentifier, rawMangledName, srcPackageName);
-        }
-        CJC_NULLPTR_CHECK(importDecl);
-        importDecl->EnableAttr(Attribute::IMPORTED);
-        this->allocatedValues.push_back(importDecl);
-        if (context.GetCurPackage() != nullptr && addToIR) {
-            context.GetCurPackage()->AddImportedVarAndFunc(importDecl);
-        }
-        return importDecl;
-    }
-
     void SetCompileTimeValueMark(bool val)
     {
         markAsCompileTimeValue = val;
@@ -336,16 +321,16 @@ public:
         return context.dynamicAllocatedTys.size();
     }
 
+    void UpdateTypeInCorePackage()
+    {
+        context.SetObjectTy(context.SearchObjectTyInPackage());
+        context.SetAnyTy(context.SearchAnyTyInPackage());
+    }
+
     void MergeAllocatedInstance()
     {
-        context.GetAllocatedExprs().insert(
-            context.GetAllocatedExprs().end(), allocatedExprs.begin(), allocatedExprs.end());
         context.GetAllocatedValues().insert(
             context.GetAllocatedValues().end(), allocatedValues.begin(), allocatedValues.end());
-        context.GetAllocatedBlockGroups().insert(context.GetAllocatedBlockGroups().end(),
-            allocatedBlockGroups.begin(), allocatedBlockGroups.end());
-        context.GetAllocatedBlocks().insert(
-            context.GetAllocatedBlocks().end(), allocatedBlocks.begin(), allocatedBlocks.end());
         context.GetAllocatedStructs().insert(
             context.GetAllocatedStructs().end(), allocatedStructs.begin(), allocatedStructs.end());
         context.GetAllocatedClasses().insert(
@@ -354,22 +339,20 @@ public:
             context.GetAllocatedEnums().end(), allocatedEnums.begin(), allocatedEnums.end());
         context.GetAllocatedExtends().insert(
             context.GetAllocatedExtends().end(), allocatedExtends.begin(), allocatedExtends.end());
-        allocatedExprs.clear();
+        context.MergeAllocatedPtrInFuncOrLambda(allocatedPtrInFuncOrLambda);
         allocatedValues.clear();
-        allocatedBlockGroups.clear();
-        allocatedBlocks.clear();
         allocatedStructs.clear();
         allocatedClasses.clear();
         allocatedEnums.clear();
         allocatedExtends.clear();
+        allocatedPtrInFuncOrLambda.clear();
     }
 
     std::unordered_set<CustomType*> GetAllCustomTypes() const;
     std::unordered_set<GenericType*> GetAllGenericTypes() const;
 
-    void EnableIRCheckerAfterPlugin();
-    void DisableIRCheckerAfterPlugin();
-    bool IsEnableIRCheckerAfterPlugin() const;
+private:
+    void StoreAllocatedPtrInFuncOrLambda(BlockGroup& bg, Base* ptr = nullptr);
 
 private:
     CHIRContext& context;
@@ -378,14 +361,12 @@ private:
     bool markAsCompileTimeValue = false;
     bool enableIRCheckerAfterPlugin = true;
     size_t threadIdx;
-    std::vector<Expression*> allocatedExprs;
     std::vector<Value*> allocatedValues;
-    std::vector<BlockGroup*> allocatedBlockGroups;
-    std::vector<Block*> allocatedBlocks;
     std::vector<StructDef*> allocatedStructs;
     std::vector<ClassDef*> allocatedClasses;
     std::vector<EnumDef*> allocatedEnums;
     std::vector<ExtendDef*> allocatedExtends;
+    std::unordered_map<BlockGroup*, std::vector<Base*>> allocatedPtrInFuncOrLambda;
 };
 } // namespace Cangjie::CHIR
 #endif // CANGJIE_CHIR_CHIRBUILDER_H

@@ -13,6 +13,7 @@
 #ifndef CANGJIE_PARSE_PARSER_H
 #define CANGJIE_PARSE_PARSER_H
 
+#include "cangjie/AST/Node.h"
 #include "cangjie/AST/NodeX.h"
 #include "cangjie/Basic/DiagnosticEngine.h"
 #include "cangjie/Lex/Lexer.h"
@@ -48,10 +49,11 @@ std::string ConvertToken(const Token& t);
 /// Record the correspondence between AnnotationKinds and identifiers.
 const std::unordered_map<std::string, AST::AnnotationKind> NAME_TO_ANNO_KIND = {
     {"JavaMirror", AST::AnnotationKind::JAVA_MIRROR}, {"JavaImpl", AST::AnnotationKind::JAVA_IMPL},
-    {"JavaHasDefault", AST::AnnotationKind::JAVA_HAS_DEFAULT}, {"ObjCMirror", AST::AnnotationKind::OBJ_C_MIRROR},
-    {"ObjCImpl", AST::AnnotationKind::OBJ_C_IMPL}, {"ForeignGetterName", AST::AnnotationKind::FOREIGN_GETTER_NAME},
-    {"ForeignSetterName", AST::AnnotationKind::FOREIGN_SETTER_NAME}, {"ObjCInit", AST::AnnotationKind::OBJ_C_INIT},
-    {"ObjCOptional", AST::AnnotationKind::OBJ_C_OPTIONAL}, {"ForeignName", AST::AnnotationKind::FOREIGN_NAME},
+    {"JavaHasDefault", AST::AnnotationKind::JAVA_HAS_DEFAULT},
+    {"ObjCMirror", AST::AnnotationKind::OBJ_C_MIRROR}, {"ObjCImpl", AST::AnnotationKind::OBJ_C_IMPL},
+    {"ForeignGetterName", AST::AnnotationKind::FOREIGN_GETTER_NAME}, {"ForeignSetterName", AST::AnnotationKind::FOREIGN_SETTER_NAME},
+    {"ObjCInit", AST::AnnotationKind::OBJ_C_INIT}, {"ObjCOptional", AST::AnnotationKind::OBJ_C_OPTIONAL},
+    {"ForeignName", AST::AnnotationKind::FOREIGN_NAME},
     {"CallingConv", AST::AnnotationKind::CALLING_CONV}, {"C", AST::AnnotationKind::C},
     {"Attribute", AST::AnnotationKind::ATTRIBUTE}, {"Intrinsic", AST::AnnotationKind::INTRINSIC},
     {"OverflowThrowing", AST::AnnotationKind::NUMERIC_OVERFLOW},
@@ -179,6 +181,9 @@ public:
     }
     /// Skip next token if token kind satisfied
     bool Skip(TokenKind kind);
+
+    /// Attach comment to node (typically by macro expansion)
+    void AttachCommentToNodes(std::vector<OwnedPtr<AST::Node>>& nodes);
 
 protected:
     /// used by QueryParser

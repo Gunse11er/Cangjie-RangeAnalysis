@@ -23,10 +23,6 @@ public:
         CJC_ASSERT(tmp.size() == 1);
         return tmp[0];
     }
-    llvm::Type* GetLayoutType() const
-    {
-        return layoutType;
-    }
 
     static llvm::StructType* GenerateArrayLayoutTypeInfo(
         CGContext& cgCtx, const std::string& layoutName, llvm::Type* elemType);

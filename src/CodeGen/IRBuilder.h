@@ -40,15 +40,13 @@ public:
 
     void SetCHIRExpr(const CHIRExprWrapper* chirExprWrapper)
     {
-        if (cgMod.GetCGContext().GetCompileOptions().disableInstantiation) {
-            this->chirExpr = chirExprWrapper;
-            this->cgFunction = cgMod.GetOrInsertCGFunction(chirExprWrapper->GetTopLevelFunc());
-        }
+        chirExpr = chirExprWrapper;
+        cgFunction = cgMod.GetOrInsertCGFunction(chirExprWrapper->GetTopLevelFunc());
     }
 
     inline void SetInsertCGFunction(const CGFunction& cgFunc)
     {
-        this->cgFunction = &cgFunc;
+        cgFunction = &cgFunc;
     }
 
     const CGFunction* GetInsertCGFunction() const
@@ -202,11 +200,11 @@ public:
     bool IsGlobalVariableBasePtr(llvm::Value* val) const;
     llvm::Instruction* CallGCRead(std::vector<llvm::Value*> args);
     llvm::Instruction* CallGCReadWeakRef(std::vector<llvm::Value*> args);
-    llvm::Instruction* CallGCReadAgg(std::vector<llvm::Value*> args);
+    llvm::Instruction* CallGCReadAgg(llvm::StructType* structType, std::vector<llvm::Value*> args);
     llvm::Instruction* CallGCReadStaticRef(const std::vector<llvm::Value*>& args);
     llvm::Instruction* CallGCReadStaticAgg(llvm::StructType* type, std::vector<llvm::Value*> args);
     llvm::Instruction* CallGCWrite(std::vector<llvm::Value*> args);
-    llvm::Instruction* CallGCWriteAgg(std::vector<llvm::Value*> args);
+    llvm::Instruction* CallGCWriteAgg(llvm::StructType* structType, std::vector<llvm::Value*> args);
     llvm::Instruction* CallGCWriteStaticRef(const std::vector<llvm::Value*>& args);
     llvm::Instruction* CallGCWriteStaticAgg(llvm::StructType* type, std::vector<llvm::Value*> args);
     llvm::Instruction* CreateWriteBarrierForGlobalVariable(const CGValue& value, const CGValue& globalVar);
@@ -466,12 +464,39 @@ private:
     llvm::Function* GetExceptionIntrinsicThrow() const;
 
 #ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
-    llvm::Value* FixFuncArg(const CGValue& srcValue, const CGType& destType, bool isThisArgInStructMut = false);
+    /**
+     * Do necessary conversions for one function argument so that the callee can accept the argument.
+     * Return the converted argument.
+     */
+    llvm::Value* FixFuncArg(const CGValue& srcValue, const CGType& destType);
+    /**
+     * Do necessary conversions for function arguments so that the callee can accept the arguments.
+     * Return a vector of converted arguments.
+     */
+    std::vector<llvm::Value*> FixFuncArgs(const CGFunctionType& calleeType,
+        const std::vector<CGValue*>& args, const CHIRCallExpr* applyWrapper);
+    /**
+     * Push SRet, do necessary conversions to args, and push type arguments into new args.
+     * Return a vector of new arguments.
+     */
+    std::vector<llvm::Value*> TransformFuncArgs(const CGFunctionType& calleeType,
+        const std::vector<CGValue*>& args, const CHIRCallExpr* applyWrapper, llvm::Value* thisTypeInfo);
+    /**
+     * Create SRet for unknown size return value.
+     * Return the created SRet.
+     */
+    llvm::Value* CreateSRetForUnknownSize(const CHIR::Type& returnCHIRType, const CHIR::Type& retValType);
     /**
      * Create Outer TypeInfo for the given CHIRCallExpr.
      * Return the created Outer TypeInfo.
      */
     llvm::Value* CreateOuterTypeInfo(const CHIRCallExpr& applyWrapper, llvm::Value* thisTypeInfo);
+    /**
+     * Get the return value from the call/invoke instruction.
+     * Handle SRet and Unit return types.
+     */
+    llvm::Value* GetReturnValue(const CGFunctionType& calleeType, llvm::CallBase* callBaseInst,
+        const std::vector<llvm::Value*>& argsVal);
 #endif
     llvm::Value* GetEnumTag(const CHIR::Field& field);
     llvm::Value* GetEnumAssociatedValue(const CHIR::Field& field);

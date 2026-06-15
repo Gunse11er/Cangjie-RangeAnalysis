@@ -20,17 +20,14 @@ namespace Cangjie::CodeGen {
  * @brief This function generates the package modules.
  *        Note that after using llvm::Module, call the ClearPackageModules to clear the memory.
  *
- * @param chirBuilder A CHIRBuilder of CHIR.
- * @param chirData CHIRData of a complete package.
- * @param options GlobalOptions to compile a package.
  * @param compilerInstance DefaultCompilerInstance.
  * @param enableIncrement A falg, indicating whether incremental compilation is enabled.
  * @return A vector of std::unique_ptr<llvm::Module>. If --aggressive-parallel-compile is enabled,
  *         multiple llvm::Modules are returned. Otherwise, only one llvm::Module is returned.
  */
 #ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
-std::vector<std::unique_ptr<llvm::Module>> GenPackageModules(CHIR::CHIRBuilder& chirBuilder, const CHIRData& chirData,
-    const GlobalOptions& options, DefaultCompilerInstance& compilerInstance, bool enableIncrement);
+std::vector<std::unique_ptr<llvm::Module>> GenPackageModules(
+    DefaultCompilerInstance& compilerInstance, bool enableIncrement);
 #endif
 
 /**

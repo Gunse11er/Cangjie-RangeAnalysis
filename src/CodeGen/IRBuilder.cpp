@@ -13,7 +13,7 @@
 
 namespace Cangjie {
 namespace CodeGen {
-
+static constexpr uint64_t MIN_ANDROID_ARM32_ENUM_ALIGN = 4;
 IRBuilder2::IRBuilder2(CGModule& cgMod) : LLVMIRBuilder2(cgMod.GetLLVMContext()), cgMod(cgMod)
 {
     if (cgMod.GetCGContext().GetCompileOptions().fastMathMode) {
@@ -106,13 +106,15 @@ llvm::AllocaInst* IRBuilder2::CreateEntryAlloca(llvm::Type* type, llvm::Value* a
 
 llvm::Instruction* IRBuilder2::CreateEntryAlloca(const CGType& cgType, const llvm::Twine& name)
 {
-    if (!GetCGContext().GetCompileOptions().disableInstantiation || cgType.GetSize()) {
+    if (cgType.GetSize()) {
         auto allocatedType = cgType.IsCGFunction()
             ? dynamic_cast<const CGFunctionType&>(cgType).GetLLVMFunctionType()->getPointerTo()
             : cgType.GetLLVMType();
         auto allocaInst = CreateEntryAlloca(allocatedType, nullptr, name);
         auto& options = cgMod.GetCGContext().GetCompileOptions();
-        auto isOptionLikeNonRef = cgType.IsCGEnum() && StaticCast<const CGEnumType*>(&cgType)->IsOptionLikeNonRef();
+        auto cgEnumType = cgType.IsCGEnum() ? StaticCast<const CGEnumType*>(&cgType) : nullptr;
+        auto isOptionLikeNonRef = cgEnumType && cgEnumType->IsOptionLikeNonRef();
+        auto isAllAssociatedValuesAreNonRef = cgEnumType && cgEnumType->IsAllAssociatedValuesAreNonRef();
         // Zero-initialize memory if:
         // 1. It is a struct in O0 debug builds.
         // 2. It is an OptionLikeNonRef type in CJDB mode.
@@ -120,6 +122,11 @@ llvm::Instruction* IRBuilder2::CreateEntryAlloca(const CGType& cgType, const llv
         options.optimizationLevel == GlobalOptions::OptimizationLevel::O0) ||
         (options.cjdbMode && isOptionLikeNonRef)) {
             (void)CreateMemsetStructWith0(allocaInst);
+        }
+        auto& target = GetCGContext().GetCompileOptions().target;
+        if (CGEnumType::NeedAndroidArm32AlignedEnumLayout(target) && cgEnumType &&
+            isAllAssociatedValuesAreNonRef) {
+            allocaInst->setAlignment(llvm::Align(MIN_ANDROID_ARM32_ENUM_ALIGN));
         }
         return allocaInst;
     }
@@ -377,10 +384,9 @@ void IRBuilder2::CreateBoxedValueForValueType(const CHIR::Debug& debugNode, cons
             CGType::TypeExtraInfo(1U));
         CreateStore(cgValue, CGValue(castedPtr, addrType));
         if (ty->IsStruct()) {
-            auto curCHIRFunc = DynamicCast<const CHIR::Func*>(&GetInsertCGFunction()->GetOriginal());
-            CJC_NULLPTR_CHECK(curCHIRFunc);
+            const auto& curCHIRFunc = StaticCast<const CHIR::Function&>(GetInsertCGFunction()->GetOriginal());
             bool shouldUpdateThis =
-                curCHIRFunc->GetSrcCodeIdentifier() == "init" || curCHIRFunc->TestAttr(CHIR::Attribute::MUT);
+                curCHIRFunc.GetSrcCodeIdentifier() == "init" || curCHIRFunc.TestAttr(CHIR::Attribute::MUT);
             cgMod.GetCGContext().debugValue =
                 shouldUpdateThis && arg->getName() == "this" ? thisDebug : cgMod.GetCGContext().debugValue;
         }
@@ -443,7 +449,7 @@ void IRBuilder2::CreateLoadInstForParameter(const CHIR::Expression& chirExpressi
                     auto structType = llvm::cast<llvm::StructType>(elemType);
                     auto layOut = GetLLVMModule()->getDataLayout().getStructLayout(structType);
                     auto size = getInt64(layOut->getSizeInBytes());
-                    CallGCReadAgg({temp, it->second, castedPtr, size});
+                    CallGCReadAgg(structType, {temp, it->second, castedPtr, size});
                 } else {
                     auto layOut = GetCGModule().GetLLVMModule()->getDataLayout().getStructLayout(
                         llvm::cast<llvm::StructType>(elemType));
@@ -466,7 +472,7 @@ void IRBuilder2::CreateGenericParaDeclare(const CGFunction& cgFunc)
     if (cgFunc.chirFunc.TestAttr(CHIR::Attribute::NO_DEBUG_INFO)) {
         return;
     }
-    auto chirFunc = dynamic_cast<const CHIR::Func*>(&cgFunc.GetOriginal());
+    auto chirFunc = dynamic_cast<const CHIR::Function*>(&cgFunc.GetOriginal());
     size_t genericIndex = 0;
     auto null = llvm::ConstantPointerNull::get(llvm::Type::getInt8PtrTy(cgMod.GetLLVMContext()));
     // For member function only.

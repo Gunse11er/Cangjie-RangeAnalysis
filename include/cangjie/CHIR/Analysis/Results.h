@@ -32,7 +32,7 @@ public:
      * @param entrySets entry state from block to domain.
      * @param lambdaResults lambda results if func has lambda.
      */
-    Results(const Func* func, std::unique_ptr<Analysis<Domain>> analysis,
+    Results(const Function* func, std::unique_ptr<Analysis<Domain>> analysis,
         std::unique_ptr<std::unordered_map<Block*, Domain>> entrySets, std::vector<LambdaState<Domain>> lambdaResults)
         : func(func),
           analysis(std::move(analysis)),
@@ -69,7 +69,7 @@ public:
         }
     }
 
-    const Func* func;
+    const Function* func;
 
 private:
 // Add only cangjie native backend for cjmp

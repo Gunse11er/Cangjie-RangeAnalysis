@@ -14,6 +14,10 @@ ERROR(module_open_bcFile_failed, "can't open output file '%s': '%s'")
 ERROR(module_loaded_ast_failed, "validation of %s file '%s' failed, please confirm it was created by compiler whose version is '%s'.")
 ERROR(module_same_name_with_indirect_dependent_pkg, "failed to load dependent package '%s' for package '%s', which have same package name with source package")
 
+WARNING(module_common_cjo_no_options, DEPRECATED, "common part cjo is missing serialized options, possibly compiled by an old cjc")
+ERROR(module_common_cjo_debug_mismatch, "common part is compiled with different debug mode: %s in common and %s in current")
+ERROR(module_common_cjo_opt_mismatch, "common part is compiled with different optimization level: %s in common and %s in the current compilation")
+
 // Used by lsp
 ERROR(module_unsupport_circular_dependencies, "packages %s are in circular dependencies.")
 ERROR(module_common_cjo_wrong_package, "common part is for another package '%s', expected the same as for current package '%s'.")

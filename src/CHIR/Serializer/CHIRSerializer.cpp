@@ -6,6 +6,7 @@
 
 #include "cangjie/CHIR/Serializer/CHIRSerializer.h"
 #include "CHIRSerializerImpl.h"
+#include "cangjie/CHIR/IR/Expression/Terminator.h"
 #include "cangjie/CHIR/Utils/CHIRCasting.h"
 #include "cangjie/CHIR/IR/Annotation.h"
 #include "cangjie/CHIR/IR/IntrinsicKind.h"
@@ -18,7 +19,7 @@
 #include "cangjie/CHIR/Utils/UserDefinedType.h"
 #include "cangjie/Utils/ICEUtil.h"
 #include "flatbuffers/PackageFormat_generated.h"
-#include "flatbuffers/buffer.h"
+#include "flatbuffers/detached_buffer.h"
 
 #include <algorithm>
 #include <set>
@@ -29,10 +30,19 @@ using namespace Cangjie::CHIR;
 
 void CHIRSerializer::Serialize(const Package& package, const std::string filename, ToCHIR::Phase phase)
 {
+    Utils::ProfileRecorder recorder("CHIR", "serialization: " + PhaseToString(phase));
     CHIRSerializerImpl serializer(package);
     serializer.Initialize();
     serializer.Dispatch();
     serializer.Save(filename, phase);
+}
+
+flatbuffers::DetachedBuffer CHIRSerializer::Serialize(const Package& package)
+{
+    CHIRSerializerImpl serializer(package);
+    serializer.Initialize();
+    serializer.Dispatch();
+    return serializer.ConvertToMemoryData();
 }
 
 // ========================== ID Fetchers ==============================
@@ -149,7 +159,18 @@ flatbuffers::Offset<PackageFormat::DebugLocation> CHIRSerializer::CHIRSerializer
 template <>
 flatbuffers::Offset<PackageFormat::AnnoInfo> CHIRSerializer::CHIRSerializerImpl::Serialize(const AnnoInfo& obj)
 {
-    return PackageFormat::CreateAnnoInfoDirect(builder, obj.mangledName.data());
+    std::vector<flatbuffers::Offset<PackageFormat::CustomAnnoInstance>> instances;
+    for (const auto& inst : obj.GetCustomAnnoInstances()) {
+        std::vector<flatbuffers::Offset<flatbuffers::String>> argStrs;
+        for (const auto& arg : inst.GetArgValues()) {
+            argStrs.push_back(builder.CreateSharedString(arg));
+        }
+        auto locOff = Serialize<PackageFormat::DebugLocation>(inst.GetDebugLocation());
+        instances.push_back(PackageFormat::CreateCustomAnnoInstanceDirect(builder,
+            inst.GetAnnoClassName().data(), argStrs.empty() ? nullptr : &argStrs, locOff));
+    }
+    return PackageFormat::CreateAnnoInfoDirect(builder, obj.GetAnnoFactoryFuncMangledName().data(),
+        instances.empty() ? nullptr : &instances);
 }
 
 [[maybe_unused]] static void Empty(Annotation*)
@@ -178,10 +199,6 @@ template <> flatbuffers::Offset<PackageFormat::Base> CHIRSerializer::CHIRSeriali
                 .Union());
     };
 
-    // DebugLocationInfo
-    annoTypes.emplace_back(PackageFormat::Annotation::Annotation_debugLocationInfo);
-    annos.emplace_back(Serialize<PackageFormat::DebugLocation>(obj.Base::GetDebugLocation()).Union());
-
     // DebugLocationInfoForWarning
     annoHandler[typeid(CHIR::DebugLocationInfoForWarning)] = [this, &annos, &annoTypes](Annotation* anno) {
         annoTypes.push_back(PackageFormat::Annotation::Annotation_debugLocationInfoForWarning);
@@ -207,7 +224,7 @@ template <> flatbuffers::Offset<PackageFormat::Base> CHIRSerializer::CHIRSeriali
     };
 
     // WrappedRawMethod may be removed body when removeUnusedImported, do not serializer it
-    auto wrapMethod = dynamic_cast<Func*>(obj.Get<CHIR::WrappedRawMethod>());
+    auto wrapMethod = dynamic_cast<Function*>(obj.Get<CHIR::WrappedRawMethod>());
     if (wrapMethod != nullptr && !wrapMethod->GetBody()) {
         annoHandler[typeid(CHIR::WrappedRawMethod)] = Empty;
     } else {
@@ -288,13 +305,13 @@ template <> flatbuffers::Offset<PackageFormat::Base> CHIRSerializer::CHIRSeriali
             CJC_ABORT();
         }
     }
-    return PackageFormat::CreateBaseDirect(builder, &annoTypes, &annos);
+    auto loc = Serialize<PackageFormat::DebugLocation>(obj.Base::GetDebugLocation());
+    auto attributes = obj.GetAttributeInfo().GetRawAttrs().to_ulong();
+    return PackageFormat::CreateBaseDirect(builder, &annoTypes, &annos, loc, attributes);
 }
 
 template <>
 flatbuffers::Offset<PackageFormat::Expression> CHIRSerializer::CHIRSerializerImpl::Serialize(const Expression& obj);
-
-template <> flatbuffers::Offset<PackageFormat::Tuple> CHIRSerializer::CHIRSerializerImpl::Serialize(const Tuple& obj);
 
 template <>
 flatbuffers::Offset<PackageFormat::MemberVarInfo> CHIRSerializer::CHIRSerializerImpl::Serialize(
@@ -319,84 +336,13 @@ flatbuffers::Offset<PackageFormat::EnumCtorInfo> CHIRSerializer::CHIRSerializerI
         builder, obj.name.data(), obj.mangledName.data(), GetId<Type>(obj.funcType));
 }
 
-template <>
-flatbuffers::Offset<PackageFormat::AbstractMethodParam> CHIRSerializer::CHIRSerializerImpl::Serialize(
-    const AbstractMethodParam& obj)
-{
-    auto paramName = obj.paramName;
-    auto paramType = GetId<Type>(obj.type);
-    auto annoInfo = Serialize<PackageFormat::AnnoInfo>(obj.annoInfo);
-    return PackageFormat::CreateAbstractMethodParamDirect(builder, paramName.data(), paramType, annoInfo);
-}
-
-template <>
-flatbuffers::Offset<PackageFormat::AbstractMethodInfo> CHIRSerializer::CHIRSerializerImpl::Serialize(
-    const AbstractMethodInfo& obj)
-{
-    auto methodName = obj.methodName;
-    auto mangledName = obj.GetASTMangledName();
-    auto methodType = GetId<Type>(obj.methodTy);
-    auto paramsInfo = SerializeVec<PackageFormat::AbstractMethodParam>(obj.paramInfos);
-    auto attributes = obj.attributeInfo.GetRawAttrs().to_ulong();
-    auto annoInfo = Serialize<PackageFormat::AnnoInfo>(obj.annoInfo);
-    auto methodGenericTypeParams = GetId<Type>(obj.methodGenericTypeParams);
-    auto hasBody = obj.hasBody;
-    auto parent = GetId<CustomTypeDef>(obj.parent);
-    return PackageFormat::CreateAbstractMethodInfoDirect(builder, methodName.data(), mangledName.data(), methodType,
-        &paramsInfo, attributes, annoInfo, methodGenericTypeParams.empty() ? nullptr : &methodGenericTypeParams,
-        hasBody, parent);
-}
-
 // ========================== Type Serializers =================================
 
 template <> flatbuffers::Offset<PackageFormat::Type> CHIRSerializer::CHIRSerializerImpl::Serialize(const Type& obj)
 {
-    auto typeId = GetId<Type>(&obj);
     auto kind = PackageFormat::CHIRTypeKind(obj.GetTypeKind());
     auto argTys = GetId<Type>(obj.GetTypeArgs());
-    return PackageFormat::CreateTypeDirect(builder, kind, typeId, argTys.empty() ? nullptr : &argTys);
-}
-
-template <>
-flatbuffers::Offset<PackageFormat::RuneType> CHIRSerializer::CHIRSerializerImpl::Serialize(const RuneType& obj)
-{
-    auto base = Serialize<PackageFormat::Type>(static_cast<const Type&>(obj));
-    return PackageFormat::CreateRuneTypeDirect(builder, base);
-}
-
-template <>
-flatbuffers::Offset<PackageFormat::BooleanType> CHIRSerializer::CHIRSerializerImpl::Serialize(const BooleanType& obj)
-{
-    auto base = Serialize<PackageFormat::Type>(static_cast<const Type&>(obj));
-    return PackageFormat::CreateBooleanTypeDirect(builder, base);
-}
-
-template <>
-flatbuffers::Offset<PackageFormat::UnitType> CHIRSerializer::CHIRSerializerImpl::Serialize(const UnitType& obj)
-{
-    auto base = Serialize<PackageFormat::Type>(static_cast<const Type&>(obj));
-    return PackageFormat::CreateUnitTypeDirect(builder, base);
-}
-
-template <>
-flatbuffers::Offset<PackageFormat::NothingType> CHIRSerializer::CHIRSerializerImpl::Serialize(const NothingType& obj)
-{
-    auto base = Serialize<PackageFormat::Type>(static_cast<const Type&>(obj));
-    return PackageFormat::CreateNothingTypeDirect(builder, base);
-}
-
-template <>
-flatbuffers::Offset<PackageFormat::NumericType> CHIRSerializer::CHIRSerializerImpl::Serialize(const NumericType& obj)
-{
-    auto base = Serialize<PackageFormat::Type>(static_cast<const Type&>(obj));
-    return PackageFormat::CreateNumericTypeDirect(builder, base);
-}
-
-template <>
-flatbuffers::Offset<PackageFormat::TupleType> CHIRSerializer::CHIRSerializerImpl::Serialize(const TupleType& obj)
-{
-    auto base = Serialize<PackageFormat::Type>(static_cast<const Type&>(obj));
-    return PackageFormat::CreateTupleType(builder, base);
+    return PackageFormat::CreateTypeDirect(builder, kind, argTys.empty() ? nullptr : &argTys);
 }
 
 template <>
@@ -433,20 +379,6 @@ flatbuffers::Offset<PackageFormat::CustomType> CHIRSerializer::CHIRSerializerImp
 }
 
 template <>
-flatbuffers::Offset<PackageFormat::CStringType> CHIRSerializer::CHIRSerializerImpl::Serialize(const CStringType& obj)
-{
-    auto base = Serialize<PackageFormat::Type>(static_cast<const Type&>(obj));
-    return PackageFormat::CreateCStringTypeDirect(builder, base);
-}
-
-template <>
-flatbuffers::Offset<PackageFormat::CPointerType> CHIRSerializer::CHIRSerializerImpl::Serialize(const CPointerType& obj)
-{
-    auto base = Serialize<PackageFormat::Type>(static_cast<const Type&>(obj));
-    return PackageFormat::CreateCPointerTypeDirect(builder, base);
-}
-
-template <>
 flatbuffers::Offset<PackageFormat::GenericType> CHIRSerializer::CHIRSerializerImpl::Serialize(const GenericType& obj)
 {
     auto base = Serialize<PackageFormat::Type>(static_cast<const Type&>(obj));
@@ -457,85 +389,41 @@ flatbuffers::Offset<PackageFormat::GenericType> CHIRSerializer::CHIRSerializerIm
         srcCodeIndentifier.data(), upperBounds.empty() ? nullptr : &upperBounds);
 }
 
-template <>
-flatbuffers::Offset<PackageFormat::RefType> CHIRSerializer::CHIRSerializerImpl::Serialize(const RefType& obj)
-{
-    auto base = Serialize<PackageFormat::Type>(static_cast<const Type&>(obj));
-    return PackageFormat::CreateRefType(builder, base);
-}
-
-template <>
-flatbuffers::Offset<PackageFormat::BoxType> CHIRSerializer::CHIRSerializerImpl::Serialize(const BoxType& obj)
-{
-    auto base = Serialize<PackageFormat::Type>(static_cast<const Type&>(obj));
-    return PackageFormat::CreateBoxType(builder, base);
-}
-
-template <>
-flatbuffers::Offset<PackageFormat::VoidType> CHIRSerializer::CHIRSerializerImpl::Serialize(const VoidType& obj)
-{
-    auto base = Serialize<PackageFormat::Type>(static_cast<const Type&>(obj));
-    return PackageFormat::CreateVoidType(builder, base);
-}
-
-template <>
-flatbuffers::Offset<PackageFormat::ThisType> CHIRSerializer::CHIRSerializerImpl::Serialize(const ThisType& obj)
-{
-    auto base = Serialize<PackageFormat::Type>(static_cast<const Type&>(obj));
-    return PackageFormat::CreateThisType(builder, base);
-}
-
-// ========================== Numeric Type Serializers =========================
-
-template <>
-flatbuffers::Offset<PackageFormat::IntType> CHIRSerializer::CHIRSerializerImpl::Serialize(const IntType& obj)
-{
-    auto base = Serialize<PackageFormat::NumericType>(static_cast<const NumericType&>(obj));
-    return PackageFormat::CreateIntType(builder, base);
-}
-
-template <>
-flatbuffers::Offset<PackageFormat::FloatType> CHIRSerializer::CHIRSerializerImpl::Serialize(const FloatType& obj)
-{
-    auto base = Serialize<PackageFormat::NumericType>(static_cast<const NumericType&>(obj));
-    return PackageFormat::CreateFloatType(builder, base);
-}
-
-// ========================== Custom Type Serializers ==========================
-
-template <>
-flatbuffers::Offset<PackageFormat::EnumType> CHIRSerializer::CHIRSerializerImpl::Serialize(const EnumType& obj)
-{
-    auto base = Serialize<PackageFormat::CustomType>(static_cast<const CustomType&>(obj));
-    return PackageFormat::CreateEnumType(builder, base);
-}
-
-template <>
-flatbuffers::Offset<PackageFormat::StructType> CHIRSerializer::CHIRSerializerImpl::Serialize(const StructType& obj)
-{
-    auto base = Serialize<PackageFormat::CustomType>(static_cast<const CustomType&>(obj));
-    return PackageFormat::CreateStructType(builder, base);
-}
-
-template <>
-flatbuffers::Offset<PackageFormat::ClassType> CHIRSerializer::CHIRSerializerImpl::Serialize(const ClassType& obj)
-{
-    auto base = Serialize<PackageFormat::CustomType>(static_cast<const CustomType&>(obj));
-    return PackageFormat::CreateClassType(builder, base);
-}
-
 // ======================= Value Serializers ===================================
 template <> flatbuffers::Offset<PackageFormat::Value> CHIRSerializer::CHIRSerializerImpl::Serialize(const Value& obj)
 {
     auto base = Serialize<PackageFormat::Base>(static_cast<const Base&>(obj));
-    auto valueId = GetId<Value>(&obj);
     auto identifier = obj.GetIdentifier();
     auto type = GetId<Type>(obj.GetType());
-    auto kind = PackageFormat::ValueKind(obj.GetValueKind());
-    auto attributes = obj.GetAttributeInfo().GetRawAttrs().to_ulong();
-    auto annoInfo = Serialize<PackageFormat::AnnoInfo>(obj.GetAnnoInfo());
-    return PackageFormat::CreateValueDirect(
-        builder, base, type, identifier.data(), kind, valueId, attributes, annoInfo);
+    // Map C++ ValueKind to schema ValueKind (IMPORTED_* removed; use attrs for imported)
+    PackageFormat::ValueKind kind;
+    switch (obj.GetValueKind()) {
+        case Value::ValueKind::KIND_LITERAL:
+            kind = PackageFormat::ValueKind_LITERAL;
+            break;
+        case Value::ValueKind::KIND_GLOBALVAR:
+            kind = PackageFormat::ValueKind_GLOBALVAR;
+            break;
+        case Value::ValueKind::KIND_PARAMETER:
+            kind = PackageFormat::ValueKind_PARAMETER;
+            break;
+        case Value::ValueKind::KIND_LOCALVAR:
+            kind = PackageFormat::ValueKind_LOCALVAR;
+            break;
+        case Value::ValueKind::KIND_FUNC:
+            kind = PackageFormat::ValueKind_FUNC;
+            break;
+        case Value::ValueKind::KIND_BLOCK:
+            kind = PackageFormat::ValueKind_BLOCK;
+            break;
+        case Value::ValueKind::KIND_BLOCK_GROUP:
+            kind = PackageFormat::ValueKind_BLOCK_GROUP;
+            break;
+        default:
+            CJC_ABORT();
+    }
+
+    return PackageFormat::CreateValueDirect(builder, base, type, identifier.data(), kind);
 }
 
 template <>
@@ -544,7 +432,10 @@ flatbuffers::Offset<PackageFormat::Parameter> CHIRSerializer::CHIRSerializerImpl
     auto base = Serialize<PackageFormat::Value>(static_cast<const Value&>(obj));
     auto ownedFunc = GetId<Value>(obj.GetOwnerFunc());
     auto ownedLambda = GetId<Expression>(obj.GetOwnerLambda());
-    return PackageFormat::CreateParameter(builder, base, ownedFunc, ownedLambda);
+    auto srcCodeIdentifier = obj.GetSrcCodeIdentifier();
+    auto annoInfo = Serialize<PackageFormat::AnnoInfo>(obj.GetAnnoInfo());
+    return PackageFormat::CreateParameterDirect(
+        builder, base, ownedFunc, ownedLambda, srcCodeIdentifier.data(), annoInfo);
 }
 
 template <>
@@ -553,21 +444,31 @@ flatbuffers::Offset<PackageFormat::LocalVar> CHIRSerializer::CHIRSerializerImpl:
     auto base = Serialize<PackageFormat::Value>(static_cast<const Value&>(obj));
     auto associatedExpr = GetId<Expression>(obj.GetExpr());
     auto isRetVal = obj.IsRetValue();
-    return PackageFormat::CreateLocalVar(builder, base, associatedExpr, isRetVal);
+    auto srcCodeIdentifier = obj.GetSrcCodeIdentifier();
+    return PackageFormat::CreateLocalVarDirect(builder, base, associatedExpr, isRetVal, srcCodeIdentifier.data());
+}
+
+template <>
+flatbuffers::Offset<PackageFormat::GlobalValue> CHIRSerializer::CHIRSerializerImpl::Serialize(const GlobalValue& obj)
+{
+    auto valueOffset = Serialize<PackageFormat::Value>(static_cast<const Value&>(obj));
+    auto declaredParent = obj.GetParentCustomTypeDef() ? GetId<CustomTypeDef>(obj.GetParentCustomTypeDef()) : 0u;
+    std::vector<flatbuffers::Offset<flatbuffers::String>> features;
+    for (const auto& name : obj.GetFeatures()) {
+        features.push_back(builder.CreateSharedString(name));
+    }
+    auto annoInfo = Serialize<PackageFormat::AnnoInfo>(obj.GetAnnoInfo());
+    return PackageFormat::CreateGlobalValueDirect(builder, valueOffset,
+        obj.GetSrcCodeIdentifier().data(), obj.GetRawMangledName().data(), obj.GetPackageName().data(),
+        declaredParent, features.empty() ? nullptr : &features, annoInfo);
 }
 
 template <>
 flatbuffers::Offset<PackageFormat::GlobalVar> CHIRSerializer::CHIRSerializerImpl::Serialize(const GlobalVar& obj)
 {
-    auto base = Serialize<PackageFormat::Value>(static_cast<const Value&>(obj));
-    auto srcCodeIdentifier = obj.GetSrcCodeIdentifier();
-    auto packageName = obj.GetPackageName();
-    auto rawMangledName = obj.GetRawMangledName();
-    auto defaultInitVal = GetId<Value>(obj.GetInitializer());
-    auto associatedInitFunc = GetId<Value>(obj.GetInitFunc());
-    auto declaredParent = GetId<CustomTypeDef>(obj.GetParentCustomTypeDef());
-    return PackageFormat::CreateGlobalVarDirect(builder, base, rawMangledName.data(), srcCodeIdentifier.data(),
-        packageName.data(), defaultInitVal, associatedInitFunc, declaredParent);
+    auto globalSymbolOffset = Serialize<PackageFormat::GlobalValue>(static_cast<const GlobalValue&>(obj));
+    uint32_t initializerId = obj.GetInitializerValue() ? GetId<Value>(obj.GetInitializerValue()) : 0;
+    return PackageFormat::CreateGlobalVar(builder, globalSymbolOffset, initializerId);
 }
 
 template <> flatbuffers::Offset<PackageFormat::Block> CHIRSerializer::CHIRSerializerImpl::Serialize(const Block& obj)
@@ -595,63 +496,43 @@ flatbuffers::Offset<PackageFormat::BlockGroup> CHIRSerializer::CHIRSerializerImp
         builder, base, entryBlock, blocks.empty() ? nullptr : &blocks, ownedFunc, ownedExpression);
 }
 
-template <> flatbuffers::Offset<PackageFormat::Func> CHIRSerializer::CHIRSerializerImpl::Serialize(const Func& obj)
+template <>
+flatbuffers::Offset<PackageFormat::Function> CHIRSerializer::CHIRSerializerImpl::Serialize(const Function& obj)
 {
-    auto base = Serialize<PackageFormat::Value>(static_cast<const Value&>(obj));
-    // FuncBase
-    auto srcCodeIdentifier = obj.GetSrcCodeIdentifier();
-    auto rawMangledName = obj.GetRawMangledName();
-    auto packageName = obj.GetPackageName();
-    auto declaredParent = GetId<CustomTypeDef>(obj.GetParentCustomTypeDef());
-    bool skipGenericDecl = false;
+    auto globalSymbolOffset = Serialize<PackageFormat::GlobalValue>(static_cast<const GlobalValue&>(obj));
+
+    // skip serializing genericDecl when it's imported (no body)
     uint32_t genericDecl = 0;
-    // genericFunc may be removed body when removeUnusedImported, do not serializer it
-    if (auto genericFunc = DynamicCast<Func*>(obj.GetGenericDecl()); genericFunc && !genericFunc->GetBody()) {
-        skipGenericDecl = true;
-    }
-    if (!skipGenericDecl) {
-        genericDecl = GetId<Value>(obj.GetGenericDecl());
+    if (auto gFunc = obj.GetGenericDecl(); gFunc && gFunc->IsFuncWithBody()) {
+        genericDecl = GetId<Value>(gFunc);
     }
 
     auto funcKind = PackageFormat::FuncKind(obj.GetFuncKind());
-    uint32_t oriLambdaFuncTy = obj.GetFuncKind() == LAMBDA ? GetId<Type>(obj.GetOriginalLambdaType()) : 0;
-    std::vector<uint32_t> oriLambdaGenericTypeParams{};
-    if (obj.GetFuncKind() == LAMBDA) {
-        oriLambdaGenericTypeParams = GetId<Type>(obj.GetOriginalGenericTypeParams());
+    flatbuffers::Offset<PackageFormat::FuncSigInfo> originalLambdaInfoOffset = 0;
+    if (obj.GetFuncKind() == LAMBDA && obj.originalLambdaInfo.funcType != nullptr) {
+        auto funcName = obj.originalLambdaInfo.funcName;
+        auto oriLambdaFuncTy = GetId<Type>(obj.originalLambdaInfo.funcType);
+        auto oriLambdaGenericTypeParams = GetId<Type>(obj.originalLambdaInfo.genericTypeParams);
+        originalLambdaInfoOffset = PackageFormat::CreateFuncSigInfoDirect(builder, funcName.data(), oriLambdaFuncTy,
+            oriLambdaGenericTypeParams.empty() ? nullptr : &oriLambdaGenericTypeParams);
     }
     auto genericTypeParams = GetId<Type>(obj.GetGenericTypeParams());
-    Func* paramDftValHostFuncDecl = nullptr;
-    // the host func of desugaring func for named parameter may be removed body when doing uselessFuncElimination,
-    // do not serializer it
-    if (auto paramDftValHostFunc = DynamicCast<Func*>(obj.GetParamDftValHostFunc());
-        paramDftValHostFunc && paramDftValHostFunc->GetBody()) {
-        paramDftValHostFuncDecl = paramDftValHostFunc;
-    }
-    auto paramDftValHostFunc = GetId<Value>(paramDftValHostFuncDecl);
+    auto paramDftValHostFunc = GetId<Value>(obj.GetParamDftValHostFunc());
 
-    // FuncBody
-    CJC_NULLPTR_CHECK(obj.GetBody());
-    auto body = GetId<Value>(obj.GetBody());
-    auto params = GetId<Value>(obj.GetParams());
-    auto retVal = GetId<Value>(obj.GetReturnValue());
-
+    uint32_t body = 0;
+    std::vector<uint32_t> params = GetId<Value>(obj.GetParams());
+    uint32_t retVal = 0;
     auto propLoc = Serialize<PackageFormat::DebugLocation>(obj.GetPropLocation());
-    auto localId = obj.localId;
-    auto blockId = obj.blockId;
-    auto blockGroupId = obj.blockGroupId;
-    return PackageFormat::CreateFuncDirect(builder, base, srcCodeIdentifier.data(), rawMangledName.data(),
-        packageName.data(), declaredParent, genericDecl, funcKind, obj.IsFastNative(), obj.IsCFFIWrapper(),
-        oriLambdaFuncTy, oriLambdaGenericTypeParams.empty() ? nullptr : &oriLambdaGenericTypeParams,
-        genericTypeParams.empty() ? nullptr : &genericTypeParams, paramDftValHostFunc, body,
-        params.empty() ? nullptr : &params, retVal, propLoc, localId, blockId, blockGroupId);
-}
+    if (obj.IsFuncWithBody()) {
+        CJC_NULLPTR_CHECK(obj.GetBody());
+        body = GetId<Value>(obj.GetBody());
+        retVal = GetId<Value>(obj.GetReturnValue());
+    }
 
-template <>
-flatbuffers::Offset<PackageFormat::ImportedValue> CHIRSerializer::CHIRSerializerImpl::Serialize(
-    const ImportedValue& obj)
-{
-    auto base = Serialize<PackageFormat::Value>(static_cast<const Value&>(obj));
-    return PackageFormat::CreateImportedValue(builder, base);
+    return PackageFormat::CreateFunctionDirect(builder, globalSymbolOffset, genericDecl, funcKind, obj.IsFastNative(),
+        obj.IsCFFIWrapper(), originalLambdaInfoOffset, genericTypeParams.empty() ? nullptr : &genericTypeParams,
+        paramDftValHostFunc, body, params.empty() ? nullptr : &params, retVal, propLoc, obj.localId, obj.blockId,
+        obj.blockGroupId);
 }
 
 template <>
@@ -660,55 +541,6 @@ flatbuffers::Offset<PackageFormat::LiteralValue> CHIRSerializer::CHIRSerializerI
     auto base = Serialize<PackageFormat::Value>(static_cast<const Value&>(obj));
     auto literalKind = PackageFormat::ConstantValueKind(obj.GetConstantValueKind());
     return PackageFormat::CreateLiteralValue(builder, base, literalKind);
-}
-
-// ======================= Imported Value Serializers ===========================
-
-template <>
-flatbuffers::Offset<PackageFormat::ImportedFunc> CHIRSerializer::CHIRSerializerImpl::Serialize(const ImportedFunc& obj)
-{
-    auto base = Serialize<PackageFormat::ImportedValue>(static_cast<const ImportedValue&>(obj));
-    // FuncBase
-    auto srcCodeIdentifier = obj.GetSrcCodeIdentifier();
-    auto rawMangledName = obj.GetRawMangledName();
-    auto packageName = obj.GetPackageName();
-    auto declaredParent = GetId<CustomTypeDef>(obj.GetParentCustomTypeDef());
-    bool skipGenericDecl = false;
-    uint32_t genericDecl = 0;
-    // genericFunc may be removed body when removeUnusedImported, do not serializer it
-    if (auto genericFunc = DynamicCast<Func*>(obj.GetGenericDecl()); genericFunc && !genericFunc->GetBody()) {
-        skipGenericDecl = true;
-    }
-    if (!skipGenericDecl) {
-        genericDecl = GetId<Value>(obj.GetGenericDecl());
-    }
-    auto funcKind = PackageFormat::FuncKind(obj.GetFuncKind());
-    uint32_t oriLambdaFuncTy = obj.GetFuncKind() == LAMBDA ? GetId<Type>(obj.GetOriginalLambdaType()) : 0;
-    std::vector<uint32_t> oriLambdaGenericTypeParams{};
-    if (obj.GetFuncKind() == LAMBDA) {
-        oriLambdaGenericTypeParams = GetId<Type>(obj.GetOriginalGenericTypeParams());
-    }
-    auto genericTypeParams = GetId<Type>(obj.GetGenericTypeParams());
-    auto paramDftValHostFunc = GetId<Value>(obj.GetParamDftValHostFunc());
-
-    auto paramInfo = SerializeVec<PackageFormat::AbstractMethodParam>(obj.GetParamInfo());
-
-    return PackageFormat::CreateImportedFuncDirect(builder, base, srcCodeIdentifier.data(), rawMangledName.data(),
-        packageName.data(), declaredParent, genericDecl, funcKind, obj.IsFastNative(), obj.IsCFFIWrapper(),
-        oriLambdaFuncTy, oriLambdaGenericTypeParams.empty() ? nullptr : &oriLambdaGenericTypeParams,
-        genericTypeParams.empty() ? nullptr : &genericTypeParams, paramDftValHostFunc, &paramInfo);
-}
-
-template <>
-flatbuffers::Offset<PackageFormat::ImportedVar> CHIRSerializer::CHIRSerializerImpl::Serialize(const ImportedVar& obj)
-{
-    auto base = Serialize<PackageFormat::ImportedValue>(static_cast<const ImportedValue&>(obj));
-    auto packageName = obj.GetPackageName();
-    auto srcCodeIdentifier = obj.GetSrcCodeIdentifier();
-    auto rawMangledName = obj.GetRawMangledName();
-    auto declaredParent = GetId<CustomTypeDef>(obj.GetParentCustomTypeDef());
-    return PackageFormat::CreateImportedVarDirect(
-        builder, base, packageName.c_str(), srcCodeIdentifier.c_str(), rawMangledName.c_str(), declaredParent);
 }
 
 // ======================= Literal Value Serializers ===========================
@@ -768,65 +600,169 @@ flatbuffers::Offset<PackageFormat::NullLiteral> CHIRSerializer::CHIRSerializerIm
 }
 
 // ======================= Expression Serializers ==============================
+
+static PackageFormat::CHIRExprKind ToPackageExprKind(const Expression& expr)
+{
+    switch (expr.GetExprKind()) {
+        case ExprKind::GOTO:                              return PackageFormat::CHIRExprKind_Goto;
+        case ExprKind::BRANCH:                            return PackageFormat::CHIRExprKind_Branch;
+        case ExprKind::MULTIBRANCH:                       return PackageFormat::CHIRExprKind_MultiBranch;
+        case ExprKind::EXIT:                              return PackageFormat::CHIRExprKind_Exit;
+        case ExprKind::APPLY_WITH_EXCEPTION:              return PackageFormat::CHIRExprKind_TryApply;
+        case ExprKind::INVOKE_WITH_EXCEPTION:             return PackageFormat::CHIRExprKind_TryInvoke;
+        case ExprKind::INVOKESTATIC_WITH_EXCEPTION:       return PackageFormat::CHIRExprKind_TryInvoke;
+        case ExprKind::RAISE_EXCEPTION:                   return PackageFormat::CHIRExprKind_RaiseException;
+        case ExprKind::INT_OP_WITH_EXCEPTION: {
+            const auto& intOp = static_cast<const IntOpWithException&>(expr);
+            switch (intOp.GetOpKind()) {
+                case ExprKind::NEG:    return PackageFormat::CHIRExprKind_TryNeg;
+                case ExprKind::ADD:    return PackageFormat::CHIRExprKind_TryAdd;
+                case ExprKind::SUB:    return PackageFormat::CHIRExprKind_TrySub;
+                case ExprKind::MUL:    return PackageFormat::CHIRExprKind_TryMul;
+                case ExprKind::DIV:    return PackageFormat::CHIRExprKind_TryDiv;
+                case ExprKind::MOD:    return PackageFormat::CHIRExprKind_TryMod;
+                case ExprKind::EXP:    return PackageFormat::CHIRExprKind_TryExp;
+                case ExprKind::LSHIFT: return PackageFormat::CHIRExprKind_TryLShift;
+                case ExprKind::RSHIFT: return PackageFormat::CHIRExprKind_TryRShift;
+                default:               return PackageFormat::CHIRExprKind_Invalid;
+            }
+        }
+        case ExprKind::SPAWN_WITH_EXCEPTION:              return PackageFormat::CHIRExprKind_TrySpawn;
+        case ExprKind::TYPECAST_WITH_EXCEPTION:           return PackageFormat::CHIRExprKind_TryNumericCast;
+        case ExprKind::INTRINSIC_WITH_EXCEPTION:          return PackageFormat::CHIRExprKind_TryIntrinsic;
+        case ExprKind::ALLOCATE_WITH_EXCEPTION:           return PackageFormat::CHIRExprKind_TryAllocate;
+        case ExprKind::RAW_ARRAY_ALLOCATE_WITH_EXCEPTION: return PackageFormat::CHIRExprKind_TryRawArrayAllocate;
+        case ExprKind::NEG:                               return PackageFormat::CHIRExprKind_Neg;
+        case ExprKind::NOT:                               return PackageFormat::CHIRExprKind_Not;
+        case ExprKind::BITNOT:                            return PackageFormat::CHIRExprKind_BitNot;
+        case ExprKind::ADD:                               return PackageFormat::CHIRExprKind_Add;
+        case ExprKind::SUB:                               return PackageFormat::CHIRExprKind_Sub;
+        case ExprKind::MUL:                               return PackageFormat::CHIRExprKind_Mul;
+        case ExprKind::DIV:                               return PackageFormat::CHIRExprKind_Div;
+        case ExprKind::MOD:                               return PackageFormat::CHIRExprKind_Mod;
+        case ExprKind::EXP:                               return PackageFormat::CHIRExprKind_Exp;
+        case ExprKind::LSHIFT:                            return PackageFormat::CHIRExprKind_LShift;
+        case ExprKind::RSHIFT:                            return PackageFormat::CHIRExprKind_RShift;
+        case ExprKind::BITAND:                            return PackageFormat::CHIRExprKind_BitAnd;
+        case ExprKind::BITOR:                             return PackageFormat::CHIRExprKind_BitOr;
+        case ExprKind::BITXOR:                            return PackageFormat::CHIRExprKind_BitXor;
+        case ExprKind::LT:                                return PackageFormat::CHIRExprKind_LT;
+        case ExprKind::GT:                                return PackageFormat::CHIRExprKind_GT;
+        case ExprKind::LE:                                return PackageFormat::CHIRExprKind_LE;
+        case ExprKind::GE:                                return PackageFormat::CHIRExprKind_GE;
+        case ExprKind::EQUAL:                             return PackageFormat::CHIRExprKind_Equal;
+        case ExprKind::NOTEQUAL:                          return PackageFormat::CHIRExprKind_NotEqual;
+        case ExprKind::AND:                               return PackageFormat::CHIRExprKind_And;
+        case ExprKind::OR:                                return PackageFormat::CHIRExprKind_Or;
+        case ExprKind::TYPECAST:                          return PackageFormat::CHIRExprKind_NumericCast;
+        case ExprKind::BOX:                               return PackageFormat::CHIRExprKind_Box;
+        case ExprKind::UNBOX:                             return PackageFormat::CHIRExprKind_UnboxToValue;
+        case ExprKind::UNBOX_TO_REF:                      return PackageFormat::CHIRExprKind_UnboxToRef;
+        case ExprKind::TRANSFORM_TO_GENERIC:              return PackageFormat::CHIRExprKind_CastToGeneric;
+        case ExprKind::TRANSFORM_TO_CONCRETE:             return PackageFormat::CHIRExprKind_CastToConcrete;
+        case ExprKind::ALLOCATE:                          return PackageFormat::CHIRExprKind_Allocate;
+        case ExprKind::LOAD:                              return PackageFormat::CHIRExprKind_Load;
+        case ExprKind::STORE:                             return PackageFormat::CHIRExprKind_Store;
+        case ExprKind::GET_ELEMENT_BY_NAME:               return PackageFormat::CHIRExprKind_GetElementByName;
+        case ExprKind::GET_ELEMENT_REF:                   return PackageFormat::CHIRExprKind_GetElementRef;
+        case ExprKind::STORE_ELEMENT_BY_NAME:             return PackageFormat::CHIRExprKind_StoreElementByName;
+        case ExprKind::STORE_ELEMENT_REF:                 return PackageFormat::CHIRExprKind_StoreElementRef;
+        case ExprKind::FIELD:                             return PackageFormat::CHIRExprKind_Field;
+        case ExprKind::FIELD_BY_NAME:                     return PackageFormat::CHIRExprKind_FieldByName;
+        case ExprKind::RAW_ARRAY_ALLOCATE:                return PackageFormat::CHIRExprKind_RawArrayAllocate;
+        case ExprKind::RAW_ARRAY_LITERAL_INIT:            return PackageFormat::CHIRExprKind_RawArrayLiteralInit;
+        case ExprKind::RAW_ARRAY_INIT_BY_VALUE:           return PackageFormat::CHIRExprKind_RawArrayInitByValue;
+        case ExprKind::VARRAY:                            return PackageFormat::CHIRExprKind_VArrayExpr;
+        case ExprKind::VARRAY_BUILDER:                    return PackageFormat::CHIRExprKind_VArrayBuilder;
+        case ExprKind::CONSTANT:                          return PackageFormat::CHIRExprKind_Constant;
+        case ExprKind::DEBUGEXPR:                         return PackageFormat::CHIRExprKind_Debug;
+        case ExprKind::TUPLE:                             return PackageFormat::CHIRExprKind_Tuple;
+        case ExprKind::INSTANCEOF:                        return PackageFormat::CHIRExprKind_InstanceOf;
+        case ExprKind::GET_EXCEPTION:                     return PackageFormat::CHIRExprKind_GetException;
+        case ExprKind::SPAWN:                             return PackageFormat::CHIRExprKind_Spawn;
+        case ExprKind::LAMBDA:                            return PackageFormat::CHIRExprKind_Lambda;
+        case ExprKind::GET_INSTANTIATE_VALUE:             return PackageFormat::CHIRExprKind_GetInstantiateValue;
+        case ExprKind::APPLY:                             return PackageFormat::CHIRExprKind_Apply;
+        case ExprKind::INVOKE:                            return PackageFormat::CHIRExprKind_Invoke;
+        case ExprKind::INVOKESTATIC:                      return PackageFormat::CHIRExprKind_Invoke;
+        case ExprKind::INTRINSIC:                         return PackageFormat::CHIRExprKind_Intrinsic;
+        case ExprKind::GET_RTTI:                          return PackageFormat::CHIRExprKind_GetRtti;
+        case ExprKind::GET_RTTI_STATIC:                   return PackageFormat::CHIRExprKind_GetRttiStatic;
+        case ExprKind::FORIN_RANGE:
+        case ExprKind::FORIN_ITER:
+        case ExprKind::FORIN_CLOSED_RANGE:
+        case ExprKind::INVALID:
+        case ExprKind::MAX_EXPR_KINDS:
+        default:                                          return PackageFormat::CHIRExprKind_Invalid;
+    }
+}
+
 template <>
 flatbuffers::Offset<PackageFormat::Expression> CHIRSerializer::CHIRSerializerImpl::Serialize(const Expression& obj)
 {
     auto base = Serialize<PackageFormat::Base>(static_cast<const Base&>(obj));
-    auto expressionId = GetId<Expression>(&obj);
-    auto kind = PackageFormat::CHIRExprKind(obj.GetExprKind());
-    auto operands = GetId<Value>(obj.GetOperands());
+    auto kind = ToPackageExprKind(obj);
+    auto operands = GetId<Value>(obj.Expression::GetOperands());
     auto blockGroups = GetId<Value>(obj.GetBlockGroups());
-    auto parentBlock = GetId<Value>(obj.GetParentBlock());
+    auto owner = GetId<Value>(obj.GetParentBlock());
     auto resultLocalVar = GetId<Value>(obj.GetResult());
     auto resultTy = GetId<Type>(obj.GetResult() ? obj.GetResult()->GetType() : nullptr);
-    return PackageFormat::CreateExpressionDirect(builder, base, kind, expressionId,
-        operands.empty() ? nullptr : &operands, blockGroups.empty() ? nullptr : &blockGroups, parentBlock,
+    return PackageFormat::CreateExpressionDirect(builder, base, kind,
+        operands.empty() ? nullptr : &operands, blockGroups.empty() ? nullptr : &blockGroups, owner,
         resultLocalVar, resultTy);
 }
 
 template <>
-flatbuffers::Offset<PackageFormat::UnaryExpression> CHIRSerializer::CHIRSerializerImpl::Serialize(
+flatbuffers::Offset<PackageFormat::UnaryExpressionBase> CHIRSerializer::CHIRSerializerImpl::Serialize(
     const UnaryExpression& obj)
 {
     auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
     auto overflowStrategy = PackageFormat::OverflowStrategy(obj.GetOverflowStrategy());
-    return PackageFormat::CreateUnaryExpression(builder, base, overflowStrategy);
+    return PackageFormat::CreateUnaryExpressionBase(builder, base, overflowStrategy);
 }
 
 template <>
-flatbuffers::Offset<PackageFormat::BinaryExpression> CHIRSerializer::CHIRSerializerImpl::Serialize(
+flatbuffers::Offset<PackageFormat::UnaryExpressionBase> CHIRSerializer::CHIRSerializerImpl::Serialize(
+    const IntOpWithException& obj)
+{
+    auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
+    auto overflowStrategy = PackageFormat::OverflowStrategy(obj.GetOverflowStrategy());
+    return PackageFormat::CreateUnaryExpressionBase(builder, base, overflowStrategy);
+}
+
+template <>
+flatbuffers::Offset<PackageFormat::BinaryExpressionBase> CHIRSerializer::CHIRSerializerImpl::Serialize(
     const BinaryExpression& obj)
 {
     auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
     auto overflowStrategy = PackageFormat::OverflowStrategy(obj.GetOverflowStrategy());
-    return PackageFormat::CreateBinaryExpression(builder, base, overflowStrategy);
+    return PackageFormat::CreateBinaryExpressionBase(builder, base, overflowStrategy);
 }
 
 template <>
-flatbuffers::Offset<PackageFormat::Constant> CHIRSerializer::CHIRSerializerImpl::Serialize(const Constant& obj)
+flatbuffers::Offset<PackageFormat::BinaryExpressionBase> CHIRSerializer::CHIRSerializerImpl::Serialize(
+    const IntOpWithException& obj)
 {
     auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
-    return PackageFormat::CreateConstant(builder, base);
+    auto overflowStrategy = PackageFormat::OverflowStrategy(obj.GetOverflowStrategy());
+    return PackageFormat::CreateBinaryExpressionBase(builder, base, overflowStrategy);
 }
 
 template <>
-flatbuffers::Offset<PackageFormat::Allocate> CHIRSerializer::CHIRSerializerImpl::Serialize(const Allocate& obj)
+flatbuffers::Offset<PackageFormat::AllocateBase> CHIRSerializer::CHIRSerializerImpl::Serialize(const Allocate& obj)
 {
     auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
-    auto targetType = GetId<Type>(obj.GetType());
-    return PackageFormat::CreateAllocate(builder, base, targetType);
+    auto allocatedType = GetId<Type>(obj.GetType());
+    return PackageFormat::CreateAllocateBase(builder, base, allocatedType);
 }
 
-template <> flatbuffers::Offset<PackageFormat::Load> CHIRSerializer::CHIRSerializerImpl::Serialize(const Load& obj)
+template <>
+flatbuffers::Offset<PackageFormat::AllocateBase> CHIRSerializer::CHIRSerializerImpl::Serialize(
+    const AllocateWithException& obj)
 {
     auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
-    return PackageFormat::CreateLoad(builder, base);
-}
-
-template <> flatbuffers::Offset<PackageFormat::Store> CHIRSerializer::CHIRSerializerImpl::Serialize(const Store& obj)
-{
-    auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
-    return PackageFormat::CreateStore(builder, base);
+    auto allocatedType = GetId<Type>(obj.GetType());
+    return PackageFormat::CreateAllocateBase(builder, base, allocatedType);
 }
 
 template <>
@@ -865,47 +801,140 @@ flatbuffers::Offset<PackageFormat::StoreElementByName> CHIRSerializer::CHIRSeria
     return PackageFormat::CreateStoreElementByName(builder, base, names);
 }
 
-template <> flatbuffers::Offset<PackageFormat::Apply> CHIRSerializer::CHIRSerializerImpl::Serialize(const Apply& obj)
+template <>
+flatbuffers::Offset<PackageFormat::ApplyBase> CHIRSerializer::CHIRSerializerImpl::Serialize(const Apply& obj)
 {
-    auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
-    auto instTypeArgs = GetId<Type>(obj.GetInstantiatedTypeArgs());
-    auto isSuperCall = obj.IsSuperCall();
-    auto thisType = GetId<Type>(obj.GetThisType());
-    return PackageFormat::CreateApplyDirect(
-        builder, base, isSuperCall, instTypeArgs.empty() ? nullptr : &instTypeArgs, thisType);
-}
+    // 1. serialize Expression
+    auto exprBase = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
 
-template <> flatbuffers::Offset<PackageFormat::Invoke> CHIRSerializer::CHIRSerializerImpl::Serialize(const Invoke& obj)
-{
-    auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
+    // 2. serialize FuncCall
     auto instTypeArgs = GetId<Type>(obj.GetInstantiatedTypeArgs());
     auto thisType = GetId<Type>(obj.GetThisType());
-    auto tempTypes = GetId<Type>(obj.GetGenericTypeParams());
-    auto virMethodCtx = PackageFormat::CreateVirMethodContextDirect(builder,
-        obj.GetMethodName().data(), GetId<Type>(obj.GetMethodType()), tempTypes.empty() ? nullptr : &tempTypes);
-    return PackageFormat::CreateInvokeDirect(
-        builder, base, instTypeArgs.empty() ? nullptr : &instTypeArgs, thisType, virMethodCtx);
+    auto funcCall = PackageFormat::CreateFuncCallDirect(
+        builder, exprBase, instTypeArgs.empty() ? nullptr : &instTypeArgs, thisType);
+
+    // 3. serialize Apply
+    return PackageFormat::CreateApplyBase(builder, funcCall, obj.IsSuperCall());
 }
 
 template <>
-flatbuffers::Offset<PackageFormat::InvokeStatic> CHIRSerializer::CHIRSerializerImpl::Serialize(const InvokeStatic& obj)
+flatbuffers::Offset<PackageFormat::ApplyBase> CHIRSerializer::CHIRSerializerImpl::Serialize(
+    const ApplyWithException& obj)
 {
-    auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
+    // 1. serialize Expression
+    auto exprBase = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
+
+    // 2. serialize FuncCall
     auto instTypeArgs = GetId<Type>(obj.GetInstantiatedTypeArgs());
     auto thisType = GetId<Type>(obj.GetThisType());
-    auto tempTypes = GetId<Type>(obj.GetGenericTypeParams());
-    auto virMethodCtx = PackageFormat::CreateVirMethodContextDirect(builder,
-        obj.GetMethodName().data(), GetId<Type>(obj.GetMethodType()), tempTypes.empty() ? nullptr : &tempTypes);
-    return PackageFormat::CreateInvokeStaticDirect(
-        builder, base, instTypeArgs.empty() ? nullptr : &instTypeArgs, thisType, virMethodCtx);
+    auto funcCall = PackageFormat::CreateFuncCallDirect(
+        builder, exprBase, instTypeArgs.empty() ? nullptr : &instTypeArgs, thisType);
+
+    // 3. serialize ApplyWithException
+    return PackageFormat::CreateApplyBase(builder, funcCall, false);
 }
 
 template <>
-flatbuffers::Offset<PackageFormat::TypeCast> CHIRSerializer::CHIRSerializerImpl::Serialize(const TypeCast& obj)
+flatbuffers::Offset<PackageFormat::FuncSigInfo> CHIRSerializer::CHIRSerializerImpl::Serialize(const FuncSigInfo& obj)
+{
+    auto tempTypes = GetId<Type>(obj.genericTypeParams);
+    return PackageFormat::CreateFuncSigInfoDirect(builder, obj.funcName.data(),
+        GetId<Type>(obj.funcType), tempTypes.empty() ? nullptr : &tempTypes);
+}
+
+template <>
+flatbuffers::Offset<PackageFormat::InvokeBase> CHIRSerializer::CHIRSerializerImpl::Serialize(const Invoke& obj)
+{
+    // 1. serialize Expression
+    auto exprBase = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
+
+    // 2. serialize FuncCall
+    auto instTypeArgs = GetId<Type>(obj.GetInstantiatedTypeArgs());
+    auto thisType = GetId<Type>(obj.GetThisType());
+    auto funcCall = PackageFormat::CreateFuncCallDirect(
+        builder, exprBase, instTypeArgs.empty() ? nullptr : &instTypeArgs, thisType);
+
+    // 3. serialize virMethodCtx
+    auto virMethodCtx = Serialize<PackageFormat::FuncSigInfo>(obj.virMethodCtx);
+    
+    // 4. serialize Invoke
+    return PackageFormat::CreateInvokeBase(builder, funcCall, virMethodCtx);
+}
+
+template <>
+flatbuffers::Offset<PackageFormat::InvokeBase> CHIRSerializer::CHIRSerializerImpl::Serialize(
+    const InvokeWithException& obj)
+{
+    // 1. serialize Expression
+    auto exprBase = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
+
+    // 2. serialize FuncCall
+    auto instTypeArgs = GetId<Type>(obj.GetInstantiatedTypeArgs());
+    auto thisType = GetId<Type>(obj.GetThisType());
+    auto funcCall = PackageFormat::CreateFuncCallDirect(
+        builder, exprBase, instTypeArgs.empty() ? nullptr : &instTypeArgs, thisType);
+
+    // 3. serialize virMethodCtx
+    auto virMethodCtx = Serialize<PackageFormat::FuncSigInfo>(obj.virMethodCtx);
+    
+    // 4. serialize InvokeWithException
+    return PackageFormat::CreateInvokeBase(builder, funcCall, virMethodCtx);
+}
+
+template <>
+flatbuffers::Offset<PackageFormat::InvokeBase> CHIRSerializer::CHIRSerializerImpl::Serialize(const InvokeStatic& obj)
+{
+    // 1. serialize Expression
+    auto exprBase = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
+
+    // 2. serialize FuncCall
+    auto instTypeArgs = GetId<Type>(obj.GetInstantiatedTypeArgs());
+    auto thisType = GetId<Type>(obj.GetThisType());
+    auto funcCall = PackageFormat::CreateFuncCallDirect(
+        builder, exprBase, instTypeArgs.empty() ? nullptr : &instTypeArgs, thisType);
+
+    // 3. serialize virMethodCtx
+    auto virMethodCtx = Serialize<PackageFormat::FuncSigInfo>(obj.virMethodCtx);
+    
+    // 4. serialize InvokeStatic
+    return PackageFormat::CreateInvokeBase(builder, funcCall, virMethodCtx);
+}
+
+template <>
+flatbuffers::Offset<PackageFormat::InvokeBase> CHIRSerializer::CHIRSerializerImpl::Serialize(
+    const InvokeStaticWithException& obj)
+{
+    // 1. serialize Expression
+    auto exprBase = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
+
+    // 2. serialize FuncCall
+    auto instTypeArgs = GetId<Type>(obj.GetInstantiatedTypeArgs());
+    auto thisType = GetId<Type>(obj.GetThisType());
+    auto funcCall = PackageFormat::CreateFuncCallDirect(
+        builder, exprBase, instTypeArgs.empty() ? nullptr : &instTypeArgs, thisType);
+
+    // 3. serialize virMethodCtx
+    auto virMethodCtx = Serialize<PackageFormat::FuncSigInfo>(obj.virMethodCtx);
+    
+    // 4. serialize InvokeStaticWithException
+    return PackageFormat::CreateInvokeBase(builder, funcCall, virMethodCtx);
+}
+
+template <>
+flatbuffers::Offset<PackageFormat::NumericCastBase> CHIRSerializer::CHIRSerializerImpl::Serialize(const TypeCast& obj)
 {
     auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
     auto overflowStrategy = PackageFormat::OverflowStrategy(obj.GetOverflowStrategy());
-    return PackageFormat::CreateTypeCast(builder, base, overflowStrategy);
+    return PackageFormat::CreateNumericCastBase(builder, base, overflowStrategy);
+}
+
+template <>
+flatbuffers::Offset<PackageFormat::NumericCastBase> CHIRSerializer::CHIRSerializerImpl::Serialize(
+    const TypeCastWithException& obj)
+{
+    auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
+    auto overflowStrategy = PackageFormat::OverflowStrategy(obj.GetOverflowStrategy());
+    return PackageFormat::CreateNumericCastBase(builder, base, overflowStrategy);
 }
 
 template <>
@@ -916,35 +945,10 @@ flatbuffers::Offset<PackageFormat::InstanceOf> CHIRSerializer::CHIRSerializerImp
     return PackageFormat::CreateInstanceOf(builder, base, targetType);
 }
 
-template <> flatbuffers::Offset<PackageFormat::Box> CHIRSerializer::CHIRSerializerImpl::Serialize(const Box& expr)
-{
-    auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(expr));
-    return PackageFormat::CreateBox(builder, base);
-}
-
-template <> flatbuffers::Offset<PackageFormat::UnBox> CHIRSerializer::CHIRSerializerImpl::Serialize(const UnBox& expr)
-{
-    auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(expr));
-    return PackageFormat::CreateUnBox(builder, base);
-}
-
 template <>
-flatbuffers::Offset<PackageFormat::Terminator> CHIRSerializer::CHIRSerializerImpl::Serialize(const Terminator& obj)
+flatbuffers::Offset<PackageFormat::Branch> CHIRSerializer::CHIRSerializerImpl::Serialize(const Branch& obj)
 {
     auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
-    auto successors = GetId<Value>(obj.GetSuccessors());
-    return PackageFormat::CreateTerminatorDirect(builder, base, successors.empty() ? nullptr : &successors);
-}
-
-template <> flatbuffers::Offset<PackageFormat::GoTo> CHIRSerializer::CHIRSerializerImpl::Serialize(const GoTo& obj)
-{
-    auto base = Serialize<PackageFormat::Terminator>(static_cast<const Terminator&>(obj));
-    return PackageFormat::CreateGoTo(builder, base);
-}
-
-template <> flatbuffers::Offset<PackageFormat::Branch> CHIRSerializer::CHIRSerializerImpl::Serialize(const Branch& obj)
-{
-    auto base = Serialize<PackageFormat::Terminator>(static_cast<const Terminator&>(obj));
     auto sourceExpr = obj.GetSourceExpr();
     return PackageFormat::CreateBranch(builder, base, PackageFormat::SourceExpr(sourceExpr));
 }
@@ -952,64 +956,9 @@ template <> flatbuffers::Offset<PackageFormat::Branch> CHIRSerializer::CHIRSeria
 template <>
 flatbuffers::Offset<PackageFormat::MultiBranch> CHIRSerializer::CHIRSerializerImpl::Serialize(const MultiBranch& obj)
 {
-    auto base = Serialize<PackageFormat::Terminator>(static_cast<const Terminator&>(obj));
+    auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
     auto caseVals = obj.GetCaseVals();
     return PackageFormat::CreateMultiBranchDirect(builder, base, caseVals.empty() ? nullptr : &caseVals);
-}
-
-template <> flatbuffers::Offset<PackageFormat::Exit> CHIRSerializer::CHIRSerializerImpl::Serialize(const Exit& obj)
-{
-    auto base = Serialize<PackageFormat::Terminator>(static_cast<const Terminator&>(obj));
-    return PackageFormat::CreateExit(builder, base);
-}
-
-template <>
-flatbuffers::Offset<PackageFormat::RaiseException> CHIRSerializer::CHIRSerializerImpl::Serialize(
-    const RaiseException& obj)
-{
-    auto base = Serialize<PackageFormat::Terminator>(static_cast<const Terminator&>(obj));
-    return PackageFormat::CreateRaiseException(builder, base);
-}
-
-template <>
-flatbuffers::Offset<PackageFormat::ApplyWithException> CHIRSerializer::CHIRSerializerImpl::Serialize(
-    const ApplyWithException& obj)
-{
-    CJC_ASSERT(!obj.GetOperands().empty());
-    auto base = Serialize<PackageFormat::Terminator>(static_cast<const Terminator&>(obj));
-    auto thisType = GetId<Type>(obj.GetThisType());
-    auto instantiateArgs = GetId<Type>(obj.GetInstantiatedTypeArgs());
-    return PackageFormat::CreateApplyWithExceptionDirect(
-        builder, base, thisType, instantiateArgs.empty() ? nullptr : &instantiateArgs);
-}
-
-template <>
-flatbuffers::Offset<PackageFormat::InvokeWithException> CHIRSerializer::CHIRSerializerImpl::Serialize(
-    const InvokeWithException& obj)
-{
-    CJC_ASSERT(!obj.GetOperands().empty());
-    auto base = Serialize<PackageFormat::Terminator>(static_cast<const Terminator&>(obj));
-    auto instTypeArgs = GetId<Type>(obj.GetInstantiatedTypeArgs());
-    auto thisType = GetId<Type>(obj.GetThisType());
-    auto tempTypes = GetId<Type>(obj.GetGenericTypeParams());
-    auto virMethodCtx = PackageFormat::CreateVirMethodContextDirect(builder,
-        obj.GetMethodName().data(), GetId<Type>(obj.GetMethodType()), tempTypes.empty() ? nullptr : &tempTypes);
-    return PackageFormat::CreateInvokeWithExceptionDirect(
-        builder, base, instTypeArgs.empty() ? nullptr : &instTypeArgs, thisType, virMethodCtx);
-}
-
-template <>
-flatbuffers::Offset<PackageFormat::InvokeStaticWithException> CHIRSerializer::CHIRSerializerImpl::Serialize(
-    const InvokeStaticWithException& obj)
-{
-    auto base = Serialize<PackageFormat::Terminator>(static_cast<const Terminator&>(obj));
-    auto instTypeArgs = GetId<Type>(obj.GetInstantiatedTypeArgs());
-    auto thisType = GetId<Type>(obj.GetThisType());
-    auto tempTypes = GetId<Type>(obj.GetGenericTypeParams());
-    auto virMethodCtx = PackageFormat::CreateVirMethodContextDirect(builder,
-        obj.GetMethodName().data(), GetId<Type>(obj.GetMethodType()), tempTypes.empty() ? nullptr : &tempTypes);
-    return PackageFormat::CreateInvokeStaticWithExceptionDirect(
-        builder, base, instTypeArgs.empty() ? nullptr : &instTypeArgs, thisType, virMethodCtx);
 }
 
 template <>
@@ -1023,36 +972,6 @@ flatbuffers::Offset<PackageFormat::GetInstantiateValue> CHIRSerializer::CHIRSeri
 }
 
 template <>
-flatbuffers::Offset<PackageFormat::TransformToConcrete> CHIRSerializer::CHIRSerializerImpl::Serialize(
-    const TransformToConcrete& obj)
-{
-    auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
-    return PackageFormat::CreateTransformToConcrete(builder, base);
-}
-
-template <>
-flatbuffers::Offset<PackageFormat::TransformToGeneric> CHIRSerializer::CHIRSerializerImpl::Serialize(
-    const TransformToGeneric& obj)
-{
-    auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
-    return PackageFormat::CreateTransformToGeneric(builder, base);
-}
-
-template <>
-flatbuffers::Offset<PackageFormat::UnBoxToRef> CHIRSerializer::CHIRSerializerImpl::Serialize(const UnBoxToRef& obj)
-{
-    auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
-    return PackageFormat::CreateUnBoxToRef(builder, base);
-}
-
-template <>
-flatbuffers::Offset<PackageFormat::GetRTTI> CHIRSerializer::CHIRSerializerImpl::Serialize(const GetRTTI& obj)
-{
-    auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
-    return PackageFormat::CreateGetRTTI(builder, base);
-}
-
-template <>
 flatbuffers::Offset<PackageFormat::GetRTTIStatic> CHIRSerializer::CHIRSerializerImpl::Serialize(
     const GetRTTIStatic& obj)
 {
@@ -1062,75 +981,15 @@ flatbuffers::Offset<PackageFormat::GetRTTIStatic> CHIRSerializer::CHIRSerializer
 }
 
 template <>
-flatbuffers::Offset<PackageFormat::IntOpWithException> CHIRSerializer::CHIRSerializerImpl::Serialize(
-    const IntOpWithException& obj)
-{
-    auto base = Serialize<PackageFormat::Terminator>(static_cast<const Terminator&>(obj));
-    auto opKind = PackageFormat::CHIRExprKind(obj.GetOpKind());
-    auto overflowStrategy = PackageFormat::OverflowStrategy(obj.GetOverflowStrategy());
-    return PackageFormat::CreateIntOpWithException(builder, base, opKind, overflowStrategy);
-}
-
-template <>
-flatbuffers::Offset<PackageFormat::TypeCastWithException> CHIRSerializer::CHIRSerializerImpl::Serialize(
-    const TypeCastWithException& obj)
-{
-    auto base = Serialize<PackageFormat::Terminator>(static_cast<const Terminator&>(obj));
-    return PackageFormat::CreateTypeCastWithException(builder, base);
-}
-
-template <>
-flatbuffers::Offset<PackageFormat::IntrinsicWithException> CHIRSerializer::CHIRSerializerImpl::Serialize(
-    const IntrinsicWithException& obj)
-{
-    auto base = Serialize<PackageFormat::Terminator>(static_cast<const Terminator&>(obj));
-    auto intrinsicKind = PackageFormat::IntrinsicKind(obj.GetIntrinsicKind());
-    auto instantiatedTypeArgs = GetId<Type>(obj.GetInstantiatedTypeArgs());
-    return PackageFormat::CreateIntrinsicWithExceptionDirect(
-        builder, base, intrinsicKind, instantiatedTypeArgs.empty() ? nullptr : &instantiatedTypeArgs);
-}
-
-template <>
-flatbuffers::Offset<PackageFormat::AllocateWithException> CHIRSerializer::CHIRSerializerImpl::Serialize(
-    const AllocateWithException& obj)
-{
-    auto base = Serialize<PackageFormat::Terminator>(static_cast<const Terminator&>(obj));
-    auto targetType = GetId<Type>(obj.GetType());
-    return PackageFormat::CreateAllocateWithException(builder, base, targetType);
-}
-
-template <>
-flatbuffers::Offset<PackageFormat::RawArrayAllocateWithException> CHIRSerializer::CHIRSerializerImpl::Serialize(
-    const RawArrayAllocateWithException& obj)
-{
-    auto base = Serialize<PackageFormat::Terminator>(static_cast<const Terminator&>(obj));
-    auto elementType = GetId<Type>(obj.GetElementType());
-    return PackageFormat::CreateRawArrayAllocateWithException(builder, base, elementType);
-}
-
-template <>
-flatbuffers::Offset<PackageFormat::SpawnWithException> CHIRSerializer::CHIRSerializerImpl::Serialize(
-    const SpawnWithException& obj)
-{
-    auto base = Serialize<PackageFormat::Terminator>(static_cast<const Terminator&>(obj));
-    auto executeClosure = GetId<Value>(obj.GetExecuteClosure());
-    return PackageFormat::CreateSpawnWithException(builder, base, executeClosure);
-}
-
-template <> flatbuffers::Offset<PackageFormat::Tuple> CHIRSerializer::CHIRSerializerImpl::Serialize(const Tuple& obj)
-{
-    auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
-    return PackageFormat::CreateTuple(builder, base);
-}
-
-template <> flatbuffers::Offset<PackageFormat::Field> CHIRSerializer::CHIRSerializerImpl::Serialize(const Field& obj)
+flatbuffers::Offset<PackageFormat::Field> CHIRSerializer::CHIRSerializerImpl::Serialize(const Field& obj)
 {
     auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
     auto path = obj.GetPath();
     return PackageFormat::CreateFieldDirect(builder, base, path.empty() ? nullptr : &path);
 }
 
-template <> flatbuffers::Offset<PackageFormat::FieldByName> CHIRSerializer::CHIRSerializerImpl::Serialize(
+template <>
+flatbuffers::Offset<PackageFormat::FieldByName> CHIRSerializer::CHIRSerializerImpl::Serialize(
     const FieldByName& obj)
 {
     auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
@@ -1139,95 +998,58 @@ template <> flatbuffers::Offset<PackageFormat::FieldByName> CHIRSerializer::CHIR
 }
 
 template <>
-flatbuffers::Offset<PackageFormat::RawArrayAllocate> CHIRSerializer::CHIRSerializerImpl::Serialize(
+flatbuffers::Offset<PackageFormat::RawArrayAllocateBase> CHIRSerializer::CHIRSerializerImpl::Serialize(
     const RawArrayAllocate& obj)
 {
     auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
     auto elementType = GetId<Type>(obj.GetElementType());
-    return PackageFormat::CreateRawArrayAllocate(builder, base, elementType);
+    return PackageFormat::CreateRawArrayAllocateBase(builder, base, elementType);
 }
 
 template <>
-flatbuffers::Offset<PackageFormat::RawArrayLiteralInit> CHIRSerializer::CHIRSerializerImpl::Serialize(
-    const RawArrayLiteralInit& obj)
+flatbuffers::Offset<PackageFormat::RawArrayAllocateBase> CHIRSerializer::CHIRSerializerImpl::Serialize(
+    const RawArrayAllocateWithException& obj)
 {
     auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
-    return PackageFormat::CreateRawArrayLiteralInit(builder, base);
+    auto elementType = GetId<Type>(obj.GetElementType());
+    return PackageFormat::CreateRawArrayAllocateBase(builder, base, elementType);
 }
 
 template <>
-flatbuffers::Offset<PackageFormat::RawArrayInitByValue> CHIRSerializer::CHIRSerializerImpl::Serialize(
-    const RawArrayInitByValue& obj)
+flatbuffers::Offset<PackageFormat::IntrinsicBase> CHIRSerializer::CHIRSerializerImpl::Serialize(const Intrinsic& obj)
 {
-    auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
-    return PackageFormat::CreateRawArrayInitByValue(builder, base);
-}
+    // 1. serialize Expression
+    auto exprBase = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
 
-template <> flatbuffers::Offset<PackageFormat::VArray> CHIRSerializer::CHIRSerializerImpl::Serialize(const VArray& obj)
-{
-    auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
-    return PackageFormat::CreateVArray(builder, base);
-}
-
-template <>
-flatbuffers::Offset<PackageFormat::VArrayBd> CHIRSerializer::CHIRSerializerImpl::Serialize(const VArrayBuilder& obj)
-{
-    auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
-    return PackageFormat::CreateVArrayBd(builder, base);
-}
-
-template <>
-flatbuffers::Offset<PackageFormat::GetException> CHIRSerializer::CHIRSerializerImpl::Serialize(const GetException& obj)
-{
-    auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
-    return PackageFormat::CreateGetException(builder, base);
-}
-
-template <>
-flatbuffers::Offset<PackageFormat::Intrinsic> CHIRSerializer::CHIRSerializerImpl::Serialize(const Intrinsic& obj)
-{
-    auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
-    auto intrinsicKind = PackageFormat::IntrinsicKind(obj.GetIntrinsicKind());
+    // 2. serialize FuncCall
     auto instantiatedTypeArgs = GetId<Type>(obj.GetInstantiatedTypeArgs());
-    return PackageFormat::CreateIntrinsicDirect(
-        builder, base, intrinsicKind, instantiatedTypeArgs.empty() ? nullptr : &instantiatedTypeArgs);
-}
+    auto funcCall = PackageFormat::CreateFuncCallDirect(
+        builder, exprBase, instantiatedTypeArgs.empty() ? nullptr : &instantiatedTypeArgs, 0);
 
-template <> flatbuffers::Offset<PackageFormat::If> CHIRSerializer::CHIRSerializerImpl::Serialize(const If& obj)
-{
-    auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
-    return PackageFormat::CreateIf(builder, base);
-}
-
-template <> flatbuffers::Offset<PackageFormat::Loop> CHIRSerializer::CHIRSerializerImpl::Serialize(const Loop& obj)
-{
-    auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
-    return PackageFormat::CreateLoop(builder, base);
+    // 3. serialize Intrinsic
+    auto intrinsicKind = PackageFormat::IntrinsicKind(obj.GetIntrinsicKind());
+    return PackageFormat::CreateIntrinsicBase(builder, funcCall, intrinsicKind);
 }
 
 template <>
-flatbuffers::Offset<PackageFormat::ForInRange> CHIRSerializer::CHIRSerializerImpl::Serialize(const ForInRange& obj)
+flatbuffers::Offset<PackageFormat::IntrinsicBase> CHIRSerializer::CHIRSerializerImpl::Serialize(
+    const IntrinsicWithException& obj)
 {
-    auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
-    return PackageFormat::CreateForInRange(builder, base);
+    // 1. serialize Expression
+    auto exprBase = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
+
+    // 2. serialize FuncCall
+    auto instantiatedTypeArgs = GetId<Type>(obj.GetInstantiatedTypeArgs());
+    auto funcCall = PackageFormat::CreateFuncCallDirect(
+        builder, exprBase, instantiatedTypeArgs.empty() ? nullptr : &instantiatedTypeArgs, 0);
+
+    // 3. serialize IntrinsicWithException
+    auto intrinsicKind = PackageFormat::IntrinsicKind(obj.GetIntrinsicKind());
+    return PackageFormat::CreateIntrinsicBase(builder, funcCall, intrinsicKind);
 }
 
 template <>
-flatbuffers::Offset<PackageFormat::ForInClosedRange> CHIRSerializer::CHIRSerializerImpl::Serialize(
-    const ForInClosedRange& obj)
-{
-    auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
-    return PackageFormat::CreateForInClosedRange(builder, base);
-}
-
-template <>
-flatbuffers::Offset<PackageFormat::ForInIter> CHIRSerializer::CHIRSerializerImpl::Serialize(const ForInIter& obj)
-{
-    auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
-    return PackageFormat::CreateForInIter(builder, base);
-}
-
-template <> flatbuffers::Offset<PackageFormat::Debug> CHIRSerializer::CHIRSerializerImpl::Serialize(const Debug& obj)
+flatbuffers::Offset<PackageFormat::Debug> CHIRSerializer::CHIRSerializerImpl::Serialize(const Debug& obj)
 {
     auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
     auto srcCodeIdentifier = obj.GetSrcCodeIdentifier();
@@ -1235,19 +1057,30 @@ template <> flatbuffers::Offset<PackageFormat::Debug> CHIRSerializer::CHIRSerial
     return PackageFormat::CreateDebugDirect(builder, base, srcCodeIdentifier.data());
 }
 
-template <> flatbuffers::Offset<PackageFormat::Spawn> CHIRSerializer::CHIRSerializerImpl::Serialize(const Spawn& obj)
+template <>
+flatbuffers::Offset<PackageFormat::SpawnBase> CHIRSerializer::CHIRSerializerImpl::Serialize(const Spawn& obj)
 {
     auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
     auto executeClosure = GetId<Value>(obj.GetExecuteClosure());
-    return PackageFormat::CreateSpawn(builder, base, executeClosure);
+    return PackageFormat::CreateSpawnBase(builder, base, executeClosure);
 }
 
-template <> flatbuffers::Offset<PackageFormat::Lambda> CHIRSerializer::CHIRSerializerImpl::Serialize(const Lambda& obj)
+template <>
+flatbuffers::Offset<PackageFormat::SpawnBase> CHIRSerializer::CHIRSerializerImpl::Serialize(
+    const SpawnWithException& obj)
+{
+    auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
+    auto executeClosure = GetId<Value>(obj.GetExecuteClosure());
+    return PackageFormat::CreateSpawnBase(builder, base, executeClosure);
+}
+
+template <>
+flatbuffers::Offset<PackageFormat::Lambda> CHIRSerializer::CHIRSerializerImpl::Serialize(const Lambda& obj)
 {
     CJC_ASSERT(obj.GetBlockGroups().size() == 1);
     CJC_ASSERT(obj.GetBody());
     auto base = Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj));
-    auto funcTy = GetId<Type>(obj.GetFuncType()); // use typeID
+    auto funcTy = GetId<Type>(obj.GetFuncType());
     auto isLocalFunc = obj.IsLocalFunc();
     auto identifier = obj.GetIdentifier();
     auto srcCodeIdentifier = obj.GetSrcCodeIdentifier();
@@ -1312,15 +1145,13 @@ flatbuffers::Offset<PackageFormat::CustomTypeDef> CHIRSerializer::CHIRSerializer
         ? SerializeVec<PackageFormat::MemberVarInfo>(StaticCast<const ClassDef&>(obj).GetDirectInstanceVars())
         : SerializeVec<PackageFormat::MemberVarInfo>(obj.GetAllInstanceVars());
     auto staticMemberVars = GetId<Value>(obj.GetStaticMemberVars());
-    auto attributes = obj.GetAttributeInfo().GetRawAttrs().to_ulong();
     auto annoInfo = Serialize<PackageFormat::AnnoInfo>(obj.GetAnnoInfo());
     auto vtable = SerializeVTable(obj.GetDefVTable());
     auto varInitializationFunc = GetId<Value>(obj.GetVarInitializationFunc());
     return PackageFormat::CreateCustomTypeDefDirect(builder, base, kind, customTypeDefID, srcCodeIdentifier.data(),
         identifier.data(), packageName.data(), type, genericDecl, methods.empty() ? nullptr : &methods,
         implementedInterfaces.empty() ? nullptr : &implementedInterfaces, &instanceMemberVars,
-        staticMemberVars.empty() ? nullptr : &staticMemberVars, attributes, annoInfo, &vtable, nullptr,
-        varInitializationFunc);
+        staticMemberVars.empty() ? nullptr : &staticMemberVars, annoInfo, &vtable, varInitializationFunc);
 }
 
 template <>
@@ -1344,17 +1175,15 @@ template <>
 flatbuffers::Offset<PackageFormat::ClassDef> CHIRSerializer::CHIRSerializerImpl::Serialize(const ClassDef& obj)
 {
     auto base = Serialize<PackageFormat::CustomTypeDef>(static_cast<const CustomTypeDef&>(obj));
-    auto kind = obj.IsInterface() ? PackageFormat::ClassDefKind::ClassDefKind_INTERFACE
-                                  : PackageFormat::ClassDefKind::ClassDefKind_CLASS;
-    auto isAnnotation = obj.IsAnnotation();
-    auto superClass = GetId<Type>(obj.GetSuperClassTy());
-    auto abstractMethods = SerializeVec<PackageFormat::AbstractMethodInfo>(obj.GetAbstractMethods());
-    std::vector<flatbuffers::Offset<flatbuffers::String>> namesVec;
-    for (const auto& name : obj.GetAllMethodMangledNames()) {
-        namesVec.push_back(builder.CreateSharedString(name));
+    std::vector<uint32_t> annotationTargetIds;
+    const std::vector<uint32_t>* annotationTargetsVec = nullptr;
+    if (obj.IsAnnotation()) {
+        annotationTargetIds = GetId<Value>(obj.GetAnnotationTargets());
+        annotationTargetsVec = &annotationTargetIds;
     }
-    return PackageFormat::CreateClassDefDirect(builder, base, kind, isAnnotation,
-        superClass, &abstractMethods, &namesVec);
+    auto superClass = GetId<Type>(obj.GetSuperClassTy());
+    return PackageFormat::CreateClassDefDirect(
+        builder, base, obj.IsClass(), obj.IsAnnotation(), annotationTargetsVec, superClass);
 }
 
 template <>
@@ -1382,69 +1211,40 @@ template <> flatbuffers::Offset<void> CHIRSerializer::CHIRSerializerImpl::Dispat
         case Type::TypeKind::TYPE_UINT32:
         case Type::TypeKind::TYPE_UINT64:
         case Type::TypeKind::TYPE_UINT_NATIVE:
-            typeKind[GetId<Type>(&obj) - 1] = static_cast<uint8_t>(PackageFormat::TypeElem_IntType);
-            return Serialize<PackageFormat::IntType>(static_cast<const IntType&>(obj)).Union();
         case Type::TypeKind::TYPE_FLOAT16:
         case Type::TypeKind::TYPE_FLOAT32:
         case Type::TypeKind::TYPE_FLOAT64:
-            typeKind[GetId<Type>(&obj) - 1] = static_cast<uint8_t>(PackageFormat::TypeElem_FloatType);
-            return Serialize<PackageFormat::FloatType>(static_cast<const FloatType&>(obj)).Union();
         case Type::TypeKind::TYPE_RUNE:
-            typeKind[GetId<Type>(&obj) - 1] = static_cast<uint8_t>(PackageFormat::TypeElem_RuneType);
-            return Serialize<PackageFormat::RuneType>(static_cast<const RuneType&>(obj)).Union();
         case Type::TypeKind::TYPE_BOOLEAN:
-            typeKind[GetId<Type>(&obj) - 1] = static_cast<uint8_t>(PackageFormat::TypeElem_BooleanType);
-            return Serialize<PackageFormat::BooleanType>(static_cast<const BooleanType&>(obj)).Union();
         case Type::TypeKind::TYPE_UNIT:
-            typeKind[GetId<Type>(&obj) - 1] = static_cast<uint8_t>(PackageFormat::TypeElem_UnitType);
-            return Serialize<PackageFormat::UnitType>(static_cast<const UnitType&>(obj)).Union();
         case Type::TypeKind::TYPE_NOTHING:
-            typeKind[GetId<Type>(&obj) - 1] = static_cast<uint8_t>(PackageFormat::TypeElem_NothingType);
-            return Serialize<PackageFormat::NothingType>(static_cast<const NothingType&>(obj)).Union();
         case Type::TypeKind::TYPE_VOID:
-            typeKind[GetId<Type>(&obj) - 1] = static_cast<uint8_t>(PackageFormat::TypeElem_VoidType);
-            return Serialize<PackageFormat::VoidType>(static_cast<const VoidType&>(obj)).Union();
         case Type::TypeKind::TYPE_TUPLE:
-            typeKind[GetId<Type>(&obj) - 1] = static_cast<uint8_t>(PackageFormat::TypeElem_TupleType);
-            return Serialize<PackageFormat::TupleType>(static_cast<const TupleType&>(obj)).Union();
+        case Type::TypeKind::TYPE_CPOINTER:
+        case Type::TypeKind::TYPE_CSTRING:
+        case Type::TypeKind::TYPE_REFTYPE:
+        case Type::TypeKind::TYPE_BOXTYPE:
+        case Type::TypeKind::TYPE_THIS:
+            typeKind[GetId<Type>(&obj) - 1] = static_cast<uint8_t>(PackageFormat::TypeElem_Type);
+            return Serialize<PackageFormat::Type>(static_cast<const Type&>(obj)).Union();
         case Type::TypeKind::TYPE_STRUCT:
-            typeKind[GetId<Type>(&obj) - 1] = static_cast<uint8_t>(PackageFormat::TypeElem_StructType);
-            return Serialize<PackageFormat::StructType>(static_cast<const StructType&>(obj)).Union();
         case Type::TypeKind::TYPE_ENUM:
-            typeKind[GetId<Type>(&obj) - 1] = static_cast<uint8_t>(PackageFormat::TypeElem_EnumType);
-            return Serialize<PackageFormat::EnumType>(static_cast<const EnumType&>(obj)).Union();
+        case Type::TypeKind::TYPE_CLASS:
+            typeKind[GetId<Type>(&obj) - 1] = static_cast<uint8_t>(PackageFormat::TypeElem_CustomType);
+            return Serialize<PackageFormat::CustomType>(static_cast<const CustomType&>(obj)).Union();
         case Type::TypeKind::TYPE_FUNC:
             typeKind[GetId<Type>(&obj) - 1] = static_cast<uint8_t>(PackageFormat::TypeElem_FuncType);
             return Serialize<PackageFormat::FuncType>(static_cast<const FuncType&>(obj)).Union();
-        case Type::TypeKind::TYPE_CLASS:
-            typeKind[GetId<Type>(&obj) - 1] = static_cast<uint8_t>(PackageFormat::TypeElem_ClassType);
-            return Serialize<PackageFormat::ClassType>(static_cast<const ClassType&>(obj)).Union();
         case Type::TypeKind::TYPE_RAWARRAY:
             typeKind[GetId<Type>(&obj) - 1] = static_cast<uint8_t>(PackageFormat::TypeElem_RawArrayType);
             return Serialize<PackageFormat::RawArrayType>(static_cast<const RawArrayType&>(obj)).Union();
         case Type::TypeKind::TYPE_VARRAY:
             typeKind[GetId<Type>(&obj) - 1] = static_cast<uint8_t>(PackageFormat::TypeElem_VArrayType);
             return Serialize<PackageFormat::VArrayType>(static_cast<const VArrayType&>(obj)).Union();
-        case Type::TypeKind::TYPE_CPOINTER:
-            typeKind[GetId<Type>(&obj) - 1] = static_cast<uint8_t>(PackageFormat::TypeElem_CPointerType);
-            return Serialize<PackageFormat::CPointerType>(static_cast<const CPointerType&>(obj)).Union();
-        case Type::TypeKind::TYPE_CSTRING:
-            typeKind[GetId<Type>(&obj) - 1] = static_cast<uint8_t>(PackageFormat::TypeElem_CStringType);
-            return Serialize<PackageFormat::CStringType>(static_cast<const CStringType&>(obj)).Union();
         case Type::TypeKind::TYPE_GENERIC:
             typeKind[GetId<Type>(&obj) - 1] = static_cast<uint8_t>(PackageFormat::TypeElem_GenericType);
             return Serialize<PackageFormat::GenericType>(static_cast<const GenericType&>(obj)).Union();
-        case Type::TypeKind::TYPE_REFTYPE:
-            typeKind[GetId<Type>(&obj) - 1] = static_cast<uint8_t>(PackageFormat::TypeElem_RefType);
-            return Serialize<PackageFormat::RefType>(static_cast<const RefType&>(obj)).Union();
-        case Type::TypeKind::TYPE_BOXTYPE:
-            typeKind[GetId<Type>(&obj) - 1] = static_cast<uint8_t>(PackageFormat::TypeElem_BoxType);
-            return Serialize<PackageFormat::BoxType>(static_cast<const BoxType&>(obj)).Union();
-        case Type::TypeKind::TYPE_THIS:
-            typeKind[GetId<Type>(&obj) - 1] = static_cast<uint8_t>(PackageFormat::TypeElem_ThisType);
-            return Serialize<PackageFormat::ThisType>(static_cast<const ThisType&>(obj)).Union();
-        case Type::TypeKind::TYPE_INVALID:
-        case Type::TypeKind::MAX_TYPE_KIND:
+        default:
             CJC_ABORT();
             return 0;
     }
@@ -1476,6 +1276,9 @@ template <> flatbuffers::Offset<void> CHIRSerializer::CHIRSerializerImpl::Dispat
             return Serialize<PackageFormat::NullLiteral>(static_cast<const NullLiteral&>(obj)).Union();
         case ConstantValueKind::KIND_FUNC:
             return 0;
+        default:
+            CJC_ABORT();
+            return 0;
     }
 }
 
@@ -1490,84 +1293,39 @@ template <> flatbuffers::Offset<void> CHIRSerializer::CHIRSerializerImpl::Dispat
         case Value::ValueKind::KIND_PARAMETER:
             valueKind[GetId<Value>(&obj) - 1] = PackageFormat::ValueElem_Parameter;
             return Serialize<PackageFormat::Parameter>(static_cast<const Parameter&>(obj)).Union();
-        case Value::ValueKind::KIND_IMP_FUNC:
-            valueKind[GetId<Value>(&obj) - 1] = PackageFormat::ValueElem_ImportedFunc;
-            return Serialize<PackageFormat::ImportedFunc>(dynamic_cast<const ImportedFunc&>(obj)).Union();
-        case Value::ValueKind::KIND_IMP_VAR:
-            valueKind[GetId<Value>(&obj) - 1] = PackageFormat::ValueElem_ImportedVar;
-            return Serialize<PackageFormat::ImportedVar>(dynamic_cast<const ImportedVar&>(obj)).Union();
         case Value::ValueKind::KIND_LOCALVAR:
             valueKind[GetId<Value>(&obj) - 1] = PackageFormat::ValueElem_LocalVar;
             return Serialize<PackageFormat::LocalVar>(static_cast<const LocalVar&>(obj)).Union();
         case Value::ValueKind::KIND_FUNC:
-            valueKind[GetId<Value>(&obj) - 1] = PackageFormat::ValueElem_Func;
-            return Serialize<PackageFormat::Func>(dynamic_cast<const Func&>(obj)).Union();
+            valueKind[GetId<Value>(&obj) - 1] = PackageFormat::ValueElem_Function;
+            return Serialize<PackageFormat::Function>(dynamic_cast<const Function&>(obj)).Union();
         case Value::ValueKind::KIND_BLOCK:
             valueKind[GetId<Value>(&obj) - 1] = PackageFormat::ValueElem_Block;
             return Serialize<PackageFormat::Block>(static_cast<const Block&>(obj)).Union();
         case Value::ValueKind::KIND_BLOCK_GROUP:
             valueKind[GetId<Value>(&obj) - 1] = PackageFormat::ValueElem_BlockGroup;
             return Serialize<PackageFormat::BlockGroup>(static_cast<const BlockGroup&>(obj)).Union();
+        default:
+            CJC_ABORT();
+            return 0;
     }
 }
 
 template <> flatbuffers::Offset<void> CHIRSerializer::CHIRSerializerImpl::Dispatch(const Expression& obj)
 {
     switch (obj.GetExprKind()) {
-        case ExprKind::GOTO:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_GoTo;
-            return Serialize<PackageFormat::GoTo>(static_cast<const GoTo&>(obj)).Union();
-        case ExprKind::BRANCH:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_Branch;
-            return Serialize<PackageFormat::Branch>(static_cast<const Branch&>(obj)).Union();
-        case ExprKind::MULTIBRANCH:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_MultiBranch;
-            return Serialize<PackageFormat::MultiBranch>(static_cast<const MultiBranch&>(obj)).Union();
-        case ExprKind::EXIT:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_Exit;
-            return Serialize<PackageFormat::Exit>(static_cast<const Exit&>(obj)).Union();
-        case ExprKind::APPLY_WITH_EXCEPTION:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_ApplyWithException;
-            return Serialize<PackageFormat::ApplyWithException>(static_cast<const ApplyWithException&>(obj)).Union();
-        case ExprKind::INVOKE_WITH_EXCEPTION:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_InvokeWithException;
-            return Serialize<PackageFormat::InvokeWithException>(static_cast<const InvokeWithException&>(obj)).Union();
-        case ExprKind::RAISE_EXCEPTION:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_RaiseException;
-            return Serialize<PackageFormat::RaiseException>(static_cast<const RaiseException&>(obj)).Union();
-        case ExprKind::INT_OP_WITH_EXCEPTION:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_IntOpWithException;
-            return Serialize<PackageFormat::IntOpWithException>(static_cast<const IntOpWithException&>(obj)).Union();
-        case ExprKind::SPAWN_WITH_EXCEPTION:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_SpawnWithException;
-            return Serialize<PackageFormat::SpawnWithException>(static_cast<const SpawnWithException&>(obj)).Union();
-        case ExprKind::TYPECAST_WITH_EXCEPTION:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_TypeCastWithException;
-            return Serialize<PackageFormat::TypeCastWithException>(static_cast<const TypeCastWithException&>(obj))
-                .Union();
-        case ExprKind::INTRINSIC_WITH_EXCEPTION:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_IntrinsicWithException;
-            return Serialize<PackageFormat::IntrinsicWithException>(static_cast<const IntrinsicWithException&>(obj))
-                .Union();
+        case ExprKind::ALLOCATE:
+            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_AllocateBase;
+            return Serialize<PackageFormat::AllocateBase>(static_cast<const Allocate&>(obj)).Union();
         case ExprKind::ALLOCATE_WITH_EXCEPTION:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_AllocateWithException;
-            return Serialize<PackageFormat::AllocateWithException>(static_cast<const AllocateWithException&>(obj))
-                .Union();
-        case ExprKind::INVOKESTATIC_WITH_EXCEPTION:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_InvokeStaticWithException;
-            return Serialize<PackageFormat::InvokeStaticWithException>(
-                static_cast<const InvokeStaticWithException&>(obj))
-                .Union();
-        case ExprKind::RAW_ARRAY_ALLOCATE_WITH_EXCEPTION:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_RawArrayAllocateWithException;
-            return Serialize<PackageFormat::RawArrayAllocateWithException>(
-                static_cast<const RawArrayAllocateWithException&>(obj))
-                .Union();
-        case ExprKind::NEG:
-        case ExprKind::NOT:
-        case ExprKind::BITNOT:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_UnaryExpression;
-            return Serialize<PackageFormat::UnaryExpression>(static_cast<const UnaryExpression&>(obj)).Union();
+            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_AllocateBase;
+            return Serialize<PackageFormat::AllocateBase>(static_cast<const AllocateWithException&>(obj)).Union();
+        case ExprKind::APPLY:
+            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_ApplyBase;
+            return Serialize<PackageFormat::ApplyBase>(static_cast<const Apply&>(obj)).Union();
+        case ExprKind::APPLY_WITH_EXCEPTION:
+            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_ApplyBase;
+            return Serialize<PackageFormat::ApplyBase>(static_cast<const ApplyWithException&>(obj)).Union();
         case ExprKind::ADD:
         case ExprKind::SUB:
         case ExprKind::MUL:
@@ -1587,127 +1345,127 @@ template <> flatbuffers::Offset<void> CHIRSerializer::CHIRSerializerImpl::Dispat
         case ExprKind::NOTEQUAL:
         case ExprKind::AND:
         case ExprKind::OR:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_BinaryExpression;
-            return Serialize<PackageFormat::BinaryExpression>(static_cast<const BinaryExpression&>(obj)).Union();
-        case ExprKind::ALLOCATE:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_Allocate;
-            return Serialize<PackageFormat::Allocate>(static_cast<const Allocate&>(obj)).Union();
-        case ExprKind::LOAD:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_Load;
-            return Serialize<PackageFormat::Load>(static_cast<const Load&>(obj)).Union();
-        case ExprKind::STORE:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_Store;
-            return Serialize<PackageFormat::Store>(static_cast<const Store&>(obj)).Union();
-        case ExprKind::GET_ELEMENT_REF:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_GetElementRef;
-            return Serialize<PackageFormat::GetElementRef>(static_cast<const GetElementRef&>(obj)).Union();
-        case ExprKind::GET_ELEMENT_BY_NAME:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_GetElementByName;
-            return Serialize<PackageFormat::GetElementByName>(static_cast<const GetElementByName&>(obj)).Union();
-        case ExprKind::STORE_ELEMENT_REF:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_StoreElementRef;
-            return Serialize<PackageFormat::StoreElementRef>(static_cast<const StoreElementRef&>(obj)).Union();
-        case ExprKind::STORE_ELEMENT_BY_NAME:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_StoreElementByName;
-            return Serialize<PackageFormat::StoreElementByName>(static_cast<const StoreElementByName&>(obj)).Union();
-        case ExprKind::IF:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_If;
-            return Serialize<PackageFormat::If>(static_cast<const If&>(obj)).Union();
-        case ExprKind::LOOP:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_Loop;
-            return Serialize<PackageFormat::Loop>(static_cast<const Loop&>(obj)).Union();
-        case ExprKind::FORIN_RANGE:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_ForInRange;
-            return Serialize<PackageFormat::ForInRange>(static_cast<const ForInRange&>(obj)).Union();
-        case ExprKind::FORIN_ITER:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_ForInIter;
-            return Serialize<PackageFormat::ForInIter>(static_cast<const ForInIter&>(obj)).Union();
-        case ExprKind::FORIN_CLOSED_RANGE:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_ForInClosedRange;
-            return Serialize<PackageFormat::ForInClosedRange>(static_cast<const ForInClosedRange&>(obj)).Union();
-        case ExprKind::LAMBDA:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_Lambda;
-            return Serialize<PackageFormat::Lambda>(static_cast<const Lambda&>(obj)).Union();
-        case ExprKind::CONSTANT:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_Constant;
-            return Serialize<PackageFormat::Constant>(static_cast<const Constant&>(obj)).Union();
+            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_BinaryExpressionBase;
+            return Serialize<PackageFormat::BinaryExpressionBase>(static_cast<const BinaryExpression&>(obj)).Union();
+        case ExprKind::BRANCH:
+            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_Branch;
+            return Serialize<PackageFormat::Branch>(static_cast<const Branch&>(obj)).Union();
         case ExprKind::DEBUGEXPR:
             exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_Debug;
             return Serialize<PackageFormat::Debug>(static_cast<const Debug&>(obj)).Union();
-        case ExprKind::TUPLE:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_Tuple;
-            return Serialize<PackageFormat::Tuple>(static_cast<const Tuple&>(obj)).Union();
         case ExprKind::FIELD:
             exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_Field;
             return Serialize<PackageFormat::Field>(static_cast<const Field&>(obj)).Union();
         case ExprKind::FIELD_BY_NAME:
             exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_FieldByName;
             return Serialize<PackageFormat::FieldByName>(static_cast<const FieldByName&>(obj)).Union();
-        case ExprKind::APPLY:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_Apply;
-            return Serialize<PackageFormat::Apply>(static_cast<const Apply&>(obj)).Union();
-        case ExprKind::INVOKE:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_Invoke;
-            return Serialize<PackageFormat::Invoke>(static_cast<const Invoke&>(obj)).Union();
-        case ExprKind::INVOKESTATIC:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_InvokeStatic;
-            return Serialize<PackageFormat::InvokeStatic>(static_cast<const InvokeStatic&>(obj)).Union();
-        case ExprKind::INSTANCEOF:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_InstanceOf;
-            return Serialize<PackageFormat::InstanceOf>(static_cast<const InstanceOf&>(obj)).Union();
-        case ExprKind::BOX:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_Box;
-            return Serialize<PackageFormat::Box>(static_cast<const Box&>(obj)).Union();
-        case ExprKind::UNBOX:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_UnBox;
-            return Serialize<PackageFormat::UnBox>(static_cast<const UnBox&>(obj)).Union();
-        case ExprKind::TYPECAST:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_TypeCast;
-            return Serialize<PackageFormat::TypeCast>(static_cast<const TypeCast&>(obj)).Union();
-        case ExprKind::GET_EXCEPTION:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_GetException;
-            return Serialize<PackageFormat::GetException>(static_cast<const GetException&>(obj)).Union();
-        case ExprKind::RAW_ARRAY_ALLOCATE:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_RawArrayAllocate;
-            return Serialize<PackageFormat::RawArrayAllocate>(static_cast<const RawArrayAllocate&>(obj)).Union();
-        case ExprKind::RAW_ARRAY_LITERAL_INIT:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_RawArrayLiteralInit;
-            return Serialize<PackageFormat::RawArrayLiteralInit>(static_cast<const RawArrayLiteralInit&>(obj)).Union();
-        case ExprKind::RAW_ARRAY_INIT_BY_VALUE:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_RawArrayInitByValue;
-            return Serialize<PackageFormat::RawArrayInitByValue>(static_cast<const RawArrayInitByValue&>(obj)).Union();
-        case ExprKind::VARRAY:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_VArray;
-            return Serialize<PackageFormat::VArray>(static_cast<const VArray&>(obj)).Union();
-        case ExprKind::VARRAY_BUILDER:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_VArrayBd;
-            return Serialize<PackageFormat::VArrayBd>(static_cast<const VArrayBuilder&>(obj)).Union();
-        case ExprKind::INTRINSIC:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_Intrinsic;
-            return Serialize<PackageFormat::Intrinsic>(static_cast<const Intrinsic&>(obj)).Union();
-        case ExprKind::SPAWN:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_Spawn;
-            return Serialize<PackageFormat::Spawn>(static_cast<const Spawn&>(obj)).Union();
+        case ExprKind::GET_ELEMENT_BY_NAME:
+            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_GetElementByName;
+            return Serialize<PackageFormat::GetElementByName>(static_cast<const GetElementByName&>(obj)).Union();
+        case ExprKind::GET_ELEMENT_REF:
+            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_GetElementRef;
+            return Serialize<PackageFormat::GetElementRef>(static_cast<const GetElementRef&>(obj)).Union();
         case ExprKind::GET_INSTANTIATE_VALUE:
             exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_GetInstantiateValue;
             return Serialize<PackageFormat::GetInstantiateValue>(static_cast<const GetInstantiateValue&>(obj)).Union();
-        case ExprKind::TRANSFORM_TO_GENERIC:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_TransformToGeneric;
-            return Serialize<PackageFormat::TransformToGeneric>(static_cast<const TransformToGeneric&>(obj)).Union();
-        case ExprKind::TRANSFORM_TO_CONCRETE:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_TransformToConcrete;
-            return Serialize<PackageFormat::TransformToConcrete>(static_cast<const TransformToConcrete&>(obj)).Union();
-        case ExprKind::UNBOX_TO_REF:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_UnBoxToRef;
-            return Serialize<PackageFormat::UnBoxToRef>(static_cast<const UnBoxToRef&>(obj)).Union();
-        case ExprKind::GET_RTTI:
-            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_GetRTTI;
-            return Serialize<PackageFormat::GetRTTI>(static_cast<const GetRTTI&>(obj)).Union();
         case ExprKind::GET_RTTI_STATIC:
             exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_GetRTTIStatic;
             return Serialize<PackageFormat::GetRTTIStatic>(static_cast<const GetRTTIStatic&>(obj)).Union();
+        case ExprKind::INSTANCEOF:
+            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_InstanceOf;
+            return Serialize<PackageFormat::InstanceOf>(static_cast<const InstanceOf&>(obj)).Union();
+        case ExprKind::INT_OP_WITH_EXCEPTION: {
+            const auto& expr = static_cast<const IntOpWithException&>(obj);
+            if (ExprKindMgr::Instance()->GetMajorKind(expr.GetOpKind()) == ExprMajorKind::UNARY_EXPR) {
+                exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_UnaryExpressionBase;
+                return Serialize<PackageFormat::UnaryExpressionBase>(expr).Union();
+            } else {
+                exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_BinaryExpressionBase;
+                return Serialize<PackageFormat::BinaryExpressionBase>(expr).Union();
+            }
+        }
+        case ExprKind::INTRINSIC:
+            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_IntrinsicBase;
+            return Serialize<PackageFormat::IntrinsicBase>(static_cast<const Intrinsic&>(obj)).Union();
+        case ExprKind::INTRINSIC_WITH_EXCEPTION:
+            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_IntrinsicBase;
+            return Serialize<PackageFormat::IntrinsicBase>(static_cast<const IntrinsicWithException&>(obj)).Union();
+        case ExprKind::INVOKE:
+            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_InvokeBase;
+            return Serialize<PackageFormat::InvokeBase>(static_cast<const Invoke&>(obj)).Union();
+        case ExprKind::INVOKE_WITH_EXCEPTION:
+            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_InvokeBase;
+            return Serialize<PackageFormat::InvokeBase>(static_cast<const InvokeWithException&>(obj)).Union();
+        case ExprKind::INVOKESTATIC:
+            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_InvokeBase;
+            return Serialize<PackageFormat::InvokeBase>(static_cast<const InvokeStatic&>(obj)).Union();
+        case ExprKind::INVOKESTATIC_WITH_EXCEPTION:
+            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_InvokeBase;
+            return Serialize<PackageFormat::InvokeBase>(static_cast<const InvokeStaticWithException&>(obj)).Union();
+        case ExprKind::LAMBDA:
+            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_Lambda;
+            return Serialize<PackageFormat::Lambda>(static_cast<const Lambda&>(obj)).Union();
+        case ExprKind::MULTIBRANCH:
+            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_MultiBranch;
+            return Serialize<PackageFormat::MultiBranch>(static_cast<const MultiBranch&>(obj)).Union();
+        case ExprKind::TYPECAST:
+            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_NumericCastBase;
+            return Serialize<PackageFormat::NumericCastBase>(static_cast<const TypeCast&>(obj)).Union();
+        case ExprKind::TYPECAST_WITH_EXCEPTION:
+            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_NumericCastBase;
+            return Serialize<PackageFormat::NumericCastBase>(static_cast<const TypeCastWithException&>(obj)).Union();
+        case ExprKind::RAW_ARRAY_ALLOCATE:
+            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_RawArrayAllocateBase;
+            return Serialize<PackageFormat::RawArrayAllocateBase>(static_cast<const RawArrayAllocate&>(obj)).Union();
+        case ExprKind::RAW_ARRAY_ALLOCATE_WITH_EXCEPTION:
+            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_RawArrayAllocateBase;
+            return Serialize<PackageFormat::RawArrayAllocateBase>(
+                static_cast<const RawArrayAllocateWithException&>(obj)).Union();
+        case ExprKind::SPAWN:
+            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_SpawnBase;
+            return Serialize<PackageFormat::SpawnBase>(static_cast<const Spawn&>(obj)).Union();
+        case ExprKind::SPAWN_WITH_EXCEPTION:
+            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_SpawnBase;
+            return Serialize<PackageFormat::SpawnBase>(static_cast<const SpawnWithException&>(obj)).Union();
+        case ExprKind::STORE_ELEMENT_BY_NAME:
+            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_StoreElementByName;
+            return Serialize<PackageFormat::StoreElementByName>(static_cast<const StoreElementByName&>(obj)).Union();
+        case ExprKind::STORE_ELEMENT_REF:
+            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_StoreElementRef;
+            return Serialize<PackageFormat::StoreElementRef>(static_cast<const StoreElementRef&>(obj)).Union();
+        case ExprKind::NEG:
+        case ExprKind::NOT:
+        case ExprKind::BITNOT:
+            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_UnaryExpressionBase;
+            return Serialize<PackageFormat::UnaryExpressionBase>(static_cast<const UnaryExpression&>(obj)).Union();
+        case ExprKind::GOTO:
+        case ExprKind::EXIT:
+        case ExprKind::RAISE_EXCEPTION:
+        case ExprKind::LOAD:
+        case ExprKind::STORE:
+        case ExprKind::CONSTANT:
+        case ExprKind::FORIN_RANGE:
+        case ExprKind::FORIN_ITER:
+        case ExprKind::FORIN_CLOSED_RANGE:
+        case ExprKind::TUPLE:
+        case ExprKind::BOX:
+        case ExprKind::UNBOX:
+        case ExprKind::GET_EXCEPTION:
+        case ExprKind::RAW_ARRAY_LITERAL_INIT:
+        case ExprKind::RAW_ARRAY_INIT_BY_VALUE:
+        case ExprKind::VARRAY:
+        case ExprKind::VARRAY_BUILDER:
+        case ExprKind::TRANSFORM_TO_GENERIC:
+        case ExprKind::TRANSFORM_TO_CONCRETE:
+        case ExprKind::UNBOX_TO_REF:
+        case ExprKind::GET_RTTI:
+            exprKind[GetId<Expression>(&obj) - 1] = PackageFormat::ExpressionElem_Expression;
+            return Serialize<PackageFormat::Expression>(static_cast<const Expression&>(obj)).Union();
         case ExprKind::INVALID:
         case ExprKind::MAX_EXPR_KINDS:
+            CJC_ABORT();
+            return 0;
+        default:
             CJC_ABORT();
             return 0;
     }
@@ -1728,6 +1486,9 @@ template <> flatbuffers::Offset<void> CHIRSerializer::CHIRSerializerImpl::Dispat
         case CustomDefKind::TYPE_EXTEND:
             defKind[GetId<CustomTypeDef>(&obj) - 1] = PackageFormat::CustomTypeDefElem_ExtendDef;
             return Serialize<PackageFormat::ExtendDef>(static_cast<const ExtendDef&>(obj)).Union();
+        default:
+            CJC_ABORT();
+            return 0;
     }
 }
 
@@ -1768,8 +1529,7 @@ void CHIRSerializer::CHIRSerializerImpl::Save(const std::string& filename, ToCHI
     auto serializedPackage = PackageFormat::CreateCHIRPackageDirect(builder, packageName.c_str(), "",
         PackageFormat::PackageAccessLevel(accesslevel), &typeKind, &allType, &valueKind, &allValue, &exprKind,
         &allExpression, &defKind, &allCustomTypeDef, packageInitFunc, PackageFormat::Phase(phase),
-        packageLiteralInitFunc, maxImportedValueId, maxImportedStructId, maxImportedClassId, maxImportedEnumId,
-        maxImportedExtendId);
+        packageLiteralInitFunc);
 
     builder.Finish(serializedPackage);
     const uint8_t* buf = builder.GetBufferPointer();
@@ -1782,47 +1542,14 @@ void CHIRSerializer::CHIRSerializerImpl::Save(const std::string& filename, ToCHI
 
 void CHIRSerializer::CHIRSerializerImpl::Initialize()
 {
-    // imports
-    for (auto value : package.GetImportedVarAndFuncs()) {
-        valueQueue.push_back(value);
-    }
-    maxImportedValueId = static_cast<uint32_t>(valueQueue.size());
-    for (auto def : package.GetImportedStructs()) {
-        defQueue.push_back(def);
-    }
-    maxImportedStructId = static_cast<uint32_t>(defQueue.size());
-    for (auto def : package.GetImportedClasses()) {
-        defQueue.push_back(def);
-    }
-    maxImportedClassId = static_cast<uint32_t>(defQueue.size());
-    for (auto def : package.GetImportedEnums()) {
-        defQueue.push_back(def);
-    }
-    maxImportedEnumId = static_cast<uint32_t>(defQueue.size());
-    for (auto def : package.GetImportedExtends()) {
-        defQueue.push_back(def);
-    }
-    maxImportedExtendId = static_cast<uint32_t>(defQueue.size());
-    // current package
     for (auto value : package.GetGlobalVars()) {
         valueQueue.push_back(value);
     }
-
-    for (auto def : package.GetStructs()) {
-        defQueue.push_back(def);
-    }
-    for (auto def : package.GetClasses()) {
-        defQueue.push_back(def);
-    }
-    for (auto def : package.GetEnums()) {
-        defQueue.push_back(def);
-    }
-    for (auto def : package.GetExtends()) {
-        defQueue.push_back(def);
-    }
-
-    for (auto value : package.GetGlobalFuncs()) {
+    for (auto value : package.GetGlobalFunctions()) {
         valueQueue.push_back(value);
+    }
+    for (auto def : package.GetAllCustomTypeDef()) {
+        defQueue.push_back(def);
     }
 
     // allocate def id earlier
@@ -1838,4 +1565,17 @@ void CHIRSerializer::CHIRSerializerImpl::Initialize()
         allValue.emplace_back(0);
         valueKind.emplace_back(0);
     }
+}
+
+flatbuffers::DetachedBuffer CHIRSerializer::CHIRSerializerImpl::ConvertToMemoryData()
+{
+    auto accesslevel = package.GetPackageAccessLevel();
+    auto packageName = package.GetName();
+    auto serializedPackage = PackageFormat::CreateCHIRPackageDirect(builder, packageName.c_str(), "",
+        PackageFormat::PackageAccessLevel(accesslevel), &typeKind, &allType, &valueKind, &allValue, &exprKind,
+        &allExpression, &defKind, &allCustomTypeDef, packageInitFunc, PackageFormat::Phase::Phase_RAW,
+        packageLiteralInitFunc);
+
+    builder.Finish(serializedPackage);
+    return builder.Release();
 }

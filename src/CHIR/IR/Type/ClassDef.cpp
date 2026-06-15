@@ -34,35 +34,9 @@ bool ClassDef::HasSuperClass() const
     return GetSuperClassDef() != nullptr;
 }
 
-void ClassDef::PrintAbstractMethod(std::stringstream& ss) const
-{
-    for (auto& method : abstractMethods) {
-        PrintIndent(ss);
-        ss << method.attributeInfo.ToString();
-        ss << "func " << method.methodName << ": " << method.methodTy->ToString() << "\n";
-    }
-}
-
 void ClassDef::SetSuperClassTy(ClassType& ty)
 {
     superClassTy = &ty;
-}
-
-std::string ClassDef::ToString() const
-{
-    std::stringstream ss;
-    PrintAttrAndTitle(ss);
-    ss << " {";
-    PrintComment(ss);
-    ss << "\n";
-
-    PrintLocalVar(ss);
-    PrintStaticVar(ss);
-    PrintMethod(ss);
-    PrintAbstractMethod(ss);
-    PrintVTable(ss);
-    ss << "}";
-    return ss.str();
 }
 
 bool ClassDef::IsAbstract() const
@@ -80,14 +54,19 @@ bool ClassDef::IsClass() const
     return isClass;
 }
 
-void ClassDef::SetAnnotation(bool value)
+void ClassDef::SetAnnotationTargets(std::vector<GlobalVar*>&& targets)
 {
-    isAnnotation = value;
+    annotationTargets = std::move(targets);
 }
 
 bool ClassDef::IsAnnotation() const
 {
-    return isAnnotation;
+    return annotationTargets.has_value();
+}
+
+std::vector<GlobalVar*> ClassDef::GetAnnotationTargets() const
+{
+    return annotationTargets.value_or(std::vector<GlobalVar*>{});
 }
 
 ClassType* ClassDef::GetSuperClassTy() const
@@ -95,7 +74,7 @@ ClassType* ClassDef::GetSuperClassTy() const
     return superClassTy;
 }
 
-FuncBase* ClassDef::GetFinalizer() const
+Function* ClassDef::GetFinalizer() const
 {
     for (auto m : methods) {
         if (m->GetFuncKind() == FuncKind::FINALIZER) {
@@ -103,29 +82,6 @@ FuncBase* ClassDef::GetFinalizer() const
         }
     }
     return nullptr;
-}
-
-void ClassDef::AddAbstractMethod(AbstractMethodInfo methodInfo, bool recordOrder)
-{
-    auto mangledName = methodInfo.GetASTMangledName();
-    CJC_ASSERT(!mangledName.empty());
-    if (recordOrder) {
-        if (std::find(allMethodMangledNames.begin(), allMethodMangledNames.end(), mangledName) ==
-            allMethodMangledNames.end()) {
-            allMethodMangledNames.emplace_back(mangledName);
-        }
-    }
-    abstractMethods.emplace_back(std::move(methodInfo));
-}
-
-std::vector<AbstractMethodInfo> ClassDef::GetAbstractMethods() const
-{
-    return abstractMethods;
-}
-
-void ClassDef::SetAbstractMethods(const std::vector<AbstractMethodInfo>& methods)
-{
-    abstractMethods = methods;
 }
 
 void ClassDef::SetType(CustomType& ty)
@@ -139,35 +95,17 @@ ClassType* ClassDef::GetType() const
     return StaticCast<ClassType>(type);
 }
 
-void ClassDef::PrintComment(std::stringstream& ss) const
+std::string ClassDef::AddExtraComment() const
 {
-    CustomTypeDef::PrintComment(ss);
-    AddCommaOrNot(ss);
-    if (ss.str().empty()) {
-        ss << " // ";
+    if (!IsAnnotation()) {
+        return "";
     }
-    ss << "isAnnotation: " << BoolToString(isAnnotation);
-}
-
-void ClassDef::AddMethod(FuncBase* method, bool recordOrder)
-{
-    CustomTypeDef::AddMethod(method);
-    auto mangledName = method->GetIdentifierWithoutPrefix();
-    CJC_ASSERT(!mangledName.empty());
-    if (recordOrder) {
-        if (std::find(allMethodMangledNames.begin(), allMethodMangledNames.end(), mangledName) ==
-            allMethodMangledNames.end()) {
-            allMethodMangledNames.emplace_back(mangledName);
-        }
+    std::string targetStr;
+    const auto& targets = annotationTargets.value();
+    if (targets.empty()) {
+        targetStr = "[ALL]";
+    } else {
+        targetStr = ValueIdVecToString("[", targets, "]");
     }
-}
-
-const std::vector<std::string>& ClassDef::GetAllMethodMangledNames() const
-{
-    return allMethodMangledNames;
-}
-
-void ClassDef::SetAllMethodMangledNames(const std::vector<std::string>& names)
-{
-    allMethodMangledNames = names;
+    return "AnnoTargets: " + targetStr;
 }

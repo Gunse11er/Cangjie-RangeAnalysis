@@ -125,6 +125,9 @@ bool DeserializeInputCHIR(const std::string& path)
             return false;
         case FileUtil::AccessResultType::OK:
             break;
+        default:
+            CJC_ABORT();
+            break;
     }
     std::unordered_map<unsigned int, std::string> fileNameMap;
     CHIR::CHIRContext cctx(&fileNameMap);
@@ -144,7 +147,9 @@ bool DeserializeInputCHIR(const std::string& path)
 
 int main(int argc, const char** argv)
 {
+#ifndef CANGJIE_ENABLE_GCOV
     try {
+#endif
         RegisterSignalHandler();
         auto args = Utils::StringifyArgumentVector(argc, argv);
         ActionInfo info;
@@ -165,10 +170,8 @@ int main(int argc, const char** argv)
 #ifndef CANGJIE_ENABLE_GCOV
     } catch (const NullPointerException& nullPointerException) {
         Cangjie::ICE::TriggerPointSetter iceSetter(nullPointerException.GetTriggerPoint());
-#else
-    } catch (const std::exception& nullPointerException) {
-#endif
         InternalError("null pointer");
     }
+#endif
     return EXIT_CODE_SUCCESS;
 }

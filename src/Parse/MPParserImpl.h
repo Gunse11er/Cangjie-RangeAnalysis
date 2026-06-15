@@ -38,15 +38,15 @@ public:
 private:
     bool CheckCJMPModifiersOf(const AST::Decl& decl) const;
     bool CheckCJMPModifiersBetween(const AST::Decl& inner, const AST::Decl& outer) const;
-    void CheckCJMPFuncParams(AST::Decl& decl, const Ptr<AST::FuncBody> funcBody) const;
     void CheckSpecificInterface(const AST::InterfaceDecl& decl) const;
     // Diag report
     void DiagOuterDeclMissMatch(const AST::Node& node,
         const std::string& p0, const std::string& p1, const std::string& p2, const std::string& p3) const;
+    bool CompileCommon() const;
+    bool CompilePlatform() const;
 private:
     const ParserImpl* ref;
-    bool compileCommon{false}; // true if compiling common part
-    bool compileSpecific{false}; // true if compiling specific part
+    const GlobalOptions* opts = nullptr;
 };
 
 } // namespace Cangjie

@@ -18,7 +18,7 @@ using OrderedDecl = std::pair<std::vector<Ptr<AST::File>>, std::vector<Ptr<AST::
 class GlobalVarInitializer {
 public:
     explicit GlobalVarInitializer(Translator& trans, const ImportManager& importManager,
-        std::vector<FuncBase*>& initFuncsForConstVar, bool enableIncre)
+        std::vector<Function*>& initFuncsForConstVar, bool enableIncre)
         : builder(trans.builder),
           globalSymbolTable(trans.globalSymbolTable),
           opts(trans.opts),
@@ -40,40 +40,40 @@ public:
 private:
     void CreatePackageInit(const AST::Package& curPackage, const InitOrder& initOrder);
     void CreatePackageLiteralInit(const AST::Package& curPackage, const InitOrder& initOrder);
-    inline std::pair<Func*, Block*> PreparePackageInit(const AST::Package& curPackage);
-    inline std::pair<Func*, Block*> PreparePackageLiteralInit(const AST::Package& curPackage);
-    void InsertInitializerIntoPackageInitializer(FuncBase& init, Func& packageInit);
-    FuncBase* TranslateSingleInitializer(const AST::VarDecl& decl);
+    inline std::pair<Function*, Block*> PreparePackageInit(const AST::Package& curPackage);
+    inline std::pair<Function*, Block*> PreparePackageLiteralInit(const AST::Package& curPackage);
+    void InsertInitializerIntoPackageInitializer(Function& init, Function& packageInit);
+    Function* TranslateSingleInitializer(const AST::VarDecl& decl);
     bool IsIncrementalNoChange(const AST::VarDecl& decl) const;
-    Func* TranslateInitializerToFunction(const AST::VarDecl& decl);
-    ImportedFunc* TranslateIncrementalNoChangeVar(const AST::VarDecl& decl);
+    Function* TranslateInitializerToFunction(const AST::VarDecl& decl);
+    Function* TranslateIncrementalNoChangeVar(const AST::VarDecl& decl);
     Ptr<Value> GetGlobalVariable(const AST::VarDecl& decl);
-    template <typename T, typename... Args> Ptr<Func> CreateGVInitFunc(const T& node, Args&& ... args) const;
-    void RemoveInitializerForVarDecl(const AST::VarDecl& varDecl, Func& fileInit) const;
+    template <typename T, typename... Args> Ptr<Function> CreateGVInitFunc(const T& node, Args&& ... args) const;
+    void RemoveInitializerForVarDecl(const AST::VarDecl& varDecl, Function& fileInit) const;
     void RemoveCommonInitializersReplacedWithSpecific(
-        Func& fileInit, const std::vector<Ptr<const AST::Decl>>& decls) const;
-    Ptr<Func> TryGetFileInitialializer(const AST::File& file, const std::string& suffix = "");
-    Ptr<Func> TranslateFileInitializer(const AST::File& file, const std::vector<Ptr<const AST::Decl>>& decls);
-    Ptr<Func> TranslateFileLiteralInitializer(const AST::File& file, const std::vector<Ptr<const AST::Decl>>& decls);
-    Func* TranslateVarWithPatternInitializer(const AST::VarWithPatternDecl& decl);
-    Func* TranslateWildcardPatternInitializer(const AST::VarWithPatternDecl& decl);
-    Func* TranslateTupleOrEnumPatternInitializer(const AST::VarWithPatternDecl& decl);
+        Function& fileInit, const std::vector<Ptr<const AST::Decl>>& decls) const;
+    Ptr<Function> TryGetFileInitializer(const AST::File& file, const std::string& suffix = "");
+    Ptr<Function> TranslateFileInitializer(const AST::File& file, const std::vector<Ptr<const AST::Decl>>& decls);
+    Ptr<Function> TranslateFileLiteralInitializer(
+        const AST::File& file, const std::vector<Ptr<const AST::Decl>>& decls);
+    Function* TranslateVarWithPatternInitializer(const AST::VarWithPatternDecl& decl);
+    Function* TranslateWildcardPatternInitializer(const AST::VarWithPatternDecl& decl);
+    Function* TranslateTupleOrEnumPatternInitializer(const AST::VarWithPatternDecl& decl);
     void FillGVInitFuncWithApplyAndExit(const std::vector<Ptr<Value>>& varInitFuncs);
     void AddImportedPackageInit(const AST::Package& curPackage, const std::string& suffix = "");
-    Ptr<Func> GetImportsInitFunc(const AST::Package& curPackage, const std::string& suffix = "");
-    Ptr<Func> CreateImportsInitFunc(const AST::Package& curPackage, const std::string& suffix = "");
-    void UpdateImportsInit(const AST::Package& curPackage, Func& importsInitFunc, const std::string& suffix = "");
+    Ptr<Function> GetImportsInitFunc(const AST::Package& curPackage, const std::string& suffix = "");
+    Ptr<Function> CreateImportsInitFunc(const AST::Package& curPackage, const std::string& suffix = "");
+    void UpdateImportsInit(const AST::Package& curPackage, Function& importsInitFunc, const std::string& suffix = "");
     void AddGenericInstantiatedInit();
-    Ptr<Func> GeneratePackageInitBase(const AST::Package& curPackage, const std::string& suffix = "");
-    void InsertAnnotationVarInitInto(Func& packageInit);
+    Ptr<Function> GeneratePackageInitBase(const AST::Package& curPackage, const std::string& suffix = "");
     bool NeedVarLiteralInitFunc(const AST::Decl& decl);
-    FuncBase* TranslateVarInit(const AST::Decl& var);
+    Function* TranslateVarInit(const AST::Decl& var);
 
     // Add methods for CJMP
     template<typename T>
     T* TryGetDeserialized(const std::string& mangledName)
     {
-        // merging specific
+        // merging platform
         if (opts.IsCompilingCJMPSpecific()) {
             return TryGetFromCache<Value, T>(GLOBAL_VALUE_PREFIX + mangledName, trans.deserializedVals);
         }
@@ -85,7 +85,7 @@ private:
     AST2CHIRNodeMap<Value>& globalSymbolTable;
     const GlobalOptions& opts;
     const ImportManager& importManager;
-    std::vector<FuncBase*>& initFuncsForConstVar;
+    std::vector<Function*>& initFuncsForConstVar;
     Translator& trans;
     bool enableIncre;
 };

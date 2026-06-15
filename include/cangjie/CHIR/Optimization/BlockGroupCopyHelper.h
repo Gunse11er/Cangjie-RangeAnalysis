@@ -15,6 +15,7 @@
 
 #include "cangjie/CHIR/IR/CHIRBuilder.h"
 #include "cangjie/CHIR/IR/Expression/Terminator.h"
+#include "cangjie/CHIR/IR/Value/Value.h"
 
 namespace Cangjie::CHIR {
 /**
@@ -35,11 +36,11 @@ public:
 
     /**
      * @brief main entry for copying block group, return result block group and its return value.
-     * @param other block group copy from
-     * @param parentFunc parent func where copy block in
+     * @param oldBG block group copy from
+     * @param newBG block group copy block in
      * @return
      */
-    std::pair<BlockGroup*, LocalVar*> CloneBlockGroup(const BlockGroup& other, Func& parentFunc);
+    std::pair<std::vector<Block*>, LocalVar*> CloneBlockGroup(const BlockGroup& oldBG, BlockGroup& newBG);
 
     /**
      * @brief get instantiation map from apply call, using for function instantiation.
@@ -47,26 +48,18 @@ public:
      * @param newBodyOuterFunction func that encloses new body to decide this type conversion,
      *  use apply's top level function if nullptr
      */
-    void GetInstMapFromApply(const Apply& apply, const FuncBase* newBodyOuterFunction = nullptr);
+    void GetInstMapFromApply(const Apply& apply, const Function* newBodyOuterFunction = nullptr);
 
-    /**
-     * @brief replace value with extra value map, such as parameter value map from old block group.
-     * @param block block to replace value
-     * @param valueMap extra value map to replace value
-     */
-    void SubstituteValue(Ptr<BlockGroup> block, std::unordered_map<Value*, Value*>& valueMap);
+    static void ReplaceExprOperands(std::vector<Block*>& blocks, const std::unordered_map<Value*, Value*>& valueMap);
 private:
-    void InstBlockGroup(Ptr<BlockGroup> group);
+    void InstBlockGroup(std::vector<Block*>& blocks);
 
     static void CollectValueMap(const Lambda& oldLambda, const Lambda& newLambda,
         std::unordered_map<Value*, Value*>& valueMap, std::unordered_set<Expression*>& newDebugs);
-    static void CollectValueMap(const Block& oldBlk, const Block& newBlk,
+    static void CollectValueMap(Block& oldBlk, Block& newBlk,
         std::unordered_map<Value*, Value*>& valueMap, std::unordered_set<Expression*>& newDebugs);
-    static void CollectValueMap(const BlockGroup& oldBG, const BlockGroup& newBG,
+    static void CollectValueMap(const BlockGroup& oldBG, std::vector<Block*>& newBlocks,
         std::unordered_map<Value*, Value*>& valueMap, std::unordered_set<Expression*>& newDebugs);
-
-    static void ReplaceExprOperands(const Block& block, const std::unordered_map<Value*, Value*>& valueMap);
-    static void ReplaceExprOperands(const BlockGroup& bg, const std::unordered_map<Value*, Value*>& valueMap);
 
     // map for block group instantiation
     std::unordered_map<const GenericType*, Type*> instMap;
@@ -75,7 +68,7 @@ private:
     CHIRBuilder& builder;
 };
 
-void FixCastProblemAfterInst(Ptr<BlockGroup> group, CHIRBuilder& builder);
+void FixCastProblemAfterInst(std::vector<Block*>& blocks, CHIRBuilder& builder);
 }  // namespace Cangjie::CHIR
 
 #endif

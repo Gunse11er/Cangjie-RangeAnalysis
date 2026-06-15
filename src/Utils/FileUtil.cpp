@@ -51,6 +51,13 @@ constexpr char BACKSLASH = '\\';
 constexpr char BACKTICK = '`';
 constexpr std::string_view TEST_FILE_NAME{"_test.cj"};
 
+#ifdef __arm__
+    const size_t FILE_LEN_LIMIT = 2ULL * 1024 * 1024 * 1024; // 2 GB for arm32
+    const std::string FILE_LEN_LIMIT_STR = "2 GB";
+#else
+    const size_t FILE_LEN_LIMIT = 4ULL * 1024 * 1024 * 1024; // 4 GB
+    const std::string FILE_LEN_LIMIT_STR = "4 GB";
+#endif
 #ifdef _WIN32
 inline int Mkdir(const std::string& path)
 {
@@ -563,7 +570,7 @@ bool ReadBinaryFileToBuffer(const std::string& filePath, std::vector<uint8_t>& b
         failedReason = "empty binary file";
     }
     if (fileLength >= FILE_LEN_LIMIT) {
-        failedReason = "exceed the max file length: 4 GB";
+        failedReason = "exceed the max file length: " + FILE_LEN_LIMIT_STR;
     }
     if (!failedReason.empty()) {
         is.close();
@@ -655,7 +662,7 @@ std::optional<std::string> ReadFileContent(const std::string& filePath, std::str
     }
     size_t len = GetFileSize(realFilePath.value());
     if (len >= FILE_LEN_LIMIT) {
-        failedReason = "exceed the max file length: 4 GB";
+        failedReason = "exceed the max file length: " + FILE_LEN_LIMIT_STR;
         is.close();
         return std::nullopt;
     }
@@ -1397,8 +1404,8 @@ std::string ToCjoFileName(std::string_view fullPackageName)
     constexpr std::string::difference_type dcSize = 2;
     if (auto it = fullPackageName.find(dc); it != std::string::npos) {
         // packageName@orgName
-        return std::string{fullPackageName.substr(it + dcSize)} + std::string{ORG_NAME_SEPARATOR}
-            + std::string{fullPackageName.substr(0, it)};
+        return std::string{fullPackageName.substr(it + dcSize)} + std::string{ORG_NAME_SEPARATOR} +
+            std::string{fullPackageName.substr(0, it)};
     }
     return std::string{fullPackageName};
 }

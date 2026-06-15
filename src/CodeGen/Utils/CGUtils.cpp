@@ -55,8 +55,8 @@ const std::unordered_map<ChirTypeKind, std::string> TYPE_MANGLING_LUT = {
     {ChirTypeKind::TYPE_VOID, "u"},
 };
 
-void GetGenericArgsFromCHIRTypeHelper(const Cangjie::CHIR::Type& type, std::vector<size_t> path,
-    std::vector<Cangjie::CodeGen::GenericTypeAndPath>& res)
+void GetGenericArgsFromCHIRTypeHelper(
+    const Cangjie::CHIR::Type& type, std::vector<size_t> path, std::vector<Cangjie::CodeGen::GenericTypeAndPath>& res)
 {
     auto baseType = Cangjie::CodeGen::DeRef(type);
     if (baseType->IsGeneric()) {
@@ -77,13 +77,13 @@ void GetGenericArgsFromCHIRTypeHelper(const Cangjie::CHIR::Type& type, std::vect
 
 namespace Cangjie {
 namespace CodeGen {
+
 int64_t GetIntMaxOrMin(IRBuilder2& irBuilder, const CHIR::IntType& ty, bool isMax)
 {
     auto tyKind = irBuilder.GetTypeKindFromType(ty);
     auto minMax = G_SIGNED_INT_MAP.at(tyKind);
     return isMax ? minMax.second : minMax.first;
 }
-
 
 std::vector<llvm::Metadata*> UnwindGenericRelateType(llvm::LLVMContext& llvmCtx, const CHIR::Type& ty)
 {
@@ -96,7 +96,7 @@ std::vector<llvm::Metadata*> UnwindGenericRelateType(llvm::LLVMContext& llvmCtx,
         std::string ttName = CGType::GetNameOfTypeTemplateGV(ty);
         tyArgMeta.emplace_back(llvm::MDString::get(llvmCtx, ttName));
         auto tyArg = ty.GetTypeArgs()[0];
-        if (tyArg->IsValueType()) {
+        if (CGType::GetCGGenericKind(*tyArg) == CGType::CGGenericKind::CONCRETE) {
             std::string tiName = CGType::GetNameOfTypeInfoGV(*tyArg);
             tyArgMeta.emplace_back(llvm::MDString::get(llvmCtx, tiName));
         } else {
@@ -645,6 +645,24 @@ void ReplaceDelimiterAfterOrgName(std::string& packageName) {
     if (auto splitterIt = packageName.find("::"); splitterIt != std::string::npos) {
         packageName.replace(splitterIt, 2U, "/");
     }
+}
+
+std::vector<std::pair<CHIR::Function*, CHIR::FuncType*>> GetInstAbstractMethodTypes(
+    const CHIR::ClassType& interfaceTy, CHIR::CHIRBuilder& builder)
+{
+    std::vector<std::pair<CHIR::Function*, CHIR::FuncType*>> res;
+    auto typeArgs = interfaceTy.GetGenericArgs();
+    auto paramArgs = interfaceTy.GetClassDef()->GetGenericTypeParams();
+    std::unordered_map<const GenericType*, Type*> instMap;
+    CJC_ASSERT(typeArgs.size() == paramArgs.size());
+    for (size_t i = 0; i < typeArgs.size(); ++i) {
+        instMap.emplace(paramArgs[i], typeArgs[i]);
+    }
+    for (auto method : interfaceTy.GetClassDef()->GetMethods()) {
+        auto instFuncType = CHIR::ReplaceRawGenericArgType(*method->GetType(), instMap, builder);
+        res.emplace_back(std::make_pair(method, StaticCast<CHIR::FuncType*>(instFuncType)));
+    }
+    return res;
 }
 } // namespace CodeGen
 } // namespace Cangjie

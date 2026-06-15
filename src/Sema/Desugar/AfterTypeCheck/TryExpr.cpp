@@ -30,7 +30,7 @@ OwnedPtr<RefExpr> CreateRefSome(FuncTy& funcTy)
     CJC_NULLPTR_CHECK(decl);
     auto refExpr = CreateRefExpr(*decl);
     (void)refExpr->ref.targets.emplace_back(decl); // for `GetFuncTargets`
-    refExpr->ty = &funcTy;
+    refExpr->SetTy(&funcTy);
     refExpr->instTys = enumTy.typeArgs;
     return refExpr;
 }
@@ -41,7 +41,7 @@ OwnedPtr<RefExpr> CreateRefNone(EnumTy& enumTy)
     auto decl = LookupEnumMember(enumTy.declPtr, OPTION_NONE_CTOR);
     CJC_NULLPTR_CHECK(decl);
     auto refExpr = CreateRefExpr(*decl);
-    refExpr->ty = &enumTy;
+    refExpr->SetTy(&enumTy);
     refExpr->instTys = enumTy.typeArgs;
     return refExpr;
 }
@@ -63,8 +63,9 @@ OwnedPtr<ThrowExpr> CreateThrowExpr(const VarPattern& vp)
 OwnedPtr<MatchExpr> CreateMatchExpr(FuncTy& someTy, VarDecl& freshExc, OwnedPtr<Expr> noneBody)
 {
     // `case Some(v) => throw v`
-    CJC_ASSERT(Ty::IsTyCorrect(freshExc.ty) && freshExc.ty->IsEnum() && freshExc.ty->typeArgs.size() == 1);
-    auto vp = CreateVarPattern(V_COMPILER, freshExc.ty->typeArgs.front());
+    CJC_ASSERT(
+        Ty::IsTyCorrect(freshExc.GetTy()) && freshExc.GetTy()->IsEnum() && freshExc.GetTy()->typeArgs.size() == 1);
+    auto vp = CreateVarPattern(V_COMPILER, freshExc.GetTy()->typeArgs.front());
     auto throwExpr = CreateThrowExpr(*vp);
     auto somePattern = MakeOwnedNode<EnumPattern>();
     somePattern->constructor = CreateRefSome(someTy);
@@ -72,13 +73,13 @@ OwnedPtr<MatchExpr> CreateMatchExpr(FuncTy& someTy, VarDecl& freshExc, OwnedPtr<
     auto caseSome = CreateMatchCase(std::move(somePattern), std::move(throwExpr));
     // `case None => noneBody`
     auto nonePattern = MakeOwnedNode<EnumPattern>();
-    nonePattern->constructor = CreateRefNone(StaticCast<EnumTy&>(*freshExc.ty));
+    nonePattern->constructor = CreateRefNone(StaticCast<EnumTy&>(*freshExc.GetTy()));
     auto caseNone = CreateMatchCase(std::move(nonePattern), std::move(noneBody));
     // `match`
     std::vector<OwnedPtr<MatchCase>> matchCases;
     (void)matchCases.emplace_back(std::move(caseSome));
     (void)matchCases.emplace_back(std::move(caseNone));
-    return CreateMatchExpr(CreateRefExpr(freshExc), std::move(matchCases), nullptr);
+    return CreateMatchExpr(CreateRefExpr(freshExc), std::move(matchCases), TypeManager::GetInvalidTy());
 }
 
 // Create `x.isClosed()` or `x.close()`.
@@ -112,14 +113,14 @@ OwnedPtr<CallExpr> CreateCallExpr(VarDecl& vd, Decl& func)
 OwnedPtr<TryExpr> TypeChecker::TypeCheckerImpl::CreateTryInFinally(
     ASTContext& ctx, ClassDecl& exceptionDecl, FuncTy& someTy, VarDecl& x, VarDecl& freshExc)
 {
-    CJC_ASSERT(Ty::IsTyCorrect(freshExc.ty) && freshExc.ty->typeArgs.size() == 1);
-    auto vp = CreateVarPattern(V_COMPILER, freshExc.ty->typeArgs.front());
+    CJC_ASSERT(Ty::IsTyCorrect(freshExc.GetTy()) && freshExc.GetTy()->typeArgs.size() == 1);
+    auto vp = CreateVarPattern(V_COMPILER, freshExc.GetTy()->typeArgs.front());
     // `if`
     std::vector<OwnedPtr<Node>> thenBlockNodes;
 
     auto findFunc = [this, &ctx, &x](const std::string& fieldName) -> Ptr<Decl> {
-        LookupInfo info{x.ty, x.curFile, true, true, false};
-        std::vector<Ptr<Decl>> decls = FieldLookup(ctx, Ty::GetDeclPtrOfTy(x.ty), fieldName, info);
+        LookupInfo info{x.GetTy(), x.curFile, true, true, false};
+        std::vector<Ptr<Decl>> decls = FieldLookup(ctx, Ty::GetDeclPtrOfTy(x.GetTy()), fieldName, info);
         Ptr<Decl> func = nullptr;
         for (auto& decl : decls) {
             if (auto funcDecl = DynamicCast<FuncDecl*>(decl); funcDecl && funcDecl->funcBody &&
@@ -180,8 +181,9 @@ OwnedPtr<TryExpr> TypeChecker::TypeCheckerImpl::CreateTryInFinally(
 OwnedPtr<TryExpr> TypeChecker::TypeCheckerImpl::CreateTryCatchFinally(
     ASTContext& ctx, ClassDecl& exceptionDecl, FuncTy& someTy, VarDecl& x, VarDecl& freshExc, OwnedPtr<Block> tryBlock)
 {
-    CJC_ASSERT(Ty::IsTyCorrect(freshExc.ty) && freshExc.ty->IsEnum() && freshExc.ty->typeArgs.size() == 1);
-    auto vp = CreateVarPattern(V_COMPILER, freshExc.ty->typeArgs.front());
+    CJC_ASSERT(
+        Ty::IsTyCorrect(freshExc.GetTy()) && freshExc.GetTy()->IsEnum() && freshExc.GetTy()->typeArgs.size() == 1);
+    auto vp = CreateVarPattern(V_COMPILER, freshExc.GetTy()->typeArgs.front());
     std::vector<OwnedPtr<FuncArg>> args;
     (void)args.emplace_back(CreateFuncArg(CreateRefExpr(*vp->varDecl)));
     auto assignExpr = CreateAssignExpr(CreateRefExpr(freshExc), CreateCallExpr(CreateRefSome(someTy), std::move(args)));
@@ -265,32 +267,32 @@ OwnedPtr<Block> TypeChecker::TypeCheckerImpl::CreateOuterTryBlock(ASTContext& ct
  */
 void TypeChecker::TypeCheckerImpl::DesugarTryWithResourcesExpr(ASTContext& ctx, TryExpr& te)
 {
-    if (te.resourceSpec.empty() || !Ty::IsTyCorrect(te.ty)) {
+    if (te.resourceSpec.empty() || !Ty::IsTyCorrect(te.GetTy())) {
         return;
     }
     auto exceptionDecl = importManager.GetCoreDecl<ClassDecl>(CLASS_EXCEPTION);
     CJC_NULLPTR_CHECK(exceptionDecl);
     auto optionDecl = StaticCast<EnumDecl*>(importManager.GetCoreDecl("Option"));
     CJC_NULLPTR_CHECK(optionDecl);
-    auto noneTy = typeManager.GetEnumTy(*optionDecl, {exceptionDecl->ty});
+    auto noneTy = typeManager.GetEnumTy(*optionDecl, {exceptionDecl->GetTy()});
     CJC_NULLPTR_CHECK(noneTy);
-    auto someTy = typeManager.GetFunctionTy({exceptionDecl->ty}, noneTy);
+    auto someTy = typeManager.GetFunctionTy({exceptionDecl->GetTy()}, noneTy);
     auto unitTy = TypeManager::GetPrimitiveTy(TypeKind::TYPE_UNIT);
     // try-with-resources expression is of type Unit.
-    if (!typeManager.IsSubtype(te.tryBlock->ty, unitTy)) {
+    if (!typeManager.IsSubtype(te.tryBlock->GetTy(), unitTy)) {
         (void)te.tryBlock->body.emplace_back(CreateUnitExpr(unitTy));
-        te.tryBlock->ty = unitTy;
+        te.tryBlock->SetTy(unitTy);
     }
     auto tryBlock = CreateOuterTryBlock(ctx, *exceptionDecl, *someTy, *noneTy, te.resourceSpec, std::move(te.tryBlock));
     // Only try-block needs `Synthesize`. `catch` and `finally` were checked by `SynTryWithResourcesExpr`.
     // And they will be moved to the desugar try expression.
-    SynthesizeWithoutRecover(ctx, tryBlock.get());
-    CJC_ASSERT(Ty::IsTyCorrect(tryBlock->ty) && tryBlock->ty->IsUnit());
+    SynthesizeWithoutRecover({ctx, SynPos::EXPR_ARG}, tryBlock.get());
+    CJC_ASSERT(Ty::IsTyCorrect(tryBlock->GetTy()) && tryBlock->GetTy()->IsUnit());
     for (auto& block : te.catchBlocks) {
         CJC_NULLPTR_CHECK(block);
-        if (!typeManager.IsSubtype(block->ty, unitTy)) {
+        if (!typeManager.IsSubtype(block->GetTy(), unitTy)) {
             (void)block->body.emplace_back(CreateUnitExpr(unitTy));
-            block->ty = unitTy;
+            block->SetTy(unitTy);
         }
     }
     auto emptyCatchAndFinally = te.catchBlocks.empty() && te.finallyBlock == nullptr;
@@ -300,7 +302,7 @@ void TypeChecker::TypeCheckerImpl::DesugarTryWithResourcesExpr(ASTContext& ctx, 
     tryExpr->catchPatterns = std::move(te.catchPatterns);
     tryExpr->catchBlocks = std::move(te.catchBlocks);
     tryExpr->finallyBlock = emptyCatchAndFinally ? std::move(finallyBlock) : std::move(te.finallyBlock);
-    tryExpr->ty = unitTy;
+    tryExpr->SetTy(unitTy);
     CopyBasicInfo(&te, tryExpr.get());
     AddCurFile(*tryExpr, te.curFile);
     te.desugarExpr = std::move(tryExpr);

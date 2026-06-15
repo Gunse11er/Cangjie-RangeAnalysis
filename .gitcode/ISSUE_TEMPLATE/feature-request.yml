@@ -1,5 +1,5 @@
 name: "新需求|Feature"
-description: "您需要反馈或实现一个新需求时，使用此模板。  Please use this template when you need to request or implement a new feature."
+description: "您需要反馈或实现一个新需求时，使用此模板。 &#124; Please use this template when you need to request or implement a new feature."
 title: "[Feature]: "
 labels: ["enhancement"]
 body:

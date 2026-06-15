@@ -33,7 +33,7 @@ void MarkUpperBoundIgnored(const Node& node, Generic& generic)
 {
     for (const auto& constraint : generic.genericConstraints) {
         for (const auto& upperBound : constraint->upperBounds) {
-            if (upperBound->ty->HasGeneric()) {
+            if (upperBound->GetTy()->HasGeneric()) {
                 // If the upper bound has generic param, must not check it to prevent infinite recursion.
                 upperBound->visitedByWalkerID = node.visitedByWalkerID;
             }
@@ -44,13 +44,13 @@ void MarkUpperBoundIgnored(const Node& node, Generic& generic)
 std::pair<Ptr<Ty>, Ptr<Decl>> GetRealReferenceType(const Node& node)
 {
     auto target = GetRealTarget(node.GetTarget());
-    auto baseTy = node.ty; // Ty is guaranteed by caller.
+    auto baseTy = node.GetTy(); // Ty is guaranteed by caller.
     // If target is constructor, instantiate outer structure declaration.
     if (target && IsClassOrEnumConstructor(*target)) {
         target = target->outerDecl;
         CJC_ASSERT(target != nullptr);
-        if (node.ty->IsFunc()) {
-            baseTy = RawStaticCast<FuncTy*>(node.ty)->retTy;
+        if (node.GetTy()->IsFunc()) {
+            baseTy = RawStaticCast<FuncTy*>(node.GetTy())->retTy;
         }
     }
     return {baseTy, target};
@@ -75,12 +75,12 @@ void StructInheritanceChecker::CheckInstMemberSignatures(
     auto members = structInheritedMembers[&decl];
     for (auto& member : decl.GetMemberDecls()) {
         CJC_NULLPTR_CHECK(member);
-        if (!Ty::IsTyCorrect(member->ty) || !member->outerDecl) {
+        if (!Ty::IsTyCorrect(member->GetTy()) || !member->outerDecl) {
             continue;
         }
         // Add constructors and private functions again for instantiated member's checking.
         if (IsInstanceConstructor(*member) || member->TestAttr(Attribute::PRIVATE)) {
-            (void)UpdateInheritedMemberIfNeeded(members, MemberSignature{member, member->ty, decl.ty});
+            (void)UpdateInheritedMemberIfNeeded(members, MemberSignature{member, member->GetTy(), decl.GetTy()});
         }
     }
     MemberMap genericTyMembers;
@@ -125,11 +125,11 @@ void StructInheritanceChecker::CheckInstMemberSignatures(
 std::set<Ptr<ExtendDecl>, CmpNodeByPos> StructInheritanceChecker::GetVisibleExtendsForInstantiation(
     const Decl& decl, const std::vector<Ptr<Ty>>& instTys)
 {
-    if (decl.astKind == ASTKind::EXTEND_DECL || !Ty::IsTyCorrect(decl.ty)) {
+    if (decl.astKind == ASTKind::EXTEND_DECL || !Ty::IsTyCorrect(decl.GetTy())) {
         return {};
     }
     std::set<Ptr<ExtendDecl>, CmpNodeByPos> orderedVisibleExtends;
-    auto extends = typeManager.GetAllExtendsByTy(*decl.ty);
+    auto extends = typeManager.GetAllExtendsByTy(*decl.GetTy());
     for (auto& extend : extends) {
         // Check for extend decl if it is defined in current package or it has external attribute,
         // and also the instantiation meets extend constraints.
@@ -187,7 +187,7 @@ bool StructInheritanceChecker::WillCauseInfiniteInstantiation(
     };
     bool hasSelfRecursion = false;
     for (size_t i = 0; i < instTys.size(); ++i) {
-        genericTy = generic->typeParameters[i]->ty; // Update ty which captured by lambda;
+        genericTy = generic->typeParameters[i]->GetTy(); // Update ty which captured by lambda;
         hasSelfRecursion = std::any_of(instTys[i]->typeArgs.begin(), instTys[i]->typeArgs.end(), checkRecursion);
         if (hasSelfRecursion) {
             break;
@@ -208,7 +208,7 @@ VisitAction StructInheritanceChecker::CheckInstDupFuncsRecursively(Node& node)
     if (node.astKind == ASTKind::GENERIC) {
         MarkUpperBoundIgnored(node, static_cast<Generic&>(node));
     }
-    if (!Ty::IsTyCorrect(node.ty) || node.TestAttr(Attribute::HAS_BROKEN)) {
+    if (!Ty::IsTyCorrect(node.GetTy()) || node.TestAttr(Attribute::HAS_BROKEN)) {
         return VisitAction::WALK_CHILDREN;
     }
     auto [baseTy, target] = GetRealReferenceType(node);
@@ -269,14 +269,14 @@ void StructInheritanceChecker::CheckInstantiatedDecl(Decl& decl, const std::vect
         return; // Do not check for builtin decl.
     }
     TypeSubst typeMapping;
-    if (auto ed = DynamicCast<ExtendDecl*>(&decl); ed && ed->ty && ed->ty->IsNominal()) {
+    if (auto ed = DynamicCast<ExtendDecl*>(&decl); ed && ed->GetTy() && ed->GetTy()->IsNominal()) {
         // For extend decl of a user defined type, treat the extend decl members' type as inside origin type decl.
-        auto target = Ty::GetDeclPtrOfTy(ed->ty);
+        auto target = Ty::GetDeclPtrOfTy(ed->GetTy());
         if (target == nullptr) {
             return;
         }
         typeMapping = GenerateTypeMapping(*target, instTys);
-        typeMapping.merge(GenerateTypeMapping(decl, ed->ty->typeArgs));
+        typeMapping.merge(GenerateTypeMapping(decl, ed->GetTy()->typeArgs));
     } else {
         typeMapping = GenerateTypeMapping(decl, instTys);
     }
@@ -306,7 +306,7 @@ void StructInheritanceChecker::CheckInstWithCStructTypeArg(const Node& node)
     }
     if (auto rt = DynamicCast<const RefType*>(&node); rt) {
         if (!rt->typeArguments.empty()) {
-            CheckCStructArguments(*rt, *rt->ty, rt->leftAnglePos, rt->GetTypeArgs());
+            CheckCStructArguments(*rt, *rt->GetTy(), rt->leftAnglePos, rt->GetTypeArgs());
         }
         return;
     }
@@ -334,10 +334,10 @@ void StructInheritanceChecker::CheckInstWithCStructTypeArg(const Node& node)
     }
     auto typeArgs = ref.GetTypeArgs();
     if (ref.instTys.size() == typeArgs.size()) {
-        auto ty = ref.ty;
+        auto ty = ref.GetTy();
         if (ref.astKind == ASTKind::REF_EXPR && target->TestAttr(Attribute::CONSTRUCTOR)) {
             CJC_NULLPTR_CHECK(target->outerDecl);
-            ty = target->outerDecl->ty;
+            ty = target->outerDecl->GetTy();
         }
         Position leftAnglePos = ref.astKind == ASTKind::REF_EXPR ? static_cast<const RefExpr&>(ref).leftAnglePos
                                                                  : static_cast<const MemberAccess&>(ref).leftAnglePos;
@@ -362,7 +362,7 @@ void StructInheritanceChecker::CheckCStructArguments(const Node& node, const AST
 
 void StructInheritanceChecker::CheckCStructArgument(const Ty& ty, const Type& typeArg)
 {
-    if (!Ty::IsTyCorrect(typeArg.ty)) {
+    if (!Ty::IsTyCorrect(typeArg.GetTy())) {
         return;
     }
     // Transitional state, only one will be retained in the future.
@@ -370,16 +370,16 @@ void StructInheritanceChecker::CheckCStructArgument(const Ty& ty, const Type& ty
         // The type arg of CPointer constraint:
         // 1. CPointer<T>, defined in core/CPointer.cj
         // 2. CPointer<`CType`>
-        if (!typeArg.ty->IsGeneric() && !Ty::IsMetCType(*typeArg.ty)) {
+        if (!typeArg.GetTy()->IsGeneric() && !Ty::IsMetCType(*typeArg.GetTy())) {
             diag.Diagnose(typeArg, DiagKind::sema_illegal_cpointer_generic_type);
         }
         return;
     }
     // Only Array<CString>, Array<CPointer> is allowed. Other CType argument is not.
-    if (ty.IsStructArray() && (typeArg.ty->IsCString() || typeArg.ty->IsPointer())) {
+    if (ty.IsStructArray() && (typeArg.GetTy()->IsCString() || typeArg.GetTy()->IsPointer())) {
         return;
     }
-    CheckCStruct(*typeArg.ty, typeArg);
+    CheckCStruct(*typeArg.GetTy(), typeArg);
 }
 
 void StructInheritanceChecker::CheckCStruct(const Ty& ty, const Type& typeArg)

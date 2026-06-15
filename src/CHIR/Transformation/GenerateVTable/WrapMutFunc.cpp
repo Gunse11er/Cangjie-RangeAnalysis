@@ -17,132 +17,156 @@ using namespace Cangjie::CHIR;
 using namespace Cangjie;
 
 namespace {
-void GetAllInstantiatedParentType2(ClassType& cur, ClassType& targetParent, CHIRBuilder& builder,
-    std::vector<ClassType*>& parents, std::unordered_map<const GenericType*, Type*>& replaceTable,
-    std::unordered_set<ClassType*>& visited, bool& stop)
+/**
+ * DFS for a path from `cur` to `targetParent` (same ClassType object identity) in the inheritance graph.
+ * On success, `outPath` is [target, ..., cur] with instantiated types.
+ */
+bool FindPathToTarget(ClassType& cur, ClassType& targetParent, CHIRBuilder& builder,
+    const std::unordered_map<const GenericType*, Type*>& replaceTable, std::vector<ClassType*>& outPath,
+    std::unordered_set<ClassType*>& onPath)
 {
-    if (stop) {
-        return;
-    }
-    if (std::find(visited.begin(), visited.end(), &cur) != visited.end()) {
-        return;
-    }
     if (&cur == &targetParent) {
-        stop = true;
+        outPath.push_back(StaticCast<ClassType*>(ReplaceRawGenericArgType(cur, replaceTable, builder)));
+        return true;
     }
+    if (!onPath.insert(&cur).second) {
+        return false;
+    }
+
+    auto unwindAndRecord =
+        [&](ClassType& child, const std::unordered_map<const GenericType*, Type*>& childReplaceTable) {
+        if (FindPathToTarget(child, targetParent, builder, childReplaceTable, outPath, onPath)) {
+            outPath.push_back(StaticCast<ClassType*>(ReplaceRawGenericArgType(cur, replaceTable, builder)));
+            return true;
+        }
+        return false;
+    };
+
     for (auto ex : cur.GetCustomTypeDef()->GetExtends()) {
         // maybe we can meet `extend<T> A<B<T>> {}`, and `curType` is A<Int32>, then ignore this def,
         // so not need to check `res`
         auto [res, extendTable] = ex->GetExtendedType()->CalculateGenericTyMapping(cur);
+        if (!res) {
+            continue;
+        }
         for (auto interface : ex->GetImplementedInterfaceTys()) {
-            GetAllInstantiatedParentType2(*interface, targetParent, builder, parents, extendTable, visited, stop);
-            if (!stop) {
-                CJC_ASSERT(parents.back() == interface);
-                parents.pop_back();
+            if (unwindAndRecord(*interface, extendTable)) {
+                onPath.erase(&cur);
+                return true;
             }
         }
     }
     for (auto interface : cur.GetImplementedInterfaceTys(&builder)) {
-        GetAllInstantiatedParentType2(*interface, targetParent, builder, parents, replaceTable, visited, stop);
-        if (!stop) {
-            CJC_ASSERT(parents.back() == interface);
-            parents.pop_back();
+        if (unwindAndRecord(*interface, replaceTable)) {
+            onPath.erase(&cur);
+            return true;
         }
     }
     if (cur.GetSuperClassTy(&builder) != nullptr) {
         auto superClass = cur.GetSuperClassTy(&builder);
-        GetAllInstantiatedParentType2(*superClass, targetParent, builder, parents, replaceTable, visited, stop);
-        if (!stop) {
-            CJC_ASSERT(parents.back() == superClass);
-            parents.pop_back();
+        if (unwindAndRecord(*superClass, replaceTable)) {
+            onPath.erase(&cur);
+            return true;
         }
     }
-    visited.emplace(&cur);
-    parents.emplace_back(Cangjie::StaticCast<ClassType*>(ReplaceRawGenericArgType(cur, replaceTable, builder)));
+    onPath.erase(&cur);
+    return false;
 }
 
 std::vector<ClassType*> GetTargetInheritanceList(CustomTypeDef& curDef, ClassType& targetParent, CHIRBuilder& builder)
 {
-    std::vector<ClassType*> inheritanceList;
-    std::unordered_set<ClassType*> visited;
+    std::vector<ClassType*> path;
+    std::unordered_set<ClassType*> onPath;
     std::unordered_map<const GenericType*, Type*> emptyTable;
-    bool stop = false;
-    for (auto interface : curDef.GetImplementedInterfaceTys()) {
-        GetAllInstantiatedParentType2(*interface, targetParent, builder, inheritanceList, emptyTable, visited, stop);
-        if (!stop) {
-            CJC_ASSERT(inheritanceList.back() == interface);
-            inheritanceList.pop_back();
+
+    auto tryFrom = [&](ClassType& start) -> bool {
+        path.clear();
+        onPath.clear();
+        return FindPathToTarget(start, targetParent, builder, emptyTable, path, onPath);
+    };
+
+    auto structTy = StaticCast<StructType*>(curDef.GetType());
+    for (auto iface : structTy->GetImplementedInterfaceTys(&builder)) {
+        if (tryFrom(*iface)) {
+            return path;
         }
     }
-    if (curDef.IsClassLike()) {
-        auto superClass = StaticCast<ClassDef*>(&curDef)->GetSuperClassTy();
-        if (superClass != nullptr) {
-            GetAllInstantiatedParentType2(
-                *superClass, targetParent, builder, inheritanceList, emptyTable, visited, stop);
-            if (!stop) {
-                CJC_ASSERT(inheritanceList.back() == superClass);
-                inheritanceList.pop_back();
-            }
-        }
-    }
-    CJC_ASSERT(stop);
-    return inheritanceList;
+    CJC_ASSERT(false);
+    return path;
 }
 
-std::unordered_map<const GenericType*, Type*> CollectReplaceTableFromAllParents(
-    CustomTypeDef& curDef, ClassType& srcClassTy, CHIRBuilder& builder)
+std::unordered_map<const GenericType*, Type*> CollectReplaceTable(
+    CustomTypeDef& curDef, ClassType& targetParent, Function& rawFunc, CHIRBuilder& builder)
 {
+    auto inheritanceList = GetTargetInheritanceList(curDef, targetParent, builder);
     std::unordered_map<const GenericType*, Type*> replaceTable;
-
-    auto parentTypes = GetTargetInheritanceList(curDef, srcClassTy, builder);
-    for (auto parentType : parentTypes) {
-        auto instTypeArgs = parentType->GetTypeArgs();
-        auto genericTypeArgs = parentType->GetCustomTypeDef()->GetGenericTypeParams();
-        for (size_t i = 0; i < genericTypeArgs.size(); ++i) {
-            replaceTable.emplace(genericTypeArgs[i], instTypeArgs[i]);
+    bool found = false;
+    auto targetParentDef = rawFunc.GetParentCustomTypeDef();
+    for (auto parent : inheritanceList) {
+        if (parent->GetCustomTypeDef() != targetParentDef) {
+            continue;
         }
+        std::tie(found, replaceTable) = parent->GetCustomTypeDef()->GetType()->CalculateGenericTyMapping(*parent);
+        CJC_ASSERT(found);
+        break;
     }
     return replaceTable;
 }
+
+std::vector<GenericType*> CreateWrapperFuncGenericParams(Function& rawFunc, const std::string& funcIdentifier,
+    std::unordered_map<const GenericType*, Type*>& replaceTable, CHIRBuilder& builder)
+{
+    std::vector<GenericType*> wrapperGenericParams;
+    auto rawFuncGenericParams = rawFunc.GetGenericTypeParams();
+    wrapperGenericParams.reserve(rawFuncGenericParams.size());
+    for (size_t i = 0; i < rawFuncGenericParams.size(); ++i) {
+        auto srcIdentifier = "fT" + std::to_string(i);
+        auto tyIdentifier = funcIdentifier + '_' + srcIdentifier;
+        auto wrapperGenericParam = builder.GetType<GenericType>(tyIdentifier, srcIdentifier);
+        wrapperGenericParams.emplace_back(wrapperGenericParam);
+        replaceTable[rawFuncGenericParams[i]] = wrapperGenericParam;
+    }
+    for (size_t i = 0; i < wrapperGenericParams.size(); ++i) {
+        std::vector<Type*> newUpperBounds;
+        for (auto ty : rawFuncGenericParams[i]->GetUpperBounds()) {
+            newUpperBounds.emplace_back(ReplaceRawGenericArgType(*ty, replaceTable, builder));
+        }
+        wrapperGenericParams[i]->SetUpperBounds(newUpperBounds);
+    }
+    return wrapperGenericParams;
+}
 } // namespace
 
-void WrapMutFunc::CreateMutFuncWrapper(FuncBase* rawFunc, CustomTypeDef& curDef, ClassType& srcClassTy)
+void WrapMutFunc::CreateMutFuncWrapper(Function& rawFunc, CustomTypeDef& curDef, ClassType& srcClassTy)
 {
     // create the wrapper func
-    auto replaceTable = CollectReplaceTableFromAllParents(curDef, srcClassTy, builder);
+    auto replaceTable = CollectReplaceTable(curDef, srcClassTy, rawFunc, builder);
+    auto funcIdentifier = CHIRMangling::GenerateVirtualFuncMangleName(&rawFunc, curDef, &srcClassTy, false);
+    auto wrapperGenericParams = CreateWrapperFuncGenericParams(rawFunc, funcIdentifier, replaceTable, builder);
 
-    auto instFuncTy = StaticCast<FuncType*>(ReplaceRawGenericArgType(*rawFunc->GetFuncType(), replaceTable, builder));
+    auto instFuncTy = StaticCast<FuncType*>(ReplaceRawGenericArgType(*rawFunc.GetFuncType(), replaceTable, builder));
     auto wrapperParamsTy = instFuncTy->GetParamTypes();
-    auto parentDefType = curDef.IsExtend() ? StaticCast<ExtendDef>(curDef).GetExtendedType() : curDef.GetType();
+    auto parentDefType = curDef.GetType();
     wrapperParamsTy[0] = builder.GetType<RefType>(parentDefType);
     auto retTy = instFuncTy->GetReturnType();
     auto wrapperFuncTy = builder.GetType<FuncType>(wrapperParamsTy, retTy);
 
-    auto funcIdentifier = CHIRMangling::GenerateVirtualFuncMangleName(rawFunc, curDef, &srcClassTy, false);
     auto pkgName = curDef.GetPackageName();
+    auto func = builder.CreateFunction(wrapperFuncTy, funcIdentifier, "", "", pkgName, wrapperGenericParams);
+    wrapperFuncs.emplace(funcIdentifier, func);
 
-    bool isImported = curDef.TestAttr(Attribute::IMPORTED);
-    FuncBase* funcBase = nullptr;
-    if (isImported) {
-        funcBase = builder.CreateImportedVarOrFunc<ImportedFunc>(wrapperFuncTy, funcIdentifier, "", "", pkgName);
-    } else {
-        funcBase = builder.CreateFunc(INVALID_LOCATION, wrapperFuncTy, funcIdentifier, "", "", pkgName);
-    }
-    wrapperFuncs.emplace(funcIdentifier, funcBase);
-    CJC_NULLPTR_CHECK(funcBase);
+    func->Set<WrappedRawMethod>(&rawFunc);
+    func->AppendAttributeInfo(rawFunc.GetAttributeInfo());
+    func->DisableAttr(Attribute::VIRTUAL);
+    func->EnableAttr(Attribute::NO_REFLECT_INFO);
+    curDef.AddMethod(func);
 
-    funcBase->Set<WrappedRawMethod>(rawFunc);
-    funcBase->AppendAttributeInfo(rawFunc->GetAttributeInfo());
-    funcBase->DisableAttr(Attribute::VIRTUAL);
-    funcBase->EnableAttr(Attribute::NO_REFLECT_INFO);
-    curDef.AddMethod(funcBase);
-
-    if (isImported) {
+    if (curDef.TestAttr(Attribute::IMPORTED)) {
+        func->EnableAttr(Attribute::IMPORTED);
         return;
     }
 
-    auto func = DynamicCast<Func*>(funcBase);
-    CJC_NULLPTR_CHECK(func);
+    func->DisableAttr(Attribute::IMPORTED);
     // create the func body
     BlockGroup* body = builder.CreateBlockGroup(*func);
     func->InitBody(*body);
@@ -158,15 +182,21 @@ void WrapMutFunc::CreateMutFuncWrapper(FuncBase* rawFunc, CustomTypeDef& curDef,
         Cangjie::CHIR::CreateAndAppendExpression<Allocate>(builder, builder.GetType<RefType>(retTy), retTy, entry);
     func->SetReturnValue(*ret->GetResult());
 
-    auto rawFuncFirstArgType = rawFunc->GetFuncType()->GetParamTypes()[0]->StripAllRefs();
+    auto rawFuncFirstArgType = rawFunc.GetFuncType()->GetParamTypes()[0]->StripAllRefs();
     auto firstArgType = GetInstSubType(*rawFuncFirstArgType, srcClassTy, builder);
-    if (!firstArgType->IsValueType() || rawFunc->TestAttr(Attribute::MUT)) {
+    if (!firstArgType->IsValueType() || rawFunc.TestAttr(Attribute::MUT)) {
         firstArgType = builder.GetType<RefType>(firstArgType);
     }
     args[0] = Cangjie::CHIR::TypeCastOrBoxIfNeeded(*args[0], *firstArgType, builder, *entry, INVALID_LOCATION);
 
-    auto apply = Cangjie::CHIR::CreateAndAppendExpression<Apply>(builder, retTy, rawFunc, FuncCallContext{
+    std::vector<Type*> instArgTypes;
+    instArgTypes.reserve(wrapperGenericParams.size());
+    for (auto wrapperGenericParam : wrapperGenericParams) {
+        instArgTypes.emplace_back(wrapperGenericParam);
+    }
+    auto apply = Cangjie::CHIR::CreateAndAppendExpression<Apply>(builder, retTy, &rawFunc, FuncCallContext{
         .args = args,
+        .instTypeArgs = instArgTypes,
         .thisType = curDef.GetType()}, entry);
     Cangjie::CHIR::CreateAndAppendExpression<Store>(
         builder, builder.GetUnitTy(), apply->GetResult(), func->GetReturnValue(), entry);
@@ -202,7 +232,7 @@ void WrapMutFunc::Run(CustomTypeDef& customTypeDef)
     }
     for (auto& vtableIt : customTypeDef.GetDefVTable().GetTypeVTables()) {
         for (auto& methodInfo : vtableIt.GetVirtualMethods()) {
-            if (methodInfo.GetVirtualMethod() == nullptr) {
+            if (methodInfo.GetVirtualMethod()->IsPureAbstract()) {
                 continue;
             }
             auto rawFunc = methodInfo.GetVirtualMethod();
@@ -216,7 +246,7 @@ void WrapMutFunc::Run(CustomTypeDef& customTypeDef)
                 ex && ex->GetExtendedCustomTypeDef() == rawFunc->GetParentCustomTypeDef()) {
                 continue;
             }
-            CreateMutFuncWrapper(rawFunc, customTypeDef, *vtableIt.GetSrcParentType());
+            CreateMutFuncWrapper(*rawFunc, customTypeDef, *vtableIt.GetSrcParentType());
         }
     }
 }
@@ -225,7 +255,7 @@ WrapMutFunc::WrapMutFunc(CHIRBuilder& b) : builder(b)
 {
 }
 
-std::unordered_map<std::string, FuncBase*>&& WrapMutFunc::GetWrappers()
+std::unordered_map<std::string, Function*>&& WrapMutFunc::GetWrappers()
 {
     return std::move(wrapperFuncs);
 }

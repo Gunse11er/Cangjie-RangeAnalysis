@@ -11,10 +11,10 @@
  */
 
 #include "cangjie/Basic/StringConvertor.h"
-
 #include "cangjie/Lex/Lexer.h"
 
 #ifdef _WIN32
+#include <limits>
 #include <wchar.h>
 #include <windows.h>
 #endif
@@ -27,15 +27,16 @@ std::optional<std::wstring> CodePageToUTF16(unsigned codepage, const std::string
 {
     std::wstring utf16;
     if (!original.empty()) {
-        int len = MultiByteToWideChar(
-            codepage, MB_ERR_INVALID_CHARS, const_cast<char*>(original.data()), original.size(), nullptr, 0);
+        auto originalSize = static_cast<int>(original.size());
+        int len = MultiByteToWideChar(codepage, MB_ERR_INVALID_CHARS, original.data(), originalSize, nullptr, 0);
         if (len <= 0) {
             return {};
         }
-        utf16.reserve(len + 1);
-        utf16.resize(len);
-        len = MultiByteToWideChar(codepage, MB_ERR_INVALID_CHARS, const_cast<char*>(original.data()), original.size(),
-            const_cast<wchar_t*>(utf16.data()), utf16.size());
+        auto utf16Size = static_cast<std::wstring::size_type>(len);
+        utf16.reserve(utf16Size + 1);
+        utf16.resize(utf16Size);
+        len = MultiByteToWideChar(codepage, MB_ERR_INVALID_CHARS, original.data(), originalSize, utf16.data(),
+            static_cast<int>(utf16.size()));
         if (len <= 0) {
             return {};
         }
@@ -47,15 +48,16 @@ std::optional<std::string> UTF16ToCodePage(unsigned codepage, std::wstring& utf1
 {
     std::string converted;
     if (!utf16.empty()) {
-        int len = WideCharToMultiByte(
-            codepage, 0, const_cast<wchar_t*>(utf16.data()), utf16.size(), nullptr, 0, nullptr, nullptr);
+        auto utf16Size = static_cast<int>(utf16.size());
+        int len = WideCharToMultiByte(codepage, 0, utf16.data(), utf16Size, nullptr, 0, nullptr, nullptr);
         if (len <= 0) {
             return {};
         }
-        converted.reserve(len + 1);
-        converted.resize(len);
-        len = WideCharToMultiByte(codepage, 0, const_cast<wchar_t*>(utf16.data()), utf16.size(),
-            const_cast<char*>(converted.data()), converted.size(), nullptr, nullptr);
+        auto convertedSize = static_cast<std::string::size_type>(len);
+        converted.reserve(convertedSize + 1);
+        converted.resize(convertedSize);
+        len = WideCharToMultiByte(codepage, 0, utf16.data(), utf16Size, converted.data(),
+            static_cast<int>(converted.size()), nullptr, nullptr);
         if (len <= 0) {
             return {};
         }
@@ -115,7 +117,6 @@ bool IsGBK(const std::string& data)
 
 bool IsUTF8(const std::string& data)
 {
-    size_t num = 0;
     size_t i = 0;
     const size_t MIN_PRENUM = 3;
     while (i < data.size()) {
@@ -124,7 +125,7 @@ bool IsUTF8(const std::string& data)
             i++;
             continue;
         }
-        size_t num = PreNum(data[i]);
+        size_t num = PreNum(static_cast<unsigned char>(data[i]));
         if (num < MIN_PRENUM) {
             // In UTF-8 encoding, multiple bytes must contain at least 2 bytes,
             // the min number of bytes used by the character is 3.

@@ -7,12 +7,20 @@
 #ifndef CANGJIE_CHIR_ANALYSIS_VALUE_RANGE_ANALYSIS_H
 #define CANGJIE_CHIR_ANALYSIS_VALUE_RANGE_ANALYSIS_H
 
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
 #include <type_traits>
+#include <unordered_map>
+#include <vector>
 
 #include "cangjie/CHIR/Analysis/BoolDomain.h"
+#include "cangjie/CHIR/Analysis/Results.h"
 #include "cangjie/CHIR/Analysis/SIntDomain.h"
 #include "cangjie/CHIR/Analysis/ValueAnalysis.h"
-#include "cangjie/CHIR/Utils/DiagAdapter.h"
+#include "cangjie/Basic/DiagnosticEngine.h"
 #include "cangjie/CHIR/Utils/Utils.h"
 
 namespace Cangjie::CHIR {
@@ -64,6 +72,8 @@ class SIntRange : public ValueRange {
 public:
     explicit SIntRange(SIntDomain domain);
 
+    SIntRange(SIntDomain domain, std::optional<std::vector<SInt>> exactValues);
+
     ~SIntRange() override = default;
 
     /// join two range, return nullopt if no change happened.
@@ -76,8 +86,11 @@ public:
     /// get range kind, get BOOL for this range type.
     const SIntDomain& GetVal() const;
 
+    const std::optional<std::vector<SInt>>& GetExactValues() const;
+
 private:
     SIntDomain domain;
+    std::optional<std::vector<SInt>> exactValues;
 };
 
 /**
@@ -119,6 +132,8 @@ template <> RangeValueDomain HandleNonNullLiteralValue<RangeValueDomain>(const L
  */
 class RangeAnalysis final : public ValueAnalysis<RangeValueDomain> {
 public:
+    using ContextResultVisitor = std::function<void(const Function*, const std::string&, Results<RangeDomain>&)>;
+
     RangeAnalysis() = delete;
     /**
      * @brief range analysis constructor.
@@ -127,9 +142,13 @@ public:
      * @param isDebug flag whether print debug log.
      * @param diag reporter to report warning or error.
      */
-    RangeAnalysis(const Func* func, CHIRBuilder& builder, bool isDebug, const Ptr<DiagAdapter>& diag);
+    RangeAnalysis(const Function* func, CHIRBuilder& builder, bool isDebug, DiagnosticEngine& diag);
 
     ~RangeAnalysis() override;
+
+    static void VisitContextSensitiveResults(const ContextResultVisitor& visitor);
+
+    static void ClearContextSensitiveResults();
 
     /**
      * @brief get bool domain of CHIR value from state.
@@ -156,6 +175,13 @@ public:
     bool CheckInQueueTimes(const Block* block, RangeDomain& curState) override;
 
 private:
+    struct ContextAbstractValue;
+    struct ContextualSummary;
+    using ContextArguments = std::vector<ContextAbstractValue>;
+
+    RangeAnalysis(const Function* func, CHIRBuilder& builder, bool isDebug, DiagnosticEngine* diag,
+        ContextArguments contextArguments);
+
     template <class Domain,
         typename = typename std::enable_if<std::is_same_v<Domain, SIntDomain> || std::is_same_v<Domain, BoolDomain>>>
     void PrintDebugMessage(const Ptr<const Expression>& expr, const Domain& domain) const
@@ -180,6 +206,31 @@ private:
     std::optional<SIntDomain> TryComputeSimpleInductionUpdateRange(const BinaryExpression* binaryExpr) const;
 
     void HandleOthersExpr(RangeDomain& state, const Expression* expression);
+
+    void HandleApplyExpr(RangeDomain& state, const Apply* apply, Value* refObj) override;
+
+    std::optional<Block*> HandleApplyWithExceptionTerminator(
+        RangeDomain& state, const ApplyWithException* apply, Value* refObj) override;
+
+    void HandleContextSensitiveCall(
+        RangeDomain& state, Value* calleeValue, const std::vector<Value*>& args, Value* result);
+
+    std::optional<ContextAbstractValue> AnalyzeCalleeWithContext(
+        const Function* callee, const ContextArguments& arguments);
+
+    std::optional<ContextAbstractValue> SummarizeReturnValue(const Function* callee, Results<RangeDomain>& results);
+
+    ContextAbstractValue CaptureContextValue(const RangeDomain& state, Value* value, bool preserveIntervals) const;
+
+    void ApplyContextValue(RangeDomain& state, Value* dest, const ContextAbstractValue& value) const;
+
+    static std::mutex& GetContextSummaryMutex();
+
+    static std::unordered_map<std::string, ContextualSummary>& GetContextSummaryCache();
+
+    static std::vector<std::string>& GetContextSummaryOrder();
+
+    static std::unordered_map<const Function*, size_t>& GetContextCounts();
 
     // ======================= Transfer functions for terminators ======================= //
 
@@ -213,7 +264,11 @@ private:
 
     BoolDomain GenerateBoolRangeFromBinaryOp(RangeDomain& state, const Ptr<const BinaryExpression>& binaryExpr) const;
 
-    DiagAdapter* diag;
+    void InitializeFuncEntryState(RangeDomain& state) override;
+
+    DiagnosticEngine* diag;
+
+    ContextArguments contextArguments;
 
     std::unordered_map<const Block*, uint32_t> inqueueTimes;
 };

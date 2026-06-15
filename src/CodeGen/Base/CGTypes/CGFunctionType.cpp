@@ -29,7 +29,7 @@ CGFunctionType::CGFunctionType(
 }
 
 CGFunctionType::CGFunctionType(
-    CGModule& cgMod, CGContext& cgCtx, const CHIR::FuncBase& chirFunc, const TypeExtraInfo& extraInfo)
+    CGModule& cgMod, CGContext& cgCtx, const CHIR::Function& chirFunc, const TypeExtraInfo& extraInfo)
     : CGType(cgMod, cgCtx,
           chirFunc.Get<CHIR::OverrideSrcFuncType>() ? *chirFunc.Get<CHIR::OverrideSrcFuncType>() : *chirFunc.GetType(),
           CGTypeKind::CG_FUNCTION)

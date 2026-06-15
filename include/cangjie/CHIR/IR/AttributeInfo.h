@@ -8,9 +8,8 @@
 #define CANGJIE_CHIR_ATTRIBUTEINFO_H
 
 #include <bitset>
-#include <stdint.h>
-#include <unordered_map>
 #include <cstdint>
+#include <unordered_map>
 
 namespace Cangjie::CHIR {
 
@@ -34,24 +33,24 @@ enum class Attribute {
     FOREIGN, ///< Mark whether a declaration is a foreign one.
 
     MUT,      ///< Mark whether a declaration is a mutable one.
-    FINAL,    /**< Mark a Func override a parent class's func, and this func self does not have VIRTUAL Attribute. */
+    FINAL,    /**< Mark a func override a parent class's func, and this func self does not have VIRTUAL Attribute. */
     OPERATOR, ///< Mark whether a declaration is a operator one.
     READONLY,             ///< 'let x = xxx', 'x' enable READONLY attribute
     CONST,                ///< correspond `const` keyword in Cangjie source code.
     IMPORTED,             ///< Mark whether variable、func、enum、struct、class is imported from other package.
-    GENERIC_INSTANTIATED, ///< Mark whether a `GlobalVar/Func/Type` is instantiated.
+    GENERIC_INSTANTIATED, ///< Mark whether a `GlobalVar/Function/Type` is instantiated.
     NO_DEBUG_INFO,        ///< Mark a `Value` doesn't contain debug info, like line/column number.
     GENERIC,              ///< Mark a declaration is generic
-    INTERNAL,             ///< GlobalVar/Func/Enum/Class/Struct/Interface is visible in current and sub package.
+    INTERNAL,             ///< GlobalVar/Function/Enum/Class/Struct/Interface is visible in current and sub package.
     COMPILER_ADD,         ///< Mark a `Value` is added by compiler, like "copied default func from interface".
 
     // compiler attribute
     NO_REFLECT_INFO, ///< Mark a `Value` is't used by `reflect` feature.
-    NO_INLINE,       ///< Mark a Func can't be inlined.
-    NON_RECOMPILE,   ///< only used in `ImportedValue` in incremental compilation, indicate this ImportedValue is
+    NO_INLINE,       ///< Mark a Function can't be inlined.
+    NON_RECOMPILE,   ///< only used in imported global var/func in incremental compilation, indicate this value is
                      ///< converted from a decl in current package that is not recompiled.
     UNREACHABLE,     ///< Mark a Block is unreachable.
-    NO_SIDE_EFFECT,  ///< Mark a Func does't have side effect.
+    NO_SIDE_EFFECT,  ///< Mark a Function does't have side effect.
     COMMON,          ///< Mark whether it's common declaration.
     SPECIFIC,        ///< Mark whether it's specific declaration.
     SKIP_ANALYSIS,   ///< Mark node that is not used for analysis.
@@ -67,6 +66,7 @@ enum class Attribute {
     OBJ_C_MIRROR,     ///< Mark whether it's @ObjCMirror declaration (binding for an Objective-C type).
     HAS_INITED_FIELD, ///< Mark whether a node is a special flag, which marks the class instance as initialized.
     JAVA_HAS_DEFAULT, ///< Mark whether JAVA_MIRROR interface has default method.
+    PREVIOUSLY_DESERIALIZED, /// Mark that deserialization occurs not in the newly created node, but in an existing one.
 
     ATTR_END
 };
@@ -86,7 +86,8 @@ const std::unordered_map<Attribute, std::string> ATTR_TO_STRING{{Attribute::STAT
     {Attribute::SKIP_ANALYSIS, "skip_analysis"}, {Attribute::DESERIALIZED, "deserialized"},
     {Attribute::INITIALIZER, "initializer"},
     {Attribute::UNSAFE, "unsafe"}, {Attribute::JAVA_MIRROR, "javaMirror"}, {Attribute::JAVA_IMPL, "javaImpl"},
-    {Attribute::OBJ_C_MIRROR, "objCMirror"}, {Attribute::HAS_INITED_FIELD, "hasInitedField"}};
+    {Attribute::OBJ_C_MIRROR, "objCMirror"}, {Attribute::HAS_INITED_FIELD, "hasInitedField"},
+    {Attribute::JAVA_HAS_DEFAULT, "javaHasDefault"}, {Attribute::PREVIOUSLY_DESERIALIZED, "previouslyDeserialized"}};
 
 constexpr uint64_t ATTR_SIZE = 64;
 

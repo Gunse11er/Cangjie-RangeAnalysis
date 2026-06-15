@@ -12,11 +12,11 @@ using namespace Cangjie;
 Ptr<Value> Translator::Visit(const AST::TypeConvExpr& typeConvExpr)
 {
     const auto& loc = TranslateLocation(typeConvExpr);
-    auto chirType = TranslateType(*typeConvExpr.ty);
+    auto chirType = TranslateType(*typeConvExpr.GetTy());
     auto operand = TranslateExprArg(*typeConvExpr.expr);
 
-    auto srcTy = typeConvExpr.expr->ty;
-    auto targetTy = typeConvExpr.ty.get();
+    auto srcTy = typeConvExpr.expr->GetTy();
+    auto targetTy = typeConvExpr.GetTy().get();
     if (srcTy->IsFunc() || srcTy->IsTuple()) {
         return CreateWrappedTypeCast(loc, chirType, operand, currentBlock)->GetResult();
     }

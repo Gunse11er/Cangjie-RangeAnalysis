@@ -98,7 +98,7 @@ void CollectStaticMember(const InheritableDecl& id, std::vector<Ptr<Decl>>& ret)
     }
     // Look up parent interface.
     for (auto& inheritedType : id.inheritedTypes) {
-        auto inherDecl = Ty::GetDeclPtrOfTy<InheritableDecl>(inheritedType->ty);
+        auto inherDecl = Ty::GetDeclPtrOfTy<InheritableDecl>(inheritedType->GetTy());
         if (auto interfaceDecl = DynamicCast<InterfaceDecl*>(inherDecl); interfaceDecl) {
             CollectStaticMember(*interfaceDecl, ret);
         }
@@ -182,7 +182,7 @@ bool TypeChecker::TypeCheckerImpl::CheckInstTypeCompleteness(const ASTContext& c
     if (!CheckInstTyWithUpperbound(ctx, typeMapping, expr)) {
         return false;
     }
-    auto extends = typeManager.GetAllExtendsByTy(*genericDecl->ty);
+    auto extends = typeManager.GetAllExtendsByTy(*genericDecl->GetTy());
     for (auto extend : extends) {
         TypeSubst extendMapping = GenerateTypeMapping(*extend, expr.instTys);
         if (!CheckInstTyWithUpperbound(ctx, extendMapping, expr)) {
@@ -219,7 +219,7 @@ bool TypeChecker::TypeCheckerImpl::CheckGenericDeclInstantiation(Ptr<const Decl>
     const std::variant<std::vector<Ptr<Type>>, std::vector<Ptr<Ty>>>& arguments, const Node& checkNode)
 {
     size_t index = arguments.index();
-    if (!d || !Ty::IsTyCorrect(d->ty) || index == std::variant_npos) {
+    if (!d || !Ty::IsTyCorrect(d->GetTy()) || index == std::variant_npos) {
         return false;
     }
 
@@ -228,7 +228,7 @@ bool TypeChecker::TypeCheckerImpl::CheckGenericDeclInstantiation(Ptr<const Decl>
     bool isTypeNode = index == 0;
     if (isTypeNode) {
         typeNodes = std::get<0>(arguments);
-        std::for_each(typeNodes.begin(), typeNodes.end(), [&typeArgs](auto it) { typeArgs.emplace_back(it->ty); });
+        std::for_each(typeNodes.begin(), typeNodes.end(), [&typeArgs](auto it) { typeArgs.emplace_back(it->GetTy()); });
     } else {
         typeArgs = std::get<1>(arguments);
     }
@@ -256,7 +256,7 @@ bool TypeChecker::TypeCheckerImpl::CheckGenericDeclInstantiation(Ptr<const Decl>
     std::unordered_map<Ptr<Ty>, size_t> indexMap = GetTyArgsIndexMap(typeArgs);
     // Check generic constraints.
     for (auto& gc : genericDecl->genericConstraints) {
-        auto instTy = typeManager.GetInstantiatedTy(gc->type->ty, instantiateMap);
+        auto instTy = typeManager.GetInstantiatedTy(gc->type->GetTy(), instantiateMap);
         if (!Ty::IsTyCorrect(instTy)) {
             return false;
         }
@@ -264,7 +264,7 @@ bool TypeChecker::TypeCheckerImpl::CheckGenericDeclInstantiation(Ptr<const Decl>
             continue; // If instantiated ty is generic type with invalid upper bounds, do not report error.
         }
         for (const auto& upperBound : gc->upperBounds) {
-            auto upperBoundTy = typeManager.GetInstantiatedTy(upperBound->ty, instantiateMap);
+            auto upperBoundTy = typeManager.GetInstantiatedTy(upperBound->GetTy(), instantiateMap);
             if (!Ty::IsTyCorrect(upperBoundTy)) {
                 return false;
             }
@@ -273,9 +273,9 @@ bool TypeChecker::TypeCheckerImpl::CheckGenericDeclInstantiation(Ptr<const Decl>
                 auto& node = isTypeNode && !typeNodes[indexMap[instTy]]->TestAttr(Attribute::COMPILER_ADD)
                     ? *typeNodes[indexMap[instTy]]
                     : checkNode;
-                diag.Diagnose(node, DiagKind::sema_generic_type_argument_not_match_constraint, d->ty->String())
+                diag.Diagnose(node, DiagKind::sema_generic_type_argument_not_match_constraint, d->GetTy()->String())
                     .AddNote(*gc, DiagKind::sema_which_constraint_not_match, instTy->String(),
-                             "'" + upperBoundTy->String() + "'");
+                        "'" + upperBoundTy->String() + "'");
                 return false;
             }
         }
@@ -289,25 +289,25 @@ Ptr<Ty> TypeChecker::TypeCheckerImpl::GetGenericType(Decl& d, const std::vector<
     if (auto gp = DynamicCast<GenericParamDecl*>(&d); gp) {
         if (!typeArgs.empty()) {
             diag.DiagnoseRefactor(DiagKindRefactor::sema_generic_argument_no_match, *typeArgs[0]);
-            return d.ty;
+            return d.GetTy();
         }
     }
 
     auto generic = d.GetGeneric();
     if (!generic) {
-        return d.ty;
+        return d.GetTy();
     }
     if (typeArgs.size() != generic->typeParameters.size()) {
         diag.DiagnoseRefactor(DiagKindRefactor::sema_generic_argument_no_match, *typeArgs[0]);
-        return d.ty;
+        return d.GetTy();
     }
     // Build generic type mapping.
     TypeSubst typeMapping;
     for (size_t i = 0; i < typeArgs.size(); ++i) {
-        typeMapping[StaticCast<TyVar*>(generic->typeParameters[i]->ty)] = typeArgs[i]->ty;
+        typeMapping[StaticCast<TyVar*>(generic->typeParameters[i]->GetTy())] = typeArgs[i]->GetTy();
     }
     // Instantiate the typeParameters of base function.
-    return typeManager.GetInstantiatedTy(d.ty, typeMapping);
+    return typeManager.GetInstantiatedTy(d.GetTy(), typeMapping);
 }
 
 void TypeChecker::TypeCheckerImpl::CheckGenericExpr(Expr& expr)
@@ -320,12 +320,12 @@ void TypeChecker::TypeCheckerImpl::CheckGenericExpr(Expr& expr)
     }
     if (exprTarget->astKind == ASTKind::TYPE_ALIAS_DECL) {
         std::vector<Ptr<Ty>> diffs = GetUnusedTysInTypeAlias(*StaticAs<ASTKind::TYPE_ALIAS_DECL>(exprTarget));
-        Utils::EraseIf(typeArgs, [&diffs](auto type) { return Utils::In(type->ty, diffs); });
+        Utils::EraseIf(typeArgs, [&diffs](auto type) { return Utils::In(type->GetTy(), diffs); });
     }
 
-    expr.ty = GetGenericType(*realTarget, typeArgs);
+    expr.SetTy(GetGenericType(*realTarget, typeArgs));
     if (!CheckGenericDeclInstantiation(realTarget, typeArgs, expr)) {
-        expr.ty = TypeManager::GetInvalidTy();
+        expr.SetTy(TypeManager::GetInvalidTy());
         return;
     }
 }
@@ -345,10 +345,10 @@ SubstPack TypeChecker::TypeCheckerImpl::GenerateGenericTypeMapping(const ASTCont
         auto sym = ScopeManager::GetCurSymbolByKind(SymbolKind::STRUCT, ctx, re->scopeName);
         if (sym && sym->node->IsNominalDecl()) { // Symbol guarantees sym->node not null.
             // Sema ty of structure declaration should be set in PreCheck stage.
-            if (!Ty::IsTyCorrect(sym->node->ty)) {
+            if (!Ty::IsTyCorrect(sym->node->GetTy())) {
                 return typeMapping;
             }
-            typeManager.GenerateGenericMapping(typeMapping, *sym->node->ty);
+            typeManager.GenerateGenericMapping(typeMapping, *sym->node->GetTy());
         }
     }
     return typeMapping;

@@ -18,6 +18,7 @@
 #include "cangjie/Utils/SafePointer.h"
 
 #include <cstdarg>
+#include <cstddef>
 #include <list>
 #include <memory>
 #include <typeindex>
@@ -145,6 +146,8 @@ public:
     bool IsTypeCast() const;
     bool IsUnaryExpr() const;
 
+    bool HasExceptionBranch() const;
+
     /**
      * @brief Retrieves all block groups.
      *
@@ -185,11 +188,18 @@ public:
     BlockGroup* GetParentBlockGroup() const;
 
     /**
+     * @brief Retrieves the function or lambda body which this expression belongs to.
+     *
+     * @return The function or lambda body.
+     */
+    BlockGroup* GetFuncOrLambdaBody() const;
+
+    /**
      * @brief Retrieves the top-level function which this expression belongs to.
      *
      * @return The top-level func.
      */
-    Func* GetTopLevelFunc() const;
+    Function* GetTopLevelFunc() const;
 
     // ===--------------------------------------------------------------------===//
     // Operand
@@ -279,10 +289,10 @@ public:
     /**
     * @brief Converts the expression to a string representation.
     *
-    * @param indent The number of spaces to indent the string. Default is 0.
+    * @param indent The number of spaces to indent the string.
     * @return The string representation of the expression.
     */
-    virtual std::string ToString(size_t indent = 0) const;
+    std::string ToString(size_t indent) const;
 
     /**
     * @brief Converts the expression to a string representation and print out.
@@ -307,12 +317,13 @@ protected:
     void AppendOperand(Value& op);
     void SetParent(Block* newParent);
     void EraseOperands();
+    virtual std::string OperandsToString() const;
     std::string CommentToString() const;
-    std::string AddExtraComment(const std::string& comment) const;
+    virtual std::string AddExtraComment() const;
 
     ExprKind kind;                        // Expression kind.
     std::vector<Value*> operands;         // The operands.
-    std::vector<BlockGroup*> blockGroups; // The regions of special expression, such as Func.
+    std::vector<BlockGroup*> blockGroups; // The regions of special expression, such as Function.
     Block* parent;                        // The owner basicblock of this expression.
     LocalVar* result = nullptr;           // The result.
 };
@@ -337,12 +348,8 @@ public:
 
     OverflowStrategy GetOverflowStrategy() const;
 
-    // ===--------------------------------------------------------------------===//
-    // Others
-    // ===--------------------------------------------------------------------===//
-    std::string ToString(size_t indent = 0) const override;
-
 protected:
+    std::string AddExtraComment() const override;
     ~UnaryExpression() override = default;
 
 private:
@@ -390,12 +397,8 @@ public:
 
     OverflowStrategy GetOverflowStrategy() const;
 
-    // ===--------------------------------------------------------------------===//
-    // Others
-    // ===--------------------------------------------------------------------===//
-    std::string ToString(size_t indent = 0) const override;
-
 protected:
+    std::string AddExtraComment() const override;
     ~BinaryExpression() override = default;
 
 private:
@@ -444,11 +447,6 @@ public:
     bool IsStringLit() const;
     bool IsUnitLit() const;
 
-    // ===--------------------------------------------------------------------===//
-    // Others
-    // ===--------------------------------------------------------------------===//
-    std::string ToString(size_t indent = 0) const override;
-
 protected:
     ~Constant() override = default;
 
@@ -479,12 +477,8 @@ public:
      */
     Type* GetType() const;
 
-    // ===--------------------------------------------------------------------===//
-    // Others
-    // ===--------------------------------------------------------------------===//
-    std::string ToString(size_t indent = 0) const override;
-
 protected:
+    std::string OperandsToString() const override;
     ~Allocate() override = default;
 
 private:
@@ -590,12 +584,8 @@ public:
 
     const std::vector<uint64_t>& GetPath() const;
 
-    // ===--------------------------------------------------------------------===//
-    // Others
-    // ===--------------------------------------------------------------------===//
-    std::string ToString(size_t indent = 0) const override;
-
 protected:
+    std::string OperandsToString() const override;
     ~GetElementRef() override = default;
 
 private:
@@ -634,12 +624,8 @@ public:
 
     const std::vector<std::string>& GetNames() const;
 
-    // ===--------------------------------------------------------------------===//
-    // Others
-    // ===--------------------------------------------------------------------===//
-    std::string ToString(size_t indent = 0) const override;
-
 protected:
+    std::string OperandsToString() const override;
     ~GetElementByName() override = default;
 
 private:
@@ -688,12 +674,8 @@ public:
      */
     const std::vector<uint64_t>& GetPath() const;
 
-    // ===--------------------------------------------------------------------===//
-    // Others
-    // ===--------------------------------------------------------------------===//
-    std::string ToString(size_t indent = 0) const override;
-
 protected:
+    std::string OperandsToString() const override;
     ~StoreElementRef() override = default;
 
 private:
@@ -737,12 +719,8 @@ public:
 
     const std::vector<std::string>& GetNames() const;
 
-    // ===--------------------------------------------------------------------===//
-    // Others
-    // ===--------------------------------------------------------------------===//
-    std::string ToString(size_t indent = 0) const override;
-
 protected:
+    std::string OperandsToString() const override;
     ~StoreElementByName() override = default;
 
 private:
@@ -765,21 +743,12 @@ struct FuncCallContext {
 };
 
 /**
- * @brief Context for a virtual function
- */
-struct VirMethodContext {
-    std::string srcCodeIdentifier;       // function name
-    FuncType* originalFuncType{nullptr}; // method signature type, from virtual method type in parent CustomTypeDef
-    std::vector<GenericType*> genericTypeParams;
-};
-
-/**
  * @brief Context for a virtual function calling
  */
 struct InvokeCallContext {
     Value* caller{nullptr};  // the object in Invoke, or the rtti in InvokeStatic
     FuncCallContext funcCallCtx;
-    VirMethodContext virMethodCtx;
+    FuncSigInfo virMethodCtx;
 };
 
 /**
@@ -896,12 +865,9 @@ public:
      */
     Type* GetInstParentCustomTyOfCallee(CHIRBuilder& builder) const;
 
-    // ===--------------------------------------------------------------------===//
-    // Others
-    // ===--------------------------------------------------------------------===//
-    std::string ToString(size_t indent = 0) const override;
-
 protected:
+    std::string OperandsToString() const override;
+    std::string AddExtraComment() const override;
     ~Apply() override = default;
 
 private:
@@ -970,9 +936,10 @@ public:
     AttributeInfo GetVirtualMethodAttr(CHIRBuilder& builder) const;
 
 protected:
+    std::string OperandsToString() const override;
     explicit DynamicDispatch(ExprKind kind, const InvokeCallContext& callContext, Block* parent);
 
-    VirMethodContext virMethodCtx;
+    FuncSigInfo virMethodCtx;
 
 private:
     std::vector<VTableSearchRes> GetVirtualMethodInfo(CHIRBuilder& builder) const;
@@ -1031,11 +998,6 @@ public:
      */
     std::vector<Value*> GetArgs() const override;
 
-    // ===--------------------------------------------------------------------===//
-    // Others
-    // ===--------------------------------------------------------------------===//
-    std::string ToString(size_t indent = 0) const override;
-
 protected:
     ~Invoke() override = default;
 
@@ -1069,11 +1031,6 @@ public:
     Value* GetOperand() const;
     using Expression::GetOperand;
 
-    // ===--------------------------------------------------------------------===//
-    // Others
-    // ===--------------------------------------------------------------------===//
-    std::string ToString(size_t indent = 0) const override;
-
 private:
     GetRTTI(Value* val, Block* parent);
     ~GetRTTI() override = default;
@@ -1100,10 +1057,8 @@ public:
     // ===--------------------------------------------------------------------===//
     Type* GetRTTIType() const;
 
-    // ===--------------------------------------------------------------------===//
-    // Others
-    // ===--------------------------------------------------------------------===//
-    std::string ToString(size_t indent = 0) const override;
+protected:
+    std::string OperandsToString() const override;
 
 private:
     GetRTTIStatic(Type* type, Block* parent);
@@ -1147,11 +1102,6 @@ public:
      */
     Value* GetRTTIValue() const;
 
-    // ===--------------------------------------------------------------------===//
-    // Others
-    // ===--------------------------------------------------------------------===//
-    std::string ToString(size_t indent = 0) const override;
-
 protected:
     ~InvokeStatic() override = default;
 
@@ -1187,12 +1137,8 @@ public:
     /** @brief Get the overflow strategy of this cast operation */
     OverflowStrategy GetOverflowStrategy() const;
 
-    // ===--------------------------------------------------------------------===//
-    // Others
-    // ===--------------------------------------------------------------------===//
-    std::string ToString(size_t indent = 0) const override;
-
 protected:
+    std::string AddExtraComment() const override;
     ~TypeCast() override = default;
 
 private:
@@ -1227,10 +1173,8 @@ public:
     /** @brief Get the tested type */
     Type* GetType() const;
 
-    // ===--------------------------------------------------------------------===//
-    // Others
-    // ===--------------------------------------------------------------------===//
-    std::string ToString(size_t indent = 0) const override;
+protected:
+    std::string OperandsToString() const override;
 
 private:
     explicit InstanceOf(Value* operand, Type* ty, Block* parent);
@@ -1245,7 +1189,7 @@ private:
  * value type includes:
  *      1. Int, UInt, Float, Rune, Bool, Unit, Nothing
  *      2. Enum, Struct
- *      3. Tuple, VArray, Func, CPointer, CString
+ *      3. Tuple, VArray, Function, CPointer, CString
  * reference type includes:
  *      1. Class&, Array&
  *      2. BoxType&
@@ -1279,7 +1223,7 @@ private:
  * value type includes:
  *      1. Int, UInt, Float, Rune, Bool, Unit, Nothing
  *      2. Enum, Struct
- *      3. Tuple, VArray, Func, CPointer, CString
+ *      3. Tuple, VArray, Function, CPointer, CString
  * reference type includes:
  *      1. Class&, Array&
  *      2. BoxType&
@@ -1441,10 +1385,8 @@ public:
 
     std::vector<uint64_t> GetPath() const;
 
-    // ===--------------------------------------------------------------------===//
-    // Others
-    // ===--------------------------------------------------------------------===//
-    std::string ToString(size_t indent = 0) const override;
+protected:
+    std::string OperandsToString() const override;
 
 private:
     explicit Field(Value* val, const std::vector<uint64_t>& path, Block* parent);
@@ -1478,10 +1420,8 @@ public:
 
     const std::vector<std::string>& GetNames() const;
 
-    // ===--------------------------------------------------------------------===//
-    // Others
-    // ===--------------------------------------------------------------------===//
-    std::string ToString(size_t indent = 0) const override;
+protected:
+    std::string OperandsToString() const override;
 
 private:
     explicit FieldByName(Value* val, const std::vector<std::string>& names, Block* parent);
@@ -1530,10 +1470,8 @@ public:
      */
     Type* GetElementType() const;
 
-    // ===--------------------------------------------------------------------===//
-    // Others
-    // ===--------------------------------------------------------------------===//
-    std::string ToString(size_t indent = 0) const override;
+protected:
+    std::string OperandsToString() const override;
 
 private:
     explicit RawArrayAllocate(Type* eleTy, Value* size, Block* parent);
@@ -1747,10 +1685,8 @@ public:
      */
     const std::vector<Value*>& GetArgs() const;
 
-    // ===--------------------------------------------------------------------===//
-    // Others
-    // ===--------------------------------------------------------------------===//
-    std::string ToString(size_t indent = 0) const override;
+protected:
+    std::string OperandsToString() const override;
 
 private:
     explicit Intrinsic(const IntrisicCallContext& callContext, Block* parent);
@@ -1761,64 +1697,6 @@ private:
 private:
     CHIR::IntrinsicKind intrinsicKind;
     std::vector<Type*> instantiatedTypeArgs;
-};
-
-/**
- * @brief A high-level description for `if` in Cangjie.
- * `If` expression will be desugared to `Branch` in the end.
- */
-class If : public Expression {
-    friend class CHIRContext;
-    friend class CHIRBuilder;
-public:
-    // ===--------------------------------------------------------------------===//
-    // Base Information
-    // ===--------------------------------------------------------------------===//
-    /** @brief Get the condition of this If Expression */
-    Value* GetCondition() const;
-
-    /** @brief Get the true branch of this If Expression */
-    BlockGroup* GetTrueBranch() const;
-
-    /** @brief Get the false branch of this If Expression */
-    BlockGroup* GetFalseBranch() const;
-
-    // ===--------------------------------------------------------------------===//
-    // Others
-    // ===--------------------------------------------------------------------===//
-    std::string ToString(size_t indent = 0) const override;
-
-private:
-    explicit If(Value* cond, BlockGroup* thenBody, BlockGroup* elseBody, Block* parent);
-    ~If() override = default;
-
-    If* Clone(CHIRBuilder& builder, Block& parent) const override;
-};
-
-/**
- * @brief A high-level description for `while` and `do-while` in Cangjie.
- * `Loop` expression will be desugared to `Branch` + `GoTo` in the end.
- */
-class Loop : public Expression {
-    friend class CHIRContext;
-    friend class CHIRBuilder;
-public:
-    // ===--------------------------------------------------------------------===//
-    // Base Information
-    // ===--------------------------------------------------------------------===//
-    /** @brief Get the loop body of this Loop Expression */
-    BlockGroup* GetLoopBody() const;
-
-    // ===--------------------------------------------------------------------===//
-    // Others
-    // ===--------------------------------------------------------------------===//
-    std::string ToString(size_t indent = 0) const override;
-
-private:
-    explicit Loop(BlockGroup* loopBody, Block* parent);
-    ~Loop() override = default;
-
-    Loop* Clone(CHIRBuilder& builder, Block& parent) const override;
 };
 
 /**
@@ -1849,11 +1727,6 @@ public:
 
     /** @brief Init the body, latch, and conditional block groups of this ForIn Expression */
     void InitBlockGroups(BlockGroup& body, BlockGroup& latch, BlockGroup& cond);
-
-    // ===--------------------------------------------------------------------===//
-    // Others
-    // ===--------------------------------------------------------------------===//
-    std::string ToString(size_t indent = 0) const override;
 
     /// Describes the execution order of sub block groups in a forin expression
     struct BGExecutionOrder {
@@ -2125,8 +1998,11 @@ public:
      * @return A vector of pointers to the captured variables.
      */
     std::vector<Value*> GetCapturedVariables() const;
-    
-    std::string ToString(size_t indent = 0) const override;
+
+    std::string LambdaOperandsToString(size_t indent) const;
+
+protected:
+    std::string AddExtraComment() const override;
 
 private:
     explicit Lambda(FuncType* ty, Block* parent, bool isLocalFunc = false, const std::string& identifier = "",
@@ -2146,7 +2022,9 @@ private:
 private:
     std::string identifier;        // the mangledName of nested function or lambda.
     std::string srcCodeIdentifier; // the name of nested function or lambda.
-    FuncBody body;
+    std::vector<Parameter*> params;
+    LocalVar* retValue{nullptr};
+    BlockGroup* body{nullptr};
     FuncType* funcTy;
     bool isLocalFunc{false};
     std::vector<GenericType*> genericTypeParams;
@@ -2172,10 +2050,8 @@ public:
 
     Value* GetValue() const;
 
-    // ===--------------------------------------------------------------------===//
-    // Others
-    // ===--------------------------------------------------------------------===//
-    std::string ToString(size_t indent = 0) const override;
+protected:
+    std::string OperandsToString() const override;
 
 private:
     explicit Debug(Value* local, std::string srcCodeIdentifier, Block* parent);
@@ -2227,7 +2103,7 @@ public:
     Value* GetSpawnArg() const;
 
     bool IsExecuteClosure() const;
-    void SetExecuteClosure(FuncBase& func);
+    void SetExecuteClosure(Function& func);
 
     // ===--------------------------------------------------------------------===//
     // Before Optimization
@@ -2244,12 +2120,10 @@ public:
     /**
      * @brief Get the member method `executeClosure` in class Future.
      */
-    FuncBase* GetExecuteClosure() const;
+    Function* GetExecuteClosure() const;
 
-    // ===--------------------------------------------------------------------===//
-    // Others
-    // ===--------------------------------------------------------------------===//
-    std::string ToString(size_t indent = 0) const override;
+protected:
+    std::string AddExtraComment() const override;
 
 private:
     explicit Spawn(Value* val, Block* parent);
@@ -2263,7 +2137,7 @@ private:
      * @brief After optimization, backend will use `executeClosure` to create new thread, not `Future` object.
      * `executeClosure` is member method in class `Future` which is declared in std.core
      */
-    FuncBase* executeClosure{nullptr};
+    Function* executeClosure{nullptr};
 };
 
 /**
@@ -2287,10 +2161,8 @@ public:
 
     Value* GetGenericResult() const;
 
-    // ===--------------------------------------------------------------------===//
-    // Others
-    // ===--------------------------------------------------------------------===//
-    std::string ToString(size_t indent = 0) const override;
+protected:
+    std::string OperandsToString() const override;
 
 private:
     explicit GetInstantiateValue(Value* val, std::vector<Type*> insTypes, Block* parent);

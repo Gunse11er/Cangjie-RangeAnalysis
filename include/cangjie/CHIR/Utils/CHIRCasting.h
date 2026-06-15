@@ -82,8 +82,6 @@ DEFINE_NODE_TYPE_KIND(CHIR::VArray, CHIR::ExprKind::VARRAY);
 DEFINE_NODE_TYPE_KIND(CHIR::VArrayBuilder, CHIR::ExprKind::VARRAY_BUILDER);
 DEFINE_NODE_TYPE_KIND(CHIR::GetException, CHIR::ExprKind::GET_EXCEPTION);
 DEFINE_NODE_TYPE_KIND(CHIR::Intrinsic, CHIR::ExprKind::INTRINSIC);
-DEFINE_NODE_TYPE_KIND(CHIR::If, CHIR::ExprKind::IF);
-DEFINE_NODE_TYPE_KIND(CHIR::Loop, CHIR::ExprKind::LOOP);
 DEFINE_NODE_TYPE_KIND(CHIR::ForInRange, CHIR::ExprKind::FORIN_RANGE);
 DEFINE_NODE_TYPE_KIND(CHIR::ForInIter, CHIR::ExprKind::FORIN_ITER);
 DEFINE_NODE_TYPE_KIND(CHIR::ForInClosedRange, CHIR::ExprKind::FORIN_CLOSED_RANGE);
@@ -103,7 +101,7 @@ DEFINE_NODE_TYPE_KIND(CHIR::StructDef, CHIR::CustomDefKind::TYPE_STRUCT);
 DEFINE_NODE_TYPE_KIND(CHIR::ExtendDef, CHIR::CustomDefKind::TYPE_EXTEND);
 
 // Defined the mono type checking method for CHIRNode.
-template <> struct TypeAs<CHIR::FuncBase> {
+template <> struct TypeAs<CHIR::Function> {
     static bool IsInstanceOf(const CHIR::Value& value)
     {
         return value.IsFunc();
@@ -121,34 +119,6 @@ template <> struct TypeAs<CHIR::BlockGroup> {
     static bool IsInstanceOf(const CHIR::Value& value)
     {
         return value.IsBlockGroup();
-    }
-};
-
-template <> struct TypeAs<CHIR::Func> {
-    static bool IsInstanceOf(const CHIR::Value& value)
-    {
-        return value.IsFuncWithBody();
-    }
-};
-
-template <> struct TypeAs<CHIR::GlobalVar> {
-    static bool IsInstanceOf(const CHIR::Value& value)
-    {
-        return value.IsGlobalVarInCurPackage();
-    }
-};
-
-template <> struct TypeAs<CHIR::ImportedFunc> {
-    static bool IsInstanceOf(const CHIR::Value& value)
-    {
-        return value.IsImportedFunc();
-    }
-};
-
-template <> struct TypeAs<CHIR::ImportedVar> {
-    static bool IsInstanceOf(const CHIR::Value& value)
-    {
-        return value.IsImportedVar();
     }
 };
 
@@ -222,17 +192,10 @@ template <> struct TypeAs<CHIR::Parameter> {
     }
 };
 
-template <> struct TypeAs<CHIR::GlobalVarBase> {
+template <> struct TypeAs<CHIR::GlobalVar> {
     static bool IsInstanceOf(const CHIR::Value& value)
     {
         return value.IsGlobalVar();
-    }
-};
-
-template <> struct TypeAs<CHIR::ImportedValue> {
-    static bool IsInstanceOf(const CHIR::Value& value)
-    {
-        return value.IsImportedSymbol();
     }
 };
 

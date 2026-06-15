@@ -12,6 +12,7 @@
 #include "cangjie/Parse/ASTHasher.h"
 #include "cangjie/AST/ASTCasting.h"
 #include "cangjie/Utils/Utils.h"
+#include "cangjie/Mangle/BaseMangler.h"
 #include "cangjie/Mangle/MangleUtils.h"
 
 using namespace Cangjie;
@@ -155,7 +156,7 @@ std::string ASTMangler::ManglePrimitiveType(const AST::Type& type)
         return *t;
     }
     // Initial type is valid only in the return type of function $test.entry when enabling --test
-    CJC_ASSERT(primitiveTy.ty && primitiveTy.ty->kind == TypeKind::TYPE_INITIAL);
+    CJC_ASSERT(primitiveTy.GetTy() && primitiveTy.TyKind() == TypeKind::TYPE_INITIAL);
     return MANGLE_INITIAL_PREFIX;
 }
 

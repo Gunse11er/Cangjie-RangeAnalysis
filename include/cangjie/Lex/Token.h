@@ -14,11 +14,11 @@
 #define CANGJIE_LEX_TOKEN_H
 
 #include <cstring>
+#include <cstdint>
 #include <string>
 #include <ostream>
 #include <unordered_map>
 #include <vector>
-#include <cstdint>
 
 #include "cangjie/Basic/Position.h"
 #include "cangjie/Utils/CheckUtils.h"
@@ -182,7 +182,7 @@ struct StringPart {
         this->end = end;
     }
 };
-using TokenVecMap = std::unordered_map<size_t, std::vector<Token>>;
+using TokenVecMap = std::unordered_map<unsigned int, std::vector<Token>>;
 const std::vector<TokenKind>& GetEscapeTokenKinds();
 } // namespace Cangjie
 

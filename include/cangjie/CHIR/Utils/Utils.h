@@ -23,7 +23,7 @@
 #include "cangjie/CHIR/Utils/Visitor/Visitor.h"
 #include "cangjie/CHIR/IR/CHIRBuilder.h"
 #include "cangjie/CHIR/IR/CHIRContext.h"
-#include "cangjie/CHIR/Utils/DiagAdapter.h"
+#include "cangjie/Basic/DiagnosticEngine.h"
 #include "cangjie/CHIR/IR/Type/CHIRType.h"
 #include "cangjie/CHIR/IR/Value/Value.h"
 #include "cangjie/Utils/CastingTemplate.h"
@@ -147,7 +147,7 @@ struct FuncInfo {
  * @param funcInfo The expected function information.
  * @return True if the function matches the expected information, false otherwise.
  */
-bool IsExpectedFunction(const FuncBase& func, const FuncInfo& funcInfo);
+bool IsExpectedFunction(const Function& func, const FuncInfo& funcInfo);
 
 /**
  * @brief Prints optimization information for an expression.
@@ -174,7 +174,7 @@ FuncKind GetFuncKindFromAST(const AST::FuncDecl& func);
  * @param funcDecl The function declaration to check.
  * @return True if the function is virtual, false otherwise.
  */
-bool IsVirtualFunction(const FuncBase& funcDecl);
+bool IsVirtualFunction(const Function& funcDecl);
 
 /**
  * @brief Checks if a function is a static method in an interface.
@@ -182,7 +182,7 @@ bool IsVirtualFunction(const FuncBase& funcDecl);
  * @param func The function to check.
  * @return True if the function is a static method in an interface, false otherwise.
  */
-bool IsInterfaceStaticMethod(const Func& func);
+bool IsInterfaceStaticMethod(const Function& func);
 
 /**
  * @brief Checks if a function is semantically abstract and an instance.
@@ -211,7 +211,7 @@ std::deque<Block*> TopologicalSort(Block* entrybb);
  * @param initFunc The global initialization function.
  * @param insertExpr The expressions to add to the initialization function.
  */
-void AddExpressionsToGlobalInitFunc(const Func& initFunc, const std::vector<Expression*>& insertExpr);
+void AddExpressionsToGlobalInitFunc(const Function& initFunc, const std::vector<Expression*>& insertExpr);
 
 /**
  * @brief Retrieves static member variables from a declaration.
@@ -293,7 +293,7 @@ template <typename T> std::pair<bool, Cangjie::Range> GetDebugPos(const T& expr)
  * @param diag The diagnostic adapter.
  * @return True if the position is in a different package, false otherwise.
  */
-bool IsCrossPackage(const Cangjie::Position& pos, const std::string& currentPackage, DiagAdapter& diag);
+bool IsCrossPackage(const Cangjie::Position& pos, const std::string& currentPackage, DiagnosticEngine& diag);
 
 /**
  * @brief Sets a value to skip print warnings.
@@ -437,7 +437,7 @@ template <typename TExpr, typename... Args> TExpr* CreateAndAppendTerminator(CHI
  * @return True if the function is a static initializer, false otherwise.
  */
 bool IsStaticInit(const AST::FuncDecl& func);
-bool IsStaticInit(const FuncBase& func);
+bool IsStaticInit(const Function& func);
 
 /**
  * @brief Checks if an expression is a super or this call.
@@ -653,7 +653,7 @@ bool IsCapturedClass(const ClassDef& def);
  * @param value The value to retrieve the parent function from.
  * @return The parent function of the given value.
  */
-Func* GetTopLevelFunc(const Value& value);
+Function* GetTopLevelFunc(const Value& value);
 
 /**
  * @brief Retrieves the visible generic types for a given value.
@@ -780,7 +780,7 @@ Type* GetInstParentType(Type& instSubType, Type& genericParentType, CHIRBuilder&
  * @param func The function to check.
  * @return True if the function's return type should be `Void`, false otherwise.
  */
-bool ReturnTypeShouldBeVoid(const FuncBase& func);
+bool ReturnTypeShouldBeVoid(const Function& func);
 
 /**
  * @brief Retrieves the reference dimensions of a type.
@@ -795,6 +795,14 @@ uint64_t GetRefDims(const Type& type);
  *
  * @return True if func is from standard library.
  */
-bool IsSTDFunction(const FuncBase& func);
+bool IsSTDFunction(const Function& func);
+
+/**
+ * @brief Retrieves the non-debug users of a value.
+ *
+ * @param val The value to retrieve the non-debug users from.
+ * @return The non-debug users of the value.
+ */
+std::vector<Expression*> GetNonDebugUsers(const Value& val);
 } // namespace Cangjie::CHIR
 #endif

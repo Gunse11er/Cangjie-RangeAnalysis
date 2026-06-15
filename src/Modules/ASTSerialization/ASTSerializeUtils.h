@@ -28,9 +28,15 @@ using TFullIdOffset = flatbuffers::Offset<PackageFormat::FullId>;
 using TImportsOffset = flatbuffers::Offset<PackageFormat::Imports>;
 using TFileInfoOffset = flatbuffers::Offset<PackageFormat::FileInfo>;
 using TImportSpecOffset = flatbuffers::Offset<PackageFormat::ImportSpec>;
+using TFeatureIdOffset = flatbuffers::Offset<PackageFormat::FeatureId>;
+using TFeaturesSetOffset = flatbuffers::Offset<PackageFormat::FeaturesSet>;
+using TFeaturesDirectiveOffset = flatbuffers::Offset<PackageFormat::FeaturesDirective>;
 using TFuncBodyOffset = flatbuffers::Offset<PackageFormat::FuncBody>;
 template <typename T> using TVectorOffset = flatbuffers::Offset<flatbuffers::Vector<T>>;
 using TPosition = PackageFormat::Position;
+using TFeaturesSet = PackageFormat::FeaturesSet;
+using TFeaturesDirective = PackageFormat::FeaturesDirective;
+using TCompilationOptions = flatbuffers::Offset<PackageFormat::CompilationOptions>;
 using TDeclHash = PackageFormat::DeclHash;
 using PackageIndex = int32_t;
 

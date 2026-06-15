@@ -73,7 +73,6 @@ cangjie_compiler/
 │   ├── Macro                   # Macro expansion
 │   ├── main.cpp                # Compiler entry point
 │   ├── Mangle                  # Symbol mangling
-│   ├── MetaTransformation      # Metaprogramming plugins
 │   ├── Modules                 # Module management
 │   ├── Option                  # Compiler options
 │   ├── Parse                   # Syntax analysis
@@ -89,7 +88,7 @@ cangjie_compiler/
 
 ## Constraints
 
-Currently, building Cangjie compiler artifacts directly in the Windows environment is not supported. Instead, you need to generate compiler artifacts that can run on Windows through cross-compilation in a Linux environment. For details, see the [Cangjie SDK Integration Build Guide](https://gitcode.com/Cangjie/cangjie_build/blob/main/README_zh.md). For future support plans, refer to the [Platform Support Roadmap](#platform-support-roadmap).
+Currently, building Cangjie compiler artifacts directly in the Windows environment is not supported. Instead, you need to generate compiler artifacts that can run on Windows through cross-compilation in a Linux environment. For details, see the [Cangjie SDK Integration Build Guide](https://gitcode.com/Cangjie/cangjie_build/blob/main/README.md). For future support plans, refer to the [Platform Support Roadmap](#platform-support-roadmap).
 
 ## Platform Support Roadmap
 
@@ -178,7 +177,7 @@ For more platform-specific build information, see the [Standalone Build Guide](d
 
 ### Integration Build Guide
 
-For integration builds, please refer to the [Cangjie SDK Integration Build Guide](https://gitcode.com/Cangjie/cangjie_build/blob/main/README_zh.md).
+For integration builds, please refer to the [Cangjie SDK Integration Build Guide](https://gitcode.com/Cangjie/cangjie_build/blob/main/README.md).
 
 ## License
 
@@ -202,7 +201,7 @@ This project is licensed under [Apache-2.0 with Runtime Library Exception](./LIC
 | flatbuffers         | Apache License V2.0                  | Used for serialization/deserialization of cjo files and macros                                                                          | Compiler & StdLib(std.ast)  | Integrated into the Cangjie binary release  |
 | libboundscheck      | Mulan Permissive Software License V2 | Used for safe function implementations in the compiler and related code                                                                 | Compiler, StdLib, Extension | Integrated into the Cangjie binary release  |
 
-For details on other build dependencies, see [Build Dependencies](https://gitcode.com/Cangjie/cangjie_build/blob/main/docs/env_zh.md) and the [Cangjie SDK Integration Build Guide](https://gitcode.com/Cangjie/cangjie_build/blob/main/README_zh.md).
+For details on other build dependencies, see [Build Dependencies](https://gitcode.com/Cangjie/cangjie_build/blob/main/doc_en/env.md) and the [Cangjie SDK Integration Build Guide](https://gitcode.com/Cangjie/cangjie_build/blob/main/README.md).
 
 ## Contribution
 

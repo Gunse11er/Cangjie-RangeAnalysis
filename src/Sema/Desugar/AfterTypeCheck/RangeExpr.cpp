@@ -24,7 +24,7 @@ std::vector<OwnedPtr<FuncArg>> CreateRangeExprArgs(const RangeExpr& re)
         args.push_back(CreateFuncArg(ASTCloner::Clone(re.startExpr.get())));
     } else {
         // If startExpr does not exist, set LitConst "0" as default value.
-        auto startExpr = CreateLitConstExpr(LitConstKind::INTEGER, "0", re.ty->typeArgs[0]);
+        auto startExpr = CreateLitConstExpr(LitConstKind::INTEGER, "0", re.GetTy()->typeArgs[0]);
         args.push_back(CreateFuncArg(std::move(startExpr)));
     }
     if (re.stopExpr != nullptr) {
@@ -32,7 +32,7 @@ std::vector<OwnedPtr<FuncArg>> CreateRangeExprArgs(const RangeExpr& re)
     } else {
         // If stopExpr does not exist, set LitConst "0" as default value.
         auto stopExpr = CreateLitConstExpr(
-            LitConstKind::INTEGER, std::to_string(std::numeric_limits<int64_t>::max()), re.ty->typeArgs[0]);
+            LitConstKind::INTEGER, std::to_string(std::numeric_limits<int64_t>::max()), re.GetTy()->typeArgs[0]);
         args.push_back(CreateFuncArg(std::move(stopExpr)));
     }
     if (re.stepExpr != nullptr) {
@@ -68,29 +68,29 @@ void DesugarRangeExpr(TypeManager& typeManager, RangeExpr& re)
         return;
     }
     CJC_NULLPTR_CHECK(re.decl->generic);
-    CJC_NULLPTR_CHECK(re.ty);
+    CJC_NULLPTR_CHECK(re.GetTy());
     if (re.desugarExpr) {
         return;
     }
-    if (re.ty->typeArgs.empty() || re.ty->typeArgs.size() != re.decl->generic->typeParameters.size() ||
-        !Ty::IsTyCorrect(re.decl->generic->typeParameters[0]->ty)) {
+    if (re.GetTy()->typeArgs.empty() || re.GetTy()->typeArgs.size() != re.decl->generic->typeParameters.size() ||
+        !Ty::IsTyCorrect(re.decl->generic->typeParameters[0]->GetTy())) {
         return;
     }
     auto rangeFunc = CreateRefExpr(re.decl->identifier);
     CopyBasicInfo(&re, rangeFunc.get());
-    (void)rangeFunc->instTys.emplace_back(re.ty->typeArgs[0]);
+    (void)rangeFunc->instTys.emplace_back(re.GetTy()->typeArgs[0]);
     TypeSubst typeMapping;
-    typeMapping.emplace(StaticCast<GenericsTy*>(re.decl->generic->typeParameters[0]->ty), re.ty->typeArgs[0]);
+    typeMapping.emplace(StaticCast<GenericsTy*>(re.decl->generic->typeParameters[0]->GetTy()), re.GetTy()->typeArgs[0]);
 
     std::vector<OwnedPtr<FuncArg>> args = CreateRangeExprArgs(re);
     auto ce = CreateCallExpr(std::move(rangeFunc), std::move(args));
-    ce->ty = re.ty;
+    ce->SetTy(re.GetTy());
     for (auto& initFn : re.decl->body->decls) {
         if (auto fd = AST::As<ASTKind::FUNC_DECL>(initFn.get()); fd && IsInstanceConstructor(*fd)) {
             if (auto refExpr = AST::As<ASTKind::REF_EXPR>(ce->baseFunc.get()); refExpr) {
                 ReplaceTarget(refExpr, fd, false);
-                CJC_NULLPTR_CHECK(fd->ty);
-                refExpr->ty = typeManager.GetInstantiatedTy(fd->ty, typeMapping);
+                CJC_NULLPTR_CHECK(fd->GetTy());
+                refExpr->SetTy(typeManager.GetInstantiatedTy(fd->GetTy(), typeMapping));
                 ce->resolvedFunction = fd;
                 ce->callKind = CallKind::CALL_OBJECT_CREATION;
             }

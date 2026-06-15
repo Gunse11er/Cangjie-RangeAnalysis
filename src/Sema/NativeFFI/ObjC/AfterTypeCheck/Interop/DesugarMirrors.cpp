@@ -100,7 +100,7 @@ void DesugarMirrors::DesugarCtor(InteropContext& ctx, ClassLikeDecl& mirror, Fun
     CJC_ASSERT(!ctor.funcBody->paramLists.empty());
 
     auto& generatedCtor = *ctx.factory.GetGeneratedBaseCtor(mirror);
-    auto thisCall = CreateThisCall(mirror, generatedCtor, generatedCtor.ty, curFile);
+    auto thisCall = CreateThisCall(mirror, generatedCtor, generatedCtor.GetTy(), curFile);
 
     CJC_ASSERT_WITH_MSG(mirror.astKind == ASTKind::CLASS_DECL,
         "Expected ASTKind::CLASS_DECL instead of " + ASTKIND_TO_STR.at(mirror.astKind));
@@ -116,18 +116,19 @@ void DesugarMirrors::DesugarStaticMethodInitializer(InteropContext& ctx, FuncDec
 {
     CJC_ASSERT(IsStaticInitMethod(initializer));
     auto curFile = initializer.curFile;
-    auto retTy = StaticCast<FuncTy>(initializer.ty)->retTy;
+    auto retTy = StaticCast<FuncTy>(initializer.GetTy())->retTy;
 
     auto initCall = ctx.factory.CreateAllocInitCall(initializer);
-    auto returnExpr = WithinFile(CreateReturnExpr(std::move(initCall)), curFile);
-    returnExpr->ty = TypeManager::GetNothingTy();
+    auto wrappedInit = ctx.factory.WrapEntity(std::move(initCall), *retTy);
+    auto returnExpr = WithinFile(CreateReturnExpr(std::move(wrappedInit)), curFile);
+    returnExpr->SetTy(TypeManager::GetNothingTy());
     initializer.funcBody->body = CreateBlock({}, retTy);
     initializer.funcBody->body->body.emplace_back(std::move(returnExpr));
 }
 
 void DesugarMirrors::DesugarMethod(InteropContext& ctx, ClassLikeDecl& mirror, FuncDecl& method)
 {
-    auto methodTy = StaticCast<FuncTy>(method.ty);
+    auto methodTy = StaticCast<FuncTy>(method.GetTy());
     auto curFile = method.curFile;
 
     auto nativeHandle = ctx.factory.CreateNativeHandleExpr(mirror, method.TestAttr(Attribute::STATIC), curFile);
@@ -138,8 +139,7 @@ void DesugarMirrors::DesugarMethod(InteropContext& ctx, ClassLikeDecl& mirror, F
         [&ctx, curFile](auto& param) { return ctx.factory.UnwrapEntity(WithinFile(CreateRefExpr(*param), curFile)); });
 
     auto arpScopeCall = ctx.factory.CreateAutoreleasePoolScope(methodTy->retTy,
-        Nodes(ctx.factory.CreateMethodCallViaMsgSend(
-            method, ASTCloner::Clone(nativeHandle.get()), std::move(msgSendArgs))));
+        Nodes(ctx.factory.CreateMethodCallViaMsgSend(method, ASTCloner::Clone(nativeHandle.get()), std::move(msgSendArgs))));
     arpScopeCall->curFile = curFile;
 
     method.funcBody->body = CreateBlock({}, methodTy->retTy);
@@ -158,7 +158,7 @@ void DesugarMirrors::DesugarMethod(InteropContext& ctx, ClassLikeDecl& mirror, F
 
 void DesugarMirrors::DesugarTopLevelFunc(InteropContext& ctx, FuncDecl& func)
 {
-    auto methodTy = StaticCast<FuncTy>(func.ty);
+    auto methodTy = StaticCast<FuncTy>(func.GetTy());
     std::vector<Ptr<Ty>> cParamTys;
     std::transform(methodTy->paramTys.begin(), methodTy->paramTys.end(), std::back_inserter(cParamTys),
         [&ctx](auto& paramTy) { return ctx.typeMapper.Cj2CType(paramTy); });
@@ -228,11 +228,11 @@ void DesugarGetter(InteropContext& ctx, ClassLikeDecl& mirror, PropDecl& prop)
 
     auto nativeHandle = ctx.factory.CreateNativeHandleExpr(mirror, prop.TestAttr(Attribute::STATIC), curFile);
     auto arpScopeCall = ctx.factory.CreateAutoreleasePoolScope(
-        prop.ty, Nodes(ctx.factory.CreatePropGetterCallViaMsgSend(prop, std::move(nativeHandle))));
+        prop.GetTy(), Nodes(ctx.factory.CreatePropGetterCallViaMsgSend(prop, std::move(nativeHandle))));
     arpScopeCall->curFile = curFile;
 
-    getter->funcBody->body = CreateBlock({}, prop.ty);
-    getter->funcBody->body->body.emplace_back(ctx.factory.WrapEntity(std::move(arpScopeCall), *prop.ty));
+    getter->funcBody->body = CreateBlock({}, prop.GetTy());
+    getter->funcBody->body->body.emplace_back(ctx.factory.WrapEntity(std::move(arpScopeCall), *prop.GetTy()));
 }
 
 void DesugarSetter(InteropContext& ctx, ClassLikeDecl& mirror, PropDecl& prop)
@@ -264,14 +264,15 @@ void DesugarFieldGetter(InteropContext& ctx, ClassLikeDecl& mirror, PropDecl& fi
     CJC_ASSERT(!field.getters.empty());
     auto& getter = field.getters[0];
     auto curFile = field.curFile;
-    getter->funcBody->body = CreateBlock({}, field.ty);
+    getter->funcBody->body = CreateBlock({}, field.GetTy());
 
     CJC_ASSERT(!field.TestAttr(Attribute::STATIC));
     auto nativeHandle = ctx.factory.CreateNativeHandleExpr(mirror, false, curFile);
 
     auto getInstanceVariableCall = ctx.factory.CreateGetInstanceVariableCall(field, std::move(nativeHandle));
 
-    getter->funcBody->body->body.emplace_back(ctx.factory.WrapEntity(std::move(getInstanceVariableCall), *field.ty));
+    getter->funcBody->body->body.emplace_back(
+        ctx.factory.WrapEntity(std::move(getInstanceVariableCall), *field.GetTy()));
 }
 
 void DesugarFieldSetter(InteropContext& ctx, ClassLikeDecl& mirror, PropDecl& field)

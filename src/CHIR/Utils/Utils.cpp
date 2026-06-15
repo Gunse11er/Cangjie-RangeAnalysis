@@ -21,16 +21,18 @@
 #include "cangjie/Utils/CheckUtils.h"
 #include "cangjie/Utils/ConstantsUtils.h"
 
+#include <cstddef>
 #include <iostream>
+#include <optional>
 #include <stack>
 
 namespace Cangjie::CHIR {
-bool CheckFuncName(const FuncBase& func, const FuncInfo& funcInfo)
+bool CheckFuncName(const Function& func, const FuncInfo& funcInfo)
 {
     return func.GetSrcCodeIdentifier() == funcInfo.funcName;
 }
 
-bool CheckParentTy(const FuncBase& func, const FuncInfo& funcInfo)
+bool CheckParentTy(const Function& func, const FuncInfo& funcInfo)
 {
     if (funcInfo.parentTy == NOT_CARE) {
         return true;
@@ -54,7 +56,7 @@ bool CheckParentTy(const FuncBase& func, const FuncInfo& funcInfo)
     return parentName == funcInfo.parentTy;
 }
 
-bool CheckParametersTy(const FuncBase& funcBase, const FuncInfo& funcInfo)
+bool CheckParametersTy(const Function& funcBase, const FuncInfo& funcInfo)
 {
     bool needToMatchArgsNum = true;
     auto paramTys = funcBase.GetFuncType()->GetParamTypes();
@@ -91,7 +93,7 @@ bool CheckParametersTy(const FuncBase& funcBase, const FuncInfo& funcInfo)
     return true;
 }
 
-bool CheckReturnTy(const FuncBase& func, const FuncInfo& funcInfo)
+bool CheckReturnTy(const Function& func, const FuncInfo& funcInfo)
 {
     if (funcInfo.returnTy == NOT_CARE || funcInfo.returnTy == ANY_TYPE) {
         return true;
@@ -101,7 +103,7 @@ bool CheckReturnTy(const FuncBase& func, const FuncInfo& funcInfo)
     return returnTy->ToSrcCodeString() == funcInfo.returnTy;
 }
 
-bool CheckPkgName(const FuncBase& func, const FuncInfo& funcInfo)
+bool CheckPkgName(const Function& func, const FuncInfo& funcInfo)
 {
     if (funcInfo.pkgName == NOT_CARE || funcInfo.pkgName == ANY_TYPE) {
         return true;
@@ -109,7 +111,7 @@ bool CheckPkgName(const FuncBase& func, const FuncInfo& funcInfo)
     return funcInfo.pkgName == func.GetPackageName();
 }
 
-bool IsExpectedFunction(const FuncBase& func, const FuncInfo& funcInfo)
+bool IsExpectedFunction(const Function& func, const FuncInfo& funcInfo)
 {
     return CheckFuncName(func, funcInfo) && CheckParentTy(func, funcInfo) && CheckParametersTy(func, funcInfo) &&
         CheckReturnTy(func, funcInfo) && CheckPkgName(func, funcInfo);
@@ -167,7 +169,7 @@ FuncKind GetFuncKindFromAST(const AST::FuncDecl& func)
     return FuncKind::DEFAULT;
 }
 
-bool IsVirtualFunction(const FuncBase& funcDecl)
+bool IsVirtualFunction(const Function& funcDecl)
 {
     // rule 1: global function is not virtual function
     auto parent = funcDecl.GetParentCustomTypeDef();
@@ -228,7 +230,7 @@ bool IsVirtualFunction(const FuncBase& funcDecl)
         funcDecl.TestAttr(Attribute::OVERRIDE);
 }
 
-bool IsInterfaceStaticMethod(const Func& func)
+bool IsInterfaceStaticMethod(const Function& func)
 {
     auto parent = func.GetParentCustomTypeDef();
     if (parent == nullptr) {
@@ -281,7 +283,7 @@ std::deque<Block*> TopologicalSort(Block* entrybb)
     return res;
 }
 
-void AddExpressionsToGlobalInitFunc(const Func& initFunc, const std::vector<Expression*>& insertExpr)
+void AddExpressionsToGlobalInitFunc(const Function& initFunc, const std::vector<Expression*>& insertExpr)
 {
     auto visitAction = [&insertExpr](Expression& expr) {
         if (expr.GetExprKind() != ExprKind::STORE) {
@@ -340,7 +342,7 @@ std::vector<Ptr<AST::VarDecl>> GetNonStaticSuperMemberVars(const AST::ClassLikeD
     return std::vector<Ptr<AST::VarDecl>>{};
 }
 
-bool IsCrossPackage(const Cangjie::Position& pos, const std::string& currentPackage, DiagAdapter& diag)
+bool IsCrossPackage(const Cangjie::Position& pos, const std::string& currentPackage, DiagnosticEngine& diag)
 {
     if (diag.GetSourceManager().GetSource(pos.fileID).packageName.has_value()) {
         if (currentPackage != diag.GetSourceManager().GetSource(pos.fileID).packageName.value()) {
@@ -666,7 +668,7 @@ bool IsStaticInit(const AST::FuncDecl& func)
     return func.TestAttr(AST::Attribute::STATIC, AST::Attribute::CONSTRUCTOR) && func.identifier == STATIC_INIT_FUNC;
 }
 
-bool IsStaticInit(const FuncBase& func)
+bool IsStaticInit(const Function& func)
 {
     return func.TestAttr(Attribute::STATIC) &&
         (func.GetFuncKind() == FuncKind::CLASS_CONSTRUCTOR || func.GetFuncKind() == FuncKind::STRUCT_CONSTRUCTOR) &&
@@ -854,7 +856,7 @@ std::vector<Type*> GetOutDefDeclaredTypes(const Value& innerDef)
     */
     auto visiableGenericTypes = GetVisiableGenericTypes(innerDef);
     std::vector<Type*> instArgs(visiableGenericTypes.begin(), visiableGenericTypes.end());
-    auto parentFunc = DynamicCast<const FuncBase*>(&innerDef);
+    auto parentFunc = DynamicCast<const Function*>(&innerDef);
     if (parentFunc == nullptr) {
         parentFunc = GetTopLevelFunc(innerDef);
     }
@@ -872,9 +874,9 @@ std::vector<Type*> GetOutDefDeclaredTypes(const Value& innerDef)
 
 std::pair<std::string, FuncType*> GetFuncTypeFromAutoEnvBaseDef(const ClassDef& autoEnvBaseDef)
 {
-    auto abstractMethods = autoEnvBaseDef.GetAbstractMethods();
-    CJC_ASSERT(abstractMethods.size() == 1);
-    return {abstractMethods[0].methodName, StaticCast<FuncType*>(abstractMethods[0].methodTy)};
+    auto methods = autoEnvBaseDef.GetMethods();
+    CJC_ASSERT(methods.size() == 1);
+    return {methods[0]->GetSrcCodeIdentifier(), methods[0]->GetFuncType()};
 }
 
 std::pair<std::vector<Type*>, Type*> GetFuncTypeWithoutThisPtrFromAutoEnvBaseType(const ClassType& autoEnvBaseType)
@@ -1030,7 +1032,7 @@ bool IsCapturedClass(const ClassDef& def)
     return def.Get<IsCapturedClassInCC>();
 }
 
-Func* GetTopLevelFunc(const Value& value)
+Function* GetTopLevelFunc(const Value& value)
 {
     if (value.IsParameter()) {
         return StaticCast<const Parameter&>(value).GetTopLevelFunc();
@@ -1045,7 +1047,7 @@ Func* GetTopLevelFunc(const Value& value)
     return nullptr;
 }
 
-void GetVisiableGenericTypes(const FuncBase& value, std::vector<GenericType*>& result)
+void GetVisiableGenericTypes(const Function& value, std::vector<GenericType*>& result)
 {
     auto curGenericTypeParams = value.GetGenericTypeParams();
     result.insert(result.begin(), curGenericTypeParams.begin(), curGenericTypeParams.end());
@@ -1111,7 +1113,7 @@ std::vector<GenericType*> GetVisiableGenericTypes(const Value& value)
 {
     std::vector<GenericType*> result;
     if (value.IsFunc()) {
-        GetVisiableGenericTypes(VirtualCast<const FuncBase&>(value), result);
+        GetVisiableGenericTypes(StaticCast<const Function&>(value), result);
     } else if (value.IsBlock()) {
         GetVisiableGenericTypes(StaticCast<const Block&>(value), result);
     } else if (value.IsBlockGroup()) {
@@ -1156,7 +1158,7 @@ FuncType* GetFuncType(const BlockGroup& funcBody)
 
 bool IsStructOrExtendMethod(const Value& value)
 {
-    auto func = DynamicCast<const FuncBase*>(&value);
+    auto func = DynamicCast<const Function*>(&value);
     if (func == nullptr) {
         return false;
     }
@@ -1176,7 +1178,7 @@ bool IsStructOrExtendMethod(const Value& value)
 
 bool IsConstructor(const Value& value)
 {
-    if (auto func = DynamicCast<FuncBase>(&value)) {
+    if (auto func = DynamicCast<Function>(&value)) {
         return func->IsConstructor();
     }
     return false;
@@ -1205,7 +1207,7 @@ Value* GetCastOriginalTarget(const Expression& expr)
 
 bool IsInstanceVarInit(const Value& value)
 {
-    if (auto func = DynamicCast<FuncBase>(&value)) {
+    if (auto func = DynamicCast<Function>(&value)) {
         return func->IsInstanceVarInit();
     }
     return false;
@@ -1246,6 +1248,10 @@ bool ParamTypeIsEquivalent(const Type& paramType, const Type& argType)
     if (&paramType == &argType) {
         return true;
     }
+    // `NothingType` is any type's sub type, so it's equivalent to any type
+    if (argType.IsNothing()) {
+        return true;
+    }
     if (argType.IsBoxRefTypeOf(paramType) || paramType.IsBoxRefTypeOf(argType)) {
         return true;
     }
@@ -1253,7 +1259,7 @@ bool ParamTypeIsEquivalent(const Type& paramType, const Type& argType)
 }
 
 ClassType* GetInstParentType(const std::vector<ClassType*>& candidate,
-    const FuncBase& callee, const std::vector<Value*>& args, CHIRBuilder& builder)
+    const Function& callee, const std::vector<Value*>& args, CHIRBuilder& builder)
 {
     CJC_ASSERT(!candidate.empty());
     if (candidate.size() == 1) {
@@ -1297,7 +1303,7 @@ ClassType* GetInstParentType(const std::vector<ClassType*>& candidate,
 Type* GetInstParentCustomTyOfCallee(
     const Value& value, const std::vector<Value*>& args, const Type* thisType, CHIRBuilder& builder)
 {
-    auto callee = DynamicCast<FuncBase*>(&value);
+    auto callee = DynamicCast<Function*>(&value);
     if (callee == nullptr) {
         return nullptr;  // call a value
     }
@@ -1532,7 +1538,6 @@ Type* CreateBoxRefTypeIfNeed(Type& baseType, CHIRBuilder& builder)
     return builder.GetType<RefType>(builder.GetType<BoxType>(&baseType));
 }
 
-
 Type* GetInstParentType(Type& instSubType, Type& genericParentType, CHIRBuilder& builder)
 {
     if (!genericParentType.IsGenericRelated()) {
@@ -1555,7 +1560,7 @@ Type* GetInstParentType(Type& instSubType, Type& genericParentType, CHIRBuilder&
     return ReplaceRawGenericArgType(genericParentType, replaceTable, builder);
 }
 
-bool ReturnTypeShouldBeVoid(const FuncBase& func)
+bool ReturnTypeShouldBeVoid(const Function& func)
 {
     // 1. global var init function
     // 2. finalizer
@@ -1577,8 +1582,19 @@ uint64_t GetRefDims(const Type& type)
     return dims;
 }
 
-bool IsSTDFunction(const FuncBase& func)
+bool IsSTDFunction(const Function& func)
 {
     return func.GetPackageName().substr(0, strlen(STD_PACKAGE_PREFIX)) == STD_PACKAGE_PREFIX;
+}
+
+std::vector<Expression*> GetNonDebugUsers(const Value& val)
+{
+    std::vector<Expression*> res;
+    for (auto expr: val.GetUsers()) {
+        if (expr->GetExprKind() != CHIR::ExprKind::DEBUGEXPR) {
+            res.emplace_back(expr);
+        }
+    }
+    return res;
 }
 } // namespace Cangjie::CHIR

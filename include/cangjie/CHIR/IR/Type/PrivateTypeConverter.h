@@ -42,7 +42,7 @@ class CustomDefTypeFunctor;
 { \
     KIND, \
     [](TSelf* self, Value& o, Args...args) { \
-        return self->VisitSubValue(*VirtualCast<OP*>(&o), std::forward(args)...); \
+        return self->VisitSubValue(*StaticCast<OP*>(&o), std::forward(args)...); \
     } \
 }
 
@@ -179,15 +179,13 @@ protected:
     {
         CJC_ABORT();
     }
-    virtual R VisitSubValue(Func& o, Args... args) VISIT_IMPL_DEFAULT(Value);
-    virtual R VisitSubValue(ImportedFunc& o, Args... args) VISIT_IMPL_DEFAULT(Value);
+    virtual R VisitSubValue(Function& o, Args... args) VISIT_IMPL_DEFAULT(Value);
 
 private:
     static Dispatcher InitValueVTable()
     {
         Dispatcher dispatcher = {
-            VISIT_IMPL_DISPATCH_VALUE(Value::ValueKind::KIND_FUNC, Func),
-            VISIT_IMPL_DISPATCH_VALUE(Value::ValueKind::KIND_IMP_FUNC, ImportedFunc),
+            VISIT_IMPL_DISPATCH_VALUE(Value::ValueKind::KIND_FUNC, Function),
         };
         return dispatcher;
     }
@@ -251,12 +249,11 @@ public:
     {
     }
 
-    void VisitSubValue(Func& o) override;
-    void VisitSubValue(ImportedFunc& o) override;
+    void VisitSubValue(Function& o) override;
     void VisitValueDefaultImpl(Value& o) override;
 
 private:
-    void VisitFuncBase(FuncBase& o);
+    void VisitFuncBase(Function& o);
 };
 
 class CustomDefTypeConverter : public virtual TypeConverter, public CustomDefTypeFunctor<void(CustomTypeDef& o)> {
@@ -324,7 +321,7 @@ public:
         return ValueTypeConverter::VisitValue(o);
     }
 
-    void VisitSubValue(Func& o) override;
+    void VisitSubValue(Function& o) override;
     void VisitValueDefaultImpl(Value& o) override;
 
 protected:

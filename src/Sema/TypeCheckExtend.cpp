@@ -26,16 +26,16 @@ using namespace AST;
 
 void TypeChecker::TypeCheckerImpl::CheckExtendGenerics(const ExtendDecl& ed)
 {
-    bool isMovedCommonED =
-        !ed.TestAttr(Attribute::IMPORTED) && ed.TestAttr(Attribute::FROM_COMMON_PART) && ed.TestAttr(Attribute::COMMON);
-    if (!ed.generic || !Ty::IsTyCorrect(ed.extendedType->ty) || !ed.extendedType->ty->IsExtendable() ||
+    bool isMovedCommonED = !ed.TestAttr(Attribute::IMPORTED) && ed.TestAttr(Attribute::FROM_COMMON_PART) &&
+        ed.TestAttr(Attribute::COMMON);
+    if (!ed.generic || !Ty::IsTyCorrect(ed.extendedType->GetTy()) || !ed.extendedType->GetTy()->IsExtendable() ||
         isMovedCommonED) {
         return;
     }
-    auto usedGenericTys = GetAllGenericTys(ed.extendedType->ty);
+    auto usedGenericTys = GetAllGenericTys(ed.extendedType->GetTy());
     std::vector<std::string> unusedTypes;
     for (auto& it : ed.generic->typeParameters) {
-        if (usedGenericTys.count(it->ty) == 0) {
+        if (usedGenericTys.count(it->GetTy()) == 0) {
             unusedTypes.emplace_back(it->identifier);
         }
     }
@@ -50,11 +50,11 @@ void TypeChecker::TypeCheckerImpl::CheckExtendGenerics(const ExtendDecl& ed)
 
 void TypeChecker::TypeCheckerImpl::CheckExtendedTypeValidity(const Type& extendedType)
 {
-    if (!Ty::IsTyCorrect(extendedType.ty) || extendedType.ty->IsExtendable()) {
+    if (!Ty::IsTyCorrect(extendedType.GetTy()) || extendedType.GetTy()->IsExtendable()) {
         return;
     }
     // All other types are not allowed to be extended.
-    diag.DiagnoseRefactor(DiagKindRefactor::sema_illegal_extended_type, extendedType, extendedType.ty->String());
+    diag.DiagnoseRefactor(DiagKindRefactor::sema_illegal_extended_type, extendedType, extendedType.GetTy()->String());
 }
 
 /**
@@ -82,12 +82,12 @@ void TypeChecker::TypeCheckerImpl::CheckExtendDupDefImplByDiffTypArgs(
             continue;
         }
         for (auto& inhert : e->inheritedTypes) {
-            auto inhertDecl = Ty::GetDeclPtrOfTy(inhert->ty);
+            auto inhertDecl = Ty::GetDeclPtrOfTy(inhert->GetTy());
             directlyImplementedInterfaces.emplace(inhertDecl);
         }
     }
     for (auto& inhert : extend.inheritedTypes) {
-        auto inhertDecl = Ty::GetDeclPtrOfTy(inhert->ty);
+        auto inhertDecl = Ty::GetDeclPtrOfTy(inhert->GetTy());
         auto found = directlyImplementedInterfaces.find(inhertDecl);
         if (found != directlyImplementedInterfaces.end()) {
             CheckDefImplWithoutOutsideGeneric(*inhertDecl, extend);
@@ -103,13 +103,13 @@ void TypeChecker::TypeCheckerImpl::CheckDefImplWithoutOutsideGeneric(Decl& inher
     }
     std::vector<Ptr<Ty>> outersideGenericParamTys;
     for (auto& tp : id->generic->typeParameters) {
-        outersideGenericParamTys.emplace_back(tp->ty);
+        outersideGenericParamTys.emplace_back(tp->GetTy());
     }
     for (auto& member : id->GetMemberDecls()) {
-        if (!member->TestAttr(Attribute::DEFAULT) || !Ty::IsTyCorrect(member->ty)) {
+        if (!member->TestAttr(Attribute::DEFAULT) || !Ty::IsTyCorrect(member->GetTy())) {
             continue;
         }
-        auto usedGenericTypeParamTys = member->ty->GetGenericTyArgs();
+        auto usedGenericTypeParamTys = member->GetTy()->GetGenericTyArgs();
         bool usedOutersideGeneric = false;
         for (auto& outer : outersideGenericParamTys) {
             if (Utils::In(outer, usedGenericTypeParamTys)) {
@@ -118,7 +118,7 @@ void TypeChecker::TypeCheckerImpl::CheckDefImplWithoutOutsideGeneric(Decl& inher
             }
         }
         if (!usedOutersideGeneric) {
-            std::string typeName = "extend " + extend.ty->String();
+            std::string typeName = "extend " + extend.GetTy()->String();
             auto builder = diag.DiagnoseRefactor(DiagKindRefactor::sema_extend_member_cannot_shadow,
                 MakeRange(member->identifier), member->identifier.Val(), typeName);
         }
@@ -132,8 +132,8 @@ void TypeChecker::TypeCheckerImpl::CheckExtendInterfaces(
     if (auto extendedDecl = Ty::GetDeclPtrOfTy<InheritableDecl>(&ty); extendedDecl) {
         std::vector<Ptr<Ty>> allSuperTys{};
         for (const auto& inheritedType : extendedDecl->inheritedTypes) {
-            if (inheritedType->ty) {
-                auto superTys = typeManager.GetAllSuperTys(*inheritedType->ty);
+            if (inheritedType->GetTy()) {
+                auto superTys = typeManager.GetAllSuperTys(*inheritedType->GetTy());
                 allSuperTys.insert(allSuperTys.end(), superTys.begin(), superTys.end());
             }
         }
@@ -149,12 +149,12 @@ void TypeChecker::TypeCheckerImpl::CheckExtendInterfaces(
             continue;
         }
         MultiTypeSubst typeMapping;
-        if (extendDecl->extendedType->ty) {
-            typeMapping = promotion.GetPromoteTypeMapping(ty, *extendDecl->extendedType->ty);
+        if (extendDecl->extendedType->GetTy()) {
+            typeMapping = promotion.GetPromoteTypeMapping(ty, *extendDecl->extendedType->GetTy());
         }
         // Check all implemented interfaces of this extend decl.
         for (const auto& interface : extendDecl->inheritedTypes) {
-            auto instantiateTy = typeManager.GetBestInstantiatedTy(interface->ty, typeMapping);
+            auto instantiateTy = typeManager.GetBestInstantiatedTy(interface->GetTy(), typeMapping);
             if (!instantiateTy->IsInterface()) {
                 continue;
             }
@@ -195,26 +195,26 @@ void TypeChecker::TypeCheckerImpl::CheckSpecializationExtend(const InheritableDe
     const ExtendDecl& extendDecl, const std::set<Ptr<ExtendDecl>, CmpNodeByPos> otherExtendDecls)
 {
     // Only check specialized versions of generic types. Only Line 3 will be checked.
-    if (extendedDecl.ty && !extendedDecl.ty->HasGeneric()) {
+    if (extendedDecl.GetTy() && !extendedDecl.GetTy()->HasGeneric()) {
         return;
     }
     // Get typemapping from 'class A<K>'(in Line 2) to 'extend A<String>'(in Line 3), it should return K |-> String.
-    auto orig2specMapping = GenerateTypeMapping(extendedDecl, extendDecl.extendedType->ty->typeArgs);
+    auto orig2specMapping = GenerateTypeMapping(extendedDecl, extendDecl.extendedType->GetTy()->typeArgs);
 
     // Check if type definition is 'class A<T> <: I<T>'. The super interface will be instantiated as 'I<String>'.
-    CheckSpecializationExtendDupImstantation(*extendedDecl.ty, extendDecl, extendedDecl, orig2specMapping, true);
+    CheckSpecializationExtendDupImstantation(*extendedDecl.GetTy(), extendDecl, extendedDecl, orig2specMapping, true);
 
     // Check with other generic extend declarations.
     for (auto ed : otherExtendDecls) {
         // Exclude all non-generic declaration.
-        if (!ed->ty || !ed->ty->HasGeneric()) {
+        if (!ed->GetTy() || !ed->GetTy()->HasGeneric()) {
             continue;
         }
         // Get typemapping from 'class A<K>'(in Line 2) to 'extend<T> A<T>'(in line 4), it should return K |-> T.
-        auto orig2genericMapping = GenerateTypeMapping(extendedDecl, ed->extendedType->ty->typeArgs);
+        auto orig2genericMapping = GenerateTypeMapping(extendedDecl, ed->extendedType->GetTy()->typeArgs);
         TypeSubst instantMapping;
         bool needCheck = true;
-        for (auto typeArg : extendedDecl.ty->typeArgs) {
+        for (auto typeArg : extendedDecl.GetTy()->typeArgs) {
             auto tyArgGen = StaticCast<GenericsTy*>(typeArg);
             auto mapping = GenerateTypeMappingByTy(orig2genericMapping[tyArgGen], orig2specMapping[tyArgGen]);
             for (auto m : mapping) {
@@ -228,7 +228,7 @@ void TypeChecker::TypeCheckerImpl::CheckSpecializationExtend(const InheritableDe
             }
         }
         if (needCheck) {
-            CheckSpecializationExtendDupImstantation(*extendedDecl.ty, extendDecl, *ed, instantMapping);
+            CheckSpecializationExtendDupImstantation(*extendedDecl.GetTy(), extendDecl, *ed, instantMapping);
         }
     }
 }
@@ -239,19 +239,19 @@ void TypeChecker::TypeCheckerImpl::CheckSpecializationExtendDupImstantation(cons
 {
     // 'compareExtend' is Specialized Version, 'beComparedDecl' is Generic Version.
     for (auto& compareSuperInterface : compareExtend.inheritedTypes) {
-        if (!compareSuperInterface || compareSuperInterface->ty->HasGeneric() ||
-            compareSuperInterface->ty->typeArgs.empty()) {
+        if (!compareSuperInterface || compareSuperInterface->GetTy()->HasGeneric() ||
+            compareSuperInterface->GetTy()->typeArgs.empty()) {
             continue;
         }
         std::unordered_set<Ptr<Ty>> allSuperTys{};
         for (const auto& inheritedType : beComparedDecl.inheritedTypes) {
-            if (!inheritedType->ty) {
+            if (!inheritedType->GetTy()) {
                 continue;
             }
             if (checkParent) {
-                allSuperTys.merge(typeManager.GetAllSuperTys(*inheritedType->ty));
+                allSuperTys.merge(typeManager.GetAllSuperTys(*inheritedType->GetTy()));
             } else {
-                allSuperTys.emplace(inheritedType->ty);
+                allSuperTys.emplace(inheritedType->GetTy());
             }
         }
         for (auto& beComparedSuperInterfaceTy : allSuperTys) {
@@ -260,11 +260,11 @@ void TypeChecker::TypeCheckerImpl::CheckSpecializationExtendDupImstantation(cons
                 continue;
             }
             auto instantTy = typeManager.GetInstantiatedTy(beComparedSuperInterfaceTy, instantMapping);
-            if (instantTy != compareSuperInterface->ty) {
+            if (instantTy != compareSuperInterface->GetTy()) {
                 continue;
             }
             auto builder = diag.DiagnoseRefactor(DiagKindRefactor::sema_extend_duplicate_interface,
-                *compareSuperInterface, compareSuperInterface->ty->String(), extendedDeclTy.String());
+                *compareSuperInterface, compareSuperInterface->GetTy()->String(), extendedDeclTy.String());
             builder.AddNote(MakeRange(beComparedDecl.begin, beComparedDecl.end),
                 "it may be an instantiated version of the following declaration");
         }
@@ -300,10 +300,10 @@ void TypeChecker::TypeCheckerImpl::PreCheckAllExtendInterface()
     auto extendedDecls = typeManager.GetAllExtendedDecls();
     std::set<Ptr<const InheritableDecl>, CmpNodeByPos> declKeys(extendedDecls.begin(), extendedDecls.end());
     for (auto decl : declKeys) {
-        CJC_ASSERT(decl->ty);
+        CJC_ASSERT(decl->GetTy());
         auto extends = typeManager.GetDeclExtends(*decl);
         std::set<Ptr<ExtendDecl>, CmpNodeByPos> ordered(extends.begin(), extends.end());
-        CheckExtendInterfaces(*decl->ty, ordered);
+        CheckExtendInterfaces(*decl->GetTy(), ordered);
         for (auto ed : ordered) {
             CheckSpecializationExtend(*decl, *ed, ordered);
         }
@@ -314,16 +314,16 @@ void TypeChecker::TypeCheckerImpl::PreCheckExtend(ASTContext& ctx, ExtendDecl& e
 {
     // Need put after TypeAlias circle check.
     if (ed.extendedType) {
-        auto decl = Ty::GetDeclOfTy(ed.extendedType->ty);
+        auto decl = Ty::GetDeclOfTy(ed.extendedType->GetTy());
         if (decl && decl->TestAttr(Attribute::C)) {
             diag.DiagnoseRefactor(
                 DiagKindRefactor::sema_c_type_cannot_extend_interface, *ed.extendedType.get(), decl->identifier);
         }
-        ed.ty = ed.extendedType->ty;
+        ed.SetTy(ed.extendedType->GetTy());
     }
     // Check implemented interfaces.
     for (auto it = ed.inheritedTypes.begin(); it != ed.inheritedTypes.end();) {
-        if (!Ty::IsTyCorrect((*it)->ty) || (*it)->ty->kind != TypeKind::TYPE_INTERFACE) {
+        if (!Ty::IsTyCorrect((*it)->GetTy()) || (*it)->TyKind() != TypeKind::TYPE_INTERFACE) {
             diag.DiagnoseRefactor(DiagKindRefactor::sema_extend_not_interface, *(*it));
             ctx.DeleteInvertedIndexes(it->get());
             it->reset();
@@ -355,14 +355,14 @@ void UpdateExtendMap(TypeManager& typeManager, const std::unordered_set<Ptr<AST:
             // The common extend with specificImplementation is skipped because its specific version already exists.
             continue;
         }
-        auto extendTy = extendDecl->extendedType->ty;
+        auto extendTy = extendDecl->extendedType->GetTy();
         if (!Ty::IsTyCorrect(extendTy) || !extendTy->IsExtendable() || !IsExtendedASTKind(*extendDecl->extendedType)) {
             continue;
         }
         for (auto& interfaceType : extendDecl->inheritedTypes) {
             CJC_NULLPTR_CHECK(interfaceType);
-            if (Ty::IsTyCorrect(interfaceType->ty) && interfaceType->ty->IsClassLike()) {
-                StaticCast<ClassLikeTy&>(*interfaceType->ty).directSubtypes.emplace(extendTy);
+            if (Ty::IsTyCorrect(interfaceType->GetTy()) && interfaceType->GetTy()->IsClassLike()) {
+                StaticCast<ClassLikeTy&>(*interfaceType->GetTy()).directSubtypes.emplace(extendTy);
             }
         }
         // extendTy is a built-in type
@@ -384,7 +384,7 @@ void UpdateExtendMap(TypeManager& typeManager, const std::unordered_set<Ptr<AST:
         }
         typeManager.declToExtendMap[decl].emplace(extendDecl);
         for (auto& interfaceType : extendDecl->inheritedTypes) {
-            auto id = Ty::GetDeclPtrOfTy(interfaceType->ty);
+            auto id = Ty::GetDeclPtrOfTy(interfaceType->GetTy());
             if (id == nullptr) {
                 continue;
             }
@@ -441,7 +441,7 @@ void TypeChecker::TypeCheckerImpl::CheckExtendRules(const ASTContext& ctx)
     for (auto& sym : syms) {
         auto extendDecl = As<ASTKind::EXTEND_DECL>(sym->node);
         bool invalid =
-            extendDecl == nullptr || !extendDecl->extendedType || !Ty::IsTyCorrect(extendDecl->extendedType->ty);
+            extendDecl == nullptr || !extendDecl->extendedType || !Ty::IsTyCorrect(extendDecl->extendedType->GetTy());
         if (invalid) {
             continue;
         }
@@ -452,7 +452,7 @@ void TypeChecker::TypeCheckerImpl::CheckExtendRules(const ASTContext& ctx)
 
 void TypeChecker::TypeCheckerImpl::CheckImmutExtendInhertMutSuper(const Type& inheritedType, const ExtendDecl& ed)
 {
-    if (!Ty::IsTyCorrect(ed.ty) || !ed.ty->IsImmutableType()) {
+    if (!Ty::IsTyCorrect(ed.GetTy()) || !ed.GetTy()->IsImmutableType()) {
         return;
     }
     Ptr<Decl> target = inheritedType.GetTarget();
@@ -482,11 +482,11 @@ void TypeChecker::TypeCheckerImpl::CheckExtendDecl(ASTContext& ctx, ExtendDecl& 
 
     // Do type legality check for extend type.
     CJC_NULLPTR_CHECK(ed.extendedType);
-    Synthesize(ctx, ed.extendedType.get());
+    Synthesize({ctx, SynPos::NONE}, ed.extendedType.get());
     Ptr<Decl> extendedDecl = ed.extendedType->GetTarget();
     // Check implemented interfaces.
     for (auto it = ed.inheritedTypes.begin(); it != ed.inheritedTypes.end();) {
-        if (!Ty::IsTyCorrect(Synthesize(ctx, it->get()))) {
+        if (!Ty::IsTyCorrect(Synthesize({ctx, SynPos::NONE}, it->get()))) {
             ctx.DeleteInvertedIndexes(it->get());
             it->reset();
             it = ed.inheritedTypes.erase(it);
@@ -500,9 +500,10 @@ void TypeChecker::TypeCheckerImpl::CheckExtendDecl(ASTContext& ctx, ExtendDecl& 
         }
     }
     for (auto& m : ed.members) {
-        Synthesize(ctx, m.get());
-        if (ed.ty && ed.ty->IsImmutableType()) {
-            if (auto fd = DynamicCast<FuncDecl*>(m.get()); fd && !ed.ty->IsEnum() && IsIndexAssignmentOperator(*fd)) {
+        Synthesize({ctx, SynPos::NONE}, m.get());
+        if (ed.GetTy() && ed.GetTy()->IsImmutableType()) {
+            if (auto fd = DynamicCast<FuncDecl*>(m.get());
+                fd && !ed.GetTy()->IsEnum() && IsIndexAssignmentOperator(*fd)) {
                 auto fdIdRange = MakeRange(fd->identifier);
                 diag.DiagnoseRefactor(
                     DiagKindRefactor::sema_immutable_type_extend_assignment_index_operator, *fd, fdIdRange);
@@ -525,28 +526,28 @@ void TypeChecker::TypeCheckerImpl::CheckExtendDecl(ASTContext& ctx, ExtendDecl& 
 
 void TypeChecker::TypeCheckerImpl::CheckExtendOrphanRule(const ASTContext& ctx, ExtendDecl& ed)
 {
-    CJC_ASSERT(ed.extendedType && ed.extendedType->ty);
+    CJC_ASSERT(ed.extendedType && ed.extendedType->GetTy());
     // Collect interfaces which has already been extended in other packages.
-    auto extendedTypeTarget = Ty::GetDeclPtrOfTy<InheritableDecl>(ed.extendedType->ty);
+    auto extendedTypeTarget = Ty::GetDeclPtrOfTy<InheritableDecl>(ed.extendedType->GetTy());
     std::unordered_set<Ptr<Ty>> otherPackageExtendInterfaceTy{};
     // 1. collect direct inherited interfaces of type decl.
-    if (extendedTypeTarget && extendedTypeTarget->ty) {
-        auto iTys = typeManager.GetAllSuperTys(*extendedTypeTarget->ty, {}, false);
+    if (extendedTypeTarget && extendedTypeTarget->GetTy()) {
+        auto iTys = typeManager.GetAllSuperTys(*extendedTypeTarget->GetTy(), {}, false);
         otherPackageExtendInterfaceTy.insert(iTys.begin(), iTys.end());
     }
     // 2. collect direct and indirect extend decls.
     auto extends = extendedTypeTarget ? CollectAllRelatedExtends(typeManager, *extendedTypeTarget)
-                                      : typeManager.GetAllExtendsByTy(*ed.extendedType->ty);
+                                      : typeManager.GetAllExtendsByTy(*ed.extendedType->GetTy());
     for (const auto& extend : extends) {
         // Replace other extended interfaces with the current extended interface generics to ensure that the interface
         // generics are the same when ty is compared. If it cannot be replaced, an empty typeMapping is generated.
-        TypeSubst typeMapping = InverseMapping(GenerateTypeMapping(ed, extend->ty->typeArgs));
+        TypeSubst typeMapping = InverseMapping(GenerateTypeMapping(ed, extend->GetTy()->typeArgs));
         if (extend->fullPackageName != ctx.fullPackageName) {
             for (const auto& inheritedType : extend->inheritedTypes) {
-                if (!inheritedType->ty) {
+                if (!inheritedType->GetTy()) {
                     continue;
                 }
-                for (auto superTy : typeManager.GetAllSuperTys(*inheritedType->ty)) {
+                for (auto superTy : typeManager.GetAllSuperTys(*inheritedType->GetTy())) {
                     otherPackageExtendInterfaceTy.insert(typeManager.GetInstantiatedTy(superTy, typeMapping));
                 }
             }
@@ -554,14 +555,14 @@ void TypeChecker::TypeCheckerImpl::CheckExtendOrphanRule(const ASTContext& ctx, 
     }
     // Check whether extended type is imported.
     bool isImportedExtendedType = (extendedTypeTarget && extendedTypeTarget->fullPackageName != ctx.fullPackageName) ||
-        ed.extendedType->ty->IsBuiltin();
+        ed.extendedType->GetTy()->IsBuiltin();
     // Check whether all extended interfaces are imported.
     std::set<Ptr<Ty>, CmpTyByName> externalDecls = {};
     for (const auto& inheritedType : ed.inheritedTypes) {
-        if (!inheritedType->ty) {
+        if (!inheritedType->GetTy()) {
             continue;
         }
-        auto allSuperTys = typeManager.GetAllSuperTys(*inheritedType->ty);
+        auto allSuperTys = typeManager.GetAllSuperTys(*inheritedType->GetTy());
         for (auto& ty : allSuperTys) {
             auto decl = Ty::GetDeclPtrOfTy(ty);
             if (decl && decl->fullPackageName != ctx.fullPackageName && otherPackageExtendInterfaceTy.count(ty) == 0) {
@@ -572,7 +573,7 @@ void TypeChecker::TypeCheckerImpl::CheckExtendOrphanRule(const ASTContext& ctx, 
     // Report errors.
     if (isImportedExtendedType && !externalDecls.empty()) {
         std::string extendedType =
-            extendedTypeTarget ? extendedTypeTarget->identifier.Val() : ed.extendedType->ty->String();
+            extendedTypeTarget ? extendedTypeTarget->identifier.Val() : ed.extendedType->GetTy()->String();
         DiagnosticBuilder diagnose = diag.DiagnoseRefactor(DiagKindRefactor::sema_type_cannot_extend_imported_interface,
             *ed.extendedType, extendedTypeTarget ? "imported" : "primitive", extendedType);
         diagnose.AddNote("used external interface: " + Ty::GetTypesToStr(externalDecls, " "));
@@ -582,7 +583,7 @@ void TypeChecker::TypeCheckerImpl::CheckExtendOrphanRule(const ASTContext& ctx, 
 void TypeChecker::TypeCheckerImpl::SetExtendExternalAttr(const ASTContext& ctx, ExtendDecl& ed)
 {
     // Check import and export.
-    Ptr<Decl> extendedTypeTarget = Ty::GetDeclPtrOfTy(ed.extendedType->ty);
+    Ptr<Decl> extendedTypeTarget = Ty::GetDeclPtrOfTy(ed.extendedType->GetTy());
     if (!extendedTypeTarget) {
         extendedTypeTarget = TypeCheckUtil::GetRealTarget(ed.extendedType->GetTarget());
     }
@@ -634,9 +635,9 @@ void TypeChecker::TypeCheckerImpl::SetExtendExternalAttr(const ASTContext& ctx, 
 
 void TypeChecker::TypeCheckerImpl::CheckExtendField(const ASTContext& ctx, MemberAccess& ma)
 {
-    ma.ty = TypeManager::GetInvalidTy(); // Ty will be set to valid if non-error happens.
+    ma.SetTy(TypeManager::GetInvalidTy()); // Ty will be set to valid if non-error happens.
     CJC_NULLPTR_CHECK(ma.curFile);
-    std::vector<Ptr<Decl>> targets = ExtendFieldLookup(ctx, *ma.curFile, ma.baseExpr->ty, ma.field);
+    std::vector<Ptr<Decl>> targets = ExtendFieldLookup(ctx, *ma.curFile, ma.baseExpr->GetTy(), ma.field);
     if (!FilterAndCheckTargetsOfNameAccess(ctx, ma, targets)) {
         return;
     }

@@ -161,7 +161,7 @@ uint32_t PosSearchApi::MAX_DIGITS_COLUMN = 5; /**< Max column width is 99999. */
 
 void PosSearchApi::UpdatePosLimit(unsigned int fileId, int line, int column)
 {
-    uint32_t digitsFile = static_cast<uint32_t>(FillZero(static_cast<int>(fileId), 0).size());
+    uint32_t digitsFile = static_cast<uint32_t>(FillZero(fileId, 0).size());
     uint32_t digitsLine = static_cast<uint32_t>(FillZero(line, 0).size());
     uint32_t digitsColumn = static_cast<uint32_t>(FillZero(column, 0).size());
     if (digitsFile > MAX_DIGITS_FILE) {
@@ -177,7 +177,7 @@ void PosSearchApi::UpdatePosLimit(unsigned int fileId, int line, int column)
 
 std::string PosSearchApi::PosToStr(const Position& pos)
 {
-    std::string ret = FillZero(static_cast<int>(pos.fileID), static_cast<int>(MAX_DIGITS_FILE));
+    std::string ret = FillZero(pos.fileID, static_cast<int>(MAX_DIGITS_FILE));
     ret += FillZero(pos.line, static_cast<int>(MAX_DIGITS_LINE));
     ret += FillZero(pos.column, static_cast<int>(MAX_DIGITS_COLUMN));
     return ret;

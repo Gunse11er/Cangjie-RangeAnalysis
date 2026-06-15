@@ -18,7 +18,7 @@ Ptr<Value> Translator::Visit(const AST::LambdaExpr& lambdaExpr)
     CJC_ASSERT(lambdaExpr.funcBody && lambdaExpr.funcBody->body);
     CJC_ASSERT(!lambdaExpr.mangledName.empty());
     auto lambdaTrans = SetupContextForLambda(*lambdaExpr.funcBody->body);
-    auto funcTy = RawStaticCast<FuncType*>(TranslateType(*lambdaExpr.ty));
+    auto funcTy = RawStaticCast<FuncType*>(TranslateType(*lambdaExpr.GetTy()));
     // Create lambda body and parameters.
     CJC_ASSERT(currentBlock->GetTopLevelFunc());
     BlockGroup* body = builder.CreateBlockGroup(*currentBlock->GetTopLevelFunc());
@@ -32,13 +32,17 @@ Ptr<Value> Translator::Visit(const AST::LambdaExpr& lambdaExpr)
     lambda->InitBody(*body);
 
     std::vector<DebugLocation> paramLoc;
+    std::vector<std::string> paramNames;
     for (auto& astParam : lambdaExpr.funcBody->paramLists[0]->params) {
         paramLoc.emplace_back(TranslateLocationWithoutScope(builder.GetChirContext(), astParam->begin, astParam->end));
+        paramNames.emplace_back(astParam->identifier);
     }
     auto paramTypes = funcTy->GetParamTypes();
     CJC_ASSERT(paramTypes.size() == paramLoc.size());
+    CJC_ASSERT(paramTypes.size() == paramNames.size());
     for (size_t i = 0; i < paramTypes.size(); ++i) {
-        builder.CreateParameter(paramTypes[i], paramLoc[i], *lambda);
+        auto param = builder.CreateParameter(paramTypes[i], paramLoc[i], *lambda);
+        param->SetSrcCodeIdentifier(paramNames[i]);
     }
 
     if (auto lambdaBody = lambda->GetBody(); lambdaBody && lambdaExpr.TestAttr(AST::Attribute::MOCK_SUPPORTED)) {

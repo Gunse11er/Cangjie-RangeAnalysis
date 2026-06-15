@@ -24,8 +24,8 @@ Ptr<Ty> TypeChecker::TypeCheckerImpl::SynLoopControlExpr(const ASTContext& ctx, 
 {
     je.refLoop = FindLoopExpr(ctx, je);
     // je.refLoop may be a null pointer, but the errors are already reported by CheckReturnAndJump in PreCheck
-    je.ty = je.refLoop ? RawStaticCast<Ty*>(TypeManager::GetNothingTy()) : TypeManager::GetInvalidTy();
-    return je.ty;
+    je.SetTy(je.refLoop ? RawStaticCast<Ty*>(TypeManager::GetNothingTy()) : TypeManager::GetInvalidTy());
+    return je.GetTy();
 }
 
 bool TypeChecker::TypeCheckerImpl::ChkLoopControlExpr(const ASTContext& ctx, JumpExpr& je) const

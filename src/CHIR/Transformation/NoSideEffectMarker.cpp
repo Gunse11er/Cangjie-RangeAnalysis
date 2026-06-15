@@ -6,6 +6,8 @@
 
 #include "cangjie/CHIR/Transformation/NoSideEffectMarker.h"
 
+#include "cangjie/Utils/ProfileRecorder.h"
+
 using namespace Cangjie::CHIR;
 
 NoSideEffectMarker::NoSideEffectMarker(Package& package) : package(package)
@@ -14,20 +16,18 @@ NoSideEffectMarker::NoSideEffectMarker(Package& package) : package(package)
 
 void NoSideEffectMarker::Run()
 {
-    for (auto func : package.GetGlobalFuncs()) {
+    Utils::ProfileRecorder recorder("Canonicalization", "NoSideEffectMarker");
+    for (auto func : package.GetGlobalFuncsWithBody()) {
         for (auto element : functionWhiteList) {
             if (IsExpectedFunction(*func, element)) {
                 func->EnableAttr(Attribute::NO_SIDE_EFFECT);
             }
         }
     }
-    for (Value* value : package.GetImportedVarAndFuncs()) {
-        if (value->IsImportedVar()) {
-            continue;
-        }
+    for (auto func : package.GetGlobalFuncsWithoutBody()) {
         for (auto element : functionWhiteList) {
-            if (IsExpectedFunction(*VirtualCast<FuncBase*>(value), element)) {
-                value->EnableAttr(Attribute::NO_SIDE_EFFECT);
+            if (IsExpectedFunction(*func, element)) {
+                func->EnableAttr(Attribute::NO_SIDE_EFFECT);
             }
         }
     }

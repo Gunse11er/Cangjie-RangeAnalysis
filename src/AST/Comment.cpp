@@ -98,6 +98,9 @@ std::string AST::Comment::ToString() const
         case CommentStyle::OTHER:
             str += "\"other\"";
             break;
+        default:
+            CJC_ABORT();
+            break;
     }
     str += ", \"kind\":";
     switch (kind) {
@@ -109,6 +112,9 @@ std::string AST::Comment::ToString() const
             break;
         case CommentKind::DOCUMENT:
             str += "\"doc\"";
+            break;
+        default:
+            CJC_ABORT();
             break;
     }
     str += ", \"info\":\"" + StringConvertor::EscapeToJsonString(info.Value()) + "\"}";

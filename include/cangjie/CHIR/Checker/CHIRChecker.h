@@ -23,7 +23,8 @@ public:
         CHECK_FUNC_BODY,                    // check all expressions in func body, including their types
         GET_INSTANTIATE_VALUE_SHOULD_GONE,  // `GetInstantiateValue` shouldn't be in IR
         CHIR_GET_RTTI_STATIC_TYPE,          // type in GetRTTIStatic should be This or Generic type
-        RETURN_TYPE_NEED_BE_VOID            // global func's return type need to be `Void`
+        RETURN_TYPE_NEED_BE_VOID,           // global func's return type need to be `Void`
+        IMPORTED_CONST_VAR_SHOULD_HAVE_INITIALIZER // imported const var should have initializer
     };
     CHIRChecker(const Package& package, const Cangjie::GlobalOptions& opts, CHIRBuilder& builder);
 
@@ -75,11 +76,11 @@ private:
     void WarningInFunc(const Value& func, const std::string& info);
     void WarningInExpr(const Value& func, const Expression& expr, const std::string& info);
     void ErrorInFunc(const Value& func, const std::string& info);
-    void ErrorInLambdaOrFunc(const FuncBase& func, const Lambda* lambda, const std::string& info);
+    void ErrorInLambdaOrFunc(const Function& func, const Lambda* lambda, const std::string& info);
     void ErrorInExpr(const Value& func, const Expression& expr, const std::string& info);
     void TypeCheckError(
-        const Expression& expr, const Value& value, const std::string& expectedType, const Func& topLevelFunc);
-    void ErrorInGlobalVar(const GlobalVarBase& var, const std::string& info);
+        const Expression& expr, const Value& value, const std::string& expectedType, const Function& topLevelFunc);
+    void ErrorInGlobalVar(const GlobalVar& var, const std::string& info);
 
     // ===--------------------------------------------------------------------===//
     // Check Values
@@ -88,30 +89,29 @@ private:
      * @brief global identifier must be unique
      */
     bool CheckGlobalValueIdentifier(const Value& value);
-    void CheckTopLevelFunc(
-        const Func* calculatedFunc, const Func& realFunc, const std::string& valueName, const std::string& valueId);
-    void CheckFunc(const Func& func);
-    void CheckGlobalVar(const GlobalVarBase& var);
-    void CheckImportedVarAndFuncs(const ImportedValue& value);
-    void CheckGlobalVarType(const GlobalVarBase& var);
+    void CheckTopLevelFunc(const Function* calculatedFunc,
+        const Function& realFunc, const std::string& valueName, const std::string& valueId);
+    void CheckFunc(const Function& func);
+    void CheckGlobalVar(const GlobalVar& var);
+    void CheckGlobalVarType(const GlobalVar& var);
     /**
      * @brief type in `params` must equal to type in `funcType`
      */
     void CheckFuncParams(
         const std::vector<Parameter*>& params, const FuncType& funcType, const std::string& funcIdentifier);
-    bool CheckFuncType(const Type* type, const Lambda* lambda, const FuncBase& topLevelFunc);
-    bool CheckParamTypes(const std::vector<Type*>& paramTypes, const Lambda* lambda, const FuncBase& topLevelFunc);
-    bool CheckCFuncType(const FuncType& funcType, const Lambda* lambda, const FuncBase& topLevelFunc);
+    bool CheckFuncType(const Type* type, const Lambda* lambda, const Function& topLevelFunc);
+    bool CheckParamTypes(const std::vector<Type*>& paramTypes, const Lambda* lambda, const Function& topLevelFunc);
+    bool CheckCFuncType(const FuncType& funcType, const Lambda* lambda, const Function& topLevelFunc);
     void CheckFuncRetValue(
-        const LocalVar* retVal, const Type& retType, const Lambda* lambda, const Func& topLevelFunc);
-    void CheckRetureTypeIfIsVoid(const FuncBase& topLevelFunc, const FuncType& funcType, bool needBeVoid);
-    void CheckBlockGroup(const BlockGroup& blockGroup, const Func& topLevelFunc);
-    void CheckBlock(const Block& block, const Func& topLevelFunc);
+        const LocalVar* retVal, const Type& retType, const Lambda* lambda, const Function& topLevelFunc);
+    void CheckRetureTypeIfIsVoid(const Function& topLevelFunc, const FuncType& funcType, bool needBeVoid);
+    void CheckBlockGroup(const BlockGroup& blockGroup, const Function& topLevelFunc);
+    void CheckBlock(const Block& block, const Function& topLevelFunc);
     /**
      * @brief the successor of current block's predecessor must be current block
      */
-    void CheckPredecessors(const Block& block, const Func& topLevelFunc);
-    void CheckLocalId(BlockGroup& blockGroup, const Func& topLevelFunc);
+    void CheckPredecessors(const Block& block, const Function& topLevelFunc);
+    void CheckLocalId(BlockGroup& blockGroup, const Function& topLevelFunc);
     void CheckUnreachableOpAndGenericTyInFuncBody(const BlockGroup& blockGroup);
     void CheckUnreachableOpAndGenericTyInBG(const BlockGroup& blockGroup,
         std::vector<Value*>& reachableValues, std::vector<GenericType*>& reachableGenericTypes);
@@ -121,15 +121,15 @@ private:
         std::vector<Value*>& reachableValues, std::vector<GenericType*>& reachableGenericTypes);
     void CheckUnreachableOperandInExpr(const Expression& expr, std::vector<Value*>& reachableValues);
     void CheckUnreachableGenericTypeInExpr(const Expression& expr, std::vector<GenericType*>& reachableGenericTypes);
-    bool CheckFuncBase(const FuncBase& func);
-    bool CheckOriginalLambdaInfo(const FuncBase& func);
-    bool CheckLiftedLambdaType(const FuncBase& func);
+    bool CheckFuncBase(const Function& func);
+    bool CheckOriginalLambdaInfo(const Function& func);
+    bool CheckLiftedLambdaType(const Function& func);
     
     // ===--------------------------------------------------------------------===//
     // Check CustomTypeDef
     // ===--------------------------------------------------------------------===//
     void CheckStructDef(const StructDef& def);
-    bool CheckParentCustomTypeDef(const FuncBase& func, const CustomTypeDef& def, bool isInDef);
+    bool CheckParentCustomTypeDef(const Function& func, const CustomTypeDef& def, bool isInDef);
     void CheckCustomTypeDef(const CustomTypeDef& def);
     bool CheckCustomTypeDefIdentifier(const CustomTypeDef& def);
     void CheckCustomType(const CustomTypeDef& def);
@@ -138,155 +138,159 @@ private:
     void CheckVTable(const CustomTypeDef& def);
     void CheckCStruct(const StructDef& def);
     void CheckClassDef(const ClassDef& def);
-    void CheckAbstractMethod(const ClassDef& def);
     void CheckEnumDef(const EnumDef& def);
     void CheckExtendDef(const ExtendDef& def);
 
     // ===--------------------------------------------------------------------===//
     // Check Terminator
     // ===--------------------------------------------------------------------===//
-    void CheckTerminator(const Expression& expr, const Func& topLevelFunc);
-    void CheckGoTo(const GoTo& expr, const Func& topLevelFunc);
-    void CheckExit(const Exit& expr, const Func& topLevelFunc);
-    void CheckRaiseException(const RaiseException& expr, const Func& topLevelFunc);
-    void CheckBranch(const Branch& expr, const Func& topLevelFunc);
-    void CheckMultiBranch(const MultiBranch& expr, const Func& topLevelFunc);
-    void CheckApplyWithException(const ApplyWithException& expr, const Func& topLevelFunc);
-    void CheckApplyBase(const ApplyBase& expr, const Func& topLevelFunc);
-    void CheckInvokeWithException(const InvokeWithException& expr, const Func& topLevelFunc);
-    void CheckInvokeBase(const InvokeBase& expr, const Func& topLevelFunc);
-    void CheckInvokeStaticWithException(const InvokeStaticWithException& expr, const Func& topLevelFunc);
-    void CheckInvokeStaticBase(const InvokeStaticBase& expr, const Func& topLevelFunc);
-    void CheckIntOpWithException(const IntOpWithException& expr, const Func& topLevelFunc);
-    void CheckUnaryExprBase(const UnaryExprBase& expr, const Func& topLevelFunc);
-    void CheckBinaryExprBase(const BinaryExprBase& expr, const Func& topLevelFunc);
-    void CheckSpawnWithException(const SpawnWithException& expr, const Func& topLevelFunc);
-    void CheckSpawnBase(const SpawnBase& expr, const Func& topLevelFunc);
-    void CheckTypeCastWithException(const TypeCastWithException& expr, const Func& topLevelFunc);
-    void CheckIntrinsicWithException(const IntrinsicWithException& expr, const Func& topLevelFunc);
-    void CheckIntrinsicBase(const IntrinsicBase& expr, const Func& topLevelFunc);
-    void CheckAllocateWithException(const AllocateWithException& expr, const Func& topLevelFunc);
-    void CheckAllocateBase(const AllocateBase& expr, const Func& topLevelFunc);
-    void CheckRawArrayAllocateWithException(const RawArrayAllocateWithException& expr, const Func& topLevelFunc);
-    void CheckRawArrayAllocateBase(const RawArrayAllocateBase& expr, const Func& topLevelFunc);
+    void CheckTerminator(const Expression& expr, const Function& topLevelFunc);
+    void CheckGoTo(const GoTo& expr, const Function& topLevelFunc);
+    void CheckExit(const Exit& expr, const Function& topLevelFunc);
+    void CheckRaiseException(const RaiseException& expr, const Function& topLevelFunc);
+    void CheckBranch(const Branch& expr, const Function& topLevelFunc);
+    void CheckMultiBranch(const MultiBranch& expr, const Function& topLevelFunc);
+    void CheckApplyWithException(const ApplyWithException& expr, const Function& topLevelFunc);
+    void CheckApplyBase(const ApplyBase& expr, const Function& topLevelFunc);
+    void CheckInvokeWithException(const InvokeWithException& expr, const Function& topLevelFunc);
+    void CheckInvokeBase(const InvokeBase& expr, const Function& topLevelFunc);
+    void CheckInvokeStaticWithException(const InvokeStaticWithException& expr, const Function& topLevelFunc);
+    void CheckInvokeStaticBase(const InvokeStaticBase& expr, const Function& topLevelFunc);
+    void CheckIntOpWithException(const IntOpWithException& expr, const Function& topLevelFunc);
+    void CheckUnaryExprBase(const UnaryExprBase& expr, const Function& topLevelFunc);
+    void CheckBinaryExprBase(const BinaryExprBase& expr, const Function& topLevelFunc);
+    void CheckSpawnWithException(const SpawnWithException& expr, const Function& topLevelFunc);
+    void CheckSpawnBase(const SpawnBase& expr, const Function& topLevelFunc);
+    void CheckTypeCastWithException(const TypeCastWithException& expr, const Function& topLevelFunc);
+    void CheckIntrinsicWithException(const IntrinsicWithException& expr, const Function& topLevelFunc);
+    void CheckIntrinsicBase(const IntrinsicBase& expr, const Function& topLevelFunc);
+    void CheckAllocateWithException(const AllocateWithException& expr, const Function& topLevelFunc);
+    void CheckAllocateBase(const AllocateBase& expr, const Function& topLevelFunc);
+    void CheckRawArrayAllocateWithException(const RawArrayAllocateWithException& expr, const Function& topLevelFunc);
+    void CheckRawArrayAllocateBase(const RawArrayAllocateBase& expr, const Function& topLevelFunc);
     // ===--------------------------------------------------------------------===//
     // Check Unary Expression
     // ===--------------------------------------------------------------------===//
-    void CheckUnaryExpression(const UnaryExpression& expr, const Func& topLevelFunc);
+    void CheckUnaryExpression(const UnaryExpression& expr, const Function& topLevelFunc);
 
     // ===--------------------------------------------------------------------===//
     // Check Binary Expression
     // ===--------------------------------------------------------------------===//
-    void CheckBinaryExpression(const BinaryExpression& expr, const Func& topLevelFunc);
-    void CheckCalculExpression(const BinaryExprBase& expr, const Func& topLevelFunc);
-    void CheckExponentiationExpression(const BinaryExprBase& expr, const Func& topLevelFunc);
-    void CheckBitExpression(const BinaryExprBase& expr, const Func& topLevelFunc);
-    void CheckCompareExpression(const BinaryExprBase& expr, const Func& topLevelFunc);
-    void CheckLogicExpression(const BinaryExprBase& expr, const Func& topLevelFunc);
+    void CheckBinaryExpression(const BinaryExpression& expr, const Function& topLevelFunc);
+    void CheckCalculExpression(const BinaryExprBase& expr, const Function& topLevelFunc);
+    void CheckExponentiationExpression(const BinaryExprBase& expr, const Function& topLevelFunc);
+    void CheckBitExpression(const BinaryExprBase& expr, const Function& topLevelFunc);
+    void CheckCompareExpression(const BinaryExprBase& expr, const Function& topLevelFunc);
+    void CheckLogicExpression(const BinaryExprBase& expr, const Function& topLevelFunc);
 
     // ===--------------------------------------------------------------------===//
     // Check Memory Expression
     // ===--------------------------------------------------------------------===//
-    void CheckMemoryExpression(const Expression& expr, const Func& topLevelFunc);
-    void CheckAllocate(const Allocate& expr, const Func& topLevelFunc);
-    void CheckLoad(const Load& expr, const Func& topLevelFunc);
-    void CheckStore(const Store& expr, const Func& topLevelFunc);
-    void CheckGetElementRef(const GetElementRef& expr, const Func& topLevelFunc);
-    void CheckGetElementByName(const GetElementByName& expr, const Func& topLevelFunc);
-    void CheckStoreElementRef(const StoreElementRef& expr, const Func& topLevelFunc);
-    void CheckStoreElementByName(const StoreElementByName& expr, const Func& topLevelFunc);
+    void CheckMemoryExpression(const Expression& expr, const Function& topLevelFunc);
+    void CheckAllocate(const Allocate& expr, const Function& topLevelFunc);
+    void CheckLoad(const Load& expr, const Function& topLevelFunc);
+    void CheckStore(const Store& expr, const Function& topLevelFunc);
+    void CheckGetElementRef(const GetElementRef& expr, const Function& topLevelFunc);
+    void CheckGetElementByName(const GetElementByName& expr, const Function& topLevelFunc);
+    void CheckStoreElementRef(const StoreElementRef& expr, const Function& topLevelFunc);
+    void CheckStoreElementByName(const StoreElementByName& expr, const Function& topLevelFunc);
 
     // ===--------------------------------------------------------------------===//
     // Check Control Flow Expression
     // ===--------------------------------------------------------------------===//
-    void CheckControlFlowExpression(const Expression& expr, const Func& topLevelFunc);
-    void CheckLambda(const Lambda& expr, const Func& topLevelFunc);
+    void CheckControlFlowExpression(const Expression& expr, const Function& topLevelFunc);
+    void CheckLambda(const Lambda& expr, const Function& topLevelFunc);
 
     // ===--------------------------------------------------------------------===//
     // Check Other Expression
     // ===--------------------------------------------------------------------===//
-    void CheckOtherExpression(const Expression& expr, const Func& topLevelFunc);
-    void CheckConstant(const Constant& expr, const Func& topLevelFunc);
-    void CheckDebug(const Debug& expr, const Func& topLevelFunc);
-    void CheckTuple(const Tuple& expr, const Func& topLevelFunc);
-    void CheckEnumTuple(const Tuple& expr, const Func& topLevelFunc);
-    void CheckStructTuple(const Tuple& expr, const Func& topLevelFunc);
-    void CheckNormalTuple(const Tuple& expr, const Func& topLevelFunc);
-    void CheckField(const Field& expr, const Func& topLevelFunc);
-    void CheckFieldByName(const FieldByName& expr, const Func& topLevelFunc);
-    void CheckApply(const Apply& expr, const Func& topLevelFunc);
-    bool CheckCallee(const Value& callee, const Expression& expr, const Func& topLevelFunc);
+    void CheckOtherExpression(const Expression& expr, const Function& topLevelFunc);
+    void CheckConstant(const Constant& expr, const Function& topLevelFunc);
+    void CheckDebug(const Debug& expr, const Function& topLevelFunc);
+    void CheckTuple(const Tuple& expr, const Function& topLevelFunc);
+    void CheckEnumTuple(const Tuple& expr, const Function& topLevelFunc);
+    void CheckStructTuple(const Tuple& expr, const Function& topLevelFunc);
+    void CheckNormalTuple(const Tuple& expr, const Function& topLevelFunc);
+    void CheckField(const Field& expr, const Function& topLevelFunc);
+    void CheckFieldByName(const FieldByName& expr, const Function& topLevelFunc);
+    void CheckApply(const Apply& expr, const Function& topLevelFunc);
+    bool CheckCallee(const Value& callee, const Expression& expr, const Function& topLevelFunc);
     void CheckApplyFuncArgs(const std::vector<Value*>& args,
-        const std::vector<Type*>& instParamTypes, bool varArgs, const Expression& expr, const Func& topLevelFunc);
+        const std::vector<Type*>& instParamTypes, bool varArgs, const Expression& expr, const Function& topLevelFunc);
     FuncType* CalculateInstFuncType(
         FuncType& originalFuncType, const std::vector<Type*>& instantiatedTypeArgs,
         const std::vector<GenericType*>& genericTypeParams, Type* instOuterType);
     bool CheckInstantiatedTypeArgs(const std::vector<Type*>& instantiatedTypeArgs,
-        const std::vector<GenericType*>& genericTypeParams, const Expression& expr, const Func& topLevelFunc);
+        const std::vector<GenericType*>& genericTypeParams, const Expression& expr, const Function& topLevelFunc);
     bool CheckApplyThisType(
-        const Value& callee, const Type* thisType, const Expression& expr, const Func& topLevelFunc);
-    void CheckApplyFuncRetValue(const Type& instRetType, const Expression& expr, const Func& topLevelFunc);
-    void CheckInvoke(const Invoke& expr, const Func& topLevelFunc);
+        const Value& callee, const Type* thisType, const Expression& expr, const Function& topLevelFunc);
+    void CheckApplyFuncRetValue(const Type& instRetType, const Expression& expr, const Function& topLevelFunc);
+    void CheckInvoke(const Invoke& expr, const Function& topLevelFunc);
     bool CheckInvokeThisType(
-        Type& objType, const Type* thisType, const Expression& expr, const Func& topLevelFunc);
-    bool CheckVirtualMethod(const VirMethodFullContext& methodCtx, const Expression& expr, const Func& topLevelFunc);
+        Type& objType, const Type* thisType, const Expression& expr, const Function& topLevelFunc);
+    bool CheckVirtualMethod(
+        const VirMethodFullContext& methodCtx, const Expression& expr, const Function& topLevelFunc);
     const std::vector<VirtualMethodInfo>* CheckVTableExist(
-        const Type& thisType, const ClassType& srcParentType, const Expression& expr, const Func& topLevelFunc);
-    const std::vector<VirtualMethodInfo>* CheckVTableExist(const BuiltinType& thisType, const ClassType& srcParentType);
+        const Type& thisType, const ClassType& srcParentType, const Expression& expr, const Function& topLevelFunc);
+    const std::vector<VirtualMethodInfo>* CheckVTableExist(
+        const BuiltinType& thisType, const ClassType& srcParentType);
     const std::vector<VirtualMethodInfo>* CheckVTableExist(const CustomType& thisType, const ClassType& srcParentType);
-    const std::vector<VirtualMethodInfo>* CheckVTableExist(const ClassType& srcParentType, const Func& topLevelFunc);
-    const std::vector<VirtualMethodInfo>* CheckVTableExist(const GenericType& thisType, const ClassType& srcParentType);
+    const std::vector<VirtualMethodInfo>* CheckVTableExist(
+        const ClassType& srcParentType, const Function& topLevelFunc);
+    const std::vector<VirtualMethodInfo>* CheckVTableExist(
+        const GenericType& thisType, const ClassType& srcParentType);
     bool CheckVirtualMethodFuncType(const FuncType& declaredType,
-        const FuncType& callSiteType, const std::string& errMsgBase, const Func& topLevelFunc);
+        const FuncType& callSiteType, const std::string& errMsgBase, const Function& topLevelFunc);
     void CheckInvokeFuncArgs(const std::vector<Value*>& args,
-        const std::vector<Type*>& originalParamTypes, const Expression& expr, const Func& topLevelFunc);
-    void CheckInvokeStatic(const InvokeStatic& expr, const Func& topLevelFunc);
-    void CheckInstanceOf(const InstanceOf& expr, const Func& topLevelFunc);
-    void CheckTypeCast(const TypeCast& expr, const Func& topLevelFunc);
-    void CheckGetException(const GetException& expr, const Func& topLevelFunc);
-    void CheckSpawn(const Spawn& expr, const Func& topLevelFunc);
-    void CheckRawArrayAllocate(const RawArrayAllocate& expr, const Func& topLevelFunc);
-    void CheckRawArrayLiteralInit(const RawArrayLiteralInit& expr, const Func& topLevelFunc);
-    void CheckRawArrayInitByValue(const RawArrayInitByValue& expr, const Func& topLevelFunc);
-    void CheckVArray(const VArray& expr, const Func& topLevelFunc);
-    void CheckVArrayBuilder(const VArrayBuilder& expr, const Func& topLevelFunc);
-    void CheckIntrinsic(const Intrinsic& expr, const Func& topLevelFunc);
-    void CheckBox(const Box& expr, const Func& topLevelFunc);
-    void CheckUnBox(const UnBox& expr, const Func& topLevelFunc);
-    void CheckTransformToGeneric(const TransformToGeneric& expr, const Func& topLevelFunc);
-    void CheckTransformToConcrete(const TransformToConcrete& expr, const Func& topLevelFunc);
-    void CheckGetInstantiateValue(const GetInstantiateValue& expr, const Func& topLevelFunc);
-    void CheckUnBoxToRef(const UnBoxToRef& expr, const Func& topLevelFunc);
-    void CheckGetRTTI(const GetRTTI& expr, const Func& topLevelFunc);
-    void CheckGetRTTIStatic(const GetRTTIStatic& expr, const Func& topLevelFunc);
+        const std::vector<Type*>& originalParamTypes, const Expression& expr, const Function& topLevelFunc);
+    void CheckInvokeStatic(const InvokeStatic& expr, const Function& topLevelFunc);
+    void CheckInstanceOf(const InstanceOf& expr, const Function& topLevelFunc);
+    void CheckTypeCast(const TypeCast& expr, const Function& topLevelFunc);
+    void CheckGetException(const GetException& expr, const Function& topLevelFunc);
+    void CheckSpawn(const Spawn& expr, const Function& topLevelFunc);
+    void CheckRawArrayAllocate(const RawArrayAllocate& expr, const Function& topLevelFunc);
+    void CheckRawArrayLiteralInit(const RawArrayLiteralInit& expr, const Function& topLevelFunc);
+    void CheckRawArrayInitByValue(const RawArrayInitByValue& expr, const Function& topLevelFunc);
+    void CheckVArray(const VArray& expr, const Function& topLevelFunc);
+    void CheckVArrayBuilder(const VArrayBuilder& expr, const Function& topLevelFunc);
+    void CheckIntrinsic(const Intrinsic& expr, const Function& topLevelFunc);
+    void CheckBox(const Box& expr, const Function& topLevelFunc);
+    void CheckUnBox(const UnBox& expr, const Function& topLevelFunc);
+    void CheckTransformToGeneric(const TransformToGeneric& expr, const Function& topLevelFunc);
+    void CheckTransformToConcrete(const TransformToConcrete& expr, const Function& topLevelFunc);
+    void CheckGetInstantiateValue(const GetInstantiateValue& expr, const Function& topLevelFunc);
+    void CheckUnBoxToRef(const UnBoxToRef& expr, const Function& topLevelFunc);
+    void CheckGetRTTI(const GetRTTI& expr, const Function& topLevelFunc);
+    void CheckGetRTTIStatic(const GetRTTIStatic& expr, const Function& topLevelFunc);
     bool CheckThisTypeIsEqualOrSubTypeOfFuncParentType(
-        Type& thisType, const FuncBase& func, const Expression& expr, const Func& topLevelFunc);
-    void CheckInout(const IntrinsicBase& expr, const Func& topLevelFunc);
-    void CheckInoutOpSrc(const Value& op, const IntrinsicBase& expr, const Func& topLevelFunc);
+        Type& thisType, const Function& func, const Expression& expr, const Function& topLevelFunc);
+    void CheckInout(const IntrinsicBase& expr, const Function& topLevelFunc);
+    void CheckInoutOpSrc(const Value& op, const IntrinsicBase& expr, const Function& topLevelFunc);
 
     // ===--------------------------------------------------------------------===//
     // Check Expressions
     // ===--------------------------------------------------------------------===//
-    void CheckExpression(const Expression& expr, const Func& topLevelFunc);
+    void CheckExpression(const Expression& expr, const Function& topLevelFunc);
     /**
      * @brief terminator can't jump to another block group
      */
-    void CheckTerminatorJump(const Terminator& terminator, const Func& topLevelFunc);
+    void CheckTerminatorJump(const Terminator& terminator, const Function& topLevelFunc);
 
     // ===--------------------------------------------------------------------===//
     // Utils
     // ===--------------------------------------------------------------------===//
     void OverflowStrategyMustBeValid(
-        const OverflowStrategy& ofs, const Expression& expr, const Func& topLevelFunc);
+        const OverflowStrategy& ofs, const Expression& expr, const Function& topLevelFunc);
     bool CheckTypeIsValid(
-        const Type& type, const std::string& typeName, const Expression& expr, const Func& topLevelFunc);
-    bool OperandNumIsEqual(size_t expectedNum, const Expression& expr, const Func& topLevelFunc);
-    bool OperandNumIsEqual(const std::vector<size_t>& expectedNum, const Expression& expr, const Func& topLevelFunc);
-    bool SuccessorNumIsEqual(size_t expectedNum, const Terminator& expr, const Func& topLevelFunc);
-    bool OperandNumAtLeast(size_t expectedNum, const Expression& expr, const Func& topLevelFunc);
-    bool SuccessorNumAtLeast(size_t expectedNum, const Terminator& expr, const Func& topLevelFunc);
-    void ShouldNotHaveResult(const Terminator& expr, const Func& topLevelFunc);
-    bool CheckHaveResult(const Expression& expr, const Func& topLevelFunc);
+        const Type& type, const std::string& typeName, const Expression& expr, const Function& topLevelFunc);
+    bool OperandNumIsEqual(size_t expectedNum, const Expression& expr, const Function& topLevelFunc);
+    bool OperandNumIsEqual(
+        const std::vector<size_t>& expectedNum, const Expression& expr, const Function& topLevelFunc);
+    bool SuccessorNumIsEqual(size_t expectedNum, const Terminator& expr, const Function& topLevelFunc);
+    bool OperandNumAtLeast(size_t expectedNum, const Expression& expr, const Function& topLevelFunc);
+    bool SuccessorNumAtLeast(size_t expectedNum, const Terminator& expr, const Function& topLevelFunc);
+    void ShouldNotHaveResult(const Terminator& expr, const Function& topLevelFunc);
+    bool CheckHaveResult(const Expression& expr, const Function& topLevelFunc);
 
 private:
     const Package& package;

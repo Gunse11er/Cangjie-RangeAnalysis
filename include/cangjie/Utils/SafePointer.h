@@ -249,19 +249,19 @@ public:
     }
 
     template <typename U, typename = std::enable_if_t<std::is_base_of_v<T, U>>>
-    Ptr<T>& operator=(const OwnedPtr<U>& src)
+    Ptr<T>& operator=(const OwnedPtr<U>& src) &
     {
         this->ptr = src.origin;
         return *this;
     }
 
-    template <typename U, typename = std::enable_if_t<std::is_base_of_v<T, U>>> Ptr<T>& operator=(const Ptr<U>& src)
+    template <typename U, typename = std::enable_if_t<std::is_base_of_v<T, U>>> Ptr<T>& operator=(const Ptr<U>& src) &
     {
         this->ptr = src.ptr;
         return *this;
     }
 
-    template <typename U, typename = std::enable_if_t<std::is_base_of_v<T, U>>> Ptr<T>& operator=(const Ptr<U>&& src)
+    template <typename U, typename = std::enable_if_t<std::is_base_of_v<T, U>>> Ptr<T>& operator=(const Ptr<U>&& src) &
     {
         this->ptr = src.ptr;
         return *this;

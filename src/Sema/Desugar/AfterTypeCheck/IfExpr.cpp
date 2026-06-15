@@ -28,25 +28,25 @@ void InsertUnitForIfExpr(TypeManager& tyMgr, IfExpr& ie)
         return; // Ignore desugared expression.
     }
     // All expression after typecheck must be welltyped.
-    CJC_NULLPTR_CHECK(ie.ty);
+    CJC_NULLPTR_CHECK(ie.GetTy());
     CJC_NULLPTR_CHECK(ie.thenBody);
     // If the 'ifExpr' is not unit typed or the type of then body is the subtype of unit type, then quit process.
-    auto skip = !ie.ty->IsUnit() || tyMgr.IsSubtype(ie.thenBody->ty, ie.ty);
+    auto skip = !ie.GetTy()->IsUnit() || tyMgr.IsSubtype(ie.thenBody->GetTy(), ie.GetTy());
     if (skip) {
         return;
     }
     // If the type of 'then' is not unit, then the block must not be empty.
     CJC_ASSERT(!ie.thenBody->body.empty());
-    auto unitExpr = CreateUnitExpr(ie.ty);
+    auto unitExpr = CreateUnitExpr(ie.GetTy());
     CopyBasicInfo(ie.thenBody->body.back().get(), unitExpr.get());
     ie.thenBody->body.push_back(std::move(unitExpr));
-    ie.thenBody->ty = ie.ty;
+    ie.thenBody->SetTy(ie.GetTy());
     // If current ifExpr dose not have elseBody, create for it.
     if (!ie.elseBody) {
         // Added 'else' does not need position.
         auto elseBody = MakeOwnedNode<Block>();
-        elseBody->body.push_back(CreateUnitExpr(ie.ty));
-        elseBody->ty = ie.ty;
+        elseBody->body.push_back(CreateUnitExpr(ie.GetTy()));
+        elseBody->SetTy(ie.GetTy());
         ie.elseBody = std::move(elseBody);
         ie.hasElse = true;
         AddCurFile(*ie.elseBody, ie.curFile);

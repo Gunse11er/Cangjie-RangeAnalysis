@@ -37,7 +37,7 @@ NodeInfo ASTWriter::ASTWriterImpl::PackNodeInfo(const Node& node)
     auto [pkgIndex, fileIndex] = GetFileIndex(begin.fileID);
     TPosition posBegin(fileIndex, pkgIndex, begin.line, begin.column, begin.GetStatus() == PositionStatus::IGNORE);
     TPosition posEnd(fileIndex, pkgIndex, end.line, end.column, end.GetStatus() == PositionStatus::IGNORE);
-    auto ty = SaveType(node.ty);
+    auto ty = SaveType(node.GetTy());
 
     return {posBegin, posEnd, ty};
 }

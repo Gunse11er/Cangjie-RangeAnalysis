@@ -30,10 +30,8 @@
 
 #if defined(__GNUC__) || defined(__clang__)
 #define CJC_PRINTF_FORMAT(fmtIdx, firstVarargIdx) __attribute__((format(printf, fmtIdx, firstVarargIdx)))
-#define CJC_WPRINTF_FORMAT(fmtIdx, firstVarargIdx) __attribute__((format(wprintf, fmtIdx, firstVarargIdx)))
 #else
 #define CJC_PRINTF_FORMAT(fmtIdx, firstVarargIdx)
-#define CJC_WPRINTF_FORMAT(fmtIdx, firstVarargIdx)
 #endif
 
 namespace Cangjie {
@@ -135,7 +133,7 @@ template <typename... Args> inline void Error(Args&&... args)
 }
 
 #ifdef _WIN32
-inline void WErrorf(const wchar_t *fmt, ...)
+inline void WErrorf(const wchar_t* fmt, ...)
 {
     std::optional<std::wstring> werrMark = Cangjie::StringConvertor::StringToWString(RED_ERROR_MARK);
     if (!werrMark.has_value()) {

@@ -65,3 +65,12 @@ target_link_libraries(
     GTest::gtest
     GTest::gtest_main)
 add_test(NAME ASTToSourceTest COMMAND ASTToSourceTest)
+
+add_executable(ToStringTest ToStringTest.cpp)
+target_link_libraries(
+    ToStringTest
+    ${CMAKE_DL_LIBS}
+    cangjie-lsp
+    GTest::gtest
+    GTest::gtest_main)
+add_test(NAME ToStringTest COMMAND ToStringTest)

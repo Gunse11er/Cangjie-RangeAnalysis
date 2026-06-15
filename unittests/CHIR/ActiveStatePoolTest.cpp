@@ -21,7 +21,7 @@ public:
     {
     }
 
-    std::string ToString() const override { return "TestValue(" + GetIdentifier() + ")"; }
+    std::string ToString(size_t indent) const override { return "TestValue(" + GetIdentifier() + ")"; }
 };
 
 // Minimal abstract value used with ValueDomain in tests. It implements the

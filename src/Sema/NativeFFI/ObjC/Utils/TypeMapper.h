@@ -26,26 +26,20 @@ public:
     std::string usage;
     std::string decl;
 
-    MappedCType(std::string&& usage, std::string&& decl) : usage(usage), decl(decl)
-    {
-    }
-    explicit MappedCType(const char* usage) : usage(usage)
-    {
-    }
-    explicit MappedCType(std::string&& usage) : usage(usage)
-    {
-    }
+    MappedCType(std::string usage, std::string decl): usage(usage), decl(decl) {}
+    MappedCType(const char* usage): usage(usage) {}
+    MappedCType(std::string usage): usage(usage) {}
 };
 
 class TypeMapper {
 public:
-    explicit TypeMapper(InteropLibBridge& bridge, TypeManager& typeManager) : bridge(bridge), typeManager(typeManager)
+    explicit TypeMapper(InteropLibBridge& bridge, TypeManager& typeManager)
+        : bridge(bridge), typeManager(typeManager)
     {
     }
 
     template <class TypeRep, class ToString>
-    MappedCType BuildFunctionalCType(const AST::FuncTy& funcType, const std::vector<TypeRep>& argTypes,
-        const TypeRep& resultType, bool isBlock, ToString toString) const;
+    MappedCType BuildFunctionalCType(const AST::FuncTy& funcType, const std::vector<TypeRep>& argTypes, const TypeRep& resultType, bool isBlock, ToString toString) const;
 
     MappedCType Cj2ObjCForObjC(const AST::Ty& from) const;
     Ptr<AST::Ty> Cj2CType(Ptr<AST::Ty> cjty) const;
@@ -88,7 +82,6 @@ public:
     static bool IsPrimitiveMapping(const AST::Ty& ty);
     static bool IsObjCFwdClass(const AST::Ty& ty);
     static bool IsObjCFwdClass4Open(const AST::Ty& ty);
-
 private:
     InteropLibBridge& bridge;
     TypeManager& typeManager;

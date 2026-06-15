@@ -456,7 +456,7 @@ OwnedPtr<IfAvailableExpr> ParserImpl::ParseIfAvailable()
     
     auto parseLambda = [this, &bad] () -> OwnedPtr<LambdaExpr> {
         auto expr1 = ParseExpr();
-        if (auto e1 = Is<LambdaExpr>(expr1)) {
+        if (Is<LambdaExpr>(expr1)) {
             return OwnedPtr{StaticCast<LambdaExpr>(expr1.release())};
         } else {
             ParseDiagnoseRefactor(DiagKindRefactor::parse_ifavailable_not_lambda, *expr1);
@@ -783,26 +783,12 @@ void ParserImpl::ParseQuestSuffixExpr(OwnedPtr<Expr>& expr)
     }
 }
 
-OwnedPtr<Expr> ParserImpl::ParseOptionalExpr(
-    const Position questPos, OwnedPtr<Expr> baseExpr, SuffixKind suffix) const
-{
-    if (suffix == SuffixKind::QUEST) {
-        OwnedPtr<OptionalExpr> ret = MakeOwned<OptionalExpr>();
-        ret->questPos = questPos;
-        ret->begin = baseExpr->begin;
-        ret->end = baseExpr->end;
-        ret->baseExpr = std::move(baseExpr);
-        return ret;
-    }
-    return baseExpr;
-}
-
 OwnedPtr<TrailingClosureExpr> ParserImpl::ParseTrailingClosureExpr(OwnedPtr<Expr> baseExpr)
 {
     OwnedPtr<TrailingClosureExpr> ret = MakeOwned<TrailingClosureExpr>();
     std::vector<OwnedPtr<Annotation>> annos;
     ParseAnnotations(annos);
-
+    SetBeginToAnnotationsBegin(*ret, annos);
     ret->leftLambda = lastToken.Begin();
     Next();
     ret->lambda = ParseLambdaExprWithTrailingClosure();

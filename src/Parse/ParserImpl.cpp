@@ -189,6 +189,11 @@ Ptr<Node> Parser::CurMacroCall() const
     return impl->curMacroCall;
 }
 
+void Parser::AttachCommentToNodes(std::vector<OwnedPtr<AST::Node>>& nodes)
+{
+    impl->AttachCommentToNodes(nodes);
+}
+
 Parser::~Parser()
 {
     delete impl;
@@ -260,7 +265,7 @@ bool ParserImpl::CanBeAbstract(const AST::Decl& decl, ScopeKind scopeKind) const
         }
         case ASTKind::PRIMARY_CTOR_DECL: {
             auto pcd = StaticAs<ASTKind::PRIMARY_CTOR_DECL>(pdecl);
-            if (pcd->funcBody && pcd->funcBody->body) {
+            if (!pcd->funcBody && pcd->funcBody->body) {
                 return false;
             }
             break;
@@ -323,27 +328,27 @@ const std::pair<TokenKind, TokenKind>* ParserImpl::LookupExprsFollowedCommas(Exp
 const ParserImpl::CombinatorInfo* ParserImpl::LookupSeenCombinator()
 {
     // Order matters: RSHIFT_ASSIGN before RSHIFT (longer match first)
-    static const std::vector<TokenKind> rshiftAssignSeq = {TokenKind::GT, TokenKind::GT, TokenKind::ASSIGN};
-    static const CombinatorInfo rshiftAssignInfo = {TokenKind::RSHIFT_ASSIGN, ">>="};
-    static const std::vector<TokenKind> rshiftSeq = {TokenKind::GT, TokenKind::GT};
-    static const CombinatorInfo rshiftInfo = {TokenKind::RSHIFT, ">>"};
-    static const std::vector<TokenKind> geSeq = {TokenKind::GT, TokenKind::ASSIGN};
-    static const CombinatorInfo geInfo = {TokenKind::GE, ">="};
-    static const std::vector<TokenKind> coalescingSeq = {TokenKind::QUEST, TokenKind::QUEST};
-    static const CombinatorInfo coalescingInfo = {TokenKind::COALESCING, "??"};
+    static const std::vector<TokenKind> RSHIFT_ASSIGN_SEQ = {TokenKind::GT, TokenKind::GT, TokenKind::ASSIGN};
+    static const CombinatorInfo RSHIFT_ASSIGN_INFO = {TokenKind::RSHIFT_ASSIGN, ">>="};
+    static const std::vector<TokenKind> RSHIFT_SEQ = {TokenKind::GT, TokenKind::GT};
+    static const CombinatorInfo RSHIFT_INFO = {TokenKind::RSHIFT, ">>"};
+    static const std::vector<TokenKind> GE_SEQ = {TokenKind::GT, TokenKind::ASSIGN};
+    static const CombinatorInfo GE_INFO = {TokenKind::GE, ">="};
+    static const std::vector<TokenKind> COALESCING_SEQ = {TokenKind::QUEST, TokenKind::QUEST};
+    static const CombinatorInfo COALESCING_INFO = {TokenKind::COALESCING, "??"};
 
     // Check longest matches first
-    if (SeeingCombinator(rshiftAssignSeq)) {
-        return &rshiftAssignInfo;
+    if (SeeingCombinator(RSHIFT_ASSIGN_SEQ)) {
+        return &RSHIFT_ASSIGN_INFO;
     }
-    if (SeeingCombinator(rshiftSeq)) {
-        return &rshiftInfo;
+    if (SeeingCombinator(RSHIFT_SEQ)) {
+        return &RSHIFT_INFO;
     }
-    if (SeeingCombinator(geSeq)) {
-        return &geInfo;
+    if (SeeingCombinator(GE_SEQ)) {
+        return &GE_INFO;
     }
-    if (SeeingCombinator(coalescingSeq)) {
-        return &coalescingInfo;
+    if (SeeingCombinator(COALESCING_SEQ)) {
+        return &COALESCING_INFO;
     }
     return nullptr;
 }

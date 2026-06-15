@@ -4,7 +4,7 @@
 //
 // See https://cangjie-lang.cn/pages/LICENSE for license information.
 
-import define.*
+import define_report.*
 
 main() {
     @TEST_REPORT(let a = 1)

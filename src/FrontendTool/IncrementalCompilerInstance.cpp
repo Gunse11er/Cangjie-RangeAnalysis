@@ -219,7 +219,7 @@ bool IncrementalCompilerInstance::PerformIncrementalScopeAnalysis()
     }
 
     auto increRes = IncrementalScopeAnalysis({rawMangleName2DeclMap, std::move(astCacheInfo), *package, options,
-                                                 importManager, cachedInfo, fileMap, std::move(directExtends)});
+        *importManager, cachedInfo, fileMap, std::move(directExtends)});
     if (increRes.kind == IncreKind::INCR) {
         // check cached bitcode infos
         const std::string& packageName = package->fullPackageName;
@@ -283,7 +283,7 @@ bool IncrementalCompilerInstance::PerformSema()
     for (auto srcPkg : GetSourcePackages()) {
         srcPkg->EnableAttr(Attribute::INCRE_COMPILE);
         Sema::HandleCtorForIncr(*srcPkg, mangledName2DeclMap, cachedInfo.semaInfo);
-        cacheMangles.incrRemovedDecls.merge(importManager.LoadCachedTypeForPackage(*srcPkg, mangledName2DeclMap));
+        cacheMangles.incrRemovedDecls.merge(importManager->LoadCachedTypeForPackage(*srcPkg, mangledName2DeclMap));
     }
     Sema::MarkIncrementalCheckForCtor(declsToBeReCompiled);
 
@@ -311,9 +311,10 @@ bool IncrementalCompilerInstance::PerformSema()
         // PropDecl's getter/setter will be counted separately and should not be cleared from propDecl.
     };
     for (auto& [_, decl] : mangledName2DeclMap) {
-        if (!decl->toBeCompiled && !IsInDeclWithAttribute(*decl, Attribute::GENERIC) && Ty::IsTyCorrect(decl->ty) &&
+        if (!decl->toBeCompiled && !IsInDeclWithAttribute(*decl, Attribute::GENERIC) &&
+            Ty::IsTyCorrect(decl->GetTy()) &&
             (decl->astKind != ASTKind::FUNC_DECL || !decl->TestAttr(Attribute::DEFAULT))) {
-        // NOTE: for now, generic definitions and default implementations should be kept for code re-generation.
+            // NOTE: for now, generic definitions and default implementations should be kept for code re-generation.
             visit(*decl);
         }
     }
@@ -486,12 +487,7 @@ bool IncrementalCompilerInstance::PerformCodeGen()
     }
     // Before CodeGen, the dependency relationship of a package contains only some packages.
     // So this function rearranges the dependencies of all packages.
-    RearrangeImportedPackageDependence();
-    bool ret = true;
-    for (auto& srcPkg : GetSourcePackages()) {
-        ret = ret && CodegenOnePackage(*srcPkg, kind == IncreKind::INCR);
-    }
-    return ret;
+    return CodegenOnePackage(kind == IncreKind::INCR);
 }
 
 bool IncrementalCompilerInstance::PerformCjoSaving()
@@ -531,7 +527,7 @@ bool IncrementalCompilerInstance::PerformResultsSaving()
             // Write astData for incremental compilation in cache path.
             std::string cachedCjo =
                 invocation.globalOptions.GenerateCachedPathName(srcPkg->fullPackageName, SERIALIZED_FILE_EXTENSION);
-            ret = ret && FileUtil::WriteBufferToASTFile(cachedCjo, importManager.ExportASTSignature(*srcPkg));
+            ret = ret && FileUtil::WriteBufferToASTFile(cachedCjo, importManager->ExportASTSignature(*srcPkg));
         }
     }
     return ret;

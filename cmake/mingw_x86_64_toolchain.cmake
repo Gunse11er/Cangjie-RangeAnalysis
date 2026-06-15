@@ -24,12 +24,12 @@ endif()
 set(TRIPLE "x86_64-w64-mingw32")
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(WARNINGS_SETTINGS "-Wall ${EXTRA_WARNING_SETTINGS} -Werror -Wdate-time ${CUSTOM_WARNING_SETTINGS}")
 set(C_OTHER_FLAGS "-fsigned-char")
-set(CXX_OTHER_FLAGS "")
+set(CXX_OTHER_FLAGS "-Weffc++")
 set(OTHER_FLAGS
-    "-fno-omit-frame-pointer -pipe -fno-common -fno-strict-aliasing -m64 -Wa,-mbig-obj -fstack-protector-all -Wl,--stack,16777216"
+    "-fno-omit-frame-pointer -pipe -fno-common -fno-strict-aliasing -m64 -fstack-protector-all"
 )
-set(WARNINGS_SETTINGS "-w -Wdate-time -Wno-int-conversion")
 
 # The ld in MinGW toolchain is very slow, especially when linking the debug version. lld is preferred for linking cjc.exe.
 # However, the gcc cross compiler doesn't search for the name "lld", but "read-ld", "ld.lld" or "<target>-ld.lld", etc.
@@ -52,7 +52,7 @@ else()
     set(OTHER_FLAGS "${OTHER_FLAGS} -B${CMAKE_BINARY_DIR}/toolchain/ -fuse-ld=lld")
 endif()
 
-set(LINK_FLAGS "")
+set(LINK_FLAGS "-Wl,--stack,16777216")
 set(STRIP_FLAG "-s")
 
 set(C_FLAGS "${WARNINGS_SETTINGS} ${C_OTHER_FLAGS} ${OTHER_FLAGS}")

@@ -13,12 +13,12 @@
 #ifndef CANGJIE_BASIC_SOURCEMANAGER_H
 #define CANGJIE_BASIC_SOURCEMANAGER_H
 
+#include <map>
 #include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
-#include <cstdint>
 
 #include "cangjie/Basic/Position.h"
 #include "cangjie/Basic/Utils.h"
@@ -70,9 +70,9 @@ struct Source {
  */
 class SourceManager {
 private:
-    std::unordered_map<std::string, int> filePathToFileIDMap;
-    std::vector<Source> sources{{0, "", ""}};
-    
+    std::unordered_map<std::string, unsigned int> filePathToFileIDMap;
+    std::map<unsigned int, Source> sources{{0, {0, "", ""}}};
+
 public:
     SourceManager() = default;
     SourceManager(const SourceManager&) = delete;
@@ -83,29 +83,45 @@ public:
      */
     Source& GetSource(const unsigned int id)
     {
-        if (id >= sources.size()) {
-            return sources[0];
+        auto it = sources.find(id);
+        if (it != sources.end()) {
+            return it->second;
         } else {
-            return sources[id];
+            return sources.at(0);
         }
     }
 
-    const std::vector<Source>& GetSources() const
+    const std::map<unsigned int, Source>& GetSources() const
     {
         return sources;
     }
 
     /**
-     * Get the file id by file path.
+     * Get the file id by file path or -1 if not loaded yet
+     * @deprecated Only used in tooling, especially in LSP
      * @param path file path.
      */
     int GetFileID(const std::string& path)
     {
         auto exist = filePathToFileIDMap.find(path);
         if (exist != filePathToFileIDMap.end()) {
-            return exist->second;
+            return static_cast<int>(exist->second);
         } else {
             return -1;
+        }
+    }
+
+    /**
+     * Get the file id by file path or empty if not loaded yet
+     * @param path file path.
+     */
+    std::optional<unsigned int> TryGetFileID(const std::string& path)
+    {
+        auto exist = filePathToFileIDMap.find(path);
+        if (exist != filePathToFileIDMap.end()) {
+            return exist->second;
+        } else {
+            return {};
         }
     }
 
@@ -116,7 +132,7 @@ public:
     {
         return static_cast<unsigned int>(sources.size());
     }
-    
+
     bool HasSource()
     {
         // The source manager will create 1 source by default.
@@ -126,26 +142,49 @@ public:
     bool IsSourceFileExist(const unsigned int id);
     int GetLineEnd(const Position& pos);
 
-    void SaveSourceFile(unsigned int fileID, std::string normalizedPath,
-        std::string buffer, uint64_t fileHash, std::optional<std::string> packageName = std::nullopt);
-
     /**
-    * This add fake files info to `filePathToFileIDMap`,
-    * to keep the file id stable and consistent with previous compilations phase.
-    */
-    void ReserveCommonPartSources(std::vector<std::string> files);
+     * Return file identifier, by default use incremental ID.
+     * For CJMP scenario incremental ID is not correct, because in case of diamond source set graph
+     * different files can get identical IDs, that will lead to incorrent logic.
+     *
+     * E.g. files in B and C source set ID need to be different.
+     *    A
+     *   / \
+     *  B   C
+     *   \ /
+     *    D
+     *
+     * @param normalizedPath The path of file.
+     * @param buffer Source buffer of the file.
+     * @param fileHash Hash ID of the file.
+     * @param packageName The package name of the file.
+     * @param isCjmpFile Mark that file ID should be calculated as hash of relative path.
+     * @param updateBuffer Mask if the buffer should be updated.
+     */
+    unsigned int GetFileId(
+        const std::string& normalizedPath,
+        const std::string& buffer,
+        uint64_t fileHash,
+        std::optional<std::string> packageName,
+        bool isCjmpFile,
+        bool updateBuffer);
 
     /**
      * Add a source to SourceManager.
      * @param path File path.
      * @param buffer Source code.
+     * @param packageName The package name of the file.
+     * @param isCjmpFile Mark that file ID should be calculated as hash of relative path.
      */
     unsigned int AddSource(const std::string& path, const std::string& buffer,
-        std::optional<std::string> packageName = std::nullopt);
+        std::optional<std::string> packageName = std::nullopt, bool isCjmpFile = false);
     /**
      * Add source to SourceManager. Package name default to null.
+     * @param path File path.
+     * @param buffer Source code.
+     * @param isCjmpFile Mark that file ID should be calculated as hash of relative path.
      */
-    unsigned int AppendSource(const std::string& path, const std::string& buffer);
+    unsigned int AppendSource(const std::string& path, const std::string& buffer, bool isCjmpFile = false);
 
     /// Overwrite commentsMap with \ref commentsMap
     void AddComments(const TokenVecMap& commentsMap);
@@ -154,7 +193,7 @@ public:
     {
         sources.clear();
         filePathToFileIDMap.clear();
-        sources.emplace_back(Source{0, "", ""});
+        sources.insert({0, Source{0, "", ""}});
     }
 
     /**
@@ -175,6 +214,12 @@ public:
      */
     std::string GetContentBetween(unsigned int fileID, const Position& begin, const Position& end,
         const std::string& importGenericContent = "") const;
+
+    /**
+     * Check whether the given position lies in the macro expansion shadow source (*.macrocall).
+     * @param pos The position to check.
+     */
+    bool IsInMacroCallSourceFile(const Position& pos) const;
 
     static const std::string testPkgSuffix;
 };

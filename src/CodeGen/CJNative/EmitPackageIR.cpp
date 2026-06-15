@@ -527,8 +527,7 @@ void ReplaceFunction(CGModule& cgMod)
     IRBuilder2 irBuilder(cgMod);
     auto& callBasesToReplace = cgMod.GetCGContext().GetCallBasesToReplace();
     for (auto& item : callBasesToReplace) {
-        auto& applyW = item.applyExprW;
-        irBuilder.SetInsertCGFunction(*cgMod.GetOrInsertCGFunction(applyW.GetTopLevelFunc()));
+        irBuilder.SetInsertCGFunction(item.cgFuncCaller);
         auto oldCall = item.callWithoutTI;
         irBuilder.SetInsertPoint(oldCall);
         /// step1: prepare new arguments
@@ -539,17 +538,15 @@ void ReplaceFunction(CGModule& cgMod)
         for (auto& arg : oldCall->args()) {
             argsVal.emplace_back(&(*arg));
         }
-        bool isCalleeMutOrCtor = applyW.IsCalleeStructMutOrCtorMethod();
         // drop the `basePtr` parameter for mut function
         llvm::Value* basePtr = nullptr;
-        if (isCalleeMutOrCtor) {
+        if (item.isCalleeMutOrCtor) {
             auto basePtrItor = argsVal.begin() + thisParamOffset + 1U;
             basePtr = *basePtrItor;
             argsVal.erase(basePtrItor);
         }
         /// step2: alloca memory for `this` with TypeInfo
-        CJC_NULLPTR_CHECK(applyW.GetThisParam());
-        auto thisCHIRType = DeRef(*applyW.GetThisParam()->GetType());
+        auto thisCHIRType = DeRef(item.thisParamType);
         cgMod.GetCGContext().genericParamsCacheMap[irBuilder.GetInsertFunction()].clear();
         cgMod.GetCGContext().genericParamsSizeBlockLevelCacheMap[irBuilder.GetInsertBlock()].clear();
         auto thisParamTypeInfo = irBuilder.CreateTypeInfo(thisCHIRType);
@@ -560,19 +557,20 @@ void ReplaceFunction(CGModule& cgMod)
         /// step3: store `this` without TypeInfo to the memory allocated by step2
         auto payloadPtr = irBuilder.GetPayloadFromObject(thisParamWithTI);
         if (auto thisType = CGType::GetOrCreate(cgMod, thisCHIRType)->GetLLVMType(); IsTypeContainsRef(thisType)) {
-            if (isCalleeMutOrCtor) {
+            auto structType = llvm::cast<llvm::StructType>(thisType);
+            if (item.isCalleeMutOrCtor) {
                 auto load = irBuilder.CreateEntryAlloca(thisType);
                 (void)irBuilder.CreateCJMemSetStructWith0(load);
-                irBuilder.CallGCReadAgg({load, basePtr, thisParamWithoutTI, size64});
-                irBuilder.CallGCWriteAgg({thisParamWithTI, payloadPtr, load, size64});
+                irBuilder.CallGCReadAgg(structType, {load, basePtr, thisParamWithoutTI, size64});
+                irBuilder.CallGCWriteAgg(structType, {thisParamWithTI, payloadPtr, load, size64});
             } else {
-                irBuilder.CallGCWriteAgg({thisParamWithTI, payloadPtr, thisParamWithoutTI, size64});
+                irBuilder.CallGCWriteAgg(structType, {thisParamWithTI, payloadPtr, thisParamWithoutTI, size64});
             }
         } else {
             irBuilder.CreateMemCpy(payloadPtr, llvm::MaybeAlign(), thisParamWithoutTI, llvm::MaybeAlign(), size32);
         }
         /// step4: emit a new CallInst with "xxx"
-        auto callee = cgMod.GetOrInsertCGFunction(applyW.GetCallee())->GetWrapperFunction();
+        auto callee = item.cgFuncCallee.GetWrapperFunction();
         CJC_NULLPTR_CHECK(callee);
         llvm::CallBase* newCall = nullptr;
         if (llvm::isa<llvm::CallInst>(oldCall)) {
@@ -594,14 +592,15 @@ void ReplaceFunction(CGModule& cgMod)
         oldCall->eraseFromParent();
         /// step5: find out the BB to update `this` without TypeInfo
         // Note: non-mut function could skip this step. mut or ctor function should do this step.
-        if (!isCalleeMutOrCtor) {
+        if (!item.isCalleeMutOrCtor) {
             continue;
         }
         if (auto thisType = CGType::GetOrCreate(cgMod, thisCHIRType)->GetLLVMType(); IsTypeContainsRef(thisType)) {
+            auto structType = llvm::cast<llvm::StructType>(thisType);
             auto load = irBuilder.CreateEntryAlloca(thisType);
             (void)irBuilder.CreateCJMemSetStructWith0(load);
-            irBuilder.CallGCReadAgg({load, thisParamWithTI, payloadPtr, size64});
-            irBuilder.CallGCWriteAgg({basePtr, thisParamWithoutTI, load, size64});
+            irBuilder.CallGCReadAgg(structType, {load, thisParamWithTI, payloadPtr, size64});
+            irBuilder.CallGCWriteAgg(structType, {basePtr, thisParamWithoutTI, load, size64});
         } else {
             irBuilder.CreateMemCpy(thisParamWithoutTI, llvm::MaybeAlign(), payloadPtr, llvm::MaybeAlign(), size32);
         }

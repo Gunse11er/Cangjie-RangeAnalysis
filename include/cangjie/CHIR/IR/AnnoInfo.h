@@ -9,64 +9,56 @@
 
 #include <string>
 
-#include "cangjie/Utils/SafePointer.h"
+#include "cangjie/CHIR/IR/DebugLocation.h"
 
-namespace Cangjie::CHIR {
-// Need refactor: temporary solution of custom defined annotation
-/**
- * generate an instance of user defined annotation class,
- * e.g
- *
- * @annotation
- * public class JsonName {
- *     public const JsonName(public let name: String) {}
- * }
- *
- * class Worker {
- *     Worker(
- *         @JsonName["worker_name"]
- *         public let name: String,
- *         @JsonName["worker_age"]
- *         public let age: Int64
- *     ){}
- * }
- *
- * here class Worker has two member vars: name and age, and both use user-defined annotation `JsonName`,
- * so each of two member var has `AnnoInfo` to indicate a compiler-added function that is used to
- * create instance of `class JsonName`, the `mangledName` in `AnnoInfo` record the mangledName of the
- * compiler-added function.
- *
- * respectively, the two compiler-added funcs are $Anno_CN7default6Worker4nameE and $Anno_CN7default6Worker3ageE.
- *
- * the former will create `JsonName` and pass "worker_name" as argument to `JsonName`'s constructor,
- * similarly, the latter will pass "worker_age" to `JsonName`'s constructor.
- *
- * finally, the mangledName is used to generate metadata in CodeGen.
- *
+/** @Annotation
+ *  class Anno1 {
+ *      const init(param1: Type, param2: Type, ...)
+ *  }
+ *  @Annotation
+ *  class Anno2 {
+ *      const init(param1: Type, param2: Type, ...)
+ *  }
+ *  @Anno1[arg1, arg2, ...]
+ *  @Anno2[arg3, arg4, ...]
+ *  class CA {}
+ *  as we can see, @Anno1 and @Anno2 are `AnnoInfo` of class CA, we create annotation factory function for runtime,
+ *  we only need to store its mangled name
+ *  as for `@Anno1[arg1, arg2, ...]` and `@Anno2[arg3, arg4, ...]`, we call them custom annotation instance,
+ *  usually, we only need to store its class name and arguments
  */
-struct AnnoInfo {
-    // If it's not cangjie custom annotation, mangledName should be "none". Required for generating metadata.
-    std::string mangledName{"none"}; // mangledName of annotation generated func
-    // `AnnoPair` is a structure used to save the information of the annotation whose parameter values are
-    // literal constants:
-    //      - `annoClassName` is the name of that annotation class
-    //      - `paramValues` is used to save each parameter value as a string
-    // note: annotation that has no parameters is also included
-    struct AnnoPair {
-        std::string annoClassName;
-        std::vector<std::string> paramValues;
-        AnnoPair(const std::string& annoClassName, const std::vector<std::string>& paramValues)
-            : annoClassName(annoClassName), paramValues(paramValues)
-        {
-        }
-    };
-    // `annoPairs` is used to collect all annotations whose parameter values are literal constants.
-    // Annotations without parameters are also included in the collection.
-    std::vector<AnnoPair> annoPairs;
-    bool IsAvailable() const
-    {
-        return mangledName != "none";
-    }
+namespace Cangjie::CHIR {
+class CustomAnnoInstance {
+public:
+    CustomAnnoInstance(
+        const std::string& className, const std::vector<std::string>& argValues, const DebugLocation& loc);
+    std::string ToString(size_t indent) const;
+    void Dump() const;
+    std::string GetAnnoClassName() const;
+    const std::vector<std::string>& GetArgValues() const;
+    const DebugLocation& GetDebugLocation() const;
+
+private:
+    std::string annoClassName;
+    std::vector<std::string> argValues;
+    DebugLocation loc;
+};
+
+class AnnoInfo {
+public:
+    AnnoInfo();
+    AnnoInfo(const std::string& funcName, std::vector<CustomAnnoInstance>&& instances);
+    bool IsAvailable() const;
+    std::string ToString(size_t indent) const;
+    void Dump() const;
+    std::string GetAnnoFactoryFuncMangledName() const;
+    const std::vector<CustomAnnoInstance>& GetCustomAnnoInstances() const;
+
+private:
+    // attention: we have a deal with llvm ir, we use "none" to stand there is no custom annotation
+    // of course, we can use other word or just empty string, you just remember to modify it in llvm-project, too
+    std::string mangledName{"none"};
+    std::vector<CustomAnnoInstance> annoInstances;
 };
 } // namespace Cangjie::CHIR
 

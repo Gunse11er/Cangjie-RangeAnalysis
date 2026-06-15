@@ -21,9 +21,9 @@
 #ifdef __unix__
 #include <csignal>
 #include <functional>
-#elif __APPLE__
+#elif defined(__APPLE__)
 #include <signal.h>
-#elif _WIN32
+#elif defined(_WIN32)
 #include <signal.h>
 #include <windows.h>
 #endif
@@ -35,7 +35,7 @@ const std::string SIGNAL_MSG_PART_ONE = "Interrupt signal (";
 /* Create alternate signal stack. */
 void CreateAltSignalStack();
 
-#elif _WIN32
+#elif defined(_WIN32)
 const std::string SIGNAL_MSG_PART_ONE = "Windows unexpected exception code (";
 void RegisterCrashExceptionHandler();
 #endif

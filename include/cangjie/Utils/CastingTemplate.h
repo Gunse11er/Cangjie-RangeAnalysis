@@ -145,35 +145,6 @@ template <typename To, typename From> inline CastToT<To, From*> DynamicCast(Ptr<
     }
 }
 
-///@{
-/**
- * Cast from virtual base class to derived class. \ref VirtualCast asserts the class must succeed. Otherwise, use
- * \ref DynamicCast
- */
-template <typename To, typename From>
-CastToT<To, From*> VirtualCast(From* node)
-{
-    static_assert(IsVirtualBaseOfV<std::remove_pointer_t<std::remove_cv_t<From>>, std::remove_pointer_t<To>>);
-    auto r = dynamic_cast<CastToT<To, From*>>(node);
-    CJC_ASSERT(!node || r);
-    return r;
-}
-template <typename To, typename From>
-CastToT<To, From*> VirtualCast(Ptr<From> node)
-{
-    static_assert(IsVirtualBaseOfV<std::remove_pointer_t<std::remove_cv_t<From>>, std::remove_pointer_t<To>>);
-    auto r = dynamic_cast<CastToT<To, From*>>(node.get());
-    CJC_ASSERT(!node || r);
-    return r;
-}
-template <typename To, typename From>
-CastToT<To, From> VirtualCast(From& node)
-{
-    static_assert(IsVirtualBaseOfV<From, std::remove_reference_t<To>>);
-    return dynamic_cast<CastToT<To, From>>(node);
-}
-///@}
-
 // 'From' can only be pointer type with or without 'const'.
 // 'To' can be normal type or pointer type.
 template <typename To, typename From>

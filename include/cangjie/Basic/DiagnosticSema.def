@@ -4,6 +4,7 @@
 //
 // See https://cangjie-lang.cn/pages/LICENSE for license information.
 
+
 ERROR(sema_diag_begin, "")
 ERROR(sema_diag_report_error_message, "%s")
 NOTE(sema_diag_report_note_message, "%s")
@@ -152,15 +153,11 @@ ERROR(sema_cannot_convert_literal, "cannot convert %s literal to type '%s'")
 ERROR(sema_cannot_have_parameter, "%s cannot have parameter")
 
 // C FFI Sema Prepare Check.
-ERROR(sema_only_cfunc_can_use_annotation, "only CFunc can use '%s'")
 ERROR(sema_annotation_error_arg_num, "'%s' should have %s arg")
-ERROR(sema_annotation_calling_conv_not_support, "'@CallingConv' have not support '%s' yet")
-ERROR(sema_annotation_invalid_args_type, "'%s' arg should be right type")
 ERROR(sema_unexpected_wrapper, "unexpected %s")
 ERROR(sema_native_var_error, "variable can not be modified with 'foreign' and implicit @C.")
 
 // C FFI Sema Check.
-ERROR(sema_illegal_scope_use_of_annotation, "'%s' can only be used in top-level scope")
 ERROR(sema_illegal_use_of_annotation, "%s cannot be modified with '%s'")
 ERROR(sema_cffi_cannot_have_type_param, "%s cannot have type parameters")
 ERROR(sema_unsafe_function_invoke_failed, "unsafe function or native function should be invoked in unsafe context.")

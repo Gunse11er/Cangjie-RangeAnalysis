@@ -18,9 +18,9 @@ Ptr<Value> Translator::Visit(const AST::ArrayExpr& array)
 {
     if (array.isValueArray) {
         CJC_ASSERT(array.args.size() == 1);
-        CJC_ASSERT(!array.ty->typeArgs.empty());
+        CJC_ASSERT(!array.GetTy()->typeArgs.empty());
 
-        if (array.args[0]->ty->IsFunc()) {
+        if (array.args[0]->GetTy()->IsFunc()) {
             // Case A: "VArray<Int64, $5>({i => i})"
             return InitVArrayByLambda(array);
         } else {
@@ -29,12 +29,12 @@ Ptr<Value> Translator::Visit(const AST::ArrayExpr& array)
         }
     }
 
-    CJC_ASSERT(array.ty->IsArray());
+    CJC_ASSERT(array.GetTy()->IsArray());
 
     // Case A: "RawArray<T>()" which initialize an empty array.
     if (array.args.empty()) {
         auto loc = TranslateLocation(array);
-        auto arrayTy = chirTy.TranslateType(*array.ty);
+        auto arrayTy = chirTy.TranslateType(*array.GetTy());
         CJC_ASSERT(arrayTy->IsRef());
         auto eleTy = StaticCast<RawArrayType*>(StaticCast<CHIR::RefType*>(arrayTy)->GetBaseType())->GetElementType();
         auto sizeVal = CreateAndAppendConstantExpression<IntLiteral>(
@@ -60,33 +60,43 @@ Ptr<Value> Translator::Visit(const AST::ArrayExpr& array)
     return InitArrayByLambda(array);
 }
 
-Expression* Translator::GenerateFuncCall(Value& callee, const FuncType* instantiedFuncTy,
-    const std::vector<Type*> calleeInstTypeArgs, Type* thisTy,
-    const std::vector<Value*>& args, DebugLocation loc)
+Expression* Translator::CreateAndAppendApplyCallFromCallExpr(
+    Value& callee, FuncCallContext& context, const FuncType& instFuncTy, const AST::CallExpr& expr)
 {
-    auto instantiatedParamTys = instantiedFuncTy->GetParamTypes();
-    auto instantiatedRetTy = instantiedFuncTy->GetReturnType();
-
-    // Step 1: for the func args, cast it to the corresponding func param type if necessary
-    std::vector<Value*> castedArgs;
-    // Except for the func with variant param length, args number should equal to params number
-    CJC_ASSERT(args.size() == instantiatedParamTys.size() || instantiedFuncTy->HasVarArg());
-    size_t i = 0;
-    for (; i < instantiatedParamTys.size(); ++i) {
-        auto castedArg = TypeCastOrBoxIfNeeded(*args[i], *instantiatedParamTys[i], INVALID_LOCATION);
-        castedArgs.emplace_back(castedArg);
+    auto funcCall = TryCreate<Apply>(currentBlock, instFuncTy.GetReturnType(), &callee, context);
+    const auto& loc = TranslateLocation(expr);
+    funcCall->SetDebugLocation(loc);
+    if (expr.callKind == AST::CallKind::CALL_SUPER_FUNCTION) {
+        if (auto apply = DynamicCast<Apply*>(funcCall)) {
+            apply->SetSuperCall();
+        }
     }
-    for (; i < args.size(); ++i) {
-        castedArgs.emplace_back(args[i]);
+    if (HasNothingTypeArg(context.args)) {
+        if (expr.baseFunc != nullptr) {
+            const auto& warningLoc = TranslateLocation(*expr.baseFunc);
+            funcCall->Set<DebugLocationInfoForWarning>(warningLoc);
+        } else {
+            funcCall->Set<DebugLocationInfoForWarning>(loc);
+        }
     }
+    return funcCall;
+}
 
-    // Step 2: create the func call (might be a `Apply` or `ApplyWithException`) and set
-    // its instantiated type info
-    // we should make the instantiated type info as a forced input of the constructor of `Apply`
-    return TryCreate<Apply>(currentBlock, loc, instantiatedRetTy, &callee, FuncCallContext{
-        .args = castedArgs,
-        .instTypeArgs = calleeInstTypeArgs,
-        .thisType = thisTy});
+Expression* Translator::CreateAndAppendApplyCallFromArray(
+    Value& callee, FuncCallContext& context, const FuncType& instFuncTy, const AST::Expr& array)
+{
+    CJC_ASSERT(array.astKind == AST::ASTKind::ARRAY_EXPR || array.astKind == AST::ASTKind::ARRAY_LIT);
+    auto funcCall = TryCreate<Apply>(currentBlock, instFuncTy.GetReturnType(), &callee, context);
+    const auto& loc = TranslateLocation(array);
+    funcCall->SetDebugLocation(loc);
+    return funcCall;
+}
+
+Expression* Translator::CreateAndAppendGVInitFuncCall(Value& callee)
+{
+    auto instFuncTy = StaticCast<FuncType*>(callee.GetType());
+    auto funcCallContext = FuncCallContext {};
+    return TryCreate<Apply>(currentBlock, instFuncTy->GetReturnType(), &callee, funcCallContext);
 }
 
 Ptr<Value> Translator::InitArrayByLambda(const AST::ArrayExpr& array)
@@ -94,7 +104,7 @@ Ptr<Value> Translator::InitArrayByLambda(const AST::ArrayExpr& array)
     CJC_ASSERT(array.args.size() == ARGS_NUM_TWO && array.initFunc != nullptr);
 
     auto loc = TranslateLocation(array);
-    auto arrayTy = chirTy.TranslateType(*array.ty);
+    auto arrayTy = chirTy.TranslateType(*array.GetTy());
     CJC_ASSERT(arrayTy->IsRef());
     auto eleTy = StaticCast<RawArrayType*>(StaticCast<CHIR::RefType*>(arrayTy)->GetBaseType())->GetElementType();
     auto sizeVal = TranslateExprArg(*array.args[0]);
@@ -106,7 +116,7 @@ Ptr<Value> Translator::InitArrayByLambda(const AST::ArrayExpr& array)
     // if array init func is generic decl, then we will create `Apply` expr like: `Apply(init<xxx>, args)`
     // if array init func is instantiated decl, then we will create `Apply` expr like: `Apply(init, args)`
     if (array.initFunc->TestAttr(AST::Attribute::GENERIC)) {
-        for (auto ty : array.ty->typeArgs) {
+        for (auto ty : array.GetTy()->typeArgs) {
             instantiatedTypeArgs.emplace_back(chirTy.TranslateType(*ty));
         }
     }
@@ -116,9 +126,13 @@ Ptr<Value> Translator::InitArrayByLambda(const AST::ArrayExpr& array)
     std::vector<Type*> instParamTys;
     instParamTys.emplace_back(rawArrayRef->GetType());
     instParamTys.emplace_back(userInitFn->GetType());
-    auto instantiedFuncTy = builder.GetType<FuncType>(instParamTys, arrayTy);
-    GenerateFuncCall(*initFn, instantiedFuncTy, instantiatedTypeArgs, nullptr,
-        std::vector<Value*>{rawArrayRef, userInitFn}, loc);
+    auto instFuncTy = builder.GetType<FuncType>(instParamTys, arrayTy);
+    auto funcCallContext = FuncCallContext {
+        .args = std::vector<Value*>{rawArrayRef, userInitFn},
+        .instTypeArgs = instantiatedTypeArgs,
+        .thisType = nullptr
+    };
+    CreateAndAppendApplyCallFromArray(*initFn, funcCallContext, *instFuncTy, array);
 
     return rawArrayRef;
 }
@@ -128,7 +142,7 @@ Ptr<Value> Translator::InitArrayByItem(const AST::ArrayExpr& array)
     CJC_ASSERT(array.args.size() == ARGS_NUM_TWO && array.initFunc == nullptr);
 
     auto loc = TranslateLocation(array);
-    auto arrayTy = chirTy.TranslateType(*array.ty);
+    auto arrayTy = chirTy.TranslateType(*array.GetTy());
     CJC_ASSERT(arrayTy->IsRef());
     auto eleTy = StaticCast<RawArrayType*>(StaticCast<CHIR::RefType*>(arrayTy)->GetBaseType())->GetElementType();
 
@@ -153,9 +167,9 @@ CHIR::Type* Translator::GetExactParentType(
     if (outerDecl->TestAttr(AST::Attribute::GENERIC_INSTANTIATED)) {
         Type* parentTy = nullptr;
         if (outerDecl->astKind == AST::ASTKind::EXTEND_DECL) {
-            parentTy = TranslateType(*StaticCast<AST::ExtendDecl*>(outerDecl)->extendedType->ty);
+            parentTy = TranslateType(*StaticCast<AST::ExtendDecl*>(outerDecl)->extendedType->GetTy());
         } else {
-            parentTy = TranslateType(*outerDecl->ty);
+            parentTy = TranslateType(*outerDecl->GetTy());
         }
         return parentTy->StripAllRefs();
     }
@@ -191,10 +205,9 @@ CHIR::Type* Translator::GetExactParentType(
                     replaceTable.emplace(genericTy1, classInstArgs[i]);
                 }
             }
-            auto [func, done] = ex->GetExpectedFunc(
+            auto func = ex->GetExpectedFunc(
                 funcName, funcType, isStatic, replaceTable, funcInstTypeArgs, builder, checkAbstractMethod);
-            // when it's done, don't need to check `func` is nullptr, it can't be
-            if (done && func->Get<WrappedRawMethod>() == nullptr) {
+            if (func != nullptr && func->Get<WrappedRawMethod>() == nullptr) {
                 return ReplaceRawGenericArgType(*ex->GetExtendedType(), replaceTable, builder);
             }
         }
@@ -214,26 +227,28 @@ CHIR::Type* Translator::GetExactParentType(
 
 Ptr<Value> Translator::InitArrayByCollection(const AST::ArrayExpr& array)
 {
-    auto loc = TranslateLocation(array);
-    auto arrayTy = chirTy.TranslateType(*array.ty);
-    CJC_ASSERT(arrayTy->IsRef());
-    auto eleTy = StaticCast<RawArrayType*>(StaticCast<CHIR::RefType*>(arrayTy)->GetBaseType())->GetElementType();
-
     auto collection = TranslateExprArg(*array.args[0]);
     auto sizeTy = builder.GetInt64Ty();
-
-    auto sizeGetInstFuncTy = builder.GetType<FuncType>(std::vector<Type*>({collection->GetType()}), sizeTy);
     Type* originalObjType =
         StaticCast<CustomType*>(collection->GetType()->StripAllRefs())->GetCustomTypeDef()->GetType();
     originalObjType = builder.GetType<RefType>(originalObjType);
-    auto sizeGetOriginalFuncTy = builder.GetType<FuncType>(std::vector<Type*>({originalObjType}), sizeTy);
-    auto collectionDerefType = StaticCast<RefType*>(collection->GetType())->GetBaseType();
-    auto funcName = "$sizeget";
-    InstInvokeCalleeInfo funcInfo{funcName, sizeGetInstFuncTy, sizeGetOriginalFuncTy,
-        std::vector<Type*>{}, std::vector<GenericType*>{}, collectionDerefType};
-    Value* sizeVal = GenerateDynmaicDispatchFuncCall(funcInfo, std::vector<Value*>{}, collection)->GetResult();
+    auto invokeInfo = InvokeCallContext {
+        .caller = collection,
+        .funcCallCtx = FuncCallContext {
+            .thisType = collection->GetType()->StripAllRefs()
+        },
+        .virMethodCtx = FuncSigInfo {
+            .funcName = "$sizeget",
+            .funcType = builder.GetType<FuncType>(std::vector<Type*>({originalObjType}), sizeTy)
+        }
+    };
+    auto loc = TranslateLocation(array);
+    Value* sizeVal = TryCreate<Invoke>(currentBlock, loc, sizeTy, invokeInfo)->GetResult();
 
     // Create the array `RawArrayAllocate(eleTy, collection.size)`
+    auto arrayTy = chirTy.TranslateType(*array.GetTy());
+    CJC_ASSERT(arrayTy->IsRef());
+    auto eleTy = StaticCast<RawArrayType*>(arrayTy->StripAllRefs())->GetElementType();
     auto rawArrayRef =
         CreateAndAppendExpression<RawArrayAllocate>(loc, arrayTy, eleTy, sizeVal, currentBlock)->GetResult();
 
@@ -245,20 +260,23 @@ Ptr<Value> Translator::InitArrayByCollection(const AST::ArrayExpr& array)
     std::vector<Type*> instParamTys;
     instParamTys.emplace_back(rawArrayRef->GetType());
     instParamTys.emplace_back(collection->GetType());
-    auto instantiedFuncTy = builder.GetType<FuncType>(instParamTys, arrayTy);
+    auto instFuncTy = builder.GetType<FuncType>(instParamTys, arrayTy);
     // if array init func is generic decl, then we will create `Apply` expr like: `Apply(init<xxx>, args)`
     // if array init func is instantiated decl, then we will create `Apply` expr like: `Apply(init, args)`
-    auto instTys = array.initFunc->TestAttr(AST::Attribute::GENERIC) ? std::vector<Type*>{eleTy} : std::vector<Type*>{};
-    GenerateFuncCall(*initFn, instantiedFuncTy, instTys, nullptr,
-        std::vector<Value*>{rawArrayRef, collection}, loc);
-
+    auto funcCallContext = FuncCallContext {
+        .args = std::vector<Value*>{rawArrayRef, collection},
+        .instTypeArgs =
+            array.initFunc->TestAttr(AST::Attribute::GENERIC) ? std::vector<Type*>{eleTy} : std::vector<Type*>{},
+        .thisType = nullptr
+    };
+    CreateAndAppendApplyCallFromArray(*initFn, funcCallContext, *instFuncTy, array);
     return rawArrayRef;
 }
 
 Ptr<Value> Translator::InitVArrayByItem(const AST::ArrayExpr& vArray)
 {
     auto loc = TranslateLocation(vArray);
-    auto vArrayTy = StaticCast<VArrayType*>(chirTy.TranslateType(*vArray.ty));
+    auto vArrayTy = StaticCast<VArrayType*>(chirTy.TranslateType(*vArray.GetTy()));
     auto eleTy = vArrayTy->GetElementType();
 
     auto sizeVal =
@@ -276,7 +294,7 @@ Ptr<Value> Translator::InitVArrayByItem(const AST::ArrayExpr& vArray)
 Ptr<Value> Translator::InitVArrayByLambda(const AST::ArrayExpr& vArray)
 {
     auto loc = TranslateLocation(vArray);
-    auto vArrayTy = StaticCast<VArrayType*>(chirTy.TranslateType(*vArray.ty));
+    auto vArrayTy = StaticCast<VArrayType*>(chirTy.TranslateType(*vArray.GetTy()));
     auto eleTy = vArrayTy->GetElementType();
     auto sizeVal =
         CreateAndAppendConstantExpression<IntLiteral>(builder.GetInt64Ty(), *currentBlock, vArrayTy->GetSize())

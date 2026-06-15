@@ -66,8 +66,6 @@ EXPRKIND(STORE_ELEMENT_BY_NAME, "StoreElementByName", StoreElementByName)
 )
 
 MAJORKIND(STRUCTURED_CTRL_FLOW_EXPR,
-EXPRKIND(IF, "If", If)
-EXPRKIND(LOOP, "Loop", Loop)
 EXPRKIND(FORIN_RANGE, "ForInRange", ForInRange)
 EXPRKIND(FORIN_ITER, "ForInIter", ForInIter)
 EXPRKIND(FORIN_CLOSED_RANGE, "ForInClosedRange", ForInClosedRange)

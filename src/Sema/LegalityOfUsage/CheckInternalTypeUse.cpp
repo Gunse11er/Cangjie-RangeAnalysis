@@ -53,10 +53,10 @@ void CollectGenericTyAccessibility(const AST::Decl& decl, std::vector<std::pair<
     auto declLevel = GetAccessLevel(decl);
     for (auto& it : generic->genericConstraints) {
         for (auto& upperBound : it->upperBounds) {
-            if (!upperBound->ty) {
+            if (!upperBound->GetTy()) {
                 continue;
             }
-            if (auto [ubDecl, accessible] = IsAccessible(upperBound->ty, declLevel); !accessible) {
+            if (auto [ubDecl, accessible] = IsAccessible(upperBound->GetTy(), declLevel); !accessible) {
                 (void)limitedDecls.emplace_back(*upperBound, *ubDecl);
             }
         }
@@ -82,7 +82,7 @@ void TypeChecker::TypeCheckerImpl::CheckAccessLevelValidity(Package& package)
 
 void TypeChecker::TypeCheckerImpl::CheckNonPrivateDeclAccessLevelValidity(Decl& decl)
 {
-    if (!Ty::IsTyCorrect(decl.ty)) {
+    if (!Ty::IsTyCorrect(decl.GetTy())) {
         return;
     }
     if (auto id = DynamicCast<InheritableDecl>(&decl)) {
@@ -94,20 +94,20 @@ void TypeChecker::TypeCheckerImpl::CheckNonPrivateDeclAccessLevelValidity(Decl& 
     } else if (auto tad = DynamicCast<TypeAliasDecl>(&decl)) {
         std::vector<std::pair<Node&, Decl&>> limitedDecls;
         CJC_NULLPTR_CHECK(tad->type);
-        if (auto [inDecl, accessible] = IsAccessible(tad->type->ty, GetAccessLevel(*tad)); !accessible) {
+        if (auto [inDecl, accessible] = IsAccessible(tad->type->GetTy(), GetAccessLevel(*tad)); !accessible) {
             (void)limitedDecls.emplace_back(*tad->type, *inDecl);
         }
         CollectGenericTyAccessibility(*tad, limitedDecls);
         DiagLowerAccessLevelTypesUse(diag, *tad, limitedDecls);
     } else if (auto pd = DynamicCast<PropDecl>(&decl)) {
         CJC_NULLPTR_CHECK(pd->type);
-        if (auto [inDecl, accessible] = IsAccessible(pd->ty, GetAccessLevel(*pd)); !accessible) {
+        if (auto [inDecl, accessible] = IsAccessible(pd->GetTy(), GetAccessLevel(*pd)); !accessible) {
             std::vector<std::pair<Node&, Decl&>> limitedDecls;
             (void)limitedDecls.emplace_back(*pd->type, *inDecl);
             DiagLowerAccessLevelTypesUse(diag, *pd, limitedDecls);
         }
     } else if (auto vd = DynamicCast<VarDecl>(&decl)) {
-        auto [inDecl, accessible] = IsAccessible(vd->ty, GetAccessLevel(*vd));
+        auto [inDecl, accessible] = IsAccessible(vd->GetTy(), GetAccessLevel(*vd));
         if (accessible) {
             return;
         }
@@ -144,8 +144,7 @@ void TypeChecker::TypeCheckerImpl::CheckFuncAccessLevelValidity(const FuncDecl& 
     std::vector<std::pair<Node&, Decl&>> limitedDecls;
     std::vector<Ptr<Decl>> hintDecls;
     if (fd.funcBody->retType) {
-        if (auto [decl, accessible] = IsAccessible(fd.funcBody->retType->ty, GetAccessLevel(fd));
-            !accessible) {
+        if (auto [decl, accessible] = IsAccessible(fd.funcBody->retType->GetTy(), GetAccessLevel(fd)); !accessible) {
             if (!fd.funcBody->retType->TestAttr(Attribute::COMPILER_ADD)) {
                 (void)limitedDecls.emplace_back(*fd.funcBody->retType, *decl);
             } else {
@@ -159,7 +158,7 @@ void TypeChecker::TypeCheckerImpl::CheckFuncAccessLevelValidity(const FuncDecl& 
             continue;
         }
         CJC_ASSERT(param && param->type);
-        if (auto [inDecl, accessible] = IsAccessible(param->ty, GetAccessLevel(fd)); !accessible) {
+        if (auto [inDecl, accessible] = IsAccessible(param->GetTy(), GetAccessLevel(fd)); !accessible) {
             (void)limitedDecls.emplace_back(*param->type, *inDecl);
         }
     }
@@ -172,7 +171,7 @@ void TypeChecker::TypeCheckerImpl::CheckPatternVarAccessLevelValidity(AST::Patte
     std::vector<std::pair<Node&, Decl&>> limitedDecls;
     Walker(&pattern, [&limitedDecls](Ptr<Node> node) -> VisitAction {
         if (auto vd = DynamicCast<VarDecl>(node)) {
-            if (auto [inDecl, accessible] = IsAccessible(vd->ty, GetAccessLevel(*vd)); !accessible) {
+            if (auto [inDecl, accessible] = IsAccessible(vd->GetTy(), GetAccessLevel(*vd)); !accessible) {
                 (void)limitedDecls.emplace_back(*vd, *inDecl);
             }
             return VisitAction::SKIP_CHILDREN;

@@ -15,7 +15,7 @@
 
 ### 环境依赖
 
-编译器独立构建环境除额外依赖 googletest 执行 UT 外，其他内容与集成构建环境基本一致，详细信息请参阅 [Cangjie 构建指导书 (Ubuntu 22.04)-环境准备](https://gitcode.com/Cangjie/cangjie_build/blob/main/docs/linux_zh.md#2-%E7%8E%AF%E5%A2%83%E5%87%86%E5%A4%87)。
+编译器独立构建环境除额外依赖 googletest 执行 UT 外，其他内容与集成构建环境基本一致，详细信息请参阅 [Cangjie 构建指导书 (Ubuntu 22.04)-环境准备](https://gitcode.com/Cangjie/cangjie_build/blob/main/docs/linux.md#2-%E7%8E%AF%E5%A2%83%E5%87%86%E5%A4%87)。
 googletest 依赖安装可参考 [通用构建指导](https://github.com/google/googletest/blob/main/googletest/README.md)，也可以在构建时通过 [--no-test](#build-选项) 选项临时关闭 UT 构建。
 
 ### 构建命令
@@ -43,7 +43,7 @@ python3 build.py install;
 
 1. `build.py clean` 命令用于清空工作区临时文件。
 2. `build.py build` 命令开始执行编译：
-    - 二级选项 `-t` 即 `--build-type`，指定编译产物类型，可以是 `release`、`debug` 或 `relwithdebinfo`；
+    - 二级选项 `-t` 即 `--build-type`，指定编译产物类型，可以是 `release`、`debug` 或 `relwithdebinfo`。
     - 二级选项 `--build-cjdb` 选项开启 cjdb(lldb) 编译，了解更多更多关于 cjdb 内容，请参阅 [`cjdb` 工具介绍](https://gitcode.com/Cangjie/cangjie_docs/blob/main/docs/tools/source_zh_cn/cmd-tools/cjdb_manual.md)。
 3. `build.py install` 命令将编译产物安装到 `output` 目录下。
 
@@ -65,7 +65,7 @@ Target: xxxx-xxxx-xxxx
 
 ### 环境准备
 
-编译器独立构建环境除额外依赖 googletest 执行 UT 外，其他内容与集成构建环境基本一致，详细信息请参阅 [Cangjie 构建指导书 (Macos 14 Sonoma)-环境准备](https://gitcode.com/Cangjie/cangjie_build/blob/main/docs/macos_zh.md#2-%E7%8E%AF%E5%A2%83%E5%87%86%E5%A4%87)。
+编译器独立构建环境除额外依赖 googletest 执行 UT 外，其他内容与集成构建环境基本一致，详细信息请参阅 [Cangjie 构建指导书 (Macos 14 Sonoma)-环境准备](https://gitcode.com/Cangjie/cangjie_build/blob/main/docs/macos.md#2-%E7%8E%AF%E5%A2%83%E5%87%86%E5%A4%87)。
 googletest 依赖安装可参考 [通用构建指导](https://github.com/google/googletest/blob/main/googletest/README.md)，也可以在构建时通过 [--no-test](#build-选项) 选项临时关闭 UT 构建。
 
 ### 构建命令
@@ -92,7 +92,7 @@ python3 build.py install;
 
 1. `build.py clean` 命令用于清空工作区临时文件。
 2. `build.py build` 命令开始执行编译：
-    - 二级选项 `-t` 即 `--build-type`，指定编译产物类型，可以是 `release`、`debug` 或 `relwithdebinfo`；
+    - 二级选项 `-t` 即 `--build-type`，指定编译产物类型，可以是 `release`、`debug` 或 `relwithdebinfo`。
     - 二级选项 `--build-cjdb` 选项开启 cjdb(lldb) 编译，了解更多更多关于 cjdb 内容，请参阅 [`cjdb` 工具介绍](https://gitcode.com/Cangjie/cangjie_docs/blob/main/docs/tools/source_zh_cn/cmd-tools/cjdb_manual.md)。
 3. `build.py install` 命令将编译产物安装到 `output` 目录下。
 
@@ -114,7 +114,7 @@ Target: xxxx-xxxx-xxxx
 
 ### 环境准备
 
-编译器独立构建环境除额外依赖 googletest 执行 UT 外，其他内容与集成构建环境基本一致，详细信息请参阅 [Cangjie 构建指导书 (Ubuntu 22.04)-环境准备](https://gitcode.com/Cangjie/cangjie_build/blob/main/docs/linux_cross_windows_zh.md#2-%E7%8E%AF%E5%A2%83%E5%87%86%E5%A4%87)。
+编译器独立构建环境除额外依赖 googletest 执行 UT 外，其他内容与集成构建环境基本一致，详细信息请参阅 [Cangjie 构建指导书 (Ubuntu 22.04)-环境准备](https://gitcode.com/Cangjie/cangjie_build/blob/main/docs/linux_cross_windows.md#2-%E7%8E%AF%E5%A2%83%E5%87%86%E5%A4%87)。
 googletest 依赖安装可参考 [通用构建指导](https://github.com/google/googletest/blob/main/googletest/README.md)，也可以在构建时通过 [--no-test](#build-选项) 选项临时关闭 UT 构建。
 
 > **注意：**
@@ -165,7 +165,7 @@ source ./output/envsetup.bat
 cjc.exe -v
 ```
 
-该步骤仅生成目标平台 cjc 可执行文件，如需构建周边依赖请参阅 [Cangjie 构建指导书 (Ubuntu 22.04)-源码构建](https://gitcode.com/Cangjie/cangjie_build/blob/main/docs/linux_cross_windows_zh.md#4-%E7%BC%96%E8%AF%91%E6%B5%81%E7%A8%8B)。
+该步骤仅生成目标平台 cjc 可执行文件，如需构建周边依赖请参阅 [Cangjie 构建指导书 (Ubuntu 22.04)-源码构建](https://gitcode.com/Cangjie/cangjie_build/blob/main/docs/linux_cross_windows.md#4-%E7%BC%96%E8%AF%91%E6%B5%81%E7%A8%8B)。
 
 ## Linux 上构建适用于 Android 平台的基础库（交叉编译）
 
@@ -203,7 +203,7 @@ python3 build.py install --host android-aarch64;
 1. `ANDROID_NDK_ROOT` 环境变量用来设置 Android NDK 的路径。
 2. `build.py clean` 命令用于清空工作区临时文件。
 3. `build.py build` 命令开始执行编译：
-    - 二级选项 `-t` 即 `--build-type`，可以是 `release`、`debug` 或 `relwithdebuginfo`。
+    - 二级选项 `-t` 即 `--build-type`，可以是 `release`、`debug` 或 `relwithdebinfo`。
     - 二级选项 `--product` 指定构建目标产物， 可以是 `all`、`cjc` 或 `libs`。
     - 二级选项 `--target` 选项指定目标平台描述，可以是 `native`(当前编译平台)、`windows-x86_64`、`ohos-aarch64`、`ohos-x86_64`、`ios-aarch64`、`android-aarch64`、`android-x86_64`、`ios-simulator-aarch64`、`ios-aarch64`。
     - 二级选项 `--android-ndk` 选项指定 Android NDK 的路径。
@@ -246,7 +246,7 @@ python3 build.py install --host android-aarch64
 1. `ANDROID_NDK_ROOT` 环境变量用来设置 Android NDK 的路径。
 2. `build.py clean` 命令用于清空工作区临时文件。
 3. `build.py build` 命令开始执行编译：
-    - 二级选项 `-t` 即 `--build-type`，可以是 `release`、`debug` 或 `relwithdebuginfo`。
+    - 二级选项 `-t` 即 `--build-type`，可以是 `release`、`debug` 或 `relwithdebinfo`。
     - 二级选项 `--product` 指定构建目标产物， 可以是 `all`、`cjc` 或 `libs`。
     - 二级选项 `--target` 选项指定目标平台描述，可以是 `native`(当前编译平台)、`windows-x86_64`、`ohos-aarch64`、`ohos-x86_64`、`ios-aarch64`、`android-aarch64`、`android-x86_64`、`ios-simulator-aarch64`、`ios-aarch64`。
     - 二级选项 `--android-ndk` 选项指定 Android NDK 的路径。
@@ -309,7 +309,7 @@ python3 build.py install;
 4. `TOOLCHAIN_BIN` 环境变量用来设置 Xcode 工具链的二进制文件路径。
 5. `build.py clean` 命令用于清空工作区临时文件。
 6. `build.py build` 命令开始执行编译：
-    - 二级选项 `-t` 即 `--build-type`，可以是 `release`、`debug` 或 `relwithdebuginfo`。
+    - 二级选项 `-t` 即 `--build-type`，可以是 `release`、`debug` 或 `relwithdebinfo`。
     - 二级选项 `--product` 指定构建目标产物， 可以是 `all`、`cjc` 或 `libs`。
     - 二级选项 `--target` 选项指定目标平台描述，可以是 `native`(当前编译平台)、`windows-x86_64`、`ohos-aarch64`、`ohos-x86_64`、`ios-aarch64`、`android-aarch64`、`android-x86_64`、`ios-simulator-aarch64`、`ios-aarch64`。
     - 二级选项 `--target-sysroot` 选项将后面的参数传递给 C/C++ 编译器作为其 `--sysroot` 参数。

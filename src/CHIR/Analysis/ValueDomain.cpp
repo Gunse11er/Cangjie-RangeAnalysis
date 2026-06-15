@@ -11,13 +11,14 @@
  */
 
 #include "cangjie/CHIR/Analysis/ValueDomain.h"
+#include <cstddef>
 
 namespace Cangjie::CHIR {
 AbstractObject::AbstractObject(std::string identifier) : Value(nullptr, identifier, ValueKind::KIND_LOCALVAR)
 {
 }
 
-std::string AbstractObject::ToString() const
+std::string AbstractObject::ToString([[maybe_unused]] size_t indent) const
 {
     return identifier;
 }

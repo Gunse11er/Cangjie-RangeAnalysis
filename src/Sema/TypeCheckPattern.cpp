@@ -113,14 +113,14 @@ void FillEnumPatternMemberAccessTypeArgumentsTy(TypeManager& typeManager, EnumTy
         // instTys is empty, use targetTy to generate the typeMapping.
         typeManager.GenerateGenericMapping(typeMapping, targetTy);
         for (auto& typeParam : ed->generic->typeParameters) {
-            ref->instTys.emplace_back(GetMappedTy(typeMapping, StaticCast<GenericsTy*>(typeParam->ty)));
+            ref->instTys.emplace_back(GetMappedTy(typeMapping, StaticCast<GenericsTy*>(typeParam->GetTy())));
         }
-    } else if (ma.baseExpr->ty) {
-        // instTys is not empty, use ma.baseExpr->ty to generate the typeMapping.
-        typeManager.GenerateGenericMapping(typeMapping, *ma.baseExpr->ty);
+    } else if (ma.baseExpr->GetTy()) {
+        // instTys is not empty, use ma.baseExpr->GetTy() to generate the typeMapping.
+        typeManager.GenerateGenericMapping(typeMapping, *ma.baseExpr->GetTy());
     }
-    ma.baseExpr->ty = typeManager.GetBestInstantiatedTy(ed->ty, typeMapping);
-    ma.ty = typeManager.GetBestInstantiatedTy(ma.ty, typeMapping);
+    ma.baseExpr->SetTy(typeManager.GetBestInstantiatedTy(ed->GetTy(), typeMapping));
+    ma.SetTy(typeManager.GetBestInstantiatedTy(ma.GetTy(), typeMapping));
 }
 
 void SetTyForEnumPatternConstructor(TypeManager& typeManager, EnumTy& targetTy, const EnumPattern& ep)
@@ -130,7 +130,7 @@ void SetTyForEnumPatternConstructor(TypeManager& typeManager, EnumTy& targetTy, 
     }
     if (ep.constructor->astKind == ASTKind::MEMBER_ACCESS) {
         MemberAccess& ma = static_cast<MemberAccess&>(*ep.constructor);
-        if (!ma.baseExpr || !ma.baseExpr->ty || !ma.baseExpr->ty->IsEnum()) {
+        if (!ma.baseExpr || !ma.baseExpr->GetTy() || !ma.baseExpr->GetTy()->IsEnum()) {
             return;
         }
         FillEnumPatternMemberAccessTypeArgumentsTy(typeManager, targetTy, ma);
@@ -138,7 +138,7 @@ void SetTyForEnumPatternConstructor(TypeManager& typeManager, EnumTy& targetTy, 
         CJC_ASSERT(ep.constructor->astKind == ASTKind::REF_EXPR);
         MultiTypeSubst typeMapping;
         typeManager.GenerateGenericMapping(typeMapping, targetTy);
-        ep.constructor->ty = typeManager.GetBestInstantiatedTy(ep.constructor->ty, typeMapping);
+        ep.constructor->SetTy(typeManager.GetBestInstantiatedTy(ep.constructor->GetTy(), typeMapping));
     }
 }
 
@@ -224,12 +224,12 @@ bool TypeChecker::TypeCheckerImpl::ChkPattern(ASTContext& ctx, Ty& target, Patte
         }
         // Handle invalid patterns explicitly.
         case ASTKind::INVALID_PATTERN: {
-            p.ty = TypeManager::GetInvalidTy();
+            p.SetTy(TypeManager::GetInvalidTy());
             return false;
         }
         default: {
             Errorln("unhandled pattern");
-            p.ty = TypeManager::GetInvalidTy();
+            p.SetTy(TypeManager::GetInvalidTy());
             return false;
         }
     }
@@ -237,7 +237,7 @@ bool TypeChecker::TypeCheckerImpl::ChkPattern(ASTContext& ctx, Ty& target, Patte
 
 bool TypeChecker::TypeCheckerImpl::ChkWildcardPattern(Ty& target, WildcardPattern& p) const
 {
-    p.ty = &target;
+    p.SetTy(&target);
     return true;
 }
 
@@ -246,33 +246,33 @@ bool TypeChecker::TypeCheckerImpl::ChkConstPattern(ASTContext& ctx, Ty& target, 
     CJC_NULLPTR_CHECK(p.literal);
     // 1. Check the type of the literal in the constant pattern.
     if (target.IsRune() && IsSingleRuneStringLiteral(*p.literal)) {
-        p.literal->ty = &target;
-        p.ty = &target;
+        p.literal->SetTy(&target);
+        p.SetTy(&target);
     } else if (target.kind == TypeKind::TYPE_UINT8 && IsSingleByteStringLiteral(*p.literal)) {
-        p.literal->ty = &target;
-        p.ty = &target;
+        p.literal->SetTy(&target);
+        p.SetTy(&target);
         ChkLitConstExprRange(StaticCast<LitConstExpr&>(*p.literal));
     } else if (!Check(ctx, &target, p.literal.get())) {
-        p.ty = TypeManager::GetInvalidTy();
+        p.SetTy(TypeManager::GetInvalidTy());
         return false;
     }
     // 2. The literals are compared by their values, i.e., the types must be checked exactly equal,
     //    auto-boxed Options are not allowed.
-    if (!typeManager.IsTyEqual(p.literal->ty, &target)) {
+    if (!typeManager.IsTyEqual(p.literal->GetTy(), &target)) {
         DiagMismatchedTypes(diag, *p.literal, target);
-        p.ty = TypeManager::GetInvalidTy();
+        p.SetTy(TypeManager::GetInvalidTy());
         return false;
     }
     // 3. String interpolations are not allowed in constant patterns.
     if (auto lce = DynamicCast<LitConstExpr*>(p.literal.get()); lce && lce->siExpr) {
         diag.DiagnoseRefactor(DiagKindRefactor::sema_interpolation_in_const_pattern, p);
-        p.ty = TypeManager::GetInvalidTy();
+        p.SetTy(TypeManager::GetInvalidTy());
         return false;
     }
     // 4. Check if the selector can be compared with the pattern.
-    p.ty = typeManager.TryGreedySubst(&target);
+    p.SetTy(typeManager.TryGreedySubst(&target));
     const auto& typeCandidates = GetBinaryOpTypeCandidates(TokenKind::EQUAL);
-    if (Utils::InKeys(p.ty->kind, typeCandidates)) {
+    if (Utils::InKeys(p.TyKind(), typeCandidates)) {
         return true;
     }
     // String literals are compared by the `==` method.
@@ -288,7 +288,7 @@ bool TypeChecker::TypeCheckerImpl::ChkOpOverloadForConstPattern(ASTContext& ctx,
     ctx.RemoveTypeCheckCache(*callBase);
     callBase->scopeName = p.scopeName;
     callBase->baseExpr = MakeOwnedNode<RefExpr>();
-    callBase->baseExpr->ty = &target;
+    callBase->baseExpr->SetTy(&target);
     // ensure synthesize skip the dummy node
     ctx.SkipSynForCorrectTy(*callBase->baseExpr);
     callBase->field = "==";
@@ -306,7 +306,7 @@ bool TypeChecker::TypeCheckerImpl::ChkOpOverloadForConstPattern(ASTContext& ctx,
             return true;
         }
     }
-    p.ty = TypeManager::GetNonNullTy(p.ty);
+    p.SetTy(TypeManager::GetNonNullTy(p.GetTy()));
     diag.Diagnose(p, DiagKind::sema_not_overload_in_match);
     return false;
 }
@@ -315,25 +315,25 @@ bool TypeChecker::TypeCheckerImpl::ChkTypePattern(ASTContext& ctx, Ty& target, T
 {
     CJC_NULLPTR_CHECK(p.pattern);
     CJC_NULLPTR_CHECK(p.type);
-    p.type->ty = Synthesize(ctx, p.type.get());
-    CJC_NULLPTR_CHECK(p.type->ty);
-    if (typeManager.IsSubtype(&target, p.type->ty, true, false)) {
+    p.type->SetTy(Synthesize({ctx, SynPos::NONE}, p.type.get()));
+    CJC_NULLPTR_CHECK(p.type->GetTy());
+    if (typeManager.IsSubtype(&target, p.type->GetTy(), true, false)) {
         p.needRuntimeTypeCheck = false;
         p.matchBeforeRuntime = true;
     } else {
-        if (IsSubtypeBoxed(typeManager, target, *p.type->ty)) {
+        if (IsSubtypeBoxed(typeManager, target, *p.type->GetTy())) {
             diag.DiagnoseRefactor(DiagKindRefactor::sema_unreachable_pattern, p)
                 .AddNote("the selector is of type '" + target.String() + "', which is not a subtype of '" +
-                    p.type->ty->String());
+                    p.type->GetTy()->String());
         }
-        p.needRuntimeTypeCheck = IsNeedRuntimeCheck(typeManager, target, *p.type->ty);
+        p.needRuntimeTypeCheck = IsNeedRuntimeCheck(typeManager, target, *p.type->GetTy());
         p.matchBeforeRuntime = false;
     }
-    if (!ChkPattern(ctx, *p.type->ty, *p.pattern)) {
-        p.ty = TypeManager::GetInvalidTy();
+    if (!ChkPattern(ctx, *p.type->GetTy(), *p.pattern)) {
+        p.SetTy(TypeManager::GetInvalidTy());
         return false;
     }
-    p.ty = p.type->ty;
+    p.SetTy(p.type->GetTy());
     return true;
 }
 
@@ -355,15 +355,15 @@ bool TypeChecker::TypeCheckerImpl::ChkVarPattern(const ASTContext& ctx, Ty& targ
             // The variable has been defined in this MatchCase, e.g., `case (x, x) => {}`.
             // Or it conflicts with definition in while-let body, e.g., `while (let a <- 1) { let a = 1 }`
             DiagRedefinitionWithFoundNode(diag, *p.varDecl, *decl);
-            p.ty = TypeManager::GetInvalidTy();
-            p.varDecl->ty = TypeManager::GetInvalidTy();
+            p.SetTy(TypeManager::GetInvalidTy());
+            p.varDecl->SetTy(TypeManager::GetInvalidTy());
             p.varDecl->fullPackageName = p.GetFullPackageName();
             p.varDecl->EnableAttr(Attribute::IS_CHECK_VISITED);
             return false;
         }
     }
-    p.ty = &target;
-    p.varDecl->ty = p.ty;
+    p.SetTy(&target);
+    p.varDecl->SetTy(p.GetTy());
     p.varDecl->EnableAttr(Attribute::IS_CHECK_VISITED);
     return true;
 }
@@ -381,7 +381,7 @@ bool TypeChecker::TypeCheckerImpl::ChkEnumPattern(ASTContext& ctx, Ty& target, E
     } else if (target.IsPlaceholder()) {
         // in case the select has placeholder ty var, only try to find target from pattern
         FindEnumPatternTarget(ctx, nullptr, p);
-        auto enumTy = Is<FuncTy>(p.constructor->ty) ? p.constructor->ty->typeArgs[1] : p.constructor->ty;
+        auto enumTy = Is<FuncTy>(p.constructor->GetTy()) ? p.constructor->GetTy()->typeArgs[1] : p.constructor->GetTy();
         auto placeholderEnumTy = typeManager.ConstrainByCtor(StaticCast<GenericsTy&>(target), *enumTy);
         if (placeholderEnumTy) {
             SetTyForEnumPatternConstructor(typeManager, *StaticCast<EnumTy*>(placeholderEnumTy), p);
@@ -389,21 +389,21 @@ bool TypeChecker::TypeCheckerImpl::ChkEnumPattern(ASTContext& ctx, Ty& target, E
         }
     }
     if (mayMatch) {
-        if (auto enumTy = DynamicCast<EnumTy*>(p.constructor->ty);
-            enumTy && typeManager.IsTyEqual(p.constructor->ty, &target)) {
-            p.ty = p.constructor->ty;
+        if (auto enumTy = DynamicCast<EnumTy*>(p.constructor->GetTy());
+            enumTy && typeManager.IsTyEqual(p.constructor->GetTy(), &target)) {
+            p.SetTy(p.constructor->GetTy());
             return true;
-        } else if (auto funcTy = DynamicCast<FuncTy*>(p.constructor->ty); funcTy) {
+        } else if (auto funcTy = DynamicCast<FuncTy*>(p.constructor->GetTy()); funcTy) {
             if (!IsFuncTyEnumPatternMatched(ctx, target, *funcTy, p)) {
-                p.ty = TypeManager::GetInvalidTy();
+                p.SetTy(TypeManager::GetInvalidTy());
                 return false;
             }
-            p.ty = funcTy->retTy;
+            p.SetTy(funcTy->retTy);
             return true;
         }
     }
     diag.Diagnose(p, DiagKind::sema_pattern_not_match, "enum");
-    p.ty = TypeManager::GetInvalidTy();
+    p.SetTy(TypeManager::GetInvalidTy());
     return false;
 }
 
@@ -432,16 +432,16 @@ bool TypeChecker::TypeCheckerImpl::ChkVarOrEnumPattern(ASTContext& ctx, Ty& targ
     if (p.pattern != nullptr) {
         // We have to ChkPattern again because of the LSPCompilerInstance.
         if (!ChkPattern(ctx, target, *p.pattern)) {
-            p.ty = TypeManager::GetInvalidTy();
+            p.SetTy(TypeManager::GetInvalidTy());
             return false;
         }
-        p.ty = &target;
+        p.SetTy(&target);
         return true;
     }
     if (ctx.IsEnumConstructor(p.identifier)) {
         p.pattern = VarOrEnumPatternToEnumPattern(ctx, p, ci->buildTrie);
         if (!ChkPattern(ctx, target, *p.pattern)) {
-            p.ty = TypeManager::GetInvalidTy();
+            p.SetTy(TypeManager::GetInvalidTy());
             return false;
         }
     } else {
@@ -451,7 +451,7 @@ bool TypeChecker::TypeCheckerImpl::ChkVarOrEnumPattern(ASTContext& ctx, Ty& targ
         ctx.AddDeclName(name, decl);
         if (!ChkPattern(ctx, target, *p.pattern)) {
             ctx.RemoveDeclByName(name, decl);
-            p.ty = TypeManager::GetInvalidTy();
+            p.SetTy(TypeManager::GetInvalidTy());
             return false;
         }
     }
@@ -460,7 +460,7 @@ bool TypeChecker::TypeCheckerImpl::ChkVarOrEnumPattern(ASTContext& ctx, Ty& targ
         // of the `Decl`, by setting the third argument (`insertTarget`) as `true`.
         ReplaceTarget(ep->constructor.get(), ep->constructor->GetTarget(), true);
     }
-    p.ty = &target;
+    p.SetTy(&target);
     return true;
 }
 
@@ -469,12 +469,12 @@ bool TypeChecker::TypeCheckerImpl::ChkTuplePattern(ASTContext& ctx, Ty& target, 
     if (auto tupleTy = DynamicCast<TupleTy*>(&target); tupleTy) {
         if (tupleTy->typeArgs.size() != p.patterns.size()) {
             diag.Diagnose(p, DiagKind::sema_tuple_pattern_with_correct_size_expected);
-            p.ty = TypeManager::GetInvalidTy();
+            p.SetTy(TypeManager::GetInvalidTy());
             return false;
         }
         for (size_t i = 0; i < p.patterns.size(); i++) {
             if (!Check(ctx, tupleTy->typeArgs[i], p.patterns[i].get())) {
-                p.ty = TypeManager::GetInvalidTy();
+                p.SetTy(TypeManager::GetInvalidTy());
                 return false;
             }
         }
@@ -484,10 +484,10 @@ bool TypeChecker::TypeCheckerImpl::ChkTuplePattern(ASTContext& ctx, Ty& target, 
         } else {
             diag.Diagnose(p, DiagKind::sema_tuple_pattern_not_match, "initializer");
         }
-        p.ty = TypeManager::GetInvalidTy();
+        p.SetTy(TypeManager::GetInvalidTy());
         return false;
     }
-    p.ty = &target;
+    p.SetTy(&target);
     return true;
 }
 
@@ -526,7 +526,7 @@ void TypeChecker::TypeCheckerImpl::FindEnumPatternTarget(ASTContext& ctx, Ptr<En
     std::vector<Ptr<Decl>> result = FindEnumPatternTargets(ctx, ed, ep);
     if (result.empty()) {
         diag.Diagnose(ep, DiagKind::sema_undeclared_identifier, ep.GetIdentifier());
-        ep.constructor->ty = TypeManager::GetInvalidTy();
+        ep.constructor->SetTy(TypeManager::GetInvalidTy());
         return;
     }
     // Clear any existing target since the result haven't been checked.
@@ -535,14 +535,15 @@ void TypeChecker::TypeCheckerImpl::FindEnumPatternTarget(ASTContext& ctx, Ptr<En
     for (auto& it : result) {
         if (ep.patterns.empty()) {
             // If 'EnumPattern' has no sub-pattern, the target is matched when the type of decl is EnumTy.
-            if (it->ty && it->ty->kind == TypeKind::TYPE_ENUM) {
+            if (it->GetTy() && it->TyKind() == TypeKind::TYPE_ENUM) {
                 ReplaceTarget(ep.constructor.get(), it, false);
                 break;
             }
         } else {
             // If 'EnumPattern' has sub-patterns,
             // the target is matched when the type of decl is FuncTy with same number of parameters.
-            if (auto funcTy = DynamicCast<FuncTy*>(it->ty); funcTy && ep.patterns.size() == funcTy->paramTys.size()) {
+            if (auto funcTy = DynamicCast<FuncTy*>(it->GetTy());
+                funcTy && ep.patterns.size() == funcTy->paramTys.size()) {
                 CJC_ASSERT(it->astKind == ASTKind::FUNC_DECL);
                 ReplaceTarget(ep.constructor.get(), it, false);
                 break;
@@ -550,12 +551,12 @@ void TypeChecker::TypeCheckerImpl::FindEnumPatternTarget(ASTContext& ctx, Ptr<En
         }
     }
     auto target = ep.constructor->GetTarget();
-    if (!target || !Ty::IsTyCorrect(target->ty)) {
+    if (!target || !Ty::IsTyCorrect(target->GetTy())) {
         diag.Diagnose(ep, DiagKind::sema_enum_pattern_param_size_error);
-        ep.constructor->ty = TypeManager::GetInvalidTy();
+        ep.constructor->SetTy(TypeManager::GetInvalidTy());
         return;
     }
-    ep.constructor->ty = target->ty;
+    ep.constructor->SetTy(target->GetTy());
     if (ep.patterns.empty()) {
         return;
     }
@@ -564,7 +565,7 @@ void TypeChecker::TypeCheckerImpl::FindEnumPatternTarget(ASTContext& ctx, Ptr<En
     CJC_ASSERT(!fd->funcBody->paramLists.empty());
     CJC_ASSERT(fd->funcBody->paramLists[0]->params.size() >= ep.patterns.size());
     for (size_t i = 0; i < ep.patterns.size(); ++i) {
-        auto subTarget = Ty::GetDeclPtrOfTy(fd->funcBody->paramLists[0]->params[i]->ty);
+        auto subTarget = Ty::GetDeclPtrOfTy(fd->funcBody->paramLists[0]->params[i]->GetTy());
         bool hasSubEnumPattern =
             ep.patterns[i]->astKind == ASTKind::ENUM_PATTERN && subTarget && subTarget->astKind == ASTKind::ENUM_DECL;
         if (hasSubEnumPattern) {
@@ -577,7 +578,7 @@ void TypeChecker::TypeCheckerImpl::FindEnumPatternTarget(ASTContext& ctx, Ptr<En
 bool TypeChecker::TypeCheckerImpl::ChkTryWildcardPattern(
     Ptr<Ty> target, WildcardPattern& p, std::vector<Ptr<Ty>>& included)
 {
-    p.ty = target;
+    p.SetTy(target);
     if (auto classTy = DynamicCast<ClassTy*>(target); classTy) {
         if (std::find(included.begin(), included.end(), classTy) != included.end()) {
             diag.Diagnose(p, DiagKind::sema_useless_exception_type);
@@ -596,33 +597,35 @@ bool TypeChecker::TypeCheckerImpl::ChkExceptTypePattern(
     bool foundClass = exception && error;
     for (auto& type : etp.types) {
         CJC_NULLPTR_CHECK(type);
-        Synthesize(ctx, type.get());
-        CJC_NULLPTR_CHECK(type->ty);
-        if (!foundClass || type->ty->IsNothing() ||
-            (!typeManager.IsSubtype(type->ty, exception->ty) && !typeManager.IsSubtype(type->ty, error->ty))) {
+        Synthesize({ctx, SynPos::NONE}, type.get());
+        CJC_NULLPTR_CHECK(type->GetTy());
+        if (!foundClass || type->GetTy()->IsNothing() ||
+            (!typeManager.IsSubtype(type->GetTy(), exception->GetTy()) &&
+                !typeManager.IsSubtype(type->GetTy(), error->GetTy()))) {
             diag.Diagnose(*type, DiagKind::sema_except_catch_type_error);
             result = false;
             continue;
         }
-        if (Utils::In(included, [this, &type](Ptr<Ty> ty) { return typeManager.IsSubtype(type->ty, ty); })) {
+        if (Utils::In(included, [this, &type](Ptr<Ty> ty) { return typeManager.IsSubtype(type->GetTy(), ty); })) {
             diag.Diagnose(*type, DiagKind::sema_useless_exception_type);
         } else {
-            included.emplace_back(type->ty);
+            included.emplace_back(type->GetTy());
         }
-        typeTys.emplace(type->ty);
+        typeTys.emplace(type->GetTy());
     }
     if (!result || typeTys.empty()) {
-        etp.ty = TypeManager::GetInvalidTy();
+        etp.SetTy(TypeManager::GetInvalidTy());
         return false;
     }
     auto joinRes = JoinAndMeet(typeManager, typeTys, {}, &importManager, etp.curFile).JoinAsVisibleTy();
-    auto optErrs = JoinAndMeet::SetJoinedType(etp.ty, joinRes);
-    CJC_NULLPTR_CHECK(etp.ty);
+    auto [optErrs, joinedTy] = JoinAndMeet::SetJoinedType(etp.GetTy(), joinRes);
+    etp.SetTy(joinedTy);
+    CJC_NULLPTR_CHECK(etp.GetTy());
     if (optErrs.has_value()) {
         diag.Diagnose(etp, DiagKind::sema_type_incompatible, "pattern").AddNote(*optErrs);
         return false;
     }
-    return Check(ctx, etp.ty, etp.pattern.get());
+    return Check(ctx, etp.GetTy(), etp.pattern.get());
 }
 
 bool TypeChecker::TypeCheckerImpl::ChkHandlePatterns(ASTContext& ctx, Handler& h,
@@ -637,7 +640,7 @@ bool TypeChecker::TypeCheckerImpl::ChkHandlePatterns(ASTContext& ctx, Handler& h
     auto& ctpTyAsCommand = **maybeCtpTyAsCommand;
     h.commandResultTy = ctpTyAsCommand.typeArgs[0];
 
-    return Check(ctx, ctp.ty, ctp.pattern.get());
+    return Check(ctx, ctp.GetTy(), ctp.pattern.get());
 }
 
 std::optional<Ptr<Ty>> TypeChecker::TypeCheckerImpl::ChkCommandTypePattern(
@@ -655,31 +658,32 @@ std::optional<Ptr<Ty>> TypeChecker::TypeCheckerImpl::ChkCommandTypePattern(
     CJC_ASSERT(ctp.types.size() == 1);
     auto cmdTypePat = ctp.types[0].get();
     CJC_NULLPTR_CHECK(cmdTypePat);
-    Synthesize(ctx, cmdTypePat);
-    CJC_NULLPTR_CHECK(cmdTypePat->ty);
-    auto prCTys = promotion.Promote(*cmdTypePat->ty, *command->ty);
-    if (cmdTypePat->ty->IsNothing() || prCTys.empty()) {
+    Synthesize({ctx, SynPos::NONE}, cmdTypePat);
+    CJC_NULLPTR_CHECK(cmdTypePat->GetTy());
+    auto prCTys = promotion.Promote(*cmdTypePat->GetTy(), *command->GetTy());
+    if (cmdTypePat->GetTy()->IsNothing() || prCTys.empty()) {
         diag.DiagnoseRefactor(DiagKindRefactor::sema_command_handle_type_error, *cmdTypePat);
         result = false;
-        ctp.ty = TypeManager::GetInvalidTy();
+        ctp.SetTy(TypeManager::GetInvalidTy());
         return {};
     }
     CJC_ASSERT(prCTys.size() == 1);
-    if (Utils::In(included, [this, &cmdTypePat](Ty* ty) { return typeManager.IsSubtype(cmdTypePat->ty, ty); })) {
+    if (Utils::In(included, [this, &cmdTypePat](Ty* ty) { return typeManager.IsSubtype(cmdTypePat->GetTy(), ty); })) {
         diag.DiagnoseRefactor(DiagKindRefactor::sema_useless_command_type, *cmdTypePat);
     } else {
-        included.emplace_back(cmdTypePat->ty);
+        included.emplace_back(cmdTypePat->GetTy());
     }
-    typeTys.emplace(cmdTypePat->ty);
+    typeTys.emplace(cmdTypePat->GetTy());
     cmdTypeAsCommand = *prCTys.begin();
 
     if (!result || typeTys.empty()) {
-        ctp.ty = TypeManager::GetInvalidTy();
+        ctp.SetTy(TypeManager::GetInvalidTy());
         return {};
     }
     auto joinRes = JoinAndMeet(typeManager, typeTys).JoinAsVisibleTy();
-    auto optErrs = JoinAndMeet::SetJoinedType(ctp.ty, joinRes);
-    CJC_NULLPTR_CHECK(ctp.ty);
+    auto [optErrs, joinedTy] = JoinAndMeet::SetJoinedType(ctp.GetTy(), joinRes);
+    ctp.SetTy(joinedTy);
+    CJC_NULLPTR_CHECK(ctp.GetTy());
     if (optErrs.has_value()) {
         diag.Diagnose(ctp, DiagKind::sema_type_incompatible, "pattern").AddNote(*optErrs);
         return {};

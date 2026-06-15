@@ -44,7 +44,7 @@ OwnedPtr<Expr> CreateReceiverExpr(Ptr<Expr> expr)
         referencedExpr = ASTCloner::Clone(ma->baseExpr.get());
     } else if (Ptr<RefExpr> ref = As<ASTKind::REF_EXPR>(expr)) {
         auto owningDecl = ref->ref.target->outerDecl;
-        referencedExpr = CreateThisRef(owningDecl, owningDecl->ty, expr->curFile);
+        referencedExpr = CreateThisRef(owningDecl, owningDecl->GetTy(), expr->curFile);
     }
     return referencedExpr;
 }
@@ -91,6 +91,7 @@ void RewriteObjCFuncCall::HandleImpl(InteropContext& ctx)
                 return VisitAction::WALK_CHILDREN;
             }
             auto decl = GetDirectlyReferencedMemberDecl(StaticCast<Expr>(node));
+
             if (FTypeKindByCallPropertyDecl(ctx.typeMapper, decl) != ObjCFTypeKind::NONE) {
                 ctx.diag.DiagnoseRefactor(
                     DiagKindRefactor::sema_objc_func_call_property_can_only_be_called,
@@ -129,14 +130,11 @@ void RewriteObjCFuncCall::HandleImpl(InteropContext& ctx)
                 ctx.bridge.GetObjCBlockFPointerAccessor() : ctx.bridge.GetObjCFuncFPointerAccessor();
 
             auto call = ctx.factory.CreateFuncCallViaOpaquePointer(
-                CreateMemberCall(
-                    WithinFile(CreateRefExpr(*tmpVar), node->curFile),
-                    fptrAccessor),
-                ctx.typeMapper.Cj2CType(callExpr->ty),
-                std::move(unwrappedArguments));
+                CreateMemberCall(WithinFile(CreateRefExpr(*tmpVar), node->curFile), fptrAccessor),
+                ctx.typeMapper.Cj2CType(callExpr->GetTy()), std::move(unwrappedArguments));
             std::vector<OwnedPtr<Node>> block;
             block.emplace_back(std::move(tmpVar));
-            block.emplace_back(ctx.factory.WrapEntity(std::move(call), *callExpr->ty));
+            block.emplace_back(ctx.factory.WrapEntity(std::move(call), *callExpr->GetTy()));
             ctx.factory.SetDesugarExpr(
                 callExpr,
                 WrapReturningLambdaCall(

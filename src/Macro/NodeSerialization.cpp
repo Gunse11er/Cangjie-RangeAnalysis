@@ -139,9 +139,8 @@ flatbuffers::Offset<NodeFormat::ImportContent> NodeWriter::SerializeImportConten
     auto rightCurlPos =
         NodeFormat::Position(content.rightCurlPos.fileID, content.rightCurlPos.line, content.rightCurlPos.column);
 
-    return NodeFormat::CreateImportContent(
-        builder, icNodeBase, kind, prefixPaths, prefixPoses, prefixDotPoses, ident, &identPos,
-        &asPos, asIdent, &asIdentPos, &leftCurlPos, items, commaPoses, &rightCurlPos, content.hasDoubleColon);
+    return NodeFormat::CreateImportContent(builder, icNodeBase, kind, prefixPaths, prefixPoses, prefixDotPoses, ident,
+        &identPos, &asPos, asIdent, &asIdentPos, &leftCurlPos, items, commaPoses, &rightCurlPos, content.hasDoubleColon);
 }
 
 flatbuffers::Offset<NodeFormat::ImportSpec> NodeWriter::SerializeImportSpec(AstImportSpec importSpec)
@@ -755,8 +754,9 @@ flatbuffers::Offset<NodeFormat::MacroDecl> NodeWriter::SerializeMacroDecl(const 
     }
     // Serialize MacroDecl.
     auto fbDeclBase = SerializeDeclBase(macroDecl);
-    auto leftParenPos = FlatPosCreateHelper(macroDecl->leftParenPos);
-    auto rightParenPos = FlatPosCreateHelper(macroDecl->rightParenPos);
+    // MacroDecl has no parens, so we use dummy positions here. keep the empty positions for ABI compatibility.
+    auto leftParenPos = FlatPosCreateHelper(Position{0, 0, 0});
+    auto rightParenPos = FlatPosCreateHelper(Position{0, 0, 0});
     auto fbFuncBody = SerializeFuncBody(macroDecl->funcBody.get());
     return NodeFormat::CreateMacroDecl(builder, fbDeclBase, &leftParenPos, &rightParenPos, fbFuncBody);
 }
@@ -1119,10 +1119,10 @@ std::vector<flatbuffers::Offset<NodeFormat::Token>> NodeWriter::TokensVectorCrea
 flatbuffers::Offset<NodeFormat::MacroInvocation> NodeWriter::MacroInvocationCreateHelper(
     const MacroInvocation& macroInvocation)
 {
-    auto fullName = builder.CreateString(macroInvocation.fullName);
-    auto identifier = builder.CreateString(macroInvocation.identifier);
+    auto fullName = builder.CreateString(macroInvocation.macroCallDiagInfo.fullName);
+    auto identifier = builder.CreateString(macroInvocation.macroCallDiagInfo.identifier);
 
-    auto identifierPos = FlatPosCreateHelper(macroInvocation.identifierPos);
+    auto identifierPos = FlatPosCreateHelper(macroInvocation.macroCallDiagInfo.identifierPos);
     auto leftSquarePos = FlatPosCreateHelper(macroInvocation.leftSquarePos);
     auto rightSquarePos = FlatPosCreateHelper(macroInvocation.rightSquarePos);
     auto leftParenPos = FlatPosCreateHelper(macroInvocation.leftParenPos);

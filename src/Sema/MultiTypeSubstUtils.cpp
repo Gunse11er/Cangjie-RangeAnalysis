@@ -172,8 +172,8 @@ TypeSubst MultiTypeSubstToTypeSubst(const MultiTypeSubst& mts)
 std::vector<Ptr<Ty>> GetDeclTypeParams(const Decl& decl)
 {
     if (decl.astKind == ASTKind::EXTEND_DECL) {
-        CJC_NULLPTR_CHECK(decl.ty);
-        return decl.ty->typeArgs;
+        CJC_NULLPTR_CHECK(decl.GetTy());
+        return decl.GetTy()->typeArgs;
     }
     std::vector<Ptr<Ty>> ret;
     auto generic = decl.GetGeneric();
@@ -181,7 +181,7 @@ std::vector<Ptr<Ty>> GetDeclTypeParams(const Decl& decl)
         return ret;
     }
     for (auto& it : generic->typeParameters) {
-        ret.emplace_back(it->ty);
+        ret.emplace_back(it->GetTy());
     }
     return ret;
 }
@@ -379,14 +379,14 @@ void GenerateTypeMapping(TypeManager& tyMgr, SubstPack& m, const Decl& decl, con
         return;
     }
     if (decl.astKind == ASTKind::EXTEND_DECL) {
-        auto extendedTypeArgs = StaticCast<ExtendDecl>(decl).extendedType->ty->typeArgs;
+        auto extendedTypeArgs = StaticCast<ExtendDecl>(decl).extendedType->GetTy()->typeArgs;
         GenerateTypeMappingByArgs(tyMgr, m, extendedTypeArgs, typeArgs);
         return;
     }
     if (generic->typeParameters.size() == typeArgs.size()) {
         for (size_t i = 0; i < typeArgs.size(); ++i) {
-            if (Ty::IsTyCorrect(generic->typeParameters[i]->ty) && Ty::IsTyCorrect(typeArgs[i])) {
-                auto genTy = StaticCast<TyVar*>(generic->typeParameters[i]->ty);
+            if (Ty::IsTyCorrect(generic->typeParameters[i]->GetTy()) && Ty::IsTyCorrect(typeArgs[i])) {
+                auto genTy = StaticCast<TyVar*>(generic->typeParameters[i]->GetTy());
                 InsertInstMapping(tyMgr, m, *genTy, *typeArgs[i]);
             }
         }
@@ -411,8 +411,8 @@ void RelayMappingFromExtendToExtended(TypeManager& tyMgr, SubstPack& m, const Ex
     if (!target) {
         return;
     }
-    auto originalTypeArgs = GetRealTarget(target)->ty->typeArgs;
-    auto extendedTypeArgsInst = decl.extendedType->ty->typeArgs;
+    auto originalTypeArgs = GetRealTarget(target)->GetTy()->typeArgs;
+    auto extendedTypeArgsInst = decl.extendedType->GetTy()->typeArgs;
     for (auto& ty : extendedTypeArgsInst) {
         ty = tyMgr.GetInstantiatedTy(ty, m.u2i);
     }
@@ -427,14 +427,14 @@ TypeSubst GenerateTypeMapping(const Decl& decl, const std::vector<Ptr<Ty>>& type
         return substituteMapping;
     }
     if (decl.astKind == ASTKind::EXTEND_DECL) {
-        auto extendedTypeArgs = StaticCast<ExtendDecl>(decl).extendedType->ty->typeArgs;
+        auto extendedTypeArgs = StaticCast<ExtendDecl>(decl).extendedType->GetTy()->typeArgs;
         return GenerateTypeMappingByArgs(extendedTypeArgs, typeArgs);
     }
     if (generic->typeParameters.size() == typeArgs.size()) {
         for (size_t i = 0; i < typeArgs.size(); ++i) {
-            if (Ty::IsTyCorrect(generic->typeParameters[i]->ty) && Ty::IsTyCorrect(typeArgs[i])) {
+            if (Ty::IsTyCorrect(generic->typeParameters[i]->GetTy()) && Ty::IsTyCorrect(typeArgs[i])) {
                 // could be used by instantiated decl, therefore need to check
-                if (auto declGenParam = DynamicCast<TyVar*>(generic->typeParameters[i]->ty)) {
+                if (auto declGenParam = DynamicCast<TyVar*>(generic->typeParameters[i]->GetTy())) {
                     substituteMapping[declGenParam] = typeArgs[i];
                 }
             }

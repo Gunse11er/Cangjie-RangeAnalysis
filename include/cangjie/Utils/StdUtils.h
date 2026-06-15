@@ -13,6 +13,7 @@
 namespace Cangjie {
 constexpr int STOINT_BASE{10};
 std::optional<int> Stoi(const std::string& s, int base = STOINT_BASE);
+std::optional<unsigned int> Stoui(const std::string& s, int base = STOINT_BASE);
 std::optional<long> Stol(const std::string& s, int base = STOINT_BASE);
 std::optional<unsigned long> Stoul(const std::string& s, int base = STOINT_BASE);
 std::optional<long long> Stoll(const std::string& s, int base = STOINT_BASE);

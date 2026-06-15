@@ -17,7 +17,7 @@ TEST(CHIRAnalysisToStringTest, ValueTest)
 {
     // abstract value
     AbstractObject abs("test");
-    EXPECT_EQ(abs.ToString(), "test");
+    EXPECT_EQ(abs.ToString(0), "test");
     Ref ref("1", false);
     EXPECT_EQ(ref.GetUniqueID(), "1");
 

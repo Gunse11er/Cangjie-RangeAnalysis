@@ -13,8 +13,12 @@
 #include "cangjie/Macro/MacroEvaluation.h"
 #include "cangjie/Utils/ProfileRecorder.h"
 #if defined(__linux__) || defined(__APPLE__)
-#include <sys/select.h>
+#ifdef __ohos__
+#include <signal.h>
+#else
 #include <sys/signal.h>
+#endif
+#include <sys/select.h>
 #include <sys/wait.h>
 #else
 #include <windows.h>
@@ -36,6 +40,7 @@ namespace {
 
 const std::string MACRO_SRV_NAME = "LSPMacroServer";
 
+#ifndef _WIN32
 void SignalHandler(int)
 {
     Cangjie::MacroProcMsger::GetInstance().CloseMacroSrv();
@@ -49,16 +54,17 @@ void SetExitSignal(void)
     std::signal(SIGTERM, SignalHandler);
     std::signal(SIGSEGV, SignalHandler);
 }
+#endif
 
 inline bool IsResultForMacCall(const std::string& id, const Position& pos, const MacroInvocation& mi)
 {
-    if (id != mi.identifier) {
+    if (id != mi.macroCallDiagInfo.identifier) {
         return false;
     }
-    if (pos != mi.identifierPos) {
+    if (pos != mi.macroCallDiagInfo.identifierPos) {
         return false;
     }
-    if (pos.fileID != mi.identifierPos.fileID) {
+    if (pos.fileID != mi.macroCallDiagInfo.identifierPos.fileID) {
         return false;
     }
     return true;
@@ -152,7 +158,7 @@ void MacroProcMsger::CloseMacroSrv()
 bool MacroProcMsger::WriteToSrvPipe(const uint8_t* buf, size_t size) const
 {
 #ifdef _WIN32
-    return WriteFile(hParentWrite, buf, size, nullptr, 0) == TRUE;
+    return WriteFile(hParentWrite, buf, static_cast<DWORD>(size), nullptr, 0) == TRUE;
 #else
     ssize_t res = write(pipefdP2C[1], buf, size);
     while (res >= 0 && res < static_cast<ssize_t>(size)) {
@@ -167,7 +173,7 @@ bool MacroProcMsger::WriteToSrvPipe(const uint8_t* buf, size_t size) const
 bool MacroProcMsger::ReadFromSrvPipe(uint8_t* buf, size_t size) const
 {
 #ifdef _WIN32
-    return ReadFile(hParentRead, buf, size, nullptr, nullptr) == TRUE;
+    return ReadFile(hParentRead, buf, static_cast<DWORD>(size), nullptr, nullptr) == TRUE;
 #else
     ssize_t res = read(pipefdC2P[0], buf, size);
     // res == 0, means end of file; res == -1, indicates error accurred
@@ -494,8 +500,9 @@ void MacroEvaluation::ExecMacroSrv(pid_t pid) const
 {
     // args
     std::vector<char*> cstrings;
+    // For Linux/Mac: The file 'cjc' and the LSPMacroServer are not in the same directory, requiring special handling.
     std::string macSrvPath = FileUtil::JoinPath(
-        FileUtil::GetDirPath(ci->invocation.globalOptions.executablePath), MACRO_SRV_NAME);
+        FileUtil::GetDirPath(ci->invocation.globalOptions.executablePath), "../tools/bin/" + MACRO_SRV_NAME);
     std::string hRead = std::to_string(MacroProcMsger::GetInstance().pipefdP2C[0]);
     std::string hWrite = std::to_string(MacroProcMsger::GetInstance().pipefdC2P[1]);
     std::string enPara = enableParallelMacro ? "1" : "0";
@@ -577,7 +584,7 @@ void CreateJobObjectForMacroSrv()
         Errorln("Create job object for macro srv fail!");
         return;
     } else {
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {0};
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {{}};
         // Configure all child processes associated with the job to terminate when the job end
         jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         if (0 == SetInformationJobObject(ghJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli))) {
@@ -639,8 +646,9 @@ bool CreateMacroMsgPipe()
 
 std::string GetMacroSrvCmd(bool enableParallelMacro, std::string& cjcPath)
 {
+    // For Windows: The file 'cjc' and the LSPMacroServer are not in the same directory, requiring special handling.
     std::string cmdStr = FileUtil::JoinPath(
-        FileUtil::GetDirPath(cjcPath), MACRO_SRV_NAME + ".exe");
+        FileUtil::GetDirPath(cjcPath), "..\\tools\\bin\\" + MACRO_SRV_NAME + ".exe");
     const size_t buffLen = 20;
     char handlebuffer[buffLen];
     sprintf_s(handlebuffer, buffLen, "%d", MacroProcMsger::GetInstance().hChildRead);

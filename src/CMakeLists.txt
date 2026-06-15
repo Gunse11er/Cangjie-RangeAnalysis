@@ -19,21 +19,46 @@ if(IOS)
     add_compile_options(--target=${CXX_COMPATIABLE_TRIPLE})
 endif()
 
-set(CJC_EXTRA_WARNINGS -Woverloaded-virtual -Wvla -Wconversion -Wfloat-equal -Wunused -Wdelete-non-virtual-dtor -Wswitch-default -Wcast-qual -Wextra -Wformat=2 -Wno-missing-field-initializers -Wno-format-nonliteral -Wno-sign-conversion)
-# -Wno-sign-conversion here to be removed by next MR
+set(CJC_EXTRA_WARNINGS -Woverloaded-virtual -Wvla -Wconversion -Wfloat-equal -Wunused -Wdelete-non-virtual-dtor -Wswitch-default -Wcast-qual -Wextra -Wformat=2 -Wno-missing-field-initializers -Wno-format-nonliteral)
 if(${CMAKE_SYSTEM_NAME} EQUAL Darwin)
     # mac uses llvm headers for std, and llvm headers have the following warning(s)
-    set(CJC_EXTRA_WARNINGS ${CJC_EXTRA_WARNINGS} -Wno-float-equal)
+    list(APPEND CJC_EXTRA_WARNINGS -Wno-float-equal)
     # mac headers have warning on undefed macro(s) (FFI_GO_CLOSURES), so use -Wno-undef
-    set(CJC_EXTRA_WARNINGS ${CJC_EXTRA_WARNINGS} -Wno-undef)
+    list(APPEND CJC_EXTRA_WARNINGS -Wno-undef)
+else()
+    list(APPEND CJC_EXTRA_WARNINGS -Wfloat-equal -Wundef)
 endif()
-    # g++ on some platform has harsher check on -Werror=shadow, in that it does not allow function parameters to share the same name with class members, which is actually bad in constructor. So we disable this on some platform.
-    set(CJC_EXTRA_WARNINGS ${CJC_EXTRA_WARNINGS} -Wshadow)
+
+if(CMAKE_BUILD_TYPE
+   AND ("${uppercase_CMAKE_BUILD_TYPE}" MATCHES "^(RELEASE)$")
+   AND NOT CMAKE_ENABLE_ASSERT)
+    add_compile_definitions(CANGJIE_CHIR_WFC_OFF)
+endif()
 
 # when including llvm header files, the following warnings have to be excluded
-set(CJC_WITH_LLVM_EXTRA_WARNINGS ${CJC_EXTRA_WARNINGS} -Wno-sign-conversion -Wno-unused-parameter -Wno-float-conversion -Wno-shadow)
+set(CJC_WITH_LLVM_EXTRA_WARNINGS ${CJC_EXTRA_WARNINGS} -Wno-sign-conversion -Wno-unused-parameter -Wno-float-conversion -Wno-shadow -Wno-switch-default)
+include(CheckCXXCompilerFlag)
+if(${CMAKE_CXX_COMPILER_ID} STREQUAL "Clang" OR ${CMAKE_CXX_COMPILER_ID} STREQUAL "AppleClang")
+    # gcc does not recognise these options
+    set(CJC_WITH_LLVM_EXTRA_WARNINGS ${CJC_WITH_LLVM_EXTRA_WARNINGS} -Wno-implicit-int-conversion -Wno-shorten-64-to-32 -Wno-implicit-int-float-conversion)
+    check_cxx_compiler_flag("-Wno-unnecessary-virtual-specifier" COMPILER_SUPPORTS_UNNECESSARY_VIRTUAL)
+    if(COMPILER_SUPPORTS_UNNECESSARY_VIRTUAL)
+        set(CJC_WITH_LLVM_EXTRA_WARNINGS ${CJC_WITH_LLVM_EXTRA_WARNINGS} -Wno-unnecessary-virtual-specifier)
+    endif()
+endif()
+set(CJC_EXTRA_WARNINGS ${CJC_EXTRA_WARNINGS} -Wnon-virtual-dtor -Wcast-align)
+
+# when including llvm header files, the following warnings have to be excluded
+set(CJC_WITH_LLVM_EXTRA_WARNINGS ${CJC_EXTRA_WARNINGS})
+set(CJC_WITH_LLVM_EXTRA_WARNINGS ${CJC_WITH_LLVM_EXTRA_WARNINGS} -Wno-sign-conversion -Wno-unused-parameter -Wno-float-conversion -Wno-switch-default)
 # gcc on some platform does not recognise these options
 set(CJC_WITH_LLVM_EXTRA_WARNINGS ${CJC_WITH_LLVM_EXTRA_WARNINGS} -Wno-implicit-int-conversion -Wno-shorten-64-to-32 -Wno-implicit-int-float-conversion)
+
+if(${CMAKE_CXX_COMPILER_ID} STREQUAL "Clang" OR ${CMAKE_CXX_COMPILER_ID} STREQUAL "AppleClang")
+    # g++ on some platform has harsher check on -Werror=shadow, in that it does not allow function parameters to share the same name with class members, which is actually bad in constructor. So we disable this on some platform.
+    # also do not add shadow to LLVM headers
+    set(CJC_EXTRA_WARNINGS ${CJC_EXTRA_WARNINGS} -Wshadow)
+endif()
 
 if(NOT CANGJIE_BUILD_CJC AND CANGJIE_BUILD_STD_SUPPORT)
     add_subdirectory(AST)
@@ -45,9 +70,6 @@ if(NOT CANGJIE_BUILD_CJC AND CANGJIE_BUILD_STD_SUPPORT)
     add_subdirectory(Utils)
     add_subdirectory(Basic)
     add_subdirectory(Option)
-    if (CANGJIE_CODEGEN_CJNATIVE_BACKEND)
-        add_subdirectory(MetaTransformation)
-    endif()
 
     set(AST_FFI_OBJECTS
         $<TARGET_OBJECTS:CangjieASTCommon>
@@ -86,10 +108,6 @@ set(CANGJIE_SRC_COMMON_OBJECTS_LIST
     $<TARGET_OBJECTS:CangjieMangle>)
 
 if (CANGJIE_CODEGEN_CJNATIVE_BACKEND)
-    set(CANGJIE_SRC_COMMON_OBJECTS_LIST ${CANGJIE_SRC_COMMON_OBJECTS_LIST} $<TARGET_OBJECTS:CangjieMetaTransformation>)
-endif()
-
-if (CANGJIE_CODEGEN_CJNATIVE_BACKEND)
     list(APPEND CANGJIE_SRC_COMMON_OBJECTS_LIST $<TARGET_OBJECTS:CangjieCHIRBase>)
     list(APPEND CANGJIE_SRC_COMMON_OBJECTS_LIST $<TARGET_OBJECTS:CangjieCHIRExtra>)
     list(APPEND CANGJIE_SRC_COMMON_OBJECTS_LIST $<TARGET_OBJECTS:CangjieCodeGen>)
@@ -100,18 +118,10 @@ else()
     list(APPEND CANGJIE_SRC_COMMON_OBJECTS_LIST $<TARGET_OBJECTS:CangjieCodeGen>)
 endif()
 
-# By using `CangjieOption-Fully-Enabled`, we could still have a fully featured compiler for
-# compiling standard library when building for a visible options only version.
-if(CANGJIE_VISIBLE_OPTIONS_ONLY)
-    set(CANGJIE_SRC_OBJECTS
-        ${CANGJIE_SRC_COMMON_OBJECTS_LIST} $<TARGET_OBJECTS:CangjieOption-Fully-Enabled>
-        CACHE INTERNAL "")
-else()
-    set(CANGJIE_SRC_OBJECTS
-        ${CANGJIE_SRC_COMMON_OBJECTS_LIST} $<TARGET_OBJECTS:CangjieOption>
-        CACHE INTERNAL "")
-endif()
+set(CANGJIE_SRC_OBJECTS ${CANGJIE_SRC_COMMON_OBJECTS_LIST} $<TARGET_OBJECTS:CangjieOption> CACHE INTERNAL "")
+
 add_executable(cjc main.cpp ${CANGJIE_SRC_OBJECTS})
+set_source_files_properties(main.cpp PROPERTIES COMPILE_OPTIONS "${CJC_EXTRA_WARNINGS}")
 
 if(CANGJIE_CODEGEN_CJNATIVE_BACKEND)
     add_dependencies(cjc cjnative)
@@ -151,31 +161,7 @@ if(CMAKE_BUILD_TYPE MATCHES Release AND MINGW)
     # case is defined in GCC Runtime Libraries Exception and has no GPL issue.
     target_link_options(cjc PRIVATE -static)
 endif()
-
-if(CANGJIE_VISIBLE_OPTIONS_ONLY)
-    # `cjc` and `cjc-release` are identical except that `cjc` supports all compile options but
-    # `cjc-release` supports visible options only. Visible options are features that are ready to be
-    # released to users.
-    add_executable(cjc-release main.cpp ${CANGJIE_SRC_COMMON_OBJECTS_LIST} $<TARGET_OBJECTS:CangjieOption>)
-    add_dependencies(cjc-release cjc)
-    # Since `cjc` is almost identical to `cjc-release`, they always have the same link flags, link
-    # options, link libraries, etc. We get the properties of `cjc` and apply them on `cjc-release` here.
-    include(ApplyProperties)
-    apply_properties(
-        FROM_TARGET cjc
-        TO_TARGET cjc-release
-        PROPERTY_NAMES
-            LINK_FLAGS
-            INCLUDE_DIRECTORIES
-            LINK_OPTIONS
-            LINK_LIBRARIES)
-    install(
-        PROGRAMS ${CMAKE_BINARY_DIR}/bin/cjc-release${CMAKE_EXECUTABLE_SUFFIX}
-        DESTINATION bin/
-        RENAME cjc${CMAKE_EXECUTABLE_SUFFIX})
-else()
-    install(TARGETS cjc)
-endif()
+install(TARGETS cjc)
 
 # `cjc-frontend.exe` is a special wrapper executable to run our compiler frontend on windows.
 # On windows platform, symbolic link can only be created with command prompt with administrator
@@ -265,10 +251,6 @@ set(FRONTEND_SRC_OBJECTS
     $<TARGET_OBJECTS:CangjieTempFilesUtil>)
 
 if (CANGJIE_CODEGEN_CJNATIVE_BACKEND)
-    set(FRONTEND_SRC_OBJECTS ${FRONTEND_SRC_OBJECTS} $<TARGET_OBJECTS:CangjieMetaTransformation>)
-endif()
-
-if (CANGJIE_CODEGEN_CJNATIVE_BACKEND)
     list(APPEND FRONTEND_SRC_OBJECTS $<TARGET_OBJECTS:CangjieCHIRBase>)
     list(APPEND FRONTEND_SRC_OBJECTS $<TARGET_OBJECTS:CangjieCHIRExtra>)
 else()
@@ -302,6 +284,7 @@ endif()
 
 # LSPMacroServer for lsp
 add_executable(LSPMacroServer main-macrosrv.cpp)
+set_source_files_properties(main-macrosrv.cpp PROPERTIES COMPILE_OPTIONS "${CJC_EXTRA_WARNINGS}")
 if(CANGJIE_CODEGEN_CJNATIVE_BACKEND)
     add_dependencies(LSPMacroServer cjnative)
 endif()
@@ -333,6 +316,7 @@ install(TARGETS LSPMacroServer DESTINATION "tools/bin")
 
 # The chir-dis
 add_executable(chir-dis main-chir-dis.cpp)
+set_source_files_properties(main-chir-dis.cpp PROPERTIES COMPILE_OPTIONS "${CJC_EXTRA_WARNINGS}")
 if(CANGJIE_CODEGEN_CJNATIVE_BACKEND)
     add_dependencies(chir-dis cjnative)
 endif()
@@ -416,9 +400,6 @@ add_subdirectory(Utils)
 add_subdirectory(Basic)
 add_subdirectory(Option)
 add_subdirectory(Mangle)
-if (CANGJIE_CODEGEN_CJNATIVE_BACKEND)
-    add_subdirectory(MetaTransformation)
-endif()
 
 if (CANGJIE_CODEGEN_CJNATIVE_BACKEND)
     add_subdirectory(CHIR)

@@ -25,6 +25,7 @@ namespace Cangjie {
 class MockManager;
 class MockSupportManager;
 class MockUtils;
+class MockContext;
 
 enum class MockKind : uint8_t {
     PLAIN_MOCK,
@@ -42,10 +43,13 @@ public:
     static bool IsDeclOpenToMock(const AST::Decl& decl);
     static bool IsDeclGeneratedForTest(const AST::Decl& decl);
     static bool IsMockAccessor(const AST::Decl& decl);
-    void Init(GenericInstantiationManager* instantiationManager);
     ~TestManager();
 
+    void PrepareToMock(AST::Package& pkg);
+    void HandleCreateMock(AST::Package& pkg);
+
 private:
+    OwnedPtr<MockContext> ctx;
     ImportManager& importManager;
     TypeManager& typeManager;
     DiagnosticEngine& diag;
@@ -53,9 +57,7 @@ private:
     MockMode mockMode;
     const bool mockCompatibleIfNeeded;
     const bool mockCompatible;
-#ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
     const bool exportForTest;
-#endif
     OwnedPtr<MockManager> mockManager {nullptr};
     OwnedPtr<MockSupportManager> mockSupportManager {nullptr};
     Ptr<MockUtils> mockUtils {nullptr};
@@ -64,15 +66,18 @@ private:
     void GenerateAccessors(AST::Package& pkg);
     void ReplaceCallsWithAccessors(AST::Package& pkg);
     void ReplaceCallsToForeignFunctions(AST::Package& pkg);
-    void HandleMockCalls(AST::Package& pkg);
+    void HandleEnsurePreparedToMock(AST::Package& pkg);
     Ptr<AST::ClassLikeDecl> GetInstantiatedDeclInCurrentPackage(const Ptr<const AST::ClassLikeTy> classLikeToMockTy);
     void CheckIfNoMockSupportDependencies(const AST::Package& curPkg);
     bool IsThereMockUsage(AST::Package& pkg) const;
     static bool ArePackagesMockSupportConsistent(
         const AST::Package& currentPackage, const AST::Package& importedPackage);
-    AST::VisitAction HandleCreateMockCall(AST::CallExpr& callExpr, AST::Package& pkg);
+    AST::VisitAction CollectToCreateMockCalls(AST::CallExpr& callExpr, std::vector<Ptr<AST::CallExpr>>& callExprs);
+    void CreateMockCalls(AST::Package& pkg, const std::vector<Ptr<AST::CallExpr>>& callExprs);
+    Ptr<AST::MemberAccess> ExtractMemberAccessFromExpr(Ptr<AST::Expr> expr);
     void WrapWithRequireMockObjectIfNeeded(Ptr<AST::Expr> expr, Ptr<AST::Decl> target);
-    AST::VisitAction HandleMockAnnotatedLambda(const AST::LambdaExpr& lambda);
+    AST::VisitAction CollectToMockAnnotatedLambdas(const AST::LambdaExpr& lambda,
+        std::vector<Ptr<AST::Expr>>& inLambdaExprs);
     void ReportDoesntSupportMocking(const AST::Expr& reportOn, const std::string& name, const std::string& package);
     void ReportDoesntSupportFrozen(const AST::Expr& reportOn);
     void ReportUnsupportedType(const AST::Expr& reportOn);
@@ -81,14 +86,12 @@ private:
     void ReportWrongStaticDecl(const AST::Expr& reportOn);
     void PrepareDecls(AST::Package& pkg);
     void PrepareToSpy(AST::Package& pkg);
-#ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND
     void ReportFrozenRequired(const AST::FuncDecl& reportOn);
     void MarkMockCreationContainingGenericFuncs(AST::Package& pkg) const;
     bool ShouldBeMarkedAsContainingMockCreationCall(
         const AST::CallExpr& callExpr, const Ptr<AST::FuncDecl> enclosingFunc) const;
     void HandleDeclsToExportForTest(std::vector<Ptr<AST::Package>> pkgs) const;
     void CollectInternalDeclUsages(AST::Package& pkg);
-#endif
 };
 
 } // namespace Cangjie

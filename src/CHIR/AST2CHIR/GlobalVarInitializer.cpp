@@ -204,7 +204,7 @@ static bool IsSimpleLiteralValue(const AST::Expr& node)
     if (realNode->astKind != AST::ASTKind::LIT_CONST_EXPR) {
         return false;
     }
-    switch (realNode->ty->kind) {
+    switch (realNode->TyKind()) {
         case AST::TypeKind::TYPE_FLOAT16:
         case AST::TypeKind::TYPE_FLOAT64:
         case AST::TypeKind::TYPE_IDEAL_FLOAT:
@@ -224,7 +224,7 @@ static bool IsSimpleLiteralValue(const AST::Expr& node)
         case AST::TypeKind::TYPE_BOOLEAN:
             return true;
         case AST::TypeKind::TYPE_STRUCT:
-            return node.ty->IsString();
+            return node.GetTy()->IsString();
         default:
             return false;
     }
@@ -254,7 +254,7 @@ bool NeedInitGlobalVarByInitFunc(const AST::VarDecl& decl)
     if (decl.IsCommonOrSpecific()) {
         return true;
     }
-    return !(IsSimpleLiteralValue(*decl.initializer) && decl.ty == decl.initializer->ty);
+    return !(IsSimpleLiteralValue(*decl.initializer) && decl.GetTy() == decl.initializer->GetTy());
 }
 
 inline bool CanInitBeGenerated(const AST::VarDeclAbstract& varDecl)
@@ -263,7 +263,7 @@ inline bool CanInitBeGenerated(const AST::VarDeclAbstract& varDecl)
 }
 
 /// Looking for a Block with Attribute::INITIALIZER, remove its Exit node.
-inline Ptr<Block> DropExitNodeOfInitializer(const Func& packageInit)
+inline Ptr<Block> DropExitNodeOfInitializer(const Function& packageInit)
 {
     CJC_ASSERT(packageInit.TestAttr(Attribute::INITIALIZER));
     auto packageInitBody = packageInit.GetBody();
@@ -283,7 +283,7 @@ Ptr<Value> GlobalVarInitializer::GetGlobalVariable(const AST::VarDecl& decl)
 }
 
 template <typename T, typename... Args>
-Ptr<Func> GlobalVarInitializer::CreateGVInitFunc(const T& node, Args&&... args) const
+Ptr<Function> GlobalVarInitializer::CreateGVInitFunc(const T& node, Args&&... args) const
 {
     auto context = GVInit<T>(node, trans, std::forward<Args>(args)...);
     bool isConst{false};
@@ -297,13 +297,12 @@ Ptr<Func> GlobalVarInitializer::CreateGVInitFunc(const T& node, Args&&... args) 
         isConst ? INVALID_LOCATION : std::move(context.loc), context.isConst);
 }
 
-Func* GlobalVarInitializer::TranslateInitializerToFunction(const AST::VarDecl& decl)
+Function* GlobalVarInitializer::TranslateInitializerToFunction(const AST::VarDecl& decl)
 {
     auto variable = GetGlobalVariable(decl);
     auto func = CreateGVInitFunc<AST::VarDecl>(decl);
-    if (auto globalVar = DynamicCast<GlobalVar>(variable)) {
-        globalVar->SetInitFunc(*func);
-    }
+    auto globalVar = StaticCast<GlobalVar*>(variable);
+    globalVar->SetInitFunc(*func);
     // No debug location generated for const var initializer
     auto initNode = trans.TranslateExprArg(
         *decl.initializer, *StaticCast<RefType*>(variable->GetType())->GetBaseType());
@@ -314,11 +313,7 @@ Func* GlobalVarInitializer::TranslateInitializerToFunction(const AST::VarDecl& d
     }
     auto loc = decl.IsConst() ? INVALID_LOCATION : trans.TranslateLocation(decl);
     CJC_ASSERT(variable->GetType()->IsRef());
-    auto expectedTy = StaticCast<RefType*>(variable->GetType())->GetBaseType();
-    if (initNode->GetType() != expectedTy) {
-        initNode = TypeCastOrBoxIfNeeded(*initNode, *expectedTy, builder, *trans.GetCurrentBlock(), loc, true);
-    }
-    trans.CreateAndAppendExpression<Store>(loc, builder.GetUnitTy(), initNode, variable, trans.GetCurrentBlock());
+    trans.CreateAndAppendWrappedStore(*initNode, *variable, loc);
     auto curBlock = trans.GetCurrentBlock();
     if (curBlock->GetTerminator() == nullptr) {
         trans.CreateAndAppendTerminator<Exit>(curBlock);
@@ -332,13 +327,14 @@ bool GlobalVarInitializer::IsIncrementalNoChange(const AST::VarDecl& decl) const
     return enableIncre && !decl.toBeCompiled;
 }
 
-ImportedFunc* GlobalVarInitializer::TranslateIncrementalNoChangeVar(const AST::VarDecl& decl)
+Function* GlobalVarInitializer::TranslateIncrementalNoChangeVar(const AST::VarDecl& decl)
 {
     GVInit<AST::VarDecl> context{decl, trans};
     auto ty = builder.GetType<FuncType>(std::vector<Type*>{}, builder.GetUnitTy());
-    auto func = builder.CreateImportedVarOrFunc<ImportedFunc>(ty, std::move(context.mangledName),
+    auto func = builder.CreateFunction(ty, std::move(context.mangledName),
         std::move(context.srcCodeIdentifier), std::move(context.rawMangledName), context.packageName);
     func->SetFuncKind(FuncKind::GLOBALVAR_INIT);
+    func->EnableAttr(Attribute::IMPORTED);
     func->Set<LinkTypeInfo>(Cangjie::Linkage::INTERNAL);
     if (decl.isConst) {
         func->EnableAttr(Attribute::CONST);
@@ -346,7 +342,7 @@ ImportedFunc* GlobalVarInitializer::TranslateIncrementalNoChangeVar(const AST::V
     return func;
 }
 
-FuncBase* GlobalVarInitializer::TranslateSingleInitializer(const AST::VarDecl& decl)
+Function* GlobalVarInitializer::TranslateSingleInitializer(const AST::VarDecl& decl)
 {
     if (!CanInitBeGenerated(decl)) {
         return nullptr;
@@ -354,7 +350,7 @@ FuncBase* GlobalVarInitializer::TranslateSingleInitializer(const AST::VarDecl& d
     if (decl.specificImplementation) {
         return nullptr;
     }
-    if (auto func = TryGetDeserialized<Func>(GetVarInitName(decl)); func) {
+    if (auto func = TryGetDeserialized<Function>(GetVarInitName(decl)); func) {
         if (!decl.TestAttr(AST::Attribute::SPECIFIC)) {
             return func;
         }
@@ -384,13 +380,12 @@ void GlobalVarInitializer::FillGVInitFuncWithApplyAndExit(const std::vector<Ptr<
 {
     auto curBlock = trans.GetCurrentBlock();
     for (auto& func : varInitFuncs) {
-        trans.GenerateFuncCall(*func, StaticCast<FuncType*>(func->GetType()), std::vector<Type*>{}, nullptr,
-            std::vector<Value*>{}, INVALID_LOCATION);
+        trans.CreateAndAppendGVInitFuncCall(*func);
     }
     trans.CreateAndAppendTerminator<Exit>(curBlock);
 }
 
-Func* GlobalVarInitializer::TranslateTupleOrEnumPatternInitializer(const AST::VarWithPatternDecl& decl)
+Function* GlobalVarInitializer::TranslateTupleOrEnumPatternInitializer(const AST::VarWithPatternDecl& decl)
 {
     auto func = CreateGVInitFunc<AST::VarWithPatternDecl>(decl);
     if (decl.IsConst()) {
@@ -412,7 +407,7 @@ Func* GlobalVarInitializer::TranslateTupleOrEnumPatternInitializer(const AST::Va
     return func;
 }
 
-Func* GlobalVarInitializer::TranslateWildcardPatternInitializer(const AST::VarWithPatternDecl& decl)
+Function* GlobalVarInitializer::TranslateWildcardPatternInitializer(const AST::VarWithPatternDecl& decl)
 {
     auto func = CreateGVInitFunc<AST::VarWithPatternDecl>(decl);
     Translator::TranslateASTNode(*decl.initializer, trans);
@@ -424,7 +419,7 @@ Func* GlobalVarInitializer::TranslateWildcardPatternInitializer(const AST::VarWi
     return func;
 }
 
-Func* GlobalVarInitializer::TranslateVarWithPatternInitializer(const AST::VarWithPatternDecl& decl)
+Function* GlobalVarInitializer::TranslateVarWithPatternInitializer(const AST::VarWithPatternDecl& decl)
 {
     switch (decl.irrefutablePattern->astKind) {
         case AST::ASTKind::TUPLE_PATTERN:
@@ -439,7 +434,7 @@ Func* GlobalVarInitializer::TranslateVarWithPatternInitializer(const AST::VarWit
     }
 }
 
-FuncBase* GlobalVarInitializer::TranslateVarInit(const AST::Decl& var)
+Function* GlobalVarInitializer::TranslateVarInit(const AST::Decl& var)
 {
     if (auto vd = DynamicCast<const AST::VarDecl*>(&var)) {
         return TranslateSingleInitializer(*vd);
@@ -451,14 +446,14 @@ FuncBase* GlobalVarInitializer::TranslateVarInit(const AST::Decl& var)
     }
 }
 
-Ptr<Func> GlobalVarInitializer::TryGetFileInitialializer(const AST::File& file, const std::string& suffix)
+Ptr<Function> GlobalVarInitializer::TryGetFileInitializer(const AST::File& file, const std::string& suffix)
 {
     auto initializerName = GetFileInitFuncName(file.curPackage->fullPackageName, file.fileName, suffix);
 
-    return TryGetDeserialized<Func>(initializerName);
+    return TryGetDeserialized<Function>(initializerName);
 }
 
-void GlobalVarInitializer::RemoveInitializerForVarDecl(const AST::VarDecl& varDecl, Func& fileInit) const
+void GlobalVarInitializer::RemoveInitializerForVarDecl(const AST::VarDecl& varDecl, Function& fileInit) const
 {
     auto declInitName = "@" + GetVarInitName(varDecl);
 
@@ -487,7 +482,7 @@ void GlobalVarInitializer::RemoveInitializerForVarDecl(const AST::VarDecl& varDe
 }
 
 void GlobalVarInitializer::RemoveCommonInitializersReplacedWithSpecific(
-    Func& fileInit, const std::vector<Ptr<const AST::Decl>>& decls) const
+    Function& fileInit, const std::vector<Ptr<const AST::Decl>>& decls) const
 {
     for (auto decl : decls) {
         if (decl->IsCommonMatchedWithSpecific()) {
@@ -499,10 +494,10 @@ void GlobalVarInitializer::RemoveCommonInitializersReplacedWithSpecific(
     }
 }
 
-Ptr<Func> GlobalVarInitializer::TranslateFileInitializer(
+Ptr<Function> GlobalVarInitializer::TranslateFileInitializer(
     const AST::File& file, const std::vector<Ptr<const AST::Decl>>& decls)
 {
-    auto fileInit = TryGetFileInitialializer(file);
+    auto fileInit = TryGetFileInitializer(file);
     if (fileInit) {
         CJC_ASSERT(fileInit->TestAttr(Attribute::INITIALIZER));
 
@@ -514,11 +509,13 @@ Ptr<Func> GlobalVarInitializer::TranslateFileInitializer(
     std::vector<Ptr<Value>> varInitFuncs;
     for (auto decl : decls) {
         if (auto initFunc = TranslateVarInit(*decl)) {
+            auto features = decl->curFile->GetFeatures();
+            initFunc->SetFeatures(features);
             if (decl->IsConst()) {
                 initFuncsForConstVar.emplace_back(initFunc);
                 // In incremental compilation scenarios, only changes need to be re-evaluated.
                 if (!enableIncre || decl->toBeCompiled) {
-                    SetCompileTimeValueFlagRecursivly(*StaticCast<Func*>(initFunc));
+                    SetCompileTimeValueFlagRecursively(*StaticCast<Function*>(initFunc));
                 }
             }
             varInitFuncs.push_back(initFunc);
@@ -552,9 +549,8 @@ bool GlobalVarInitializer::NeedVarLiteralInitFunc(const AST::Decl& decl)
 
     CJC_ASSERT(vd->initializer->astKind == AST::ASTKind::LIT_CONST_EXPR);
     auto litExpr = StaticCast<AST::LitConstExpr*>(vd->initializer.get());
-    auto globalVar = DynamicCast<GlobalVar>(GetGlobalVariable(*vd));
-    CJC_ASSERT(globalVar);
-    globalVar->SetInitializer(*trans.TranslateLitConstant(*litExpr, *litExpr->ty));
+    auto globalVar = StaticCast<GlobalVar*>(GetGlobalVariable(*vd));
+    globalVar->SetInitializer(*trans.TranslateLitConstant(*litExpr, *litExpr->GetTy()));
 
     // mutable var decl need to be initialized in `file_literal`, codegen will call `file_literal` in
     // macro expand situation, immutable var decl doesn't need to
@@ -564,7 +560,7 @@ bool GlobalVarInitializer::NeedVarLiteralInitFunc(const AST::Decl& decl)
     return true;
 }
 
-Ptr<Func> GlobalVarInitializer::TranslateFileLiteralInitializer(
+Ptr<Function> GlobalVarInitializer::TranslateFileLiteralInitializer(
     const AST::File& file, const std::vector<Ptr<const AST::Decl>>& decls)
 {
     std::list<const AST::VarDecl*> varsToGenInit{};
@@ -585,20 +581,15 @@ Ptr<Func> GlobalVarInitializer::TranslateFileLiteralInitializer(
     func->DisableAttr(Attribute::NO_INLINE);
     func->EnableAttr(Attribute::INITIALIZER);
     func->SetDebugLocation(INVALID_LOCATION);
-    auto currentBlock = trans.GetCurrentBlock();
     for (auto vd : varsToGenInit) {
-        auto globalVar = VirtualCast<GlobalVar*>(GetGlobalVariable(*vd));
+        auto globalVar = StaticCast<GlobalVar*>(GetGlobalVariable(*vd));
         auto initNode = trans.TranslateExprArg(*vd->initializer);
         // this is in gv init for literal, we can't set breakpoint with cjdb, so we can't set DebugLocationInfo
         // for any expression
         initNode->SetDebugLocation(INVALID_LOCATION);
-        auto expectTy = StaticCast<RefType*>(globalVar->GetType())->GetBaseType();
-        if (expectTy != initNode->GetType()) {
-            initNode =
-                TypeCastOrBoxIfNeeded(*initNode, *expectTy, builder, *trans.GetCurrentBlock(), INVALID_LOCATION, true);
-        }
-        trans.CreateAndAppendExpression<Store>(builder.GetUnitTy(), initNode, globalVar, currentBlock);
+        trans.CreateAndAppendWrappedStore(*initNode, *globalVar);
     }
+    auto currentBlock = trans.GetCurrentBlock();
     trans.CreateAndAppendTerminator<Exit>(currentBlock);
 
     return func;
@@ -616,24 +607,24 @@ void GlobalVarInitializer::AddImportedPackageInit(const AST::Package& curPackage
         }
         auto context = GVInit<AST::Package>(*dep->srcPackage, trans, suffix);
         // Try get deserialized one.
-        ImportedFunc* initFunc = TryGetDeserialized<ImportedFunc>(context.mangledName);
+        Function* initFunc = TryGetDeserialized<Function>(context.mangledName);
         // Already be translated when compiling common part.
         if (initFunc) {
             continue;
         }
         auto attrs = AttributeInfo();
         attrs.SetAttr(Attribute::INITIALIZER, true);
-        initFunc = builder.CreateImportedVarOrFunc<ImportedFunc>(
+        initFunc = builder.CreateFunction(
             initFuncTy, context.mangledName, context.srcCodeIdentifier, context.rawMangledName, pkgName);
+        initFunc->EnableAttr(Attribute::IMPORTED);
         initFunc->AppendAttributeInfo(attrs);
         initFunc->EnableAttr(Attribute::PUBLIC);
-        trans.GenerateFuncCall(*initFunc, StaticCast<FuncType*>(initFunc->GetType()),
-            std::vector<Type*>{}, nullptr, std::vector<Value*>{}, INVALID_LOCATION);
+        trans.CreateAndAppendGVInitFuncCall(*initFunc);
     }
 }
 
 // [CJMP]: define inlining policy here and in other places after disabling CHIR transformations of common part
-Ptr<Func> GlobalVarInitializer::CreateImportsInitFunc(const AST::Package& curPackage, const std::string& suffix)
+Ptr<Function> GlobalVarInitializer::CreateImportsInitFunc(const AST::Package& curPackage, const std::string& suffix)
 {
     auto importsInitFunc = CreateGVInitFunc<AST::Package>(curPackage, suffix + "_importsInit");
     importsInitFunc->Set<LinkTypeInfo>(Linkage::INTERNAL);
@@ -645,10 +636,10 @@ Ptr<Func> GlobalVarInitializer::CreateImportsInitFunc(const AST::Package& curPac
     return importsInitFunc;
 }
 
-Ptr<Func> GlobalVarInitializer::GetImportsInitFunc(const AST::Package& curPackage, const std::string& suffix)
+Ptr<Function> GlobalVarInitializer::GetImportsInitFunc(const AST::Package& curPackage, const std::string& suffix)
 {
     auto initializerName = GetPackageInitFuncName(curPackage.fullPackageName, suffix + "_importsInit");
-    auto importsInitFunc = TryGetDeserialized<Func>(initializerName);
+    auto importsInitFunc = TryGetDeserialized<Function>(initializerName);
     CJC_ASSERT(importsInitFunc);
 
     return importsInitFunc;
@@ -669,7 +660,7 @@ bool DoNotGenerateInitForImport(AST::PackageDecl& dep)
 } // namespace
 
 void GlobalVarInitializer::UpdateImportsInit(
-    const AST::Package& curPackage, Func& importsInitFunc, const std::string& suffix)
+    const AST::Package& curPackage, Function& importsInitFunc, const std::string& suffix)
 {
     Block* curBlock = DropExitNodeOfInitializer(importsInitFunc);
     trans.SetCurrentBlock(*curBlock);
@@ -680,7 +671,7 @@ void GlobalVarInitializer::UpdateImportsInit(
         }
 
         auto context = GVInit<AST::Package>(*dep->srcPackage, trans, suffix);
-        if (auto initFunc = TryGetDeserialized<ImportedFunc>(context.mangledName); initFunc) {
+        if (auto initFunc = TryGetDeserialized<Function>(context.mangledName); initFunc) {
             continue;
         }
 
@@ -689,8 +680,9 @@ void GlobalVarInitializer::UpdateImportsInit(
 
         auto attrs = AttributeInfo();
         attrs.SetAttr(Attribute::INITIALIZER, true);
-        auto importInit = builder.CreateImportedVarOrFunc<ImportedFunc>(initFuncTy, context.mangledName,
+        auto importInit = builder.CreateFunction(initFuncTy, context.mangledName,
             context.srcCodeIdentifier, context.rawMangledName, dep->srcPackage->fullPackageName);
+        importInit->EnableAttr(Attribute::IMPORTED);
         importInit->AppendAttributeInfo(attrs);
         importInit->SetFuncKind(FuncKind::GLOBALVAR_INIT);
         importInit->EnableAttr(Attribute::PUBLIC);
@@ -707,7 +699,7 @@ void GlobalVarInitializer::AddGenericInstantiatedInit()
     trans.CreateAndAppendExpression<Intrinsic>(builder.GetUnitTy(), callContext, trans.GetCurrentBlock());
 }
 
-Ptr<Func> GlobalVarInitializer::GeneratePackageInitBase(const AST::Package& curPackage, const std::string& suffix)
+Ptr<Function> GlobalVarInitializer::GeneratePackageInitBase(const AST::Package& curPackage, const std::string& suffix)
 {
     /*  var initFlag: Bool = false
         func pkg_init_suffix()
@@ -728,7 +720,7 @@ Ptr<Func> GlobalVarInitializer::GeneratePackageInitBase(const AST::Package& curP
     GlobalVar* initFlag = TryGetDeserialized<GlobalVar>(initFlagName);
     if (!initFlag) {
         initFlag = builder.CreateGlobalVar(
-            INVALID_LOCATION, builder.GetType<RefType>(boolTy), initFlagName, initFlagName, "", func->GetPackageName());
+            builder.GetType<RefType>(boolTy), initFlagName, initFlagName, "", func->GetPackageName());
         initFlag->SetInitializer(*builder.CreateLiteralValue<BoolLiteral>(boolTy, false));
         initFlag->EnableAttr(Attribute::NO_REFLECT_INFO);
         initFlag->EnableAttr(Attribute::COMPILER_ADD);
@@ -751,13 +743,12 @@ Ptr<Func> GlobalVarInitializer::GeneratePackageInitBase(const AST::Package& curP
 
     // 3. set `initFlag` true
     trans.SetCurrentBlock(*applyInitFuncBlock);
-    auto unitTy = builder.GetUnitTy();
     auto trueLit = trans.CreateAndAppendConstantExpression<BoolLiteral>(boolTy, *applyInitFuncBlock, true)->GetResult();
-    trans.CreateAndAppendExpression<Store>(unitTy, trueLit, initFlag, applyInitFuncBlock);
+    trans.CreateAndAppendWrappedStore(*trueLit, *initFlag);
     return func;
 }
 
-static Ptr<Apply> FindApplyIn(const Block& block, FuncBase& applyCallee)
+static Ptr<Apply> FindApplyIn(const Block& block, Function& applyCallee)
 {
     auto expressions = block.GetExpressions();
     for (auto expression : expressions) {
@@ -768,11 +759,10 @@ static Ptr<Apply> FindApplyIn(const Block& block, FuncBase& applyCallee)
         }
     }
 
-    CJC_ABORT();
     return nullptr;
 }
 
-void GlobalVarInitializer::InsertInitializerIntoPackageInitializer(FuncBase& init, Func& packageInit)
+void GlobalVarInitializer::InsertInitializerIntoPackageInitializer(Function& init, Function& packageInit)
 {
     auto packageInitBody = packageInit.GetBody();
     auto blockWithInitializers = GetBlockWithInitializers(*packageInitBody);
@@ -781,24 +771,28 @@ void GlobalVarInitializer::InsertInitializerIntoPackageInitializer(FuncBase& ini
         // It was inserted at previous compilation phase ==>
 
         auto initCallExpr = FindApplyIn(*blockWithInitializers, init);
-        auto lastExpr = blockWithInitializers->GetExpressions().back();
-        if (initCallExpr != lastExpr) {
-            // ==> need to push to the end
-            initCallExpr->MoveAfter(lastExpr);
+        if (initCallExpr) {
+            auto lastExpr = blockWithInitializers->GetExpressions().back();
+            if (initCallExpr != lastExpr) {
+                // ==> need to push to the end
+                initCallExpr->MoveAfter(lastExpr);
+            }
+        } else {
+            // But it can be inserted in different initializer, in this case `APPLY` need to be created.
+            trans.SetCurrentBlock(*blockWithInitializers);
+            trans.CreateAndAppendGVInitFuncCall(init);
         }
         return;
     }
 
     trans.SetCurrentBlock(*blockWithInitializers);
-
-    trans.GenerateFuncCall(init, StaticCast<FuncType*>(init.GetType()), std::vector<Type*>{}, nullptr,
-        std::vector<Value*>{}, INVALID_LOCATION);
+    trans.CreateAndAppendGVInitFuncCall(init);
 }
 
-inline std::pair<Func*, Block*> GlobalVarInitializer::PreparePackageInit(const AST::Package& curPackage)
+inline std::pair<Function*, Block*> GlobalVarInitializer::PreparePackageInit(const AST::Package& curPackage)
 {
     // create/use deserialized base of package initializer function.
-    Func* packageInit = builder.GetCurPackage()->GetPackageInitFunc();
+    Function* packageInit = builder.GetCurPackage()->GetPackageInitFunc();
     Block* curBlock;
     if (packageInit) {
         curBlock = DropExitNodeOfInitializer(*packageInit);
@@ -844,15 +838,13 @@ void GlobalVarInitializer::CreatePackageInit(const AST::Package& curPackage, con
         }
     }
 
-    InsertAnnotationVarInitInto(*packageInit);
-
     trans.CreateAndAppendTerminator<Exit>(curBlock);
 }
 
-inline std::pair<Func*, Block*> GlobalVarInitializer::PreparePackageLiteralInit(const AST::Package& curPackage)
+inline std::pair<Function*, Block*> GlobalVarInitializer::PreparePackageLiteralInit(const AST::Package& curPackage)
 {
     // create/use deserialized base of package initializer function.
-    Func* packageLiteralInit = builder.GetCurPackage()->GetPackageLiteralInitFunc();
+    Function* packageLiteralInit = builder.GetCurPackage()->GetPackageLiteralInitFunc();
     Block* curBlock;
     if (packageLiteralInit) {
         curBlock = DropExitNodeOfInitializer(*packageLiteralInit);
@@ -894,10 +886,10 @@ void GlobalVarInitializer::CreatePackageLiteralInit(const AST::Package& curPacka
 
                     if (NeedVarLiteralInitFunc(*var)) {
                         auto vd = StaticCast<AST::VarDecl>(var);
-                        auto globalVar = VirtualCast<GlobalVar>(GetGlobalVariable(*vd));
+                        auto globalVar = StaticCast<GlobalVar>(GetGlobalVariable(*vd));
                         auto initNode = Translator::TranslateASTNode(*vd->initializer, trans);
                         initNode->SetDebugLocation(INVALID_LOCATION);
-                        trans.CreateAndAppendExpression<Store>(builder.GetUnitTy(), initNode, globalVar, curBlock);
+                        trans.CreateAndAppendWrappedStore(*initNode, *globalVar, *curBlock);
                     }
                 }
                 continue;

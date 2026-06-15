@@ -288,7 +288,7 @@ TEST(EngineTest, ShowColorTest)
     EXPECT_EQ(disableColorOut2.str().find("\x1b[31m"), std::string::npos);
 }
 
-#elif _WIN32
+#elif defined(_WIN32)
 TEST(EngineTest, ShowColorTest)
 {
     DiagnosticEngine diag;
@@ -337,7 +337,7 @@ TEST(EngineTest, OldDiagKindDefGuard)
     const std::vector<size_t> endNumber = {
         15,  // 0
         57,  // 1
-        291, // 2
+        287, // 2
     };
     bool oldDiagKindBeModified = false;
     for (size_t i = 0; i < endNumber.size(); ++i) {

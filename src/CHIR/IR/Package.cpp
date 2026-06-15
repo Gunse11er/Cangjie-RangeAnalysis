@@ -12,6 +12,8 @@
 #include "cangjie/CHIR/IR/Type/ExtendDef.h"
 #include "cangjie/CHIR/IR/Type/StructDef.h"
 #include "cangjie/CHIR/IR/Value/Value.h"
+#include <iostream>
+#include <string>
 
 using namespace Cangjie::CHIR;
 
@@ -24,12 +26,34 @@ std::string Package::GetName() const
     return name;
 }
 
+GlobalVar* Package::TryGetGlobalVar(const std::string& identifier)
+{
+    for (auto var : globalVars) {
+        if (var->GetIdentifier() == identifier) {
+            return var;
+        }
+    }
+
+    return nullptr;
+}
+
 void Package::AddGlobalVar(GlobalVar* item)
 {
     globalVars.emplace_back(item);
 }
 
-void Package::AddGlobalFunc(Func* item)
+Function* Package::TryGetGlobalFunc(const std::string& identifier)
+{
+    for (auto func : globalFuncs) {
+        if (func->GetIdentifier() == identifier) {
+            return func;
+        }
+    }
+
+    return nullptr;
+}
+
+void Package::AddGlobalFunc(Function* item)
 {
     globalFuncs.emplace_back(item);
 }
@@ -54,27 +78,22 @@ std::vector<EnumDef*> Package::GetEnums() const
     return enums;
 }
 
-void Package::SetPackageInitFunc(Func* func)
+void Package::SetPackageInitFunc(Function* func)
 {
     packageInitFunc = func;
 }
 
-void Package::SetPackageLiteralInitFunc(Func* func)
+void Package::SetPackageLiteralInitFunc(Function* func)
 {
     packageLiteralInitFunc = func;
 }
 
-Func* Package::GetPackageLiteralInitFunc() const
+Function* Package::GetPackageLiteralInitFunc() const
 {
     return packageLiteralInitFunc;
 }
 
-void Package::SetImportedVarAndFuncs(std::vector<ImportedValue*>&& items)
-{
-    importedVarAndFuncs = std::move(items);
-}
-
-Func* Package::GetPackageInitFunc() const
+Function* Package::GetPackageInitFunc() const
 {
     return packageInitFunc;
 }
@@ -163,11 +182,6 @@ void Package::AddImportedStruct(StructDef* item)
 {
     importedStructs.emplace_back(item);
 }
-    
-std::vector<ImportedValue*> Package::GetImportedVarAndFuncs() const
-{
-    return importedVarAndFuncs;
-}
 
 std::vector<ExtendDef*> Package::GetExtends() const
 {
@@ -194,37 +208,52 @@ void Package::AddStruct(StructDef* item)
     structs.emplace_back(item);
 }
 
-void Package::SetGlobalFuncs(const std::vector<Func*>& funcs)
+std::vector<Function*> Package::GetGlobalFuncsWithBody(bool includeSrcCodeImported) const
 {
-    globalFuncs = funcs;
+    std::vector<Function*> funcs;
+    for (auto func : globalFuncs) {
+        if (func->GetBody() == nullptr) {
+            continue;
+        }
+        if (!includeSrcCodeImported && func->IsSrcCodeImported()) {
+            continue;
+        }
+        funcs.emplace_back(func);
+    }
+    return funcs;
 }
 
-void Package::SetGlobalVars(std::vector<GlobalVar*>&& vars)
+std::vector<GlobalVar*> Package::GetGlobalVarsWithInit(bool includeSrcCodeImported) const
 {
-    std::swap(globalVars, vars);
-}
-
-std::vector<Func*> Package::GetGlobalFuncs() const
-{
-    return globalFuncs;
-}
-
-std::vector<GlobalVar*> Package::GetGlobalVars() const
-{
-    return globalVars;
+    std::vector<GlobalVar*> vars;
+    for (auto var : globalVars) {
+        if (var->GetInitializerValue() == nullptr) {
+            continue;
+        }
+        if (!includeSrcCodeImported && var->IsSrcCodeImported()) {
+            continue;
+        }
+        vars.emplace_back(var);
+    }
+    return vars;
 }
 
 std::string Package::ToString() const
 {
     std::stringstream ss;
-    ss << "package: " << name << "\n";
-    ss << "packageAccessLevel: " << PackageAccessLevelToString(pkgAccessLevel) << "\n";
-    ss << "packageInitFunc: " << GetPackageInitFunc()->GetIdentifier() << "\n";
-    ss << "\n==========================imports===============================\n";
-    for (auto& it : importedVarAndFuncs) {
-        ss << GetImportedValueStr(*it) << "\n";
+    ss << "package: " << name << std::endl;
+    ss << "packageAccessLevel: " << PackageAccessLevelToString(pkgAccessLevel) << std::endl;
+    ss << "packageInitFunc: " << GetPackageInitFunc()->GetIdentifier() << std::endl;
+    ss << "\n==========================vars===============================\n";
+    for (auto it : GetGlobalVars()) {
+        ss << it->ToString(0) << "\n\n";
+    }
+    ss << "\n==========================funcs===============================\n";
+    for (auto it : GetGlobalFunctions(true)) {
+        ss << it->ToString(0) << "\n\n";
     }
     ss << "\n\n";
+    ss << "\n==========================types=================================\n";
     for (auto& it : importedStructs) {
         ss << it->ToString() << "\n\n";
     }
@@ -237,11 +266,6 @@ std::string Package::ToString() const
     for (auto& it : importedExtends) {
         ss << it->ToString() << "\n\n";
     }
-    ss << "\n===========================vars=================================\n";
-    for (auto& it : globalVars) {
-        ss << it->ToString() << "\n";
-    }
-    ss << "\n==========================types=================================\n";
     for (auto& it : structs) {
         ss << it->ToString() << "\n\n";
     }
@@ -254,17 +278,62 @@ std::string Package::ToString() const
     for (auto& it : extends) {
         ss << it->ToString() << "\n\n";
     }
-    ss << "\n==========================funcs=================================\n";
-    for (auto& it : GetGlobalFuncs()) {
-        ss << GetFuncStr(*it);
-        ss << "\n\n";
-    }
     return ss.str();
 }
 
-void Package::AddImportedVarAndFunc(ImportedValue* item)
+std::vector<GlobalVar*> Package::GetGlobalVarsWithoutInit() const
 {
-    importedVarAndFuncs.emplace_back(item);
+    std::vector<GlobalVar*> importedGlobalVars;
+    for (auto var : globalVars) {
+        if (var->GetInitializerValue() == nullptr) {
+            importedGlobalVars.emplace_back(var);
+        }
+    }
+    return importedGlobalVars;
+}
+
+std::vector<Function*> Package::GetGlobalFuncsWithoutBody(bool includePureAbstract) const
+{
+    std::vector<Function*> funcs;
+    for (auto func : globalFuncs) {
+        if (func->GetBody() != nullptr) {
+            continue;
+        }
+        if (!includePureAbstract && func->IsPureAbstract()) {
+            continue;
+        }
+        funcs.emplace_back(func);
+    }
+    return funcs;
+}
+
+void Package::SetAllGlobalFuncs(std::vector<Function*>&& funcs)
+{
+    globalFuncs = std::move(funcs);
+}
+
+std::vector<Function*> Package::GetGlobalFunctions(bool includePureAbstract) const
+{
+    if (includePureAbstract) {
+        return globalFuncs;
+    }
+    std::vector<Function*> funcs;
+    for (auto func : globalFuncs) {
+        if (!func->IsPureAbstract()) {
+            funcs.emplace_back(func);
+        }
+    }
+    return globalFuncs;
+}
+
+void Package::SetAllGlobalVars(std::vector<GlobalVar*>&& vars)
+{
+    globalVars = std::move(vars);
+}
+
+std::vector<GlobalVar*> Package::GetGlobalVars() const
+{
+    return globalVars;
 }
 
 void Package::Dump() const
@@ -347,4 +416,64 @@ std::vector<ExtendDef*> Package::GetAllExtendDef() const
     all.insert(all.end(), importedExtends.begin(), importedExtends.end());
 
     return all;
+}
+
+ClassDef* Package::TryGetClassDef(const std::string& identifier)
+{
+    for (auto classDef : classes) {
+        if (classDef->GetIdentifier() == identifier) {
+            return classDef;
+        }
+    }
+    for (auto classDef : importedClasses) {
+        if (classDef->GetIdentifier() == identifier) {
+            return classDef;
+        }
+    }
+    return nullptr;
+}
+
+EnumDef* Package::TryGetEnumDef(const std::string& identifier)
+{
+    for (auto enumDef : enums) {
+        if (enumDef->GetIdentifier() == identifier) {
+            return enumDef;
+        }
+    }
+    for (auto enumDef : importedEnums) {
+        if (enumDef->GetIdentifier() == identifier) {
+            return enumDef;
+        }
+    }
+    return nullptr;
+}
+
+ExtendDef* Package::TryGetExtendDef(const std::string& identifier)
+{
+    for (auto extendDef : extends) {
+        if (extendDef->GetIdentifier() == identifier) {
+            return extendDef;
+        }
+    }
+    for (auto extendDef : importedExtends) {
+        if (extendDef->GetIdentifier() == identifier) {
+            return extendDef;
+        }
+    }
+    return nullptr;
+}
+
+StructDef* Package::TryGetStructDef(const std::string& identifier)
+{
+    for (auto structDef : structs) {
+        if (structDef->GetIdentifier() == identifier) {
+            return structDef;
+        }
+    }
+    for (auto structDef : importedStructs) {
+        if (structDef->GetIdentifier() == identifier) {
+            return structDef;
+        }
+    }
+    return nullptr;
 }

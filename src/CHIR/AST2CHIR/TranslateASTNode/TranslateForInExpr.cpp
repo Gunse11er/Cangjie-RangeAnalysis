@@ -212,7 +212,7 @@ Ptr<Value> Translator::GetOuterMostExpr()
             (currentBlock->GetTopLevelFunc() && bg == currentBlock->GetTopLevelFunc()->GetBody())) {
             return finalValidExpr != nullptr ? finalValidExpr : nullptr;
         }
-        if (ownedExpr && (Is<ForIn>(ownedExpr) || ownedExpr->GetExprKind() == ExprKind::IF)) {
+        if (ownedExpr && Is<ForIn>(ownedExpr)) {
             finalValidExpr = ownedExpr->GetResult();
         }
     }
@@ -229,7 +229,7 @@ void Translator::InitializeDelayExitSignal(const DebugLocation& loc)
         delayExitSignal = allocSignal->GetResult();
         auto constZero =
             CreateAndAppendConstantExpression<IntLiteral>(builder.GetInt64Ty(), *currentBlock, 0UL)->GetResult();
-        CreateWrappedStore(constZero, delayExitSignal, currentBlock);
+        CreateAndAppendWrappedStore(*constZero, *delayExitSignal);
     }
 }
 
@@ -241,7 +241,7 @@ Ptr<Value> Translator::InitializeCondVar(const DebugLocation& loc)
     auto constantTrue =
         CreateAndAppendConstantExpression<BoolLiteral>(builder.GetBoolTy(), *currentBlock, static_cast<bool>(1));
     constantTrue->Set<GeneratedFromForIn>(true);
-    CreateWrappedStore(loc, constantTrue->GetResult(), condVar->GetResult(), currentBlock);
+    CreateAndAppendWrappedStore(*constantTrue->GetResult(), *condVar->GetResult(), loc);
     auto res = condVar->GetResult();
     return res;
 }
@@ -267,7 +267,7 @@ Ptr<Value> Translator::GenerateForInRetValLocation(const DebugLocation& loc)
             forInRetValLocation->Set<GeneratedFromForIn>(true);
             Ptr<Value> forInBodyVal =
                 CreateAndAppendConstantExpression<NullLiteral>(loc, forInType, *currentBlock)->GetResult();
-            CreateWrappedStore(loc, forInBodyVal, forInRetValLocation->GetResult(), currentBlock);
+            CreateAndAppendWrappedStore(*forInBodyVal, *forInRetValLocation->GetResult(), loc);
             return forInRetValLocation->GetResult();
         }
     }
@@ -277,8 +277,8 @@ Ptr<Value> Translator::GenerateForInRetValLocation(const DebugLocation& loc)
 ForIn* Translator::InitForInExprSkeleton(const AST::ForInExpr& forInExpr, Ptr<Value>& inductiveVar, Ptr<Value>& condVar)
 {
     auto forInloc = TranslateLocation(forInExpr);
-    auto forInType = TranslateType(*forInExpr.ty);
-    Func* parentFunc = currentBlock->GetTopLevelFunc();
+    auto forInType = TranslateType(*forInExpr.GetTy());
+    Function* parentFunc = currentBlock->GetTopLevelFunc();
     CJC_NULLPTR_CHECK(parentFunc);
     BlockGroup* bodyBlockGrp = builder.CreateBlockGroup(*parentFunc);
     BlockGroup* latchBlockGrp = builder.CreateBlockGroup(*parentFunc);
@@ -413,7 +413,7 @@ void Translator::TranslateForInStringLatchBlockGroup(Ptr<Value>& inductiveVar)
     auto plusOne = CreateAndAppendExpression<BinaryExpression>(loc, inductiveVal->GetType(),
         ExprKind::ADD, inductiveVal, constOne->GetResult(), OverflowStrategy::WRAPPING, currentBlock);
     plusOne->Set<GeneratedFromForIn>(true);
-    CreateWrappedStore(loc, plusOne->GetResult(), inductiveVar, currentBlock);
+    CreateAndAppendWrappedStore(*plusOne->GetResult(), *inductiveVar, loc);
     CreateAndAppendTerminator<Exit>(loc, currentBlock);
 }
 
@@ -460,11 +460,11 @@ void Translator::TranslateForInCondControlFlow(Ptr<Value>& condVar)
     auto decreaseOne = CreateAndAppendExpression<BinaryExpression>(builder.GetInt64Ty(), ExprKind::SUB,
         delayExitSignalVal->GetResult(), constOne->GetResult(), OverflowStrategy::WRAPPING, currentBlock);
     decreaseOne->Set<GeneratedFromForIn>(true);
-    CreateWrappedStore(decreaseOne->GetResult(), delayExitSignal, currentBlock);
+    CreateAndAppendWrappedStore(*decreaseOne->GetResult(), *delayExitSignal);
     auto constantFalse =
         CreateAndAppendConstantExpression<BoolLiteral>(builder.GetBoolTy(), *currentBlock, false);
     constantFalse->Set<GeneratedFromForIn>(true);
-    CreateWrappedStore(constantFalse->GetResult(), condVar, currentBlock);
+    CreateAndAppendWrappedStore(*constantFalse->GetResult(), *condVar);
     CreateAndAppendTerminator<Exit>(loc, currentBlock);
 
     // if delayExitSignal value is equal to 0, we translate condition as normal,
@@ -515,14 +515,14 @@ void Translator::UpdateDelayExitSignalInForInEnd(const ForIn& forIn)
     constOne->Set<GeneratedFromForIn>(true);
     auto decreaseOne = CreateAndAppendExpression<BinaryExpression>(builder.GetInt64Ty(), ExprKind::SUB,
         delayExitSignalVal->GetResult(), constOne->GetResult(), OverflowStrategy::WRAPPING, currentBlock);
-    CreateWrappedStore(decreaseOne->GetResult(), delayExitSignal, currentBlock);
+    CreateAndAppendWrappedStore(*decreaseOne->GetResult(), *delayExitSignal);
     Ptr<Value> funcRetValLocation = GetOuterBlockGroupReturnValLocation();
     if (funcRetValLocation != nullptr && forInExprReturnMap.count(forIn.GetResult()) != 0) {
         Ptr<Value> forInRetValLocation = forInExprReturnMap[forIn.GetResult()];
         Ptr<Value> forInRetVal = CreateAndAppendExpression<Load>(
             loc, Cangjie::StaticCast<RefType*>(forInRetValLocation->GetType())->GetBaseType(), forInRetValLocation,
             currentBlock)->GetResult();
-        CreateWrappedStore(loc, forInRetVal, funcRetValLocation, currentBlock);
+        CreateAndAppendWrappedStore(*forInRetVal, *funcRetValLocation, loc);
     }
     if (!tryCatchContext.empty()) {
         GenerateSignalCheckForThrow();
@@ -560,7 +560,7 @@ void Translator::GenerateSignalCheckForThrow()
     currentBlock = returnBB; // contents of returnBB is filled on the caller side
 }
 
-Ptr<Value> Translator::TranslateForInIterCondition(Ptr<Value>& iterNextLocation, Ptr<AST::Ty>& astTy)
+Ptr<Value> Translator::TranslateForInIterCondition(Ptr<Value>& iterNextLocation, Ptr<AST::Ty> astTy)
 {
     // Block #8: // preds: #6
     //   %51: Enum-_CNat6OptionIRNat6StringEE<Struct-Nat6StringE> = Load(%34)
@@ -636,7 +636,7 @@ void Translator::TranslateForInIterLatchBlockGroup(
     //   Exit()
     currentBlock = delayExitFalseBlock;
     Ptr<Value> iterNext = TranslateExprArg(*matchExpr.selector);
-    CreateWrappedStore(loc, iterNext, iterNextLocation, currentBlock);
+    CreateAndAppendWrappedStore(*iterNext, *iterNextLocation, loc);
     CreateAndAppendTerminator<Exit>(loc, currentBlock);
 }
 
@@ -714,7 +714,7 @@ Ptr<Value> Translator::TranslateForInRange(const AST::ForInExpr& forInExpr)
     auto conditionInCondBG = CreateAndAppendExpression<BinaryExpression>(condLoc,
         builder.GetBoolTy(), conditionExprKind, GetDerefedValue(inductiveVar, condLoc), GetDerefedValue(stopExprVar),
         currentBlock)->GetResult();
-    CreateWrappedStore(condLoc, conditionInCondBG, condVar, currentBlock);
+    CreateAndAppendWrappedStore(*conditionInCondBG, *condVar, condLoc);
     CreateAndAppendTerminator<Exit>(condLoc, currentBlock);
     blockGroupStack.pop_back();
 
@@ -807,7 +807,7 @@ Ptr<Value> Translator::TranslateForInString(const AST::ForInExpr& forInExpr)
     auto conditionInCondBG = CreateAndAppendExpression<BinaryExpression>(
         condLoc, builder.GetBoolTy(), ExprKind::LT, GetDerefedValue(inductiveVar, condLoc), stringSize, currentBlock)
                                  ->GetResult();
-    CreateWrappedStore(condLoc, conditionInCondBG, condVar, currentBlock);
+    CreateAndAppendWrappedStore(*conditionInCondBG, *condVar, condLoc);
     CreateAndAppendTerminator<Exit>(condLoc, currentBlock);
     blockGroupStack.pop_back();
 
@@ -850,12 +850,12 @@ Ptr<Value> Translator::TranslateForInIter(const AST::ForInExpr& forInExpr)
     // 2. Translate iterNext var
     // nodes[1] is match expr, it triggers iterator next operation
     AST::MatchExpr* matchExpr = StaticCast<AST::MatchExpr>(inExpression->body[1].get());
-    auto matchTy = TranslateType(*matchExpr->ty);
+    auto matchTy = TranslateType(*matchExpr->GetTy());
     auto condLoc = TranslateLocation(*inExpression->body[1]);
     Ptr<Value> iterNextLocation = CreateAndAppendExpression<Allocate>(condLoc,
         builder.GetType<RefType>(matchTy), matchTy, currentBlock)->GetResult();
     Ptr<Value> iterInit = MakeNone(*matchTy, condLoc);
-    CreateWrappedStore(condLoc, iterInit, iterNextLocation, currentBlock);
+    CreateAndAppendWrappedStore(*iterInit, *iterNextLocation, condLoc);
     SetSkipPrintWarning(*iterInit);
 
     // 3. Translate condition var
@@ -900,8 +900,8 @@ Ptr<Value> Translator::TranslateForInIter(const AST::ForInExpr& forInExpr)
     ScopeContext context(*this);
     context.ScopePlus();
     TranslateForInCondControlFlow(condVar);
-    auto conditionInCondBG = TranslateForInIterCondition(iterNextLocation, matchExpr->ty);
-    CreateWrappedStore(condLoc, conditionInCondBG, condVar, currentBlock);
+    auto conditionInCondBG = TranslateForInIterCondition(iterNextLocation, matchExpr->GetTy());
+    CreateAndAppendWrappedStore(*conditionInCondBG, *condVar, condLoc);
     CreateAndAppendTerminator<Exit>(condLoc, currentBlock);
     blockGroupStack.pop_back();
 
@@ -1001,7 +1001,7 @@ protected:
         auto iterType = tr.builder.GetType<RefType>(intType);
         auto res1 = tr.CreateAndAppendExpression<Allocate>(loc, iterType, intType, tr.GetCurrentBlock());
         res1->Set<GeneratedFromForIn>(true);
-        tr.CreateWrappedStore(loc, &iterBegin, res1->GetResult(), tr.GetCurrentBlock());
+        tr.CreateAndAppendWrappedStore(iterBegin, *res1->GetResult(), loc);
         return res1->GetResult();
     }
 
@@ -1036,7 +1036,7 @@ protected:
 
     ForinBGs CreateRetAndBGs()
     {
-        Func* parentFunc = tr.currentBlock->GetTopLevelFunc();
+        Function* parentFunc = tr.currentBlock->GetTopLevelFunc();
         CJC_NULLPTR_CHECK(parentFunc);
         BlockGroup* bodyBlockGrp = tr.builder.CreateBlockGroup(*parentFunc);
         BlockGroup* condBlockGrp = tr.builder.CreateBlockGroup(*parentFunc);
@@ -1061,7 +1061,7 @@ protected:
     {
         auto loc = tr.TranslateLocation(*forin);
         auto forInClosedRange = tr.CreateAndAppendExpression<ForInClosedRange>(
-            loc, tr.TranslateType(*forin->ty), iterVar, condVar, tr.GetCurrentBlock());
+            loc, tr.TranslateType(*forin->GetTy()), iterVar, condVar, tr.GetCurrentBlock());
         CJC_NULLPTR_CHECK(forInClosedRange);
         CJC_NULLPTR_CHECK(bgs.body);
         CJC_NULLPTR_CHECK(bgs.latch);
@@ -1106,7 +1106,7 @@ protected:
         auto& iterVarLoc = iterVar->GetDebugLocation();
         auto conditionInCondBG = tr.CreateAndAppendExpression<BinaryExpression>(iterVarLoc, tr.builder.GetBoolTy(),
             ExprKind::NOTEQUAL, iterValue, &iterEnd, tr.GetCurrentBlock())->GetResult();
-        tr.CreateWrappedStore(iterVarLoc, conditionInCondBG, condVar, tr.GetCurrentBlock());
+        tr.CreateAndAppendWrappedStore(*conditionInCondBG, *condVar, iterVarLoc);
         tr.CreateAndAppendTerminator<Exit>(tr.GetCurrentBlock());
         tr.blockGroupStack.pop_back();
     }
@@ -1180,7 +1180,7 @@ protected:
         auto newValue = tr.CreateAndAppendExpression<BinaryExpression>(
             iterLoc, type, IsIncrement() ? ExprKind::ADD : ExprKind::SUB,
             iterValue, one, OverflowStrategy::WRAPPING, tr.GetCurrentBlock())->GetResult();
-        tr.CreateWrappedStore(iterLoc, newValue, iterVar, tr.GetCurrentBlock());
+        tr.CreateAndAppendWrappedStore(*newValue, *iterVar, iterLoc);
         tr.CreateAndAppendTerminator<GoTo>(fb, tb);
         tr.SetCurrentBlock(*fb);
     }

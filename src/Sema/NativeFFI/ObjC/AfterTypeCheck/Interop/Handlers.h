@@ -285,15 +285,14 @@ public:
 private:
     InteropType interopType{InteropType::NA};
     void GenNativeInitMethodForEnumCtor(InteropContext& ctx, AST::EnumDecl& enumDecl, bool isGenericGlueCode,
-        const std::vector<Native::FFI::GenericConfigInfo*>& genericConfigsVector);
+            const std::vector<Native::FFI::GenericConfigInfo*>& genericConfigsVector);
 };
 
 /**
  * Desugars all members of every @ObjCImpl declaration.
  * Common steps are:
  * 1. All super.* calls are desugared to `objc_msgSendSuper` calls.
- * 2. All `super(...)` and `this(...)` in generated ctors (w/ $obj and ObjCBypassMarker params) are desugared to
- * `super(..., marker, $obj)`
+ * 2. All `super(...)` and `this(...)` in generated ctors (w/ $obj and ObjCBypassMarker params) are desugared to `super(..., marker, $obj)`
  * 3. All `super(...)` in original ctors are desugared.
  */
 class DesugarImpls : public Handler<DesugarImpls, InteropContext> {
@@ -374,6 +373,14 @@ public:
 };
 
 /**
+ * Rewrite typechecks that involve ObjC-compatible types
+ */
+class RewriteObjCTypechecks : public Handler<RewriteObjCTypechecks, InteropContext> {
+public:
+    void HandleImpl(InteropContext& ctx);
+};
+
+/**
  * Rewrite pointer access performed by ObjCPointer methods to proper FFI calls
  */
 class RewriteObjCPointerAccess : public Handler<RewriteObjCPointerAccess, InteropContext> {
@@ -396,6 +403,7 @@ class RewriteObjCBlockConstruction : public Handler<RewriteObjCBlockConstruction
 public:
     void HandleImpl(InteropContext& ctx);
 };
+
 
 /**
  * Drains all declarations generated on the previous step to their corresponding files which finishes the desugaring.
@@ -446,10 +454,10 @@ public:
     OwnedPtr<AST::ClassDecl> InitInterfaceFwdClassDecl(const Ptr<AST::ClassLikeDecl>& interfaceDecl);
     OwnedPtr<AST::FuncDecl> GenerateInterfaceFwdclassMethod(InteropContext& ctx, AST::ClassDecl& fwdclassDecl,
         AST::FuncDecl& interfaceFuncDecl, Native::FFI::GenericConfigInfo* genericConfig = nullptr);
-    OwnedPtr<AST::ClassDecl> GenerateGenericInterfaceFwdclassMethod(
-        InteropContext& ctx, Ptr<AST::ClassLikeDecl>& fwdclassDecl, Native::FFI::GenericConfigInfo* genericConfig);
-    void GenerateInterfaceFwdClassBody(InteropContext& ctx, AST::ClassDecl& fwdclassDecl,
-        AST::ClassLikeDecl& interfaceDecl, Native::FFI::GenericConfigInfo* genericConfig = nullptr);
+    OwnedPtr<AST::ClassDecl> GenerateGenericInterfaceFwdclassMethod(InteropContext& ctx, Ptr<AST::ClassLikeDecl>& fwdclassDecl,
+        Native::FFI::GenericConfigInfo* genericConfig);
+    void GenerateInterfaceFwdClassBody(InteropContext& ctx, AST::ClassDecl& fwdclassDecl, AST::ClassLikeDecl& interfaceDecl,
+        Native::FFI::GenericConfigInfo* genericConfig = nullptr);
 };
 
 /**
@@ -598,6 +606,32 @@ private:
     Ptr<AST::FuncDecl> objcObj4PureCJFunc{nullptr};
     Ptr<AST::FuncDecl> objcObjFunc{nullptr};
     Ptr<AST::FuncDecl> objcAutoReleaseFunc{nullptr};
+};
+
+/**
+ * Adds implementations to previously created `init(String): NSString` constructor and `toString(): String` member
+ * function in `NSString` and `NSObject` mirrors respectively. Their declarations are created in
+ * `BeforeTypeCheck/Desugar`.
+ *
+ * ```cangjie
+ * @ObjCMirror
+ * public class NSString <: NSObject {
+ *     init(str: String) {
+ *         this(convertToNSString(str))
+ *     }
+ * }
+ *
+ * @ObjCMirror
+ * public class NSObject {
+ *     toString(): String {
+ *         return descriptionAsString($getObj)
+ *     }
+ * }
+ * ```
+ */
+class InsertStringConversions : public Handler<InsertStringConversions, InteropContext> {
+public:
+    void HandleImpl(InteropContext& ctx);
 };
 
 } // namespace Cangjie::Interop::ObjC

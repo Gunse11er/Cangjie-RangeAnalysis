@@ -25,7 +25,7 @@
 #include <vector>
 
 namespace {
-// judge if generic type is instance of a certain type.
+// judge if generic type is instance of a certain type. 
 template <class T, template<class...> class U>
 inline constexpr bool IsInstanceOfValue = std::false_type{};
 
@@ -430,7 +430,6 @@ public:
         }
     }
 
-    /// 将当前抽象状态标记为不可达。
     void SetUnreachable()
     {
         this->kind = ReachableKind::UNREACHABLE;
@@ -737,7 +736,7 @@ public:
      * @param builder CHIR builder for generating IR.
      * @param isDebug flag whether print debug log.
      */
-    ValueAnalysis(const Func* func, CHIRBuilder& builder, bool isDebug = false)
+    ValueAnalysis(const Function* func, CHIRBuilder& builder, bool isDebug = false)
         : Analysis<State<ValueDomain, ValueStatePool>>(func, isDebug), builder(builder)
     {
     }
@@ -754,7 +753,7 @@ public:
     static void InitialiseLetGVState(const Package& package, CHIRBuilder& builder)
     {
         globalState.kind = ReachableKind::REACHABLE;
-        for (auto gv : package.GetGlobalVars()) {
+        for (auto gv : package.GetGlobalVarsWithInit()) {
             if (!gv->TestAttr(Attribute::READONLY) || !gv->GetInitFunc() || !IsTrackedGV<ValueDomain>(*gv)) {
                 continue;
             }
@@ -1194,10 +1193,10 @@ private:
 
     void HandleStoreToGlobal(State<ValueDomain, ValueStatePool>& state, Value* location, Value* value)
     {
-        if (this->isStable || !location->IsGlobalVarInCurPackage()) {
+        if (this->isStable || !location->IsGlobalVarWithInitializer()) {
             return;
         }
-        auto gv = VirtualCast<GlobalVar*>(location);
+        auto gv = StaticCast<GlobalVar*>(location);
         if (!gv->TestAttr(Attribute::READONLY) || globalState.programState.Find(gv) == globalState.programState.End()) {
             return;
         }
@@ -1297,10 +1296,10 @@ private:
             return;
         }
         auto loc = load->GetLocation();
-        if (!loc->IsGlobalVarInCurPackage()) {
+        if (!loc->IsGlobalVarWithInitializer()) {
             return state.InitToTopOrTopRef(dest, dest->GetType()->IsRef());
         }
-        auto globalVar = VirtualCast<GlobalVar*>(loc);
+        auto globalVar = StaticCast<GlobalVar*>(loc);
         if (!globalVar->TestAttr(Attribute::READONLY)) {
             return state.InitToTopOrTopRef(dest, dest->GetType()->IsRef());
         }
