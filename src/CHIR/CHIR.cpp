@@ -49,6 +49,7 @@
 #include "cangjie/Driver/TempFileManager.h"
 #include "cangjie/Utils/CheckUtils.h"
 #include <filesystem>
+#include <optional>
 #include <system_error>
 #include <unordered_set>
 #include "cangjie/Utils/ProfileRecorder.h"
@@ -57,10 +58,34 @@ namespace Cangjie::CHIR {
 namespace {
 const std::string CONTEST_INPUT_FILE = "input.txt";
 
-bool HasContestInputFile()
+std::optional<std::filesystem::path> FindContestInputFile()
 {
     std::error_code ec;
-    return std::filesystem::exists(CONTEST_INPUT_FILE, ec);
+    auto current = std::filesystem::current_path(ec);
+    if (ec) {
+        return std::nullopt;
+    }
+    while (true) {
+        auto candidate = current / CONTEST_INPUT_FILE;
+        if (std::filesystem::is_regular_file(candidate, ec)) {
+            return candidate;
+        }
+        ec.clear();
+        if (current == current.root_path()) {
+            break;
+        }
+        auto parent = current.parent_path();
+        if (parent.empty() || parent == current) {
+            break;
+        }
+        current = parent;
+    }
+    return std::nullopt;
+}
+
+bool HasContestInputFile()
+{
+    return FindContestInputFile().has_value();
 }
 } // namespace
 

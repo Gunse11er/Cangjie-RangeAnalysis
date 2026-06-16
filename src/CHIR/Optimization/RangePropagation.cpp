@@ -10,10 +10,12 @@
 
 #include <algorithm>
 #include <cctype>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <sstream>
 #include <optional>
+#include <system_error>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -23,6 +25,31 @@ namespace Cangjie::CHIR {
 namespace {
 const std::string CONTEST_INPUT_FILE = "input.txt";
 const std::string CONTEST_OUTPUT_FILE = "output.txt";
+
+std::optional<std::filesystem::path> FindContestInputFile()
+{
+    std::error_code ec;
+    auto current = std::filesystem::current_path(ec);
+    if (ec) {
+        return std::nullopt;
+    }
+    while (true) {
+        auto candidate = current / CONTEST_INPUT_FILE;
+        if (std::filesystem::is_regular_file(candidate, ec)) {
+            return candidate;
+        }
+        ec.clear();
+        if (current == current.root_path()) {
+            break;
+        }
+        auto parent = current.parent_path();
+        if (parent.empty() || parent == current) {
+            break;
+        }
+        current = parent;
+    }
+    return std::nullopt;
+}
 
 bool IsGlobalVarInCurrentPackage(const Value* value)
 {
@@ -44,6 +71,7 @@ enum class ContestQueryTypeHint {
 
 struct ContestQuery {
     std::string fileName;
+    std::string sourceFileName;
     unsigned line{0};
     std::string variableName;
     std::string result;
@@ -447,21 +475,26 @@ void InferContestQuerySourceFallback(const std::vector<std::string>& lines, Cont
 }
 
 // 读取查询所在源码行，在 CHIR Debug 缺失时保留 Bool/整数 fallback 所需类型。
-void InferContestQueryTypeHintFromSource(
-    ContestQuery& query, std::unordered_map<std::string, std::vector<std::string>>& sourceCache)
+void InferContestQueryTypeHintFromSource(ContestQuery& query,
+    std::unordered_map<std::string, std::vector<std::string>>& sourceCache, const std::filesystem::path& contestRoot)
 {
     if (!query.valid || query.fileName.empty() || query.line == 0) {
         return;
     }
-    auto it = sourceCache.find(query.fileName);
+    std::filesystem::path sourcePath(query.sourceFileName.empty() ? query.fileName : query.sourceFileName);
+    if (sourcePath.is_relative()) {
+        sourcePath = contestRoot / sourcePath;
+    }
+    auto sourceKey = sourcePath.lexically_normal().string();
+    auto it = sourceCache.find(sourceKey);
     if (it == sourceCache.end()) {
         std::vector<std::string> lines;
-        std::ifstream source(query.fileName);
+        std::ifstream source(sourceKey);
         std::string sourceLine;
         while (std::getline(source, sourceLine)) {
             lines.emplace_back(sourceLine);
         }
-        it = sourceCache.emplace(query.fileName, std::move(lines)).first;
+        it = sourceCache.emplace(sourceKey, std::move(lines)).first;
     }
     if (query.line > it->second.size()) {
         return;
@@ -493,7 +526,8 @@ ContestQuery ParseContestQueryLine(const std::string& line)
         return MakeInvalidContestQuery();
     }
     ContestQuery query;
-    query.fileName = BaseName(parts[0]);
+    query.sourceFileName = parts[0];
+    query.fileName = BaseName(query.sourceFileName);
     try {
         size_t parsedSize = 0;
         auto parsedLine = std::stoul(parts[1], &parsedSize);
@@ -511,7 +545,11 @@ ContestQuery ParseContestQueryLine(const std::string& line)
 // 当 input.txt 存在时读取全部竞赛查询。
 std::optional<std::vector<ContestQuery>> LoadContestQueries()
 {
-    std::ifstream input(CONTEST_INPUT_FILE);
+    auto inputPath = FindContestInputFile();
+    if (!inputPath.has_value()) {
+        return std::nullopt;
+    }
+    std::ifstream input(inputPath.value().string());
     if (!input.is_open()) {
         return std::nullopt;
     }
@@ -520,7 +558,7 @@ std::optional<std::vector<ContestQuery>> LoadContestQueries()
     std::string line;
     while (std::getline(input, line)) {
         auto query = ParseContestQueryLine(line);
-        InferContestQueryTypeHintFromSource(query, sourceCache);
+        InferContestQueryTypeHintFromSource(query, sourceCache, inputPath.value().parent_path());
         queries.emplace_back(std::move(query));
     }
     return queries;
@@ -947,7 +985,10 @@ bool IsLoopBranchConditionExpr(const Expression& expr)
 // 按查询顺序写入 output.txt，未解析项使用 fallback。
 void WriteContestOutput(std::vector<ContestQuery>& queries)
 {
-    std::ofstream output(CONTEST_OUTPUT_FILE, std::ios::trunc);
+    auto inputPath = FindContestInputFile();
+    auto outputPath = inputPath.has_value() ? inputPath.value().parent_path() / CONTEST_OUTPUT_FILE
+                                            : std::filesystem::path(CONTEST_OUTPUT_FILE);
+    std::ofstream output(outputPath.string(), std::ios::trunc);
     if (!output.is_open()) {
         return;
     }
