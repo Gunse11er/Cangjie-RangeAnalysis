@@ -535,7 +535,8 @@ void ToCHIR::RunConstantPropagation()
 
 void ToCHIR::RunRangePropagation()
 {
-    if (!opts.IsCHIROptimizationLevelOverO2()) {
+    bool hasContestInput = HasContestInputFile();
+    if (!opts.IsCHIROptimizationLevelOverO2() && !hasContestInput) {
         return;
     }
     Utils::ProfileRecorder::Start("CHIR Opt", "Range Propagation");
@@ -543,6 +544,10 @@ void ToCHIR::RunRangePropagation()
     AnalysisWrapper<RangeAnalysis, RangeDomain> vra(builder);
     vra.RunOnPackage(chirPkg, opts.chirDebugOptimizer, opts.GetJobs(), diag);
     CHIR::RangePropagation::EmitContestOutput(chirPkg, vra);
+    if (!opts.IsCHIROptimizationLevelOverO2()) {
+        Utils::ProfileRecorder::Stop("CHIR Opt", "Range Propagation");
+        return;
+    }
     size_t threadNum = opts.GetJobs();
     DeadCodeElimination dce(builder, diag, *chirPkg);
     if (threadNum == 1) {
