@@ -1,6 +1,0 @@
-[main.cj, 3, ltTrue]
-[main.cj, 5, ltFalse]
-[main.cj, 14, flagTrue]
-[main.cj, 16, flagFalse]
-[main.cj, 19, notFlagTrue]
-[main.cj, 21, notFlagFalse]

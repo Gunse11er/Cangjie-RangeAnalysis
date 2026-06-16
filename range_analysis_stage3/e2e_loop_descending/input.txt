@@ -1,2 +1,0 @@
-[main.cj, 4, downBody]
-[main.cj, 8, downExit]
