@@ -77,3 +77,11 @@ libs/std/ast/decode.cj
 
 # vscode
 .VSCodeCounter/
+stage0/
+stage1/
+stage2/
+stage3/
+stage4/
+range_analysis_stage*/
+build/
+output/
