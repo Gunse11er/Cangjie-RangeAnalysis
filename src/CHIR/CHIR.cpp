@@ -52,40 +52,89 @@
 #include <optional>
 #include <system_error>
 #include <unordered_set>
+#include <vector>
 #include "cangjie/Utils/ProfileRecorder.h"
 
 namespace Cangjie::CHIR {
 namespace {
 const std::string CONTEST_INPUT_FILE = "input.txt";
 
-std::optional<std::filesystem::path> FindContestInputFile()
+std::optional<std::filesystem::path> FindContestInputFileFrom(const std::filesystem::path& start)
 {
     std::error_code ec;
-    auto current = std::filesystem::current_path(ec);
-    if (ec) {
+    if (start.empty()) {
         return std::nullopt;
     }
-    while (true) {
-        auto candidate = current / CONTEST_INPUT_FILE;
-        if (std::filesystem::is_regular_file(candidate, ec)) {
-            return candidate;
+    auto current = start;
+    if (current.is_relative()) {
+        auto cwd = std::filesystem::current_path(ec);
+        if (ec) {
+            return std::nullopt;
         }
+        current = cwd / current;
+    }
+    std::vector<std::filesystem::path> starts{current};
+    auto parent = current.parent_path();
+    if (!parent.empty() && parent != current) {
+        starts.emplace_back(parent);
+    }
+    for (auto probe : starts) {
         ec.clear();
-        if (current == current.root_path()) {
-            break;
+        while (true) {
+            auto candidate = probe / CONTEST_INPUT_FILE;
+            if (std::filesystem::is_regular_file(candidate, ec)) {
+                return candidate.lexically_normal();
+            }
+            ec.clear();
+            if (probe == probe.root_path()) {
+                break;
+            }
+            auto next = probe.parent_path();
+            if (next.empty() || next == probe) {
+                break;
+            }
+            probe = next;
         }
-        auto parent = current.parent_path();
-        if (parent.empty() || parent == current) {
-            break;
-        }
-        current = parent;
     }
     return std::nullopt;
 }
 
-bool HasContestInputFile()
+std::vector<std::string> BuildContestRootHints(const GlobalOptions& opts)
 {
-    return FindContestInputFile().has_value();
+    std::vector<std::string> hints;
+    std::error_code ec;
+    auto cwd = std::filesystem::current_path(ec);
+    if (!ec) {
+        hints.emplace_back(cwd.string());
+    }
+    if (!opts.moduleSrcPath.empty()) {
+        hints.emplace_back(opts.moduleSrcPath);
+    }
+    if (!opts.output.empty()) {
+        hints.emplace_back(opts.output);
+    }
+    if (opts.outputDir.has_value()) {
+        hints.emplace_back(opts.outputDir.value());
+    }
+    if (!opts.tempFolderPath.empty()) {
+        hints.emplace_back(opts.tempFolderPath);
+    }
+    if (!opts.compilationCachedPath.empty()) {
+        hints.emplace_back(opts.compilationCachedPath);
+    }
+    hints.insert(hints.end(), opts.packagePaths.begin(), opts.packagePaths.end());
+    hints.insert(hints.end(), opts.srcFiles.begin(), opts.srcFiles.end());
+    return hints;
+}
+
+bool HasContestInputFile(const GlobalOptions& opts)
+{
+    for (const auto& hint : BuildContestRootHints(opts)) {
+        if (FindContestInputFileFrom(std::filesystem::path(hint)).has_value()) {
+            return true;
+        }
+    }
+    return false;
 }
 } // namespace
 
@@ -468,7 +517,7 @@ void ToCHIR::RunFunctionInline(DevirtualizationInfo& devirtInfo)
     if (!opts.IsOptimizationExisted(GlobalOptions::OptimizationFlag::FUNC_INLINING)) {
         return;
     }
-    if (HasContestInputFile()) {
+    if (HasContestInputFile(opts)) {
         return;
     }
     Utils::ProfileRecorder::Start("CHIR Opt", "FunctionInline");
@@ -560,7 +609,8 @@ void ToCHIR::RunConstantPropagation()
 
 void ToCHIR::RunRangePropagation()
 {
-    bool hasContestInput = HasContestInputFile();
+    auto contestRootHints = BuildContestRootHints(opts);
+    bool hasContestInput = HasContestInputFile(opts);
     if (!opts.IsCHIROptimizationLevelOverO2() && !hasContestInput) {
         return;
     }
@@ -568,7 +618,7 @@ void ToCHIR::RunRangePropagation()
     RangeAnalysis::ClearContextSensitiveResults();
     AnalysisWrapper<RangeAnalysis, RangeDomain> vra(builder);
     vra.RunOnPackage(chirPkg, opts.chirDebugOptimizer, opts.GetJobs(), diag);
-    CHIR::RangePropagation::EmitContestOutput(chirPkg, vra);
+    CHIR::RangePropagation::EmitContestOutput(chirPkg, vra, contestRootHints);
     if (!opts.IsCHIROptimizationLevelOverO2()) {
         Utils::ProfileRecorder::Stop("CHIR Opt", "Range Propagation");
         return;

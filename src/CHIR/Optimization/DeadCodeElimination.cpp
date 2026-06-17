@@ -30,7 +30,25 @@ const std::string CONTEST_INPUT_FILE = "input.txt";
 bool HasContestInputFile()
 {
     std::error_code ec;
-    return std::filesystem::exists(CONTEST_INPUT_FILE, ec);
+    auto probe = std::filesystem::current_path(ec);
+    if (ec) {
+        return false;
+    }
+    while (true) {
+        auto candidate = probe / CONTEST_INPUT_FILE;
+        if (std::filesystem::is_regular_file(candidate, ec)) {
+            return true;
+        }
+        ec.clear();
+        if (probe == probe.root_path()) {
+            return false;
+        }
+        auto parent = probe.parent_path();
+        if (parent.empty() || parent == probe) {
+            return false;
+        }
+        probe = parent;
+    }
 }
 
 void DumpForDebug(const Ptr<Expression> expr, const Ptr<Function> func, bool isDebug)

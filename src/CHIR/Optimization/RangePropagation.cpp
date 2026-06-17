@@ -19,6 +19,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace Cangjie::CHIR {
 
@@ -26,27 +27,59 @@ namespace {
 const std::string CONTEST_INPUT_FILE = "input.txt";
 const std::string CONTEST_OUTPUT_FILE = "output.txt";
 
-std::optional<std::filesystem::path> FindContestInputFile()
+struct ContestInputContext {
+    std::filesystem::path inputPath;
+    std::filesystem::path rootPath;
+};
+
+std::optional<std::filesystem::path> FindContestInputFileFrom(const std::filesystem::path& start)
 {
     std::error_code ec;
-    auto current = std::filesystem::current_path(ec);
-    if (ec) {
+    if (start.empty()) {
         return std::nullopt;
     }
-    while (true) {
-        auto candidate = current / CONTEST_INPUT_FILE;
-        if (std::filesystem::is_regular_file(candidate, ec)) {
-            return candidate;
+    auto current = start;
+    if (current.is_relative()) {
+        auto cwd = std::filesystem::current_path(ec);
+        if (ec) {
+            return std::nullopt;
         }
+        current = cwd / current;
+    }
+    std::vector<std::filesystem::path> starts{current};
+    auto parent = current.parent_path();
+    if (!parent.empty() && parent != current) {
+        starts.emplace_back(parent);
+    }
+    for (auto probe : starts) {
         ec.clear();
-        if (current == current.root_path()) {
-            break;
+        while (true) {
+            auto candidate = probe / CONTEST_INPUT_FILE;
+            if (std::filesystem::is_regular_file(candidate, ec)) {
+                return candidate.lexically_normal();
+            }
+            ec.clear();
+            if (probe == probe.root_path()) {
+                break;
+            }
+            auto next = probe.parent_path();
+            if (next.empty() || next == probe) {
+                break;
+            }
+            probe = next;
         }
-        auto parent = current.parent_path();
-        if (parent.empty() || parent == current) {
-            break;
+    }
+    return std::nullopt;
+}
+
+std::optional<ContestInputContext> FindContestInputContext(const std::vector<std::string>& contestRootHints)
+{
+    for (const auto& hint : contestRootHints) {
+        auto inputPath = FindContestInputFileFrom(std::filesystem::path(hint));
+        if (!inputPath.has_value()) {
+            continue;
         }
-        current = parent;
+        return ContestInputContext{inputPath.value(), inputPath.value().parent_path()};
     }
     return std::nullopt;
 }
@@ -72,6 +105,7 @@ enum class ContestQueryTypeHint {
 struct ContestQuery {
     std::string fileName;
     std::string sourceFileName;
+    std::string fileKey;
     unsigned line{0};
     std::string variableName;
     std::string result;
@@ -83,7 +117,13 @@ struct ContestQuery {
     bool hasSourceFallback{false};
 };
 
-using ValueNameMap = std::unordered_map<Value*, std::vector<std::string>>;
+struct ValueNameInfo {
+    std::string name;
+    std::string fileKey;
+    unsigned line{0};
+};
+
+using ValueNameMap = std::unordered_map<Value*, std::vector<ValueNameInfo>>;
 
 struct ContestAggregate {
     Type* type{nullptr};
@@ -112,9 +152,47 @@ std::string BaseName(const std::string& path)
     return pos == std::string::npos ? path : path.substr(pos + 1);
 }
 
-std::string MakeContestAggregateKey(const std::string& fileName, const std::string& variableName)
+bool HasDirectoryPart(const std::string& path)
 {
-    return fileName + "\0" + variableName;
+    return path.find('/') != std::string::npos || path.find('\\') != std::string::npos;
+}
+
+std::string NormalizePathKey(const std::filesystem::path& path)
+{
+    auto key = path.lexically_normal().generic_string();
+    if (key.rfind("./", 0) == 0) {
+        key = key.substr(2);
+    }
+    return key;
+}
+
+std::string NormalizeQueryFileKey(const std::string& fileName, const std::filesystem::path& contestRoot)
+{
+    std::filesystem::path path(fileName);
+    if (path.is_absolute()) {
+        auto rel = path.lexically_relative(contestRoot);
+        if (!rel.empty() && rel.native().find("..") != 0) {
+            return NormalizePathKey(rel);
+        }
+    }
+    return NormalizePathKey(path);
+}
+
+std::string GetLocationFileKey(const DebugLocation& location, const std::filesystem::path& contestRoot)
+{
+    std::filesystem::path path(location.GetAbsPath());
+    if (path.is_absolute()) {
+        auto rel = path.lexically_relative(contestRoot);
+        if (!rel.empty() && rel.native().find("..") != 0) {
+            return NormalizePathKey(rel);
+        }
+    }
+    return NormalizePathKey(path);
+}
+
+std::string MakeContestAggregateKey(const std::string& fileKey, unsigned line, const std::string& variableName)
+{
+    return fileKey + "\0" + std::to_string(line) + "\0" + variableName;
 }
 
 std::vector<SInt> NormalizeContestExactValues(std::vector<SInt> values)
@@ -512,7 +590,7 @@ ContestQuery MakeInvalidContestQuery()
 }
 
 // 解析一行 [file, line, variable] 格式的竞赛查询。
-ContestQuery ParseContestQueryLine(const std::string& line)
+ContestQuery ParseContestQueryLine(const std::string& line, const std::filesystem::path& contestRoot)
 {
     auto trimmed = Trim(line);
     if (trimmed.empty()) {
@@ -528,6 +606,7 @@ ContestQuery ParseContestQueryLine(const std::string& line)
     ContestQuery query;
     query.sourceFileName = parts[0];
     query.fileName = BaseName(query.sourceFileName);
+    query.fileKey = NormalizeQueryFileKey(query.sourceFileName, contestRoot);
     try {
         size_t parsedSize = 0;
         auto parsedLine = std::stoul(parts[1], &parsedSize);
@@ -543,13 +622,9 @@ ContestQuery ParseContestQueryLine(const std::string& line)
 }
 
 // 当 input.txt 存在时读取全部竞赛查询。
-std::optional<std::vector<ContestQuery>> LoadContestQueries()
+std::optional<std::vector<ContestQuery>> LoadContestQueries(const ContestInputContext& inputContext)
 {
-    auto inputPath = FindContestInputFile();
-    if (!inputPath.has_value()) {
-        return std::nullopt;
-    }
-    std::ifstream input(inputPath.value().string());
+    std::ifstream input(inputContext.inputPath.string());
     if (!input.is_open()) {
         return std::nullopt;
     }
@@ -557,8 +632,8 @@ std::optional<std::vector<ContestQuery>> LoadContestQueries()
     std::unordered_map<std::string, std::vector<std::string>> sourceCache;
     std::string line;
     while (std::getline(input, line)) {
-        auto query = ParseContestQueryLine(line);
-        InferContestQueryTypeHintFromSource(query, sourceCache, inputPath.value().parent_path());
+        auto query = ParseContestQueryLine(line, inputContext.rootPath);
+        InferContestQueryTypeHintFromSource(query, sourceCache, inputContext.rootPath);
         queries.emplace_back(std::move(query));
     }
     return queries;
@@ -781,9 +856,10 @@ const ValueRange* GetContestRangeForValue(const RangeDomain& state, Value* value
 }
 
 void RememberContestAggregateFirstLine(
-    ContestAggregateMap& aggregates, const DebugLocation& location, const std::string& variableName, Type* type)
+    ContestAggregateMap& aggregates, const DebugLocation& location, const std::string& fileKey,
+    const std::string& variableName, Type* type)
 {
-    auto& aggregate = aggregates[MakeContestAggregateKey(BaseName(location.GetFileName()), variableName)];
+    auto& aggregate = aggregates[MakeContestAggregateKey(fileKey, location.GetBeginPos().line, variableName)];
     aggregate.type = aggregate.type == nullptr ? type : aggregate.type;
     aggregate.firstDebugLine = std::min(aggregate.firstDebugLine, location.GetBeginPos().line);
 }
@@ -804,9 +880,8 @@ void RecordContestAggregateValue(ContestAggregateMap& aggregates, const ValueNam
         return;
     }
     auto type = GetQueryValueType(value);
-    auto fileName = BaseName(location.GetFileName());
-    for (const auto& name : names->second) {
-        auto& aggregate = aggregates[MakeContestAggregateKey(fileName, name)];
+    for (const auto& info : names->second) {
+        auto& aggregate = aggregates[MakeContestAggregateKey(info.fileKey, info.line, info.name)];
         aggregate.type = aggregate.type == nullptr ? type : aggregate.type;
         if (aggregate.firstDebugLine != std::numeric_limits<unsigned>::max() &&
             location.GetBeginPos().line == aggregate.firstDebugLine) {
@@ -819,7 +894,7 @@ void RecordContestAggregateValue(ContestAggregateMap& aggregates, const ValueNam
 void ApplyContestAggregates(std::vector<ContestQuery>& queries, const ContestAggregateMap& aggregates)
 {
     for (auto& query : queries) {
-        auto it = aggregates.find(MakeContestAggregateKey(query.fileName, query.variableName));
+        auto it = aggregates.find(MakeContestAggregateKey(query.fileKey, query.line, query.variableName));
         if (it == aggregates.end() || !it->second.exactValues.has_value() || it->second.exactValues->size() <= 1) {
             continue;
         }
@@ -838,36 +913,57 @@ void ApplyContestAggregates(std::vector<ContestQuery>& queries, const ContestAgg
 }
 
 // 判断查询位置是否匹配 CHIR 调试位置信息。
-bool IsSameQueryLocation(const ContestQuery& query, const DebugLocation& location)
+bool IsSameQueryLocation(const ContestQuery& query, const DebugLocation& location, const std::filesystem::path& contestRoot)
 {
-    return query.fileName == BaseName(location.GetFileName()) && query.line == location.GetBeginPos().line;
+    if (query.line != location.GetBeginPos().line) {
+        return false;
+    }
+    auto locationKey = GetLocationFileKey(location, contestRoot);
+    if (query.fileKey == locationKey) {
+        return true;
+    }
+    return !HasDirectoryPart(query.sourceFileName) && query.fileName == BaseName(location.GetFileName());
 }
 
 // 判断某个值是否已关联指定源码变量名。
-bool HasValueName(const ValueNameMap& valueNames, Value* value, const std::string& name)
+bool HasValueNameForQuery(const ValueNameMap& valueNames, Value* value, const ContestQuery& query)
 {
     auto it = valueNames.find(value);
     if (it == valueNames.end()) {
         return false;
     }
-    return std::find(it->second.begin(), it->second.end(), name) != it->second.end();
+    return std::any_of(it->second.begin(), it->second.end(), [&query](const auto& info) {
+        if (info.name != query.variableName) {
+            return false;
+        }
+        if (info.fileKey == query.fileKey) {
+            return true;
+        }
+        return !HasDirectoryPart(query.sourceFileName) && query.fileName == BaseName(info.fileKey);
+    });
 }
 
 // 记录 Debug(value, name) 映射，供后续 operand 查询解析使用。
-void RememberValueName(ValueNameMap& valueNames, const Debug& debug)
+void RememberValueName(ValueNameMap& valueNames, const Debug& debug, const std::filesystem::path& contestRoot)
 {
     auto value = debug.GetValue();
     auto& names = valueNames[value];
-    if (std::find(names.begin(), names.end(), debug.GetSrcCodeIdentifier()) == names.end()) {
-        names.emplace_back(debug.GetSrcCodeIdentifier());
+    ValueNameInfo info{debug.GetSrcCodeIdentifier(), GetLocationFileKey(debug.GetDebugLocation(), contestRoot),
+        debug.GetDebugLocation().GetBeginPos().line};
+    auto sameInfo = [&info](const auto& old) {
+        return old.name == info.name && old.fileKey == info.fileKey && old.line == info.line;
+    };
+    if (std::find_if(names.begin(), names.end(), sameInfo) == names.end()) {
+        names.emplace_back(std::move(info));
     }
 }
 
 // 记录查询类型，即使精确程序点解析失败也能正确 fallback。
-void RememberQueryType(std::vector<ContestQuery>& queries, const Debug& debug)
+void RememberQueryType(std::vector<ContestQuery>& queries, const Debug& debug, const std::filesystem::path& contestRoot)
 {
     auto type = GetQueryValueType(debug.GetValue());
     auto typeHint = GetQueryTypeHint(type);
+    auto fileKey = GetLocationFileKey(debug.GetDebugLocation(), contestRoot);
     for (auto& query : queries) {
         if (!query.valid || query.type || query.variableName != debug.GetSrcCodeIdentifier()) {
             continue;
@@ -875,7 +971,8 @@ void RememberQueryType(std::vector<ContestQuery>& queries, const Debug& debug)
         if (query.typeHint != ContestQueryTypeHint::UNKNOWN && query.typeHint != typeHint) {
             continue;
         }
-        if (query.fileName == BaseName(debug.GetDebugLocation().GetFileName()) || query.fileName.empty()) {
+        if (query.fileKey == fileKey ||
+            (!HasDirectoryPart(query.sourceFileName) && query.fileName == BaseName(debug.GetDebugLocation().GetFileName()))) {
             query.type = type;
             query.typeHint = typeHint;
         }
@@ -884,12 +981,13 @@ void RememberQueryType(std::vector<ContestQuery>& queries, const Debug& debug)
 
 // 解析与具体 Debug 表达式位置和变量名匹配的查询。
 void ResolveQueryAtDebug(std::vector<ContestQuery>& queries, ValueNameMap& valueNames,
-    ContestAggregateMap& aggregates, const Debug& debug, const RangeDomain& state)
+    ContestAggregateMap& aggregates, const Debug& debug, const RangeDomain& state, const std::filesystem::path& contestRoot)
 {
-    RememberValueName(valueNames, debug);
-    RememberQueryType(queries, debug);
+    RememberValueName(valueNames, debug, contestRoot);
+    RememberQueryType(queries, debug, contestRoot);
+    auto fileKey = GetLocationFileKey(debug.GetDebugLocation(), contestRoot);
     RememberContestAggregateFirstLine(
-        aggregates, debug.GetDebugLocation(), debug.GetSrcCodeIdentifier(), GetQueryValueType(debug.GetValue()));
+        aggregates, debug.GetDebugLocation(), fileKey, debug.GetSrcCodeIdentifier(), GetQueryValueType(debug.GetValue()));
     if (debug.GetValue()->GetType()->IsRef()) {
         return;
     }
@@ -899,7 +997,7 @@ void ResolveQueryAtDebug(std::vector<ContestQuery>& queries, ValueNameMap& value
         if (!query.valid || query.variableName != debug.GetSrcCodeIdentifier()) {
             continue;
         }
-        if (!IsSameQueryLocation(query, debug.GetDebugLocation())) {
+        if (!IsSameQueryLocation(query, debug.GetDebugLocation(), contestRoot)) {
             continue;
         }
         auto result = FormatContestRange(range, type);
@@ -915,13 +1013,13 @@ void ResolveQueryAtDebug(std::vector<ContestQuery>& queries, ValueNameMap& value
 
 // 通过已记录的 value-name 映射解析同源码行 operand 查询。
 void ResolveQueryAtValue(std::vector<ContestQuery>& queries, const ValueNameMap& valueNames, const DebugLocation& location,
-    Value* value, const RangeDomain& state)
+    Value* value, const RangeDomain& state, const std::filesystem::path& contestRoot)
 {
     for (auto& query : queries) {
-        if (!query.valid || !HasValueName(valueNames, value, query.variableName)) {
+        if (!query.valid || !HasValueNameForQuery(valueNames, value, query)) {
             continue;
         }
-        if (!IsSameQueryLocation(query, location)) {
+        if (!IsSameQueryLocation(query, location, contestRoot)) {
             continue;
         }
         auto type = GetQueryValueType(value);
@@ -938,11 +1036,12 @@ void ResolveQueryAtValue(std::vector<ContestQuery>& queries, const ValueNameMap&
 
 // 在非 Debug 表达式上尝试解析所有 operand 形式查询。
 void ResolveQueryAtExpressionOperands(std::vector<ContestQuery>& queries, const ValueNameMap& valueNames,
-    ContestAggregateMap& aggregates, const Expression& expr, const RangeDomain& state)
+    ContestAggregateMap& aggregates, const Expression& expr, const RangeDomain& state,
+    const std::filesystem::path& contestRoot)
 {
     for (auto operand : expr.GetOperands()) {
         RecordContestAggregateValue(aggregates, valueNames, expr.GetDebugLocation(), operand, state);
-        ResolveQueryAtValue(queries, valueNames, expr.GetDebugLocation(), operand, state);
+        ResolveQueryAtValue(queries, valueNames, expr.GetDebugLocation(), operand, state, contestRoot);
     }
 }
 
@@ -983,11 +1082,9 @@ bool IsLoopBranchConditionExpr(const Expression& expr)
 }
 
 // 按查询顺序写入 output.txt，未解析项使用 fallback。
-void WriteContestOutput(std::vector<ContestQuery>& queries)
+void WriteContestOutput(std::vector<ContestQuery>& queries, const ContestInputContext& inputContext)
 {
-    auto inputPath = FindContestInputFile();
-    auto outputPath = inputPath.has_value() ? inputPath.value().parent_path() / CONTEST_OUTPUT_FILE
-                                            : std::filesystem::path(CONTEST_OUTPUT_FILE);
+    auto outputPath = inputContext.rootPath / CONTEST_OUTPUT_FILE;
     std::ofstream output(outputPath.string(), std::ios::trunc);
     if (!output.is_open()) {
         return;
@@ -1111,21 +1208,28 @@ void RangePropagation::RunOnFunc(const Ptr<const Function>& func, bool isDebug)
 }
 
 // 遍历缓存的 RangeAnalysis 状态并生成竞赛查询输出。
-void RangePropagation::EmitContestOutput(const Ptr<const Package>& package, RangeAnalysisWrapper& rangeAnalysisWrapper)
+void RangePropagation::EmitContestOutput(const Ptr<const Package>& package, RangeAnalysisWrapper& rangeAnalysisWrapper,
+    const std::vector<std::string>& contestRootHints)
 {
-    auto queries = LoadContestQueries();
+    auto inputContext = FindContestInputContext(contestRootHints);
+    if (!inputContext.has_value()) {
+        return;
+    }
+    auto queries = LoadContestQueries(inputContext.value());
     if (!queries.has_value()) {
         return;
     }
+    auto contestRoot = inputContext.value().rootPath;
     const auto actionBeforeVisitExpr = [](const RangeDomain&, Expression*, size_t) {};
     ValueNameMap valueNames;
     ContestAggregateMap aggregates;
-    auto actionAfterVisitExpr = [&queries, &valueNames, &aggregates](const RangeDomain& state, Expression* expr, size_t) {
+    auto actionAfterVisitExpr = [&queries, &valueNames, &aggregates, &contestRoot](
+                                    const RangeDomain& state, Expression* expr, size_t) {
         if (expr->GetExprKind() == ExprKind::DEBUGEXPR) {
-            ResolveQueryAtDebug(queries.value(), valueNames, aggregates, *StaticCast<Debug*>(expr), state);
+            ResolveQueryAtDebug(queries.value(), valueNames, aggregates, *StaticCast<Debug*>(expr), state, contestRoot);
             return;
         }
-        ResolveQueryAtExpressionOperands(queries.value(), valueNames, aggregates, *expr, state);
+        ResolveQueryAtExpressionOperands(queries.value(), valueNames, aggregates, *expr, state, contestRoot);
     };
     const auto actionOnTerminator = [](const RangeDomain&, Terminator*, std::optional<Block*>) {};
     auto resolveQueries = [&](Results<RangeDomain>& result) {
@@ -1144,7 +1248,7 @@ void RangePropagation::EmitContestOutput(const Ptr<const Package>& package, Rang
         [&](const Function*, const std::string&, Results<RangeDomain>& result) { resolveQueries(result); });
 
     ApplyContestAggregates(queries.value(), aggregates);
-    WriteContestOutput(queries.value());
+    WriteContestOutput(queries.value(), inputContext.value());
 }
 
 Ptr<LiteralValue> RangePropagation::GenerateConstExpr(const Ptr<Type>& type, const Ptr<const ValueRange>& rangeVal)

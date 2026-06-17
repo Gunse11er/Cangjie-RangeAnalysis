@@ -16,6 +16,9 @@
 #include "cangjie/CHIR/Utils/Utils.h"
 #include "cangjie/CHIR/IR/Value/Value.h"
 
+#include <string>
+#include <vector>
+
 namespace Cangjie::CHIR {
 class Function;
 /**
@@ -65,7 +68,8 @@ public:
     const std::vector<const Function*>& GetFuncsNeedRemoveBlocks() const;
 
     // 当当前工作目录存在 input.txt 时输出竞赛值域查询结果。
-    static void EmitContestOutput(const Ptr<const Package>& package, RangeAnalysisWrapper& rangeAnalysisWrapper);
+    static void EmitContestOutput(const Ptr<const Package>& package, RangeAnalysisWrapper& rangeAnalysisWrapper,
+        const std::vector<std::string>& contestRootHints);
 
 private:
     struct RewriteInfo {
