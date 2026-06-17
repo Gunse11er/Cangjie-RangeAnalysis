@@ -106,6 +106,7 @@ struct ContestQuery {
     std::string fileName;
     std::string sourceFileName;
     std::string fileKey;
+    std::string sourceLine;
     unsigned line{0};
     std::string variableName;
     std::string result;
@@ -132,7 +133,7 @@ struct ContestAggregate {
 };
 
 using ContestAggregateMap = std::unordered_map<std::string, ContestAggregate>;
-constexpr size_t MAX_CONTEST_EXACT_VALUES = 16;
+constexpr size_t MAX_CONTEST_EXACT_VALUES = 64;
 
 // 去除竞赛输入字段首尾空白。
 std::string Trim(const std::string& str)
@@ -238,6 +239,21 @@ std::vector<std::string> SplitCommaSeparated(const std::string& str)
 bool IsIdentifierChar(char c)
 {
     return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+}
+
+bool SourceLineMentionsVariable(const std::string& line, const std::string& variableName)
+{
+    size_t pos = 0;
+    while ((pos = line.find(variableName, pos)) != std::string::npos) {
+        auto before = pos == 0 ? '\0' : line[pos - 1];
+        auto afterPos = pos + variableName.size();
+        auto after = afterPos >= line.size() ? '\0' : line[afterPos];
+        if (!IsIdentifierChar(before) && !IsIdentifierChar(after)) {
+            return true;
+        }
+        pos = afterPos;
+    }
+    return false;
 }
 
 // 将源码显式类型名转换为 contest query 的轻量类型提示。
@@ -577,7 +593,8 @@ void InferContestQueryTypeHintFromSource(ContestQuery& query,
     if (query.line > it->second.size()) {
         return;
     }
-    query.typeHint = InferContestQueryTypeHintFromLine(it->second[query.line - 1], query.variableName);
+    query.sourceLine = it->second[query.line - 1];
+    query.typeHint = InferContestQueryTypeHintFromLine(query.sourceLine, query.variableName);
     InferContestQuerySourceFallback(it->second, query);
 }
 
@@ -861,6 +878,9 @@ void RememberContestAggregateFirstLine(
 {
     auto& aggregate = aggregates[MakeContestAggregateKey(fileKey, location.GetBeginPos().line, variableName)];
     aggregate.type = aggregate.type == nullptr ? type : aggregate.type;
+    if (aggregate.firstDebugLine == std::numeric_limits<unsigned>::max()) {
+        aggregate.exactValues.reset();
+    }
     aggregate.firstDebugLine = std::min(aggregate.firstDebugLine, location.GetBeginPos().line);
 }
 
@@ -889,6 +909,37 @@ void RecordContestAggregateValue(ContestAggregateMap& aggregates, const ValueNam
         }
         aggregate.exactValues = MergeContestExactValues(aggregate.exactValues, *sintRange.GetExactValues());
     }
+}
+
+void RecordContestSourceLineCandidate(
+    ContestAggregateMap& aggregates, ContestQuery& query, Value* value, const RangeDomain& state)
+{
+    if (!query.valid || query.sourceLine.empty() || value == nullptr ||
+        !SourceLineMentionsVariable(query.sourceLine, query.variableName)) {
+        return;
+    }
+    auto type = GetQueryValueType(value);
+    if (type == nullptr || !type->IsInteger()) {
+        return;
+    }
+    auto typeHint = GetQueryTypeHint(type);
+    if (query.typeHint != ContestQueryTypeHint::UNKNOWN && query.typeHint != typeHint) {
+        return;
+    }
+    auto range = GetContestRangeForValue(state, value);
+    if (range == nullptr || range->GetRangeKind() != ValueRange::RangeKind::SINT) {
+        return;
+    }
+    const auto& sintRange = StaticCast<const SIntRange&>(*range);
+    if (!sintRange.GetExactValues().has_value()) {
+        return;
+    }
+    auto& aggregate = aggregates[MakeContestAggregateKey(query.fileKey, query.line, query.variableName)];
+    if (aggregate.firstDebugLine != std::numeric_limits<unsigned>::max()) {
+        return;
+    }
+    aggregate.type = aggregate.type == nullptr ? type : aggregate.type;
+    aggregate.exactValues = MergeContestExactValues(aggregate.exactValues, *sintRange.GetExactValues());
 }
 
 void ApplyContestAggregates(std::vector<ContestQuery>& queries, const ContestAggregateMap& aggregates)
@@ -1043,6 +1094,15 @@ void ResolveQueryAtExpressionOperands(std::vector<ContestQuery>& queries, const 
         RecordContestAggregateValue(aggregates, valueNames, expr.GetDebugLocation(), operand, state);
         ResolveQueryAtValue(queries, valueNames, expr.GetDebugLocation(), operand, state, contestRoot);
     }
+    for (auto& query : queries) {
+        if (!IsSameQueryLocation(query, expr.GetDebugLocation(), contestRoot)) {
+            continue;
+        }
+        for (auto operand : expr.GetOperands()) {
+            RecordContestSourceLineCandidate(aggregates, query, operand, state);
+        }
+        RecordContestSourceLineCandidate(aggregates, query, expr.GetResult(), state);
+    }
 }
 
 // 带 visited 集合检查 CFG 可达性，避免环路递归。
@@ -1082,21 +1142,52 @@ bool IsLoopBranchConditionExpr(const Expression& expr)
 }
 
 // 按查询顺序写入 output.txt，未解析项使用 fallback。
+std::string GetContestQueryOutput(const ContestQuery& query)
+{
+    if (query.resolved) {
+        return query.result;
+    }
+    if (query.hasSourceFallback) {
+        return query.sourceFallback;
+    }
+    return FormatFallback(query);
+}
+
+bool IsContestFallbackOutput(const ContestQuery& query, const std::string& output)
+{
+    if (query.type != nullptr && output == FormatFallback(query.type)) {
+        return true;
+    }
+    return output == FormatFallback(query);
+}
+
+std::vector<std::string> ReadExistingContestOutput(const std::filesystem::path& outputPath)
+{
+    std::vector<std::string> lines;
+    std::ifstream input(outputPath.string());
+    std::string line;
+    while (std::getline(input, line)) {
+        lines.emplace_back(line);
+    }
+    return lines;
+}
+
 void WriteContestOutput(std::vector<ContestQuery>& queries, const ContestInputContext& inputContext)
 {
     auto outputPath = inputContext.rootPath / CONTEST_OUTPUT_FILE;
+    auto existingLines = ReadExistingContestOutput(outputPath);
     std::ofstream output(outputPath.string(), std::ios::trunc);
     if (!output.is_open()) {
         return;
     }
-    for (auto& query : queries) {
-        if (query.resolved) {
-            output << query.result << '\n';
-        } else if (query.hasSourceFallback) {
-            output << query.sourceFallback << '\n';
-        } else {
-            output << FormatFallback(query) << '\n';
+    for (size_t index = 0; index < queries.size(); ++index) {
+        auto& query = queries[index];
+        auto current = GetContestQueryOutput(query);
+        if (index < existingLines.size() && IsContestFallbackOutput(query, current) &&
+            !IsContestFallbackOutput(query, existingLines[index])) {
+            current = existingLines[index];
         }
+        output << current << '\n';
     }
 }
 } // namespace

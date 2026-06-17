@@ -24,8 +24,18 @@ using LoopRangeSnapshot = std::unordered_map<Value*, std::unique_ptr<SIntDomain>
 using LoopRangeSnapshots = std::unordered_map<const Block*, LoopRangeSnapshot>;
 std::unordered_map<const RangeAnalysis*, LoopRangeSnapshots> loopRangeSnapshots;
 std::mutex loopRangeSnapshotsMtx;
-constexpr size_t MAX_CONTEXT_PER_FUNCTION = 32;
-constexpr size_t MAX_EXACT_INT_SET_SIZE = 16;
+constexpr size_t MAX_CONTEXT_PER_FUNCTION = 128;
+constexpr size_t MAX_EXACT_INT_SET_SIZE = 64;
+
+struct StructArrayLiteralInfo {
+    Value* rawArray{nullptr};
+    Value* start{nullptr};
+    Value* length{nullptr};
+};
+
+std::unordered_map<Value*, std::vector<Value*>> rawArrayLiteralElements;
+std::unordered_map<Value*, StructArrayLiteralInfo> structArrayLiteralInfos;
+std::mutex aggregateLiteralMtx;
 
 std::vector<SInt> NormalizeExactIntValues(std::vector<SInt> values)
 {
@@ -297,9 +307,24 @@ void RangeAnalysis::ApplyContextValue(RangeDomain& state, Value* dest, const Con
     }
 }
 
+bool TryRecordStructArrayLiteralConstructor(const Apply* apply);
+bool TryHandleArrayLiteralIndexApply(RangeDomain& state, const Apply* apply);
+bool TryHandleStructArrayLiteralMutation(RangeDomain& state, const Apply* apply);
+void PropagateArrayLiteralInfoOnLoad(const Load* load);
+
 void RangeAnalysis::HandleApplyExpr(RangeDomain& state, const Apply* apply, Value* refObj)
 {
     (void)refObj;
+    if (TryRecordStructArrayLiteralConstructor(apply)) {
+        return;
+    }
+    if (TryHandleStructArrayLiteralMutation(state, apply)) {
+        HandleContextSensitiveCall(state, apply->GetCallee(), apply->GetArgs(), apply->GetResult());
+        return;
+    }
+    if (TryHandleArrayLiteralIndexApply(state, apply)) {
+        return;
+    }
     HandleContextSensitiveCall(state, apply->GetCallee(), apply->GetArgs(), apply->GetResult());
 }
 
@@ -325,7 +350,7 @@ void RangeAnalysis::HandleContextSensitiveCall(
     ContextArguments contextArgs;
     contextArgs.reserve(args.size());
     for (auto arg : args) {
-        contextArgs.emplace_back(CaptureContextValue(state, arg, /* preserveIntervals = */ false));
+        contextArgs.emplace_back(CaptureContextValue(state, arg, /* preserveIntervals = */ true));
     }
 
     auto summary = AnalyzeCalleeWithContext(callee, contextArgs);
@@ -1257,9 +1282,78 @@ std::optional<SIntRange> TryComputeExactBitwiseRange(
     return SIntRange{std::move(domain), std::move(exactValues)};
 }
 
+std::optional<SInt> ApplyExactArithmetic(ExprKind kind, const SInt& lhs, const SInt& rhs,
+    const Ptr<Type>& type, OverflowStrategy ov, bool isUnsigned)
+{
+    auto width = lhs.Width();
+    if (isUnsigned) {
+        auto lhsValue = lhs.UVal();
+        auto rhsValue = rhs.UVal();
+        uint64_t result = 0;
+        if ((kind == ExprKind::DIV || kind == ExprKind::MOD) && rhsValue == 0) {
+            return std::nullopt;
+        }
+        auto overflow = OverflowChecker::IsUIntOverflow(type->GetTypeKind(), kind, lhsValue, rhsValue, ov, &result);
+        if (overflow && ov == OverflowStrategy::THROWING) {
+            return std::nullopt;
+        }
+        return SInt{width, result};
+    }
+
+    auto lhsValue = lhs.SVal();
+    auto rhsValue = rhs.SVal();
+    int64_t result = 0;
+    if ((kind == ExprKind::DIV || kind == ExprKind::MOD) && rhsValue == 0) {
+        return std::nullopt;
+    }
+    auto overflow = OverflowChecker::IsIntOverflow(type->GetTypeKind(), kind, lhsValue, rhsValue, ov, &result);
+    if (overflow && ov == OverflowStrategy::THROWING) {
+        return std::nullopt;
+    }
+    return SInt{width, static_cast<uint64_t>(result)};
+}
+
+std::optional<SIntRange> TryComputeExactArithmeticRange(const BinaryExpression* binaryExpr,
+    const SIntRange* lhs, const SIntRange* rhs, bool isUnsigned)
+{
+    if (binaryExpr == nullptr || lhs == nullptr || rhs == nullptr || !lhs->GetExactValues().has_value() ||
+        !rhs->GetExactValues().has_value()) {
+        return std::nullopt;
+    }
+    auto kind = binaryExpr->GetExprKind();
+    if (!IsBasicBinaryExpr(*binaryExpr)) {
+        return std::nullopt;
+    }
+    if (lhs->GetExactValues()->size() * rhs->GetExactValues()->size() > MAX_EXACT_INT_SET_SIZE) {
+        return std::nullopt;
+    }
+    std::vector<SInt> values;
+    values.reserve(lhs->GetExactValues()->size() * rhs->GetExactValues()->size());
+    for (const auto& lhsValue : *lhs->GetExactValues()) {
+        for (const auto& rhsValue : *rhs->GetExactValues()) {
+            auto value = ApplyExactArithmetic(
+                kind, lhsValue, rhsValue, binaryExpr->GetResult()->GetType(), binaryExpr->GetOverflowStrategy(),
+                isUnsigned);
+            if (!value.has_value()) {
+                return std::nullopt;
+            }
+            values.emplace_back(value.value());
+        }
+    }
+    auto exactValues = NormalizeExactIntSet(std::move(values));
+    if (!exactValues.has_value()) {
+        return std::nullopt;
+    }
+    auto domain = DomainFromExactIntValues(*exactValues, isUnsigned);
+    return SIntRange{std::move(domain), std::move(exactValues)};
+}
+
 std::optional<SIntRange> TryComputeCountedAccumulatorUpdateRange(
     const RangeDomain& state, const BinaryExpression* binaryExpr);
 std::optional<SIntRange> TryComputeCountedAccumulatorLoadExitRange(const RangeDomain& state, const Load* load);
+namespace {
+std::optional<SIntRange> TryComputeSimpleLoopLoadRange(Value* value);
+}
 
 // 根据普通表达式类别分派对应 transfer，并在调试模式下打印可见值域。
 void RangeAnalysis::HandleNormalExpressionEffect(RangeDomain& state, const Expression* expression)
@@ -1268,9 +1362,18 @@ void RangeAnalysis::HandleNormalExpressionEffect(RangeDomain& state, const Expre
         case ExprMajorKind::MEMORY_EXPR:
             if (expression->GetExprKind() == ExprKind::LOAD) {
                 auto load = StaticCast<const Load*>(expression);
+                PropagateArrayLiteralInfoOnLoad(load);
                 if (auto countedAccumulatorRange = TryComputeCountedAccumulatorLoadExitRange(state, load);
                     countedAccumulatorRange.has_value()) {
                     auto range = std::move(countedAccumulatorRange.value());
+                    auto objectRange = range.Clone();
+                    state.Update(expression->GetResult(), std::make_unique<SIntRange>(std::move(range)));
+                    if (auto object = state.CheckAbstractObjectRefBy(load->GetLocation()); object != nullptr) {
+                        state.Update(object, std::move(objectRange));
+                    }
+                } else if (auto loopLoadRange = TryComputeSimpleLoopLoadRange(load->GetResult());
+                    loopLoadRange.has_value()) {
+                    auto range = std::move(loopLoadRange.value());
                     auto objectRange = range.Clone();
                     state.Update(expression->GetResult(), std::make_unique<SIntRange>(std::move(range)));
                     if (auto object = state.CheckAbstractObjectRefBy(load->GetLocation()); object != nullptr) {
@@ -1516,6 +1619,11 @@ void RangeAnalysis::HandleBinaryExpr(RangeDomain& state, const BinaryExpression*
         }
         auto ov = binaryExpr->GetOverflowStrategy();
         auto isUnsigned = IsUnsignedArithmetic(*binaryExpr);
+        if (auto exactRes = TryComputeExactArithmeticRange(
+                binaryExpr, GetSIntRangeFromState(state, lhs), GetSIntRangeFromState(state, rhs), isUnsigned);
+            exactRes.has_value()) {
+            return state.Update(dest, std::make_unique<SIntRange>(std::move(exactRes.value())));
+        }
         if (lRange.IsSingleValue() && rRange.IsSingleValue()) {
             auto domain = CheckSingleValueOverflow(
                 CHIRArithmeticBinopArgs{lRange, rRange, lhs, rhs, kind, ov, isUnsigned}, binaryExpr, kind, *diag);
@@ -1570,6 +1678,289 @@ SIntDomain RangeAnalysis::ComputeTypeCast(RangeDomain& state, PtrSymbol oldSymbo
 }
 
 // 处理 typecast 等其它表达式，并对未知结果设置保守 Top 或 TopRef。
+bool CopyKnownScalarRange(RangeDomain& state, Value* dest, Value* source)
+{
+    if (dest == nullptr || source == nullptr || dest->GetType()->IsRef()) {
+        return false;
+    }
+    if (dest->GetType()->IsBoolean() && source->GetType()->IsBoolean()) {
+        auto range = RangeAnalysis::GetBoolDomainFromState(state, source);
+        if (range.IsTop()) {
+            return false;
+        }
+        state.Update(dest, std::make_unique<BoolRange>(range));
+        return true;
+    }
+    if (dest->GetType()->IsInteger() && source->GetType()->IsInteger()) {
+        auto range = GetSIntRangeFromState(state, source);
+        if (range == nullptr) {
+            return false;
+        }
+        state.Update(dest, range->Clone());
+        return true;
+    }
+    return false;
+}
+
+Value* GetAggregateLiteralElement(Value* aggregate, size_t index)
+{
+    auto expr = GetDefiningExprForWidening(aggregate);
+    if (expr == nullptr) {
+        return nullptr;
+    }
+    if (expr->GetExprKind() == ExprKind::TUPLE) {
+        auto elements = StaticCast<const Tuple*>(expr)->GetElementValues();
+        return index < elements.size() ? elements[index] : nullptr;
+    }
+    if (expr->GetExprKind() == ExprKind::VARRAY) {
+        auto elements = expr->GetOperands();
+        return index < elements.size() ? elements[index] : nullptr;
+    }
+    return nullptr;
+}
+
+bool TryHandleFieldFromAggregateLiteral(RangeDomain& state, const Field* field)
+{
+    auto path = field->GetPath();
+    if (path.size() != 1) {
+        return false;
+    }
+    auto element = GetAggregateLiteralElement(field->GetBase(), static_cast<size_t>(path.front()));
+    return CopyKnownScalarRange(state, field->GetResult(), element);
+}
+
+std::optional<size_t> GetSingleNonNegativeIndex(const RangeDomain& state, Value* value)
+{
+    auto range = GetSIntRangeFromState(state, value);
+    if (range == nullptr || !range->GetVal().IsSingleValue()) {
+        return std::nullopt;
+    }
+    auto index = range->GetVal().NumericBound().GetSingleElement();
+    if (index.Slt(0)) {
+        return std::nullopt;
+    }
+    return static_cast<size_t>(index.UVal());
+}
+
+bool IsRawArrayRefValue(Value* value)
+{
+    if (value == nullptr || !value->GetType()->IsRef()) {
+        return false;
+    }
+    return value->GetType()->StripAllRefs()->IsRawArray();
+}
+
+bool IsStructArrayValue(Value* value)
+{
+    if (value == nullptr || value->GetType() == nullptr) {
+        return false;
+    }
+    auto type = value->GetType()->StripAllRefs();
+    return type != nullptr && type->IsStructArray();
+}
+
+void RecordRawArrayLiteralInit(const RawArrayLiteralInit* init)
+{
+    if (init == nullptr || !IsRawArrayRefValue(init->GetRawArray())) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(aggregateLiteralMtx);
+    rawArrayLiteralElements[init->GetRawArray()] = init->GetElements();
+}
+
+void InvalidateRawArrayLiteral(Value* rawArray)
+{
+    if (rawArray == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(aggregateLiteralMtx);
+    rawArrayLiteralElements.erase(rawArray);
+    for (auto it = structArrayLiteralInfos.begin(); it != structArrayLiteralInfos.end();) {
+        if (it->second.rawArray == rawArray) {
+            it = structArrayLiteralInfos.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+std::optional<StructArrayLiteralInfo> LookupStructArrayLiteralInfo(Value* arrayValue)
+{
+    std::lock_guard<std::mutex> lock(aggregateLiteralMtx);
+    auto it = structArrayLiteralInfos.find(arrayValue);
+    if (it == structArrayLiteralInfos.end()) {
+        return std::nullopt;
+    }
+    return it->second;
+}
+
+Value* LookupRawArrayLiteralElement(Value* rawArray, size_t index)
+{
+    std::lock_guard<std::mutex> lock(aggregateLiteralMtx);
+    auto it = rawArrayLiteralElements.find(rawArray);
+    if (it == rawArrayLiteralElements.end() || index >= it->second.size()) {
+        return nullptr;
+    }
+    return it->second[index];
+}
+
+std::optional<size_t> GetEffectiveArrayLiteralIndex(const RangeDomain& state, Value* indexValue, Value* startValue)
+{
+    auto index = GetSingleNonNegativeIndex(state, indexValue);
+    if (!index.has_value()) {
+        return std::nullopt;
+    }
+    size_t start = 0;
+    if (startValue != nullptr) {
+        auto startIndex = GetSingleNonNegativeIndex(state, startValue);
+        if (!startIndex.has_value()) {
+            return std::nullopt;
+        }
+        start = startIndex.value();
+    }
+    if (index.value() > std::numeric_limits<size_t>::max() - start) {
+        return std::nullopt;
+    }
+    return start + index.value();
+}
+
+bool TryCopyRawArrayLiteralElement(
+    RangeDomain& state, Value* dest, Value* rawArray, Value* indexValue, Value* startValue = nullptr)
+{
+    auto index = GetEffectiveArrayLiteralIndex(state, indexValue, startValue);
+    if (!index.has_value()) {
+        return false;
+    }
+    auto element = LookupRawArrayLiteralElement(rawArray, index.value());
+    return CopyKnownScalarRange(state, dest, element);
+}
+
+bool TryRecordStructArrayLiteralConstructor(const Apply* apply)
+{
+    if (apply == nullptr) {
+        return false;
+    }
+    auto args = apply->GetArgs();
+    if (args.size() < 4 || !IsStructArrayValue(args[0]) || !IsRawArrayRefValue(args[1]) ||
+        !args[2]->GetType()->IsInteger() || !args[3]->GetType()->IsInteger()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(aggregateLiteralMtx);
+    structArrayLiteralInfos[args[0]] = StructArrayLiteralInfo{args[1], args[2], args[3]};
+    return true;
+}
+
+bool TryUpdateRawArrayLiteralElement(Value* rawArray, size_t index, Value* value)
+{
+    std::lock_guard<std::mutex> lock(aggregateLiteralMtx);
+    auto it = rawArrayLiteralElements.find(rawArray);
+    if (it == rawArrayLiteralElements.end() || index >= it->second.size()) {
+        return false;
+    }
+    it->second[index] = value;
+    return true;
+}
+
+bool TryHandleStructArrayLiteralMutation(RangeDomain& state, const Apply* apply)
+{
+    if (apply == nullptr || apply->GetCallee() == nullptr) {
+        return false;
+    }
+    auto args = apply->GetArgs();
+    if (args.empty() || !IsStructArrayValue(args[0])) {
+        return false;
+    }
+    if (apply->GetCallee()->GetSrcCodeIdentifier() == "[]" && args.size() >= 3 &&
+        args[1]->GetType()->IsInteger()) {
+        auto info = LookupStructArrayLiteralInfo(args[0]);
+        auto index = info.has_value() ? GetEffectiveArrayLiteralIndex(state, args[1], info->start) : std::nullopt;
+        if (info.has_value() && index.has_value() &&
+            TryUpdateRawArrayLiteralElement(info->rawArray, index.value(), args[2])) {
+            return true;
+        }
+    } else if (apply->GetCallee()->GetSrcCodeIdentifier() == "[]") {
+        return false;
+    }
+    if (!apply->GetCallee()->TestAttr(Attribute::MUT) && apply->GetCallee()->GetSrcCodeIdentifier() != "[]") {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(aggregateLiteralMtx);
+    rawArrayLiteralElements.clear();
+    structArrayLiteralInfos.clear();
+    return true;
+}
+
+void PropagateArrayLiteralInfoOnLoad(const Load* load)
+{
+    if (load == nullptr || !IsStructArrayValue(load->GetResult())) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(aggregateLiteralMtx);
+    auto it = structArrayLiteralInfos.find(load->GetLocation());
+    if (it != structArrayLiteralInfos.end()) {
+        structArrayLiteralInfos[load->GetResult()] = it->second;
+    }
+}
+
+bool TryHandleArrayLiteralIndexApply(RangeDomain& state, const Apply* apply)
+{
+    if (apply == nullptr || apply->GetCallee() == nullptr || apply->GetCallee()->GetSrcCodeIdentifier() != "[]") {
+        return false;
+    }
+    auto args = apply->GetArgs();
+    if (args.size() < 2 || !IsStructArrayValue(args[0]) || !args[1]->GetType()->IsInteger()) {
+        return false;
+    }
+    auto info = LookupStructArrayLiteralInfo(args[0]);
+    if (!info.has_value()) {
+        return false;
+    }
+    return TryCopyRawArrayLiteralElement(state, apply->GetResult(), info->rawArray, args[1], info->start);
+}
+
+bool TryHandleRawArrayGetFromLiteral(RangeDomain& state, const Intrinsic* intrinsic)
+{
+    auto kind = intrinsic->GetIntrinsicKind();
+    if (kind != CHIR::IntrinsicKind::ARRAY_GET && kind != CHIR::IntrinsicKind::ARRAY_GET_UNCHECKED) {
+        return false;
+    }
+    const auto& args = intrinsic->GetArgs();
+    if (args.size() < 2 || !IsRawArrayRefValue(args[0]) || !args[1]->GetType()->IsInteger()) {
+        return false;
+    }
+    return TryCopyRawArrayLiteralElement(state, intrinsic->GetResult(), args[0], args[1]);
+}
+
+bool TryInvalidateRawArrayLiteralWrite(const Intrinsic* intrinsic)
+{
+    auto kind = intrinsic->GetIntrinsicKind();
+    if (kind != CHIR::IntrinsicKind::ARRAY_SET && kind != CHIR::IntrinsicKind::ARRAY_SET_UNCHECKED) {
+        return false;
+    }
+    const auto& args = intrinsic->GetArgs();
+    if (!args.empty()) {
+        InvalidateRawArrayLiteral(args[0]);
+    }
+    return true;
+}
+
+bool TryHandleVArrayGetFromLiteral(RangeDomain& state, const Intrinsic* intrinsic)
+{
+    if (intrinsic->GetIntrinsicKind() != CHIR::IntrinsicKind::VARRAY_GET) {
+        return false;
+    }
+    const auto& args = intrinsic->GetArgs();
+    if (args.size() < 2) {
+        return false;
+    }
+    auto index = GetSingleNonNegativeIndex(state, args[1]);
+    if (!index.has_value()) {
+        return false;
+    }
+    auto element = GetAggregateLiteralElement(args[0], index.value());
+    return CopyKnownScalarRange(state, intrinsic->GetResult(), element);
+}
+
 void RangeAnalysis::HandleOthersExpr(RangeDomain& state, const Expression* expression)
 {
     switch (expression->GetExprKind()) {
@@ -1577,13 +1968,36 @@ void RangeAnalysis::HandleOthersExpr(RangeDomain& state, const Expression* expre
             HandleTypeCast(state, StaticCast<const TypeCast*>(expression));
             break;
         }
+        case ExprKind::FIELD:
+            if (!TryHandleFieldFromAggregateLiteral(state, StaticCast<const Field*>(expression))) {
+                return;
+            }
+            break;
+        case ExprKind::INTRINSIC:
+            if (!TryHandleVArrayGetFromLiteral(state, StaticCast<const Intrinsic*>(expression)) &&
+                !TryHandleRawArrayGetFromLiteral(state, StaticCast<const Intrinsic*>(expression))) {
+                if (TryInvalidateRawArrayLiteralWrite(StaticCast<const Intrinsic*>(expression))) {
+                    return;
+                }
+                auto dest = expression->GetResult();
+                if (dest == nullptr) {
+                    return;
+                }
+                return state.SetToTopOrTopRef(dest, dest->GetType()->IsRef());
+            }
+            break;
+        case ExprKind::RAW_ARRAY_LITERAL_INIT:
+            RecordRawArrayLiteralInit(StaticCast<const RawArrayLiteralInit*>(expression));
+            return;
         case ExprKind::CONSTANT:
         case ExprKind::APPLY:
-        case ExprKind::FIELD:
             return;
         case ExprKind::TUPLE:
         default: {
             auto dest = expression->GetResult();
+            if (dest == nullptr) {
+                return;
+            }
             return state.SetToTopOrTopRef(dest, dest->GetType()->IsRef());
         }
     }
@@ -2314,6 +2728,83 @@ std::optional<SInt> ComputeExactInductionExit(
 }
 
 // 判断分支后继是否会离开该分支块所在循环。
+bool SatisfiesSignedRelation(__int128 lhs, RelationalOperation relation, __int128 rhs)
+{
+    switch (relation) {
+        case RelationalOperation::LT:
+            return lhs < rhs;
+        case RelationalOperation::LE:
+            return lhs <= rhs;
+        case RelationalOperation::GT:
+            return lhs > rhs;
+        case RelationalOperation::GE:
+            return lhs >= rhs;
+        case RelationalOperation::EQ:
+            return lhs == rhs;
+        case RelationalOperation::NE:
+            return lhs != rhs;
+    }
+    return false;
+}
+
+std::optional<std::vector<int64_t>> TryEnumerateInductionValues(
+    int64_t init, int64_t step, RelationalOperation relation, int64_t bound, IntWidth width)
+{
+    if (step == 0) {
+        return std::nullopt;
+    }
+    auto exit = ComputeExactInductionExit(init, step, relation, bound, width);
+    if (!exit.has_value()) {
+        return std::nullopt;
+    }
+    std::vector<int64_t> values;
+    __int128 current = init;
+    const __int128 rhs = bound;
+    while (SatisfiesSignedRelation(current, relation, rhs)) {
+        if (!FitsSignedWidth(current, width) || values.size() >= MAX_EXACT_INT_SET_SIZE) {
+            return std::nullopt;
+        }
+        values.emplace_back(static_cast<int64_t>(current));
+        current += step;
+    }
+    if (current != static_cast<__int128>(exit->SVal())) {
+        return std::nullopt;
+    }
+    return values.empty() ? std::nullopt : std::optional<std::vector<int64_t>>{std::move(values)};
+}
+
+std::optional<std::vector<int64_t>> TryEnumerateInclusiveUntilBound(
+    int64_t init, int64_t step, int64_t bound, IntWidth width)
+{
+    if (step == 0) {
+        return std::nullopt;
+    }
+    auto distance = static_cast<__int128>(bound) - static_cast<__int128>(init);
+    if ((distance > 0 && step < 0) || (distance < 0 && step > 0)) {
+        return std::nullopt;
+    }
+    auto absStep = step > 0 ? static_cast<__int128>(step) : -static_cast<__int128>(step);
+    auto absDistance = distance >= 0 ? distance : -distance;
+    if (absDistance % absStep != 0) {
+        return std::nullopt;
+    }
+    auto count = absDistance / absStep + 1;
+    if (count <= 0 || count > static_cast<__int128>(MAX_EXACT_INT_SET_SIZE)) {
+        return std::nullopt;
+    }
+    std::vector<int64_t> values;
+    values.reserve(static_cast<size_t>(count));
+    __int128 current = init;
+    for (__int128 index = 0; index < count; ++index) {
+        if (!FitsSignedWidth(current, width)) {
+            return std::nullopt;
+        }
+        values.emplace_back(static_cast<int64_t>(current));
+        current += step;
+    }
+    return values;
+}
+
 bool IsLoopExitSuccessor(const Branch* branch, const Block* successor)
 {
     if (branch != nullptr &&
@@ -2321,7 +2812,18 @@ bool IsLoopExitSuccessor(const Branch* branch, const Block* successor)
         return successor == branch->GetFalseBlock();
     }
     if (!IsLoopBranch(branch)) {
-        return false;
+        if (branch == nullptr || successor == nullptr) {
+            return false;
+        }
+        auto header = branch->GetParentBlock();
+        std::unordered_set<const Block*> trueVisited;
+        std::unordered_set<const Block*> falseVisited;
+        auto trueReachesHeader = CanReachBlock(branch->GetTrueBlock(), header, trueVisited);
+        auto falseReachesHeader = CanReachBlock(branch->GetFalseBlock(), header, falseVisited);
+        if (trueReachesHeader == falseReachesHeader) {
+            return false;
+        }
+        return successor == (trueReachesHeader ? branch->GetFalseBlock() : branch->GetTrueBlock());
     }
     std::unordered_set<const Block*> visited;
     return !CanReachBlock(successor, branch->GetParentBlock(), visited);
@@ -2570,6 +3072,24 @@ std::optional<std::vector<int64_t>> TryEnumerateSimpleLoopLoadValues(Value* valu
         init = FindIncomingSignedStoreConstantThroughPredecessors(header, location);
     }
     auto step = FindSingleReachableLoopUpdateStep(header, location);
+    auto terminator = header->GetTerminator();
+    if (init.has_value() && step.has_value() && terminator != nullptr && terminator->GetExprKind() == ExprKind::BRANCH) {
+        auto condition = GetSimpleInductionCondition(StaticCast<const Branch*>(terminator)->GetCondition());
+        if (condition.has_value() && condition->location == location) {
+            if (condition->relation == RelationalOperation::NE) {
+                auto values = TryEnumerateInclusiveUntilBound(
+                    init.value(), step.value(), condition->bound, ToWidth(*value->GetType()));
+                if (values.has_value()) {
+                    return values;
+                }
+            }
+            auto values = TryEnumerateInductionValues(
+                init.value(), step.value(), condition->relation, condition->bound, ToWidth(*value->GetType()));
+            if (values.has_value()) {
+                return values;
+            }
+        }
+    }
     auto bound = FindEqualityExitConstantBound(header, location);
     if (!init.has_value() || !step.has_value() || !bound.has_value() || step.value() != 1 ||
         bound.value() < init.value()) {
@@ -2588,6 +3108,29 @@ std::optional<std::vector<int64_t>> TryEnumerateSimpleLoopLoadValues(Value* valu
         }
     }
     return values;
+}
+
+std::optional<SIntRange> TryComputeSimpleLoopLoadRange(Value* value)
+{
+    if (value == nullptr || !value->GetType()->IsInteger() || value->GetType()->IsUnsignedInteger()) {
+        return std::nullopt;
+    }
+    auto values = TryEnumerateSimpleLoopLoadValues(value);
+    if (!values.has_value()) {
+        return std::nullopt;
+    }
+    auto width = ToWidth(*value->GetType());
+    std::vector<SInt> exact;
+    exact.reserve(values->size());
+    for (auto item : *values) {
+        exact.emplace_back(width, static_cast<uint64_t>(item));
+    }
+    auto exactValues = NormalizeExactIntSet(std::move(exact));
+    if (!exactValues.has_value()) {
+        return std::nullopt;
+    }
+    auto domain = DomainFromExactIntValues(*exactValues, value->GetType()->IsUnsignedInteger());
+    return SIntRange{std::move(domain), std::move(exactValues)};
 }
 
 std::unordered_set<const Block*> CollectLoopBackPathBlockSet(
@@ -3614,7 +4157,7 @@ std::optional<SIntDomain> RangeAnalysis::TryComputeSimpleInductionUpdateRange(
         return std::nullopt;
     }
     auto branch = StaticCast<const Branch*>(terminator);
-    if (branch->GetSourceExpr() != SourceExpr::WHILE_EXPR && branch->GetSourceExpr() != SourceExpr::DO_WHILE_EXPR) {
+    if (!IsLoopBranch(branch)) {
         return std::nullopt;
     }
 

@@ -619,7 +619,7 @@ void ToCHIR::RunRangePropagation()
     AnalysisWrapper<RangeAnalysis, RangeDomain> vra(builder);
     vra.RunOnPackage(chirPkg, opts.chirDebugOptimizer, opts.GetJobs(), diag);
     CHIR::RangePropagation::EmitContestOutput(chirPkg, vra, contestRootHints);
-    if (!opts.IsCHIROptimizationLevelOverO2()) {
+    if (hasContestInput || !opts.IsCHIROptimizationLevelOverO2()) {
         Utils::ProfileRecorder::Stop("CHIR Opt", "Range Propagation");
         return;
     }
@@ -733,6 +733,9 @@ void ToCHIR::RunOptimizationPass()
     RunArrayListConstStartOpt();
     RunUnitUnify();
     auto devirtInfo = CollectDevirtualizationInfo();
+    if (HasContestInputFile(opts)) {
+        RunRangePropagation();
+    }
     RunFunctionInline(devirtInfo);
     RedundantLoadElimination();
     RedundantGetOrThrowElimination();
