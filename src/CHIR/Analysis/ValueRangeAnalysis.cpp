@@ -1480,6 +1480,7 @@ std::optional<SIntRange> TryComputeExactArithmeticRange(const BinaryExpression* 
 std::optional<SIntRange> TryComputeCountedAccumulatorUpdateRange(
     const RangeDomain& state, const BinaryExpression* binaryExpr);
 std::optional<SIntRange> TryComputeCountedAccumulatorLoadExitRange(const RangeDomain& state, const Load* load);
+std::optional<SIntRange> TryComputeCountedAccumulatorBodyLoadRange(const RangeDomain& state, const Load* load);
 namespace {
 std::optional<SIntRange> TryComputeSimpleLoopLoadRange(Value* value);
 }
@@ -1500,6 +1501,10 @@ void RangeAnalysis::HandleNormalExpressionEffect(RangeDomain& state, const Expre
                     if (auto object = state.CheckAbstractObjectRefBy(load->GetLocation()); object != nullptr) {
                         state.Update(object, std::move(objectRange));
                     }
+                } else if (auto accumulatorBodyRange = TryComputeCountedAccumulatorBodyLoadRange(state, load);
+                    accumulatorBodyRange.has_value()) {
+                    auto range = std::move(accumulatorBodyRange.value());
+                    state.Update(expression->GetResult(), std::make_unique<SIntRange>(std::move(range)));
                 } else if (auto loopLoadRange = TryComputeSimpleLoopLoadRange(load->GetResult());
                     loopLoadRange.has_value()) {
                     auto range = std::move(loopLoadRange.value());
@@ -3080,6 +3085,7 @@ struct VariableBoundInductionExit {
     const Block* header;
     int64_t init;
     int64_t step;
+    RelationalOperation relation{RelationalOperation::LE};
 };
 
 struct CountedAccumulatorUpdate {
@@ -3087,6 +3093,16 @@ struct CountedAccumulatorUpdate {
     Type* type;
     int64_t init;
     int64_t step;
+};
+
+struct SignedInterval {
+    int64_t min;
+    int64_t max;
+};
+
+struct AccumulatorDeltaInterval {
+    size_t loadCount{0};
+    SignedInterval delta{0, 0};
 };
 
 std::optional<size_t> ShortestBlockDistance(const Block* start, const Block* target)
@@ -3453,7 +3469,8 @@ std::optional<int64_t> FindIncomingSignedStoreConstantBeforeLoop(
 }
 
 std::optional<VariableBoundInductionExit> TryBuildVariableBoundInductionCandidate(
-    Value* inductionValue, Value* boundValue, const Branch* branch, const Block* successor)
+    Value* inductionValue, Value* boundValue, const Branch* branch, const Block* successor,
+    RelationalOperation loopRelation)
 {
     auto location = GetLoadLocation(inductionValue);
     auto loadExpr = GetDefiningExpr(inductionValue);
@@ -3484,7 +3501,8 @@ std::optional<VariableBoundInductionExit> TryBuildVariableBoundInductionCandidat
     if (!distance.has_value()) {
         return std::nullopt;
     }
-    return VariableBoundInductionExit{inductionValue, location, boundValue, header, init.value(), step.value()};
+    return VariableBoundInductionExit{inductionValue, location, boundValue, header, init.value(), step.value(),
+        loopRelation};
 }
 
 std::optional<VariableBoundInductionExit> GetVariableBoundInductionExit(
@@ -3497,7 +3515,11 @@ std::optional<VariableBoundInductionExit> GetVariableBoundInductionExit(
     auto rel = ToRelationalOperation(expr->GetExprKind());
     bool branchCondition = successor == branch->GetTrueBlock();
     auto exitRel = branchCondition ? rel : NegateRelation(rel);
-    if (exitRel != RelationalOperation::EQ) {
+    auto loopRelation = branchCondition ? NegateRelation(rel) : rel;
+    if (exitRel == RelationalOperation::EQ) {
+        loopRelation = RelationalOperation::LE;
+    } else if (loopRelation != RelationalOperation::LT && loopRelation != RelationalOperation::LE &&
+        loopRelation != RelationalOperation::GT && loopRelation != RelationalOperation::GE) {
         return std::nullopt;
     }
 
@@ -3505,13 +3527,13 @@ std::optional<VariableBoundInductionExit> GetVariableBoundInductionExit(
     auto lhs = binary->GetLHSOperand();
     auto rhs = binary->GetRHSOperand();
     std::vector<std::pair<size_t, VariableBoundInductionExit>> candidates;
-    auto lhsCandidate = TryBuildVariableBoundInductionCandidate(lhs, rhs, branch, successor);
+    auto lhsCandidate = TryBuildVariableBoundInductionCandidate(lhs, rhs, branch, successor, loopRelation);
     if (lhsCandidate.has_value()) {
         auto candidate = lhsCandidate.value();
         auto distance = ShortestBlockDistance(candidate.header, branch->GetParentBlock());
         candidates.emplace_back(distance.value(), candidate);
     }
-    auto rhsCandidate = TryBuildVariableBoundInductionCandidate(rhs, lhs, branch, successor);
+    auto rhsCandidate = TryBuildVariableBoundInductionCandidate(rhs, lhs, branch, successor, SwapRelation(loopRelation));
     if (rhsCandidate.has_value()) {
         auto candidate = rhsCandidate.value();
         auto distance = ShortestBlockDistance(candidate.header, branch->GetParentBlock());
@@ -3734,6 +3756,363 @@ std::optional<std::vector<int64_t>> GetSmallSignedValuesFromState(const RangeDom
     return TryEnumerateSimpleLoopLoadValues(value);
 }
 
+
+std::optional<int64_t> NarrowToInt64(__int128 value)
+{
+    if (value < static_cast<__int128>(std::numeric_limits<int64_t>::min()) ||
+        value > static_cast<__int128>(std::numeric_limits<int64_t>::max())) {
+        return std::nullopt;
+    }
+    return static_cast<int64_t>(value);
+}
+
+std::optional<SignedInterval> CombineIntervalAdd(SignedInterval lhs, SignedInterval rhs)
+{
+    auto min = NarrowToInt64(static_cast<__int128>(lhs.min) + static_cast<__int128>(rhs.min));
+    auto max = NarrowToInt64(static_cast<__int128>(lhs.max) + static_cast<__int128>(rhs.max));
+    if (!min.has_value() || !max.has_value()) {
+        return std::nullopt;
+    }
+    return SignedInterval{min.value(), max.value()};
+}
+
+std::optional<SignedInterval> CombineIntervalSub(SignedInterval lhs, SignedInterval rhs)
+{
+    auto min = NarrowToInt64(static_cast<__int128>(lhs.min) - static_cast<__int128>(rhs.max));
+    auto max = NarrowToInt64(static_cast<__int128>(lhs.max) - static_cast<__int128>(rhs.min));
+    if (!min.has_value() || !max.has_value()) {
+        return std::nullopt;
+    }
+    return SignedInterval{min.value(), max.value()};
+}
+
+std::optional<SignedInterval> GetSignedIntervalFromSIntRange(const SIntRange* range)
+{
+    if (range == nullptr) {
+        return std::nullopt;
+    }
+    if (range->GetExactValues().has_value() && !range->GetExactValues()->empty()) {
+        std::vector<int64_t> values;
+        values.reserve(range->GetExactValues()->size());
+        for (const auto& exactValue : *range->GetExactValues()) {
+            values.emplace_back(exactValue.SVal());
+        }
+        auto [minIt, maxIt] = std::minmax_element(values.begin(), values.end());
+        return SignedInterval{*minIt, *maxIt};
+    }
+    const auto& domain = range->GetVal();
+    if (domain.IsUnsigned() || domain.IsTop() || domain.IsBottom() || !domain.SymbolicBounds().Empty()) {
+        return std::nullopt;
+    }
+    const auto& numeric = domain.NumericBound();
+    if (numeric.IsFullSet() || numeric.IsEmptySet() || numeric.IsWrappedSet() || numeric.IsSignWrappedSet()) {
+        return std::nullopt;
+    }
+    return SignedInterval{numeric.SMinValue().SVal(), numeric.SMaxValue().SVal()};
+}
+
+std::optional<SignedInterval> GetSignedIntervalFromRangeValueDomain(const RangeValueDomain* domain)
+{
+    if (domain == nullptr || domain->IsTop()) {
+        return std::nullopt;
+    }
+    auto absVal = domain->CheckAbsVal();
+    if (absVal == nullptr || absVal->GetRangeKind() != ValueRange::RangeKind::SINT) {
+        return std::nullopt;
+    }
+    return GetSignedIntervalFromSIntRange(StaticCast<const SIntRange*>(absVal));
+}
+
+bool ContainsLoadFromLocation(Value* value, Value* location, size_t depth = 0)
+{
+    constexpr size_t MAX_LOAD_SEARCH_DEPTH = 8;
+    if (value == nullptr || location == nullptr || depth > MAX_LOAD_SEARCH_DEPTH) {
+        return false;
+    }
+    if (IsLoadFromLocation(value, location)) {
+        return true;
+    }
+    auto expr = GetDefiningExpr(value);
+    if (expr == nullptr) {
+        return false;
+    }
+    for (auto operand : expr->GetOperands()) {
+        if (ContainsLoadFromLocation(operand, location, depth + 1)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::optional<SignedInterval> GetDirectSignedIntervalFromState(const RangeDomain& state, Value* value)
+{
+    if (value == nullptr || !value->GetType()->IsInteger() || value->GetType()->IsUnsignedInteger()) {
+        return std::nullopt;
+    }
+    if (auto constant = GetSignedConstantFromDefiningConstant(value); constant.has_value()) {
+        return SignedInterval{constant.value(), constant.value()};
+    }
+    if (auto values = GetSmallSignedValuesFromState(state, value); values.has_value() && !values->empty()) {
+        auto [minIt, maxIt] = std::minmax_element(values->begin(), values->end());
+        return SignedInterval{*minIt, *maxIt};
+    }
+    if (auto range = GetSIntRangeFromState(state, value); range != nullptr) {
+        return GetSignedIntervalFromSIntRange(range);
+    }
+    auto expr = GetDefiningExpr(value);
+    if (expr != nullptr && expr->GetExprKind() == ExprKind::LOAD) {
+        auto location = StaticCast<const Load*>(expr)->GetLocation();
+        if (auto object = state.CheckAbstractObjectRefBy(location); object != nullptr) {
+            return GetSignedIntervalFromRangeValueDomain(state.CheckAbstractValueWithTopBottom(object));
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<SignedInterval> GetReachableLocalStoreInterval(const RangeDomain& state, const Load* load)
+{
+    if (load == nullptr || load->GetParentBlock() == nullptr) {
+        return std::nullopt;
+    }
+    auto location = load->GetLocation();
+    auto rootType = GetIntegerRefRootType(location);
+    if (rootType == nullptr || rootType->IsUnsignedInteger()) {
+        return std::nullopt;
+    }
+
+    constexpr size_t MAX_LOCAL_STORE_SCAN_BLOCKS = 128;
+    auto loadBlock = load->GetParentBlock();
+    std::vector<const Block*> worklist{loadBlock};
+    std::unordered_set<const Block*> visited;
+    std::optional<SignedInterval> result;
+    for (size_t index = 0; index < worklist.size() && index < MAX_LOCAL_STORE_SCAN_BLOCKS; ++index) {
+        auto block = worklist[index];
+        if (block == nullptr || !visited.emplace(block).second) {
+            continue;
+        }
+        if (block != loadBlock) {
+            std::unordered_set<const Block*> reachLoad;
+            if (!CanReachBlock(block, loadBlock, reachLoad)) {
+                continue;
+            }
+        }
+        for (auto expr : block->GetExpressions()) {
+            if (expr->GetExprKind() != ExprKind::STORE) {
+                continue;
+            }
+            auto store = StaticCast<const Store*>(expr);
+            if (store->GetLocation() != location) {
+                continue;
+            }
+            if (ContainsLoadFromLocation(store->GetValue(), location)) {
+                return std::nullopt;
+            }
+            auto interval = GetDirectSignedIntervalFromState(state, store->GetValue());
+            if (!interval.has_value()) {
+                return std::nullopt;
+            }
+            if (!result.has_value()) {
+                result = interval.value();
+            } else {
+                result->min = std::min(result->min, interval->min);
+                result->max = std::max(result->max, interval->max);
+            }
+        }
+        for (auto pred : block->GetPredecessors()) {
+            worklist.emplace_back(pred);
+        }
+    }
+    return result;
+}
+
+std::optional<SignedInterval> GetSignedIntervalFromState(const RangeDomain& state, Value* value)
+{
+    if (value == nullptr || !value->GetType()->IsInteger() || value->GetType()->IsUnsignedInteger()) {
+        return std::nullopt;
+    }
+    if (auto constant = GetSignedConstantFromDefiningConstant(value); constant.has_value()) {
+        return SignedInterval{constant.value(), constant.value()};
+    }
+    if (auto values = GetSmallSignedValuesFromState(state, value); values.has_value() && !values->empty()) {
+        auto [minIt, maxIt] = std::minmax_element(values->begin(), values->end());
+        return SignedInterval{*minIt, *maxIt};
+    }
+    if (auto range = GetSIntRangeFromState(state, value); range != nullptr) {
+        if (auto interval = GetSignedIntervalFromSIntRange(range); interval.has_value()) {
+            return interval;
+        }
+    }
+    auto expr = GetDefiningExpr(value);
+    if (expr != nullptr && expr->GetExprKind() == ExprKind::LOAD) {
+        auto load = StaticCast<const Load*>(expr);
+        auto location = load->GetLocation();
+        if (auto object = state.CheckAbstractObjectRefBy(location); object != nullptr) {
+            if (auto interval = GetSignedIntervalFromRangeValueDomain(state.CheckAbstractValueWithTopBottom(object));
+                interval.has_value()) {
+                return interval;
+            }
+        }
+        if (auto interval = GetReachableLocalStoreInterval(state, load); interval.has_value()) {
+            return interval;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<AccumulatorDeltaInterval> GetAccumulatorDeltaIntervalFromLocation(
+    const RangeDomain& state, Value* value, Value* location, size_t depth = 0)
+{
+    constexpr size_t MAX_ACCUMULATOR_DELTA_DEPTH = 8;
+    if (value == nullptr || location == nullptr || depth > MAX_ACCUMULATOR_DELTA_DEPTH) {
+        return std::nullopt;
+    }
+    if (IsLoadFromLocation(value, location)) {
+        return AccumulatorDeltaInterval{1, SignedInterval{0, 0}};
+    }
+    auto expr = GetDefiningExpr(value);
+    if (expr != nullptr && expr->GetExprKind() == ExprKind::TYPECAST) {
+        auto source = StaticCast<const TypeCast*>(expr)->GetSourceValue();
+        if (source != nullptr && source->GetType()->IsInteger() && !source->GetType()->IsUnsignedInteger() &&
+            ToWidth(*source->GetType()) == ToWidth(*value->GetType())) {
+            return GetAccumulatorDeltaIntervalFromLocation(state, source, location, depth + 1);
+        }
+    }
+    if (expr != nullptr && (expr->GetExprKind() == ExprKind::ADD || expr->GetExprKind() == ExprKind::SUB)) {
+        auto binary = StaticCast<const BinaryExpression*>(expr);
+        auto lhs = GetAccumulatorDeltaIntervalFromLocation(state, binary->GetLHSOperand(), location, depth + 1);
+        auto rhs = GetAccumulatorDeltaIntervalFromLocation(state, binary->GetRHSOperand(), location, depth + 1);
+        if (!lhs.has_value() || !rhs.has_value() || lhs->loadCount + rhs->loadCount > 1) {
+            return std::nullopt;
+        }
+        if (expr->GetExprKind() == ExprKind::ADD) {
+            auto delta = CombineIntervalAdd(lhs->delta, rhs->delta);
+            if (!delta.has_value()) {
+                return std::nullopt;
+            }
+            return AccumulatorDeltaInterval{lhs->loadCount + rhs->loadCount, delta.value()};
+        }
+        if (rhs->loadCount != 0) {
+            return std::nullopt;
+        }
+        auto delta = CombineIntervalSub(lhs->delta, rhs->delta);
+        if (!delta.has_value()) {
+            return std::nullopt;
+        }
+        return AccumulatorDeltaInterval{lhs->loadCount, delta.value()};
+    }
+    auto interval = GetSignedIntervalFromState(state, value);
+    if (!interval.has_value()) {
+        return std::nullopt;
+    }
+    return AccumulatorDeltaInterval{0, interval.value()};
+}
+
+std::optional<SIntRange> BuildSignedIntervalRange(Type* type, SignedInterval interval)
+{
+    if (type == nullptr || !type->IsInteger() || type->IsUnsignedInteger()) {
+        return std::nullopt;
+    }
+    auto width = ToWidth(*type);
+    if (!FitsSignedWidth(interval.min, width) || !FitsSignedWidth(interval.max, width)) {
+        return std::nullopt;
+    }
+    auto lowerValue = SInt{width, static_cast<uint64_t>(interval.min)};
+    auto upperValue = SInt{width, static_cast<uint64_t>(interval.max)};
+    auto domain = SIntDomain::Intersects(SIntDomain::FromNumeric(RelationalOperation::GE, lowerValue, false),
+        SIntDomain::FromNumeric(RelationalOperation::LE, upperValue, false));
+    auto count = static_cast<__int128>(interval.max) - static_cast<__int128>(interval.min) + 1;
+    if (count > 0 && count <= static_cast<__int128>(MAX_EXACT_INT_SET_SIZE)) {
+        std::vector<SInt> exact;
+        exact.reserve(static_cast<size_t>(count));
+        for (int64_t value = interval.min;; ++value) {
+            exact.emplace_back(width, static_cast<uint64_t>(value));
+            if (value == interval.max) {
+                break;
+            }
+        }
+        auto exactValues = NormalizeExactIntSet(std::move(exact));
+        if (exactValues.has_value()) {
+            return SIntRange{std::move(domain), std::move(exactValues)};
+        }
+    }
+    return SIntRange{std::move(domain), std::nullopt};
+}
+
+std::optional<std::vector<int64_t>> GetCountedLoopTripCounts(
+    const RangeDomain& state, const VariableBoundInductionExit& induction)
+{
+    auto boundValues = GetSmallSignedValuesFromState(state, induction.boundValue);
+    if (!boundValues.has_value()) {
+        return std::nullopt;
+    }
+    std::vector<int64_t> tripCounts;
+    for (auto bound : *boundValues) {
+        auto values = TryEnumerateInductionValues(
+            induction.init, induction.step, induction.relation, bound, ToWidth(*induction.loadValue->GetType()));
+        if (!values.has_value()) {
+            continue;
+        }
+        tripCounts.emplace_back(static_cast<int64_t>(values->size()));
+    }
+    return tripCounts.empty() ? std::nullopt : std::optional<std::vector<int64_t>>{std::move(tripCounts)};
+}
+
+std::optional<SignedInterval> BuildCountedAccumulatorBodyInterval(
+    const RangeDomain& state, const VariableBoundInductionExit& induction, int64_t init, SignedInterval step)
+{
+    auto tripCounts = GetCountedLoopTripCounts(state, induction);
+    if (!tripCounts.has_value()) {
+        return std::nullopt;
+    }
+    std::optional<SignedInterval> result;
+    for (auto tripCountValue : *tripCounts) {
+        auto tripCount = static_cast<__int128>(tripCountValue);
+        for (__int128 iteration = 0; iteration < tripCount; ++iteration) {
+            auto lo = NarrowToInt64(static_cast<__int128>(init) + iteration * static_cast<__int128>(step.min));
+            auto hi = NarrowToInt64(static_cast<__int128>(init) + iteration * static_cast<__int128>(step.max));
+            if (!lo.has_value() || !hi.has_value()) {
+                return std::nullopt;
+            }
+            auto current = SignedInterval{std::min(lo.value(), hi.value()), std::max(lo.value(), hi.value())};
+            if (!result.has_value()) {
+                result = current;
+            } else {
+                result->min = std::min(result->min, current.min);
+                result->max = std::max(result->max, current.max);
+            }
+        }
+    }
+    return result;
+}
+
+std::optional<SignedInterval> BuildCountedAccumulatorUpdateInterval(
+    const RangeDomain& state, const VariableBoundInductionExit& induction, int64_t init, SignedInterval step)
+{
+    auto tripCounts = GetCountedLoopTripCounts(state, induction);
+    if (!tripCounts.has_value()) {
+        return std::nullopt;
+    }
+    std::optional<SignedInterval> result;
+    for (auto tripCountValue : *tripCounts) {
+        auto tripCount = static_cast<__int128>(tripCountValue);
+        for (__int128 iteration = 1; iteration <= tripCount; ++iteration) {
+            auto lo = NarrowToInt64(static_cast<__int128>(init) + iteration * static_cast<__int128>(step.min));
+            auto hi = NarrowToInt64(static_cast<__int128>(init) + iteration * static_cast<__int128>(step.max));
+            if (!lo.has_value() || !hi.has_value()) {
+                return std::nullopt;
+            }
+            auto current = SignedInterval{std::min(lo.value(), hi.value()), std::max(lo.value(), hi.value())};
+            if (!result.has_value()) {
+                result = current;
+            } else {
+                result->min = std::min(result->min, current.min);
+                result->max = std::max(result->max, current.max);
+            }
+        }
+    }
+    return result;
+}
+
 std::optional<SInt> ComputeCountedAccumulatorValue(
     const VariableBoundInductionExit& induction, const CountedAccumulatorUpdate& update, int64_t bound)
 {
@@ -3779,9 +4158,41 @@ struct CountedAccumulatorLoopContext {
     std::unordered_set<const Block*> loopBlocks;
 };
 
+bool IsLoopBodyNestedBlock(const Block* block, const Block* header, const std::unordered_set<const Block*>& loopBlocks)
+{
+    if (block == nullptr || header == nullptr) {
+        return false;
+    }
+    if (loopBlocks.find(block) != loopBlocks.end()) {
+        return true;
+    }
+    bool reachedFromLoop = false;
+    for (auto loopBlock : loopBlocks) {
+        std::unordered_set<const Block*> visited;
+        if (CanReachBlockAvoidingHeader(loopBlock, block, header, visited)) {
+            reachedFromLoop = true;
+            break;
+        }
+    }
+    if (!reachedFromLoop) {
+        return false;
+    }
+    std::unordered_set<const Block*> reachHeader;
+    if (CanReachBlock(block, header, reachHeader)) {
+        return true;
+    }
+    for (auto loopBlock : loopBlocks) {
+        std::unordered_set<const Block*> visited;
+        if (CanReachBlockAvoidingHeader(block, loopBlock, header, visited)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::optional<CountedAccumulatorLoopContext> FindCountedAccumulatorLoopContext(const Block* updateBlock)
 {
-    constexpr size_t MAX_LOOP_CONTEXT_SEARCH_BLOCKS = 32;
+    constexpr size_t MAX_LOOP_CONTEXT_SEARCH_BLOCKS = 256;
     std::vector<const Block*> worklist{updateBlock};
     std::unordered_set<const Block*> visited;
     for (size_t index = 0; index < worklist.size() && index < MAX_LOOP_CONTEXT_SEARCH_BLOCKS; ++index) {
@@ -3798,7 +4209,7 @@ std::optional<CountedAccumulatorLoopContext> FindCountedAccumulatorLoopContext(c
                     continue;
                 }
                 auto loopBlocks = CollectLoopBackPathBlockSet(branch, successor, induction->header);
-                if (loopBlocks.find(updateBlock) == loopBlocks.end()) {
+                if (!IsLoopBodyNestedBlock(updateBlock, induction->header, loopBlocks)) {
                     continue;
                 }
                 return CountedAccumulatorLoopContext{induction.value(), branch, successor, std::move(loopBlocks)};
@@ -3806,6 +4217,9 @@ std::optional<CountedAccumulatorLoopContext> FindCountedAccumulatorLoopContext(c
         }
         for (auto successor : block->GetSuccessors()) {
             worklist.emplace_back(successor);
+        }
+        for (auto pred : block->GetPredecessors()) {
+            worklist.emplace_back(pred);
         }
     }
     return std::nullopt;
@@ -3859,9 +4273,6 @@ std::optional<SIntRange> TryComputeCountedAccumulatorUpdateRangeImpl(
         return std::nullopt;
     }
     auto step = GetUpdateStepFromLocation(binaryExpr->GetResult(), location);
-    if (!step.has_value() || step.value() == 0) {
-        return std::nullopt;
-    }
     auto context = FindCountedAccumulatorLoopContext(binaryExpr->GetParentBlock());
     if (!context.has_value() || context->induction.location == location) {
         return std::nullopt;
@@ -3870,8 +4281,82 @@ std::optional<SIntRange> TryComputeCountedAccumulatorUpdateRangeImpl(
     if (!init.has_value()) {
         return std::nullopt;
     }
-    return BuildCountedAccumulatorIterationRange(
-        state, context->induction, CountedAccumulatorUpdate{location, rootType, init.value(), step.value()});
+    if (step.has_value() && step.value() != 0) {
+        return BuildCountedAccumulatorIterationRange(
+            state, context->induction, CountedAccumulatorUpdate{location, rootType, init.value(), step.value()});
+    }
+    auto delta = GetAccumulatorDeltaIntervalFromLocation(state, binaryExpr->GetResult(), location);
+    if (!delta.has_value() || delta->loadCount != 1 || (delta->delta.min == 0 && delta->delta.max == 0)) {
+        return std::nullopt;
+    }
+    auto updateInterval = BuildCountedAccumulatorUpdateInterval(state, context->induction, init.value(), delta->delta);
+    if (!updateInterval.has_value()) {
+        return std::nullopt;
+    }
+    return BuildSignedIntervalRange(rootType, updateInterval.value());
+}
+
+std::optional<SIntRange> TryComputeCountedAccumulatorBodyLoadRangeImpl(const RangeDomain& state, const Load* load)
+{
+    auto location = load->GetLocation();
+    auto rootType = GetIntegerRefRootType(location);
+    if (rootType == nullptr || rootType->IsUnsignedInteger()) {
+        return std::nullopt;
+    }
+    auto context = FindCountedAccumulatorLoopContext(load->GetParentBlock());
+    if (!context.has_value() || context->induction.location == location) {
+        return std::nullopt;
+    }
+    auto init = FindIncomingSignedStoreConstantBeforeLoop(context->induction.header, location, context->loopBlocks);
+    if (!init.has_value()) {
+        return std::nullopt;
+    }
+    std::optional<SignedInterval> stepInterval;
+    for (auto block : context->loopBlocks) {
+        bool hasStoreInBlock = false;
+        for (auto expr : block->GetExpressions()) {
+            if (expr->GetExprKind() != ExprKind::STORE) {
+                continue;
+            }
+            auto store = StaticCast<const Store*>(expr);
+            if (store->GetLocation() != location) {
+                continue;
+            }
+            if (hasStoreInBlock) {
+                return std::nullopt;
+            }
+            hasStoreInBlock = true;
+            auto step = GetUpdateStepFromLocation(store->GetValue(), location);
+            std::optional<SignedInterval> current;
+            if (step.has_value()) {
+                if (step.value() == 0) {
+                    return std::nullopt;
+                }
+                current = SignedInterval{step.value(), step.value()};
+            } else {
+                auto delta = GetAccumulatorDeltaIntervalFromLocation(state, store->GetValue(), location);
+                if (!delta.has_value() || delta->loadCount != 1 ||
+                    (delta->delta.min == 0 && delta->delta.max == 0)) {
+                    return std::nullopt;
+                }
+                current = delta->delta;
+            }
+            if (!stepInterval.has_value()) {
+                stepInterval = current.value();
+            } else {
+                stepInterval->min = std::min(stepInterval->min, current->min);
+                stepInterval->max = std::max(stepInterval->max, current->max);
+            }
+        }
+    }
+    if (!stepInterval.has_value()) {
+        return std::nullopt;
+    }
+    auto bodyInterval = BuildCountedAccumulatorBodyInterval(state, context->induction, init.value(), stepInterval.value());
+    if (!bodyInterval.has_value()) {
+        return std::nullopt;
+    }
+    return BuildSignedIntervalRange(rootType, bodyInterval.value());
 }
 
 std::optional<SIntRange> TryComputeCountedAccumulatorLoadExitRangeImpl(const RangeDomain& state, const Load* load)
@@ -4316,6 +4801,11 @@ std::optional<SIntRange> TryComputeCountedAccumulatorUpdateRange(
 std::optional<SIntRange> TryComputeCountedAccumulatorLoadExitRange(const RangeDomain& state, const Load* load)
 {
     return TryComputeCountedAccumulatorLoadExitRangeImpl(state, load);
+}
+
+std::optional<SIntRange> TryComputeCountedAccumulatorBodyLoadRange(const RangeDomain& state, const Load* load)
+{
+    return TryComputeCountedAccumulatorBodyLoadRangeImpl(state, load);
 }
 
 // 识别简单归纳变量的 i +/- const 更新，并直接推导更新表达式结果范围。
