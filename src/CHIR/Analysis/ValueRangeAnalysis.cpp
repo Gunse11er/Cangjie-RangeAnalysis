@@ -33,7 +33,6 @@ struct StructArrayLiteralInfo {
     Value* length{nullptr};
 };
 
-std::unordered_map<Value*, std::vector<Value*>> rawArrayLiteralElements;
 std::unordered_map<Value*, StructArrayLiteralInfo> structArrayLiteralInfos;
 std::mutex aggregateLiteralMtx;
 
@@ -79,6 +78,14 @@ SIntDomain DomainFromExactIntValues(const std::vector<SInt>& values, bool isUnsi
         domain = SIntDomain::Unions(domain, SIntDomain{ConstantRange{values[i]}, isUnsigned});
     }
     return domain;
+}
+
+Type* GetRefRootBaseType(Type* type)
+{
+    if (type == nullptr || !type->IsRef()) {
+        return nullptr;
+    }
+    return StaticCast<RefType*>(type)->GetRootBaseType();
 }
 }
 
@@ -165,6 +172,7 @@ struct RangeAnalysis::ContextualSummary {
     bool ready{false};
     size_t precision{0};
     std::optional<ContextAbstractValue> returnValue;
+    std::vector<std::optional<ContextAbstractValue>> refArgValues;
     const Function* callee{nullptr};
     std::unique_ptr<Results<RangeDomain>> results;
 };
@@ -253,13 +261,20 @@ RangeAnalysis::ContextAbstractValue RangeAnalysis::CaptureContextValue(
         return ContextAbstractValue{};
     }
     auto type = value->GetType();
-    const auto* domain = static_cast<const RangeValueDomain*>(nullptr);
     if (type->IsRef()) {
-        domain = state.GetAbstractDomain(value);
         type = StaticCast<RefType*>(type)->GetBaseType();
-    } else {
-        domain = state.CheckAbstractValueWithTopBottom(value);
+        return CaptureContextValue(state, state.CheckAbstractObjectRefBy(value), type, preserveIntervals);
     }
+    return CaptureContextValue(state, value, type, preserveIntervals);
+}
+
+RangeAnalysis::ContextAbstractValue RangeAnalysis::CaptureContextValue(
+    const RangeDomain& state, Value* value, Type* type, bool preserveIntervals) const
+{
+    if (value == nullptr || type == nullptr) {
+        return ContextAbstractValue{};
+    }
+    auto domain = state.CheckAbstractValueWithTopBottom(value);
     if (domain == nullptr || domain->IsTop()) {
         return ContextAbstractValue{};
     }
@@ -297,7 +312,14 @@ void RangeAnalysis::ApplyContextValue(RangeDomain& state, Value* dest, const Con
     if (dest == nullptr || value.IsTop()) {
         return;
     }
-    auto type = dest->GetType();
+    ApplyContextValue(state, dest, dest->GetType(), value);
+}
+
+void RangeAnalysis::ApplyContextValue(RangeDomain& state, Value* dest, Type* type, const ContextAbstractValue& value) const
+{
+    if (dest == nullptr || type == nullptr || value.IsTop()) {
+        return;
+    }
     if (type->IsBoolean() && value.kind == ContextAbstractValue::Kind::BOOL && value.boolValue.has_value()) {
         state.Update(dest, std::make_unique<BoolRange>(*value.boolValue));
         return;
@@ -311,6 +333,9 @@ bool TryRecordStructArrayLiteralConstructor(const Apply* apply);
 bool TryHandleArrayLiteralIndexApply(RangeDomain& state, const Apply* apply);
 bool TryHandleStructArrayLiteralMutation(RangeDomain& state, const Apply* apply);
 void PropagateArrayLiteralInfoOnLoad(const Load* load);
+std::optional<StructArrayLiteralInfo> LookupStructArrayLiteralInfo(Value* arrayValue);
+void InvalidateStructArrayLiteral(Value* arrayValue);
+void ForgetReferenceArgument(RangeDomain& state, Value* arg);
 
 void RangeAnalysis::HandleApplyExpr(RangeDomain& state, const Apply* apply, Value* refObj)
 {
@@ -319,7 +344,6 @@ void RangeAnalysis::HandleApplyExpr(RangeDomain& state, const Apply* apply, Valu
         return;
     }
     if (TryHandleStructArrayLiteralMutation(state, apply)) {
-        HandleContextSensitiveCall(state, apply->GetCallee(), apply->GetArgs(), apply->GetResult());
         return;
     }
     if (TryHandleArrayLiteralIndexApply(state, apply)) {
@@ -340,10 +364,16 @@ void RangeAnalysis::HandleContextSensitiveCall(
     RangeDomain& state, Value* calleeValue, const std::vector<Value*>& args, Value* result)
 {
     if (calleeValue == nullptr || !calleeValue->IsFuncWithBody()) {
+        for (auto arg : args) {
+            ForgetReferenceArgument(state, arg);
+        }
         return;
     }
     auto callee = DynamicCast<Function*>(calleeValue);
     if (callee == nullptr || callee->GetBody() == nullptr || callee->GetParams().size() != args.size()) {
+        for (auto arg : args) {
+            ForgetReferenceArgument(state, arg);
+        }
         return;
     }
 
@@ -353,14 +383,31 @@ void RangeAnalysis::HandleContextSensitiveCall(
         contextArgs.emplace_back(CaptureContextValue(state, arg, /* preserveIntervals = */ true));
     }
 
-    auto summary = AnalyzeCalleeWithContext(callee, contextArgs);
+    std::vector<std::optional<ContextAbstractValue>> refArgValues;
+    auto summary = AnalyzeCalleeWithContext(callee, contextArgs, refArgValues);
     if (summary.has_value()) {
         ApplyContextValue(state, result, summary.value());
+    }
+    for (size_t i = 0; i < args.size(); ++i) {
+        auto arg = args[i];
+        if (arg == nullptr || arg->GetType() == nullptr || !arg->GetType()->IsRef()) {
+            continue;
+        }
+        auto baseType = GetRefRootBaseType(arg->GetType());
+        auto object = state.CheckAbstractObjectRefBy(arg);
+        if (i < refArgValues.size() && refArgValues[i].has_value() && object != nullptr &&
+            baseType != nullptr &&
+            (baseType->IsBoolean() || baseType->IsInteger())) {
+            ApplyContextValue(state, object, baseType, *refArgValues[i]);
+        } else {
+            ForgetReferenceArgument(state, arg);
+        }
     }
 }
 
 std::optional<RangeAnalysis::ContextAbstractValue> RangeAnalysis::AnalyzeCalleeWithContext(
-    const Function* callee, const ContextArguments& arguments)
+    const Function* callee, const ContextArguments& arguments,
+    std::vector<std::optional<ContextAbstractValue>>& refArgValues)
 {
     std::stringstream keyStream;
     keyStream << callee->GetSrcCodeIdentifier() << "@" << static_cast<const void*>(callee) << "(";
@@ -379,6 +426,9 @@ std::optional<RangeAnalysis::ContextAbstractValue> RangeAnalysis::AnalyzeCalleeW
         std::lock_guard<std::mutex> lock(GetContextSummaryMutex());
         auto& summaryCache = GetContextSummaryCache();
         if (auto it = summaryCache.find(key); it != summaryCache.end()) {
+            if (it->second.ready) {
+                refArgValues = it->second.refArgValues;
+            }
             return it->second.ready ? it->second.returnValue : std::nullopt;
         }
         auto& count = GetContextCounts()[callee];
@@ -395,12 +445,14 @@ std::optional<RangeAnalysis::ContextAbstractValue> RangeAnalysis::AnalyzeCalleeW
     }
 
     std::optional<ContextAbstractValue> returnValue;
+    std::vector<std::optional<ContextAbstractValue>> summarizedRefArgs;
     auto analysis = std::unique_ptr<Analysis<RangeDomain>>(
         new RangeAnalysis(callee, builder, isDebug, diag, ContextArguments(arguments)));
     auto engine = Engine<RangeDomain>(callee, std::move(analysis));
     auto results = engine.IterateToFixpoint();
     if (results != nullptr) {
         returnValue = SummarizeReturnValue(callee, *results);
+        summarizedRefArgs = SummarizeRefParamValues(callee, *results);
     }
 
     {
@@ -408,8 +460,10 @@ std::optional<RangeAnalysis::ContextAbstractValue> RangeAnalysis::AnalyzeCalleeW
         auto& cached = GetContextSummaryCache()[key];
         cached.ready = true;
         cached.returnValue = returnValue;
+        cached.refArgValues = summarizedRefArgs;
         cached.results = std::move(results);
     }
+    refArgValues = std::move(summarizedRefArgs);
     return returnValue;
 }
 
@@ -469,6 +523,81 @@ std::optional<RangeAnalysis::ContextAbstractValue> RangeAnalysis::SummarizeRetur
         return std::nullopt;
     }
     return joined;
+}
+
+std::vector<std::optional<RangeAnalysis::ContextAbstractValue>> RangeAnalysis::SummarizeRefParamValues(
+    const Function* callee, Results<RangeDomain>& results)
+{
+    auto params = callee->GetParams();
+    std::vector<std::optional<ContextAbstractValue>> joinedValues(params.size());
+    std::vector<bool> tracked(params.size(), false);
+    std::vector<bool> sawTopExit(params.size(), false);
+    bool sawExit = false;
+
+    for (size_t i = 0; i < params.size(); ++i) {
+        auto type = params[i]->GetType();
+        auto baseType = GetRefRootBaseType(type);
+        tracked[i] = baseType != nullptr && (baseType->IsBoolean() || baseType->IsInteger());
+    }
+
+    const auto joinValues = [](const ContextAbstractValue& lhs, const ContextAbstractValue& rhs) {
+        if (lhs.IsTop() || rhs.IsTop() || lhs.kind != rhs.kind) {
+            return ContextAbstractValue{};
+        }
+        if (lhs.kind == ContextAbstractValue::Kind::BOOL && lhs.boolValue.has_value() && rhs.boolValue.has_value()) {
+            return ContextAbstractValue{BoolDomain::Union(*lhs.boolValue, *rhs.boolValue)};
+        }
+        if (lhs.kind == ContextAbstractValue::Kind::SINT && lhs.sintValue && rhs.sintValue &&
+            lhs.sintValue->Width() == rhs.sintValue->Width() &&
+            lhs.sintValue->IsUnsigned() == rhs.sintValue->IsUnsigned()) {
+            return ContextAbstractValue{SIntDomain::Unions(*lhs.sintValue, *rhs.sintValue),
+                MergeExactIntSets(lhs.exactSIntValues, rhs.exactSIntValues)};
+        }
+        return ContextAbstractValue{};
+    };
+
+    results.VisitWith(
+        [](const RangeDomain&, Expression*, size_t) {},
+        [](const RangeDomain&, Expression*, size_t) {},
+        [&](const RangeDomain& state, Terminator* terminator, std::optional<Block*>) {
+            if (terminator->GetExprKind() != ExprKind::EXIT) {
+                return;
+            }
+            sawExit = true;
+            for (size_t i = 0; i < params.size(); ++i) {
+                if (!tracked[i] || sawTopExit[i]) {
+                    continue;
+                }
+                auto object = state.CheckAbstractObjectRefBy(params[i]);
+                auto baseType = GetRefRootBaseType(params[i]->GetType());
+                auto value = CaptureContextValue(state, object, baseType, /* preserveIntervals = */ true);
+                if (value.IsTop()) {
+                    sawTopExit[i] = true;
+                    joinedValues[i].reset();
+                    continue;
+                }
+                if (!joinedValues[i].has_value()) {
+                    joinedValues[i] = std::move(value);
+                    continue;
+                }
+                joinedValues[i] = joinValues(joinedValues[i].value(), value);
+                if (!joinedValues[i].has_value() || joinedValues[i]->IsTop()) {
+                    sawTopExit[i] = true;
+                    joinedValues[i].reset();
+                }
+            }
+        });
+
+    if (!sawExit) {
+        joinedValues.clear();
+        return joinedValues;
+    }
+    for (size_t i = 0; i < joinedValues.size(); ++i) {
+        if (!tracked[i] || sawTopExit[i]) {
+            joinedValues[i].reset();
+        }
+    }
+    return joinedValues;
 }
 
 ValueRange::ValueRange(RangeKind kind) : kind(kind)
@@ -1683,20 +1812,27 @@ bool CopyKnownScalarRange(RangeDomain& state, Value* dest, Value* source)
     if (dest == nullptr || source == nullptr || dest->GetType()->IsRef()) {
         return false;
     }
-    if (dest->GetType()->IsBoolean() && source->GetType()->IsBoolean()) {
-        auto range = RangeAnalysis::GetBoolDomainFromState(state, source);
-        if (range.IsTop()) {
+    auto domain = state.CheckAbstractValueWithTopBottom(source);
+    if (domain == nullptr || domain->IsTop()) {
+        return false;
+    }
+    auto absVal = domain->CheckAbsVal();
+    if (absVal == nullptr) {
+        return false;
+    }
+    if (dest->GetType()->IsBoolean()) {
+        if (absVal->GetRangeKind() != ValueRange::RangeKind::BOOL) {
             return false;
         }
+        auto range = StaticCast<const BoolRange*>(absVal)->GetVal();
         state.Update(dest, std::make_unique<BoolRange>(range));
         return true;
     }
-    if (dest->GetType()->IsInteger() && source->GetType()->IsInteger()) {
-        auto range = GetSIntRangeFromState(state, source);
-        if (range == nullptr) {
+    if (dest->GetType()->IsInteger()) {
+        if (absVal->GetRangeKind() != ValueRange::RangeKind::SINT) {
             return false;
         }
-        state.Update(dest, range->Clone());
+        state.Update(dest, StaticCast<const SIntRange*>(absVal)->Clone());
         return true;
     }
     return false;
@@ -1759,29 +1895,88 @@ bool IsStructArrayValue(Value* value)
     return type != nullptr && type->IsStructArray();
 }
 
-void RecordRawArrayLiteralInit(const RawArrayLiteralInit* init)
+void CopyScalarStateOrTop(RangeDomain& state, Value* source, Value* dest)
+{
+    if (source == nullptr || dest == nullptr) {
+        return;
+    }
+    auto domain = state.CheckAbstractValueWithTopBottom(source);
+    if (domain != nullptr && domain->GetKind() == RangeValueDomain::ValueKind::VAL) {
+        state.Update(dest, *domain);
+        return;
+    }
+    state.SetToTopOrTopRef(dest, /* isRef = */ false);
+}
+
+void RecordRawArrayLiteralInit(RangeDomain& state, const RawArrayLiteralInit* init)
 {
     if (init == nullptr || !IsRawArrayRefValue(init->GetRawArray())) {
         return;
     }
-    std::lock_guard<std::mutex> lock(aggregateLiteralMtx);
-    rawArrayLiteralElements[init->GetRawArray()] = init->GetElements();
+    auto rawObj = state.CheckAbstractObjectRefBy(init->GetRawArray());
+    if (rawObj == nullptr) {
+        return;
+    }
+    auto elements = init->GetElements();
+    const auto setChildState = [&state, &elements](AbstractObject* child, size_t index) {
+        CopyScalarStateOrTop(state, elements[index], child);
+    };
+    state.EnsureChildren(rawObj, elements.size(), setChildState);
+    auto children = state.GetChildren(rawObj);
+    if (children.size() != elements.size()) {
+        state.ForgetChildren(rawObj);
+        return;
+    }
+    for (size_t i = 0; i < elements.size(); ++i) {
+        CopyScalarStateOrTop(state, elements[i], children[i]);
+    }
 }
 
-void InvalidateRawArrayLiteral(Value* rawArray)
+void InvalidateRawArrayLiteral(RangeDomain& state, Value* rawArray)
 {
     if (rawArray == nullptr) {
         return;
     }
-    std::lock_guard<std::mutex> lock(aggregateLiteralMtx);
-    rawArrayLiteralElements.erase(rawArray);
-    for (auto it = structArrayLiteralInfos.begin(); it != structArrayLiteralInfos.end();) {
-        if (it->second.rawArray == rawArray) {
-            it = structArrayLiteralInfos.erase(it);
-        } else {
-            ++it;
+    if (auto rawObj = state.CheckAbstractObjectRefBy(rawArray); rawObj != nullptr) {
+        state.ForgetChildren(rawObj);
+    }
+    {
+        std::lock_guard<std::mutex> lock(aggregateLiteralMtx);
+        for (auto it = structArrayLiteralInfos.begin(); it != structArrayLiteralInfos.end();) {
+            if (it->second.rawArray == rawArray) {
+                it = structArrayLiteralInfos.erase(it);
+            } else {
+                ++it;
+            }
         }
     }
+}
+
+void InvalidateStructArrayLiteral(Value* arrayValue)
+{
+    if (arrayValue == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(aggregateLiteralMtx);
+    structArrayLiteralInfos.erase(arrayValue);
+}
+
+void ForgetReferenceArgument(RangeDomain& state, Value* arg)
+{
+    if (arg == nullptr || arg->GetType() == nullptr || !arg->GetType()->IsRef()) {
+        return;
+    }
+    if (IsRawArrayRefValue(arg)) {
+        InvalidateRawArrayLiteral(state, arg);
+    }
+    if (IsStructArrayValue(arg)) {
+        auto info = LookupStructArrayLiteralInfo(arg);
+        if (info.has_value()) {
+            InvalidateRawArrayLiteral(state, info->rawArray);
+        }
+        InvalidateStructArrayLiteral(arg);
+    }
+    state.ForgetValueAndChildren(arg);
 }
 
 std::optional<StructArrayLiteralInfo> LookupStructArrayLiteralInfo(Value* arrayValue)
@@ -1794,14 +1989,13 @@ std::optional<StructArrayLiteralInfo> LookupStructArrayLiteralInfo(Value* arrayV
     return it->second;
 }
 
-Value* LookupRawArrayLiteralElement(Value* rawArray, size_t index)
+AbstractObject* LookupRawArrayLiteralElement(RangeDomain& state, Value* rawArray, size_t index)
 {
-    std::lock_guard<std::mutex> lock(aggregateLiteralMtx);
-    auto it = rawArrayLiteralElements.find(rawArray);
-    if (it == rawArrayLiteralElements.end() || index >= it->second.size()) {
+    auto rawObj = state.CheckAbstractObjectRefBy(rawArray);
+    if (rawObj == nullptr) {
         return nullptr;
     }
-    return it->second[index];
+    return state.GetChild(rawObj, index);
 }
 
 std::optional<size_t> GetEffectiveArrayLiteralIndex(const RangeDomain& state, Value* indexValue, Value* startValue)
@@ -1831,7 +2025,14 @@ bool TryCopyRawArrayLiteralElement(
     if (!index.has_value()) {
         return false;
     }
-    auto element = LookupRawArrayLiteralElement(rawArray, index.value());
+    auto element = LookupRawArrayLiteralElement(state, rawArray, index.value());
+    if (element == nullptr) {
+        return false;
+    }
+    if (dest != nullptr && dest->GetType() != nullptr && dest->GetType()->IsRef()) {
+        state.SetRefToObject(dest, element);
+        return true;
+    }
     return CopyKnownScalarRange(state, dest, element);
 }
 
@@ -1850,14 +2051,13 @@ bool TryRecordStructArrayLiteralConstructor(const Apply* apply)
     return true;
 }
 
-bool TryUpdateRawArrayLiteralElement(Value* rawArray, size_t index, Value* value)
+bool TryUpdateRawArrayLiteralElement(RangeDomain& state, Value* rawArray, size_t index, Value* value)
 {
-    std::lock_guard<std::mutex> lock(aggregateLiteralMtx);
-    auto it = rawArrayLiteralElements.find(rawArray);
-    if (it == rawArrayLiteralElements.end() || index >= it->second.size()) {
+    auto element = LookupRawArrayLiteralElement(state, rawArray, index);
+    if (element == nullptr || value == nullptr) {
         return false;
     }
-    it->second[index] = value;
+    CopyScalarStateOrTop(state, value, element);
     return true;
 }
 
@@ -1875,7 +2075,7 @@ bool TryHandleStructArrayLiteralMutation(RangeDomain& state, const Apply* apply)
         auto info = LookupStructArrayLiteralInfo(args[0]);
         auto index = info.has_value() ? GetEffectiveArrayLiteralIndex(state, args[1], info->start) : std::nullopt;
         if (info.has_value() && index.has_value() &&
-            TryUpdateRawArrayLiteralElement(info->rawArray, index.value(), args[2])) {
+            TryUpdateRawArrayLiteralElement(state, info->rawArray, index.value(), args[2])) {
             return true;
         }
     } else if (apply->GetCallee()->GetSrcCodeIdentifier() == "[]") {
@@ -1884,9 +2084,11 @@ bool TryHandleStructArrayLiteralMutation(RangeDomain& state, const Apply* apply)
     if (!apply->GetCallee()->TestAttr(Attribute::MUT) && apply->GetCallee()->GetSrcCodeIdentifier() != "[]") {
         return false;
     }
-    std::lock_guard<std::mutex> lock(aggregateLiteralMtx);
-    rawArrayLiteralElements.clear();
-    structArrayLiteralInfos.clear();
+    if (auto info = LookupStructArrayLiteralInfo(args[0]); info.has_value()) {
+        InvalidateRawArrayLiteral(state, info->rawArray);
+    }
+    state.ForgetValueAndChildren(args[0]);
+    InvalidateStructArrayLiteral(args[0]);
     return true;
 }
 
@@ -1931,15 +2133,21 @@ bool TryHandleRawArrayGetFromLiteral(RangeDomain& state, const Intrinsic* intrin
     return TryCopyRawArrayLiteralElement(state, intrinsic->GetResult(), args[0], args[1]);
 }
 
-bool TryInvalidateRawArrayLiteralWrite(const Intrinsic* intrinsic)
+bool TryInvalidateRawArrayLiteralWrite(RangeDomain& state, const Intrinsic* intrinsic)
 {
     auto kind = intrinsic->GetIntrinsicKind();
     if (kind != CHIR::IntrinsicKind::ARRAY_SET && kind != CHIR::IntrinsicKind::ARRAY_SET_UNCHECKED) {
         return false;
     }
     const auto& args = intrinsic->GetArgs();
+    if (args.size() >= 3 && IsRawArrayRefValue(args[0]) && args[1]->GetType()->IsInteger()) {
+        auto index = GetSingleNonNegativeIndex(state, args[1]);
+        if (index.has_value() && TryUpdateRawArrayLiteralElement(state, args[0], index.value(), args[2])) {
+            return true;
+        }
+    }
     if (!args.empty()) {
-        InvalidateRawArrayLiteral(args[0]);
+        InvalidateRawArrayLiteral(state, args[0]);
     }
     return true;
 }
@@ -1976,7 +2184,7 @@ void RangeAnalysis::HandleOthersExpr(RangeDomain& state, const Expression* expre
         case ExprKind::INTRINSIC:
             if (!TryHandleVArrayGetFromLiteral(state, StaticCast<const Intrinsic*>(expression)) &&
                 !TryHandleRawArrayGetFromLiteral(state, StaticCast<const Intrinsic*>(expression))) {
-                if (TryInvalidateRawArrayLiteralWrite(StaticCast<const Intrinsic*>(expression))) {
+                if (TryInvalidateRawArrayLiteralWrite(state, StaticCast<const Intrinsic*>(expression))) {
                     return;
                 }
                 auto dest = expression->GetResult();
@@ -1986,8 +2194,10 @@ void RangeAnalysis::HandleOthersExpr(RangeDomain& state, const Expression* expre
                 return state.SetToTopOrTopRef(dest, dest->GetType()->IsRef());
             }
             break;
+        case ExprKind::RAW_ARRAY_ALLOCATE:
+            return;
         case ExprKind::RAW_ARRAY_LITERAL_INIT:
-            RecordRawArrayLiteralInit(StaticCast<const RawArrayLiteralInit*>(expression));
+            RecordRawArrayLiteralInit(state, StaticCast<const RawArrayLiteralInit*>(expression));
             return;
         case ExprKind::CONSTANT:
         case ExprKind::APPLY:

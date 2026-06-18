@@ -216,13 +216,22 @@ private:
         RangeDomain& state, Value* calleeValue, const std::vector<Value*>& args, Value* result);
 
     std::optional<ContextAbstractValue> AnalyzeCalleeWithContext(
-        const Function* callee, const ContextArguments& arguments);
+        const Function* callee, const ContextArguments& arguments,
+        std::vector<std::optional<ContextAbstractValue>>& refArgValues);
 
     std::optional<ContextAbstractValue> SummarizeReturnValue(const Function* callee, Results<RangeDomain>& results);
 
+    std::vector<std::optional<ContextAbstractValue>> SummarizeRefParamValues(
+        const Function* callee, Results<RangeDomain>& results);
+
     ContextAbstractValue CaptureContextValue(const RangeDomain& state, Value* value, bool preserveIntervals) const;
 
+    ContextAbstractValue CaptureContextValue(
+        const RangeDomain& state, Value* value, Type* type, bool preserveIntervals) const;
+
     void ApplyContextValue(RangeDomain& state, Value* dest, const ContextAbstractValue& value) const;
+
+    void ApplyContextValue(RangeDomain& state, Value* dest, Type* type, const ContextAbstractValue& value) const;
 
     static std::mutex& GetContextSummaryMutex();
 

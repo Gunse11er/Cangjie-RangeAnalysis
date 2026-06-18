@@ -241,19 +241,40 @@ bool IsIdentifierChar(char c)
     return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
 }
 
-bool SourceLineMentionsVariable(const std::string& line, const std::string& variableName)
+bool SourceLineDeclaresVariable(const std::string& line, const std::string& variableName)
 {
+    auto comment = line.find("//");
+    auto trimmed = Trim(comment == std::string::npos ? line : line.substr(0, comment));
+    const std::string letPrefix = "let ";
+    const std::string varPrefix = "var ";
     size_t pos = 0;
-    while ((pos = line.find(variableName, pos)) != std::string::npos) {
-        auto before = pos == 0 ? '\0' : line[pos - 1];
-        auto afterPos = pos + variableName.size();
-        auto after = afterPos >= line.size() ? '\0' : line[afterPos];
-        if (!IsIdentifierChar(before) && !IsIdentifierChar(after)) {
-            return true;
-        }
-        pos = afterPos;
+    if (trimmed.rfind(letPrefix, 0) == 0) {
+        pos = letPrefix.size();
+    } else if (trimmed.rfind(varPrefix, 0) == 0) {
+        pos = varPrefix.size();
+    } else {
+        return false;
     }
-    return false;
+    while (pos < trimmed.size() && std::isspace(static_cast<unsigned char>(trimmed[pos]))) {
+        ++pos;
+    }
+    auto nameBegin = pos;
+    while (pos < trimmed.size() && IsIdentifierChar(trimmed[pos])) {
+        ++pos;
+    }
+    if (nameBegin == pos || trimmed.substr(nameBegin, pos - nameBegin) != variableName) {
+        return false;
+    }
+    while (pos < trimmed.size() && std::isspace(static_cast<unsigned char>(trimmed[pos]))) {
+        ++pos;
+    }
+    if (pos < trimmed.size() && trimmed[pos] == ':') {
+        ++pos;
+        while (pos < trimmed.size() && trimmed[pos] != '=') {
+            ++pos;
+        }
+    }
+    return pos < trimmed.size() && trimmed[pos] == '=';
 }
 
 // 将源码显式类型名转换为 contest query 的轻量类型提示。
@@ -527,9 +548,20 @@ void InferContestQuerySourceFallback(const std::vector<std::string>& lines, Cont
     if (!query.valid || query.line == 0 || query.line > lines.size()) {
         return;
     }
+    auto setSourceFallback = [&query](const SourceExactValue& value) {
+        query.sourceFallback = value.typeHint == ContestQueryTypeHint::BOOL
+            ? (value.boolValue ? "true" : "false")
+            : std::to_string(value.intValue);
+        query.hasSourceFallback = true;
+    };
     std::vector<SourceScope> scopes(1);
     for (unsigned lineNo = 1; lineNo <= query.line; ++lineNo) {
         auto line = lines[lineNo - 1];
+        if (lineNo == query.line && !SourceLineDeclaresVariable(line, query.variableName)) {
+            if (auto value = LookupSourceValue(scopes, query.variableName); value != nullptr) {
+                setSourceFallback(*value);
+            }
+        }
         std::string name;
         ContestQueryTypeHint typeHint{ContestQueryTypeHint::UNKNOWN};
         std::string expr;
@@ -551,10 +583,7 @@ void InferContestQuerySourceFallback(const std::vector<std::string>& lines, Cont
             if (hasValue) {
                 scopes.back()[name] = value;
                 if (lineNo == query.line && name == query.variableName) {
-                    query.sourceFallback = typeHint == ContestQueryTypeHint::BOOL
-                        ? (value.boolValue ? "true" : "false")
-                        : std::to_string(value.intValue);
-                    query.hasSourceFallback = true;
+                    setSourceFallback(value);
                 }
             }
         }
@@ -915,7 +944,7 @@ void RecordContestSourceLineCandidate(
     ContestAggregateMap& aggregates, ContestQuery& query, Value* value, const RangeDomain& state)
 {
     if (!query.valid || query.sourceLine.empty() || value == nullptr ||
-        !SourceLineMentionsVariable(query.sourceLine, query.variableName)) {
+        !SourceLineDeclaresVariable(query.sourceLine, query.variableName)) {
         return;
     }
     auto type = GetQueryValueType(value);
@@ -1098,9 +1127,6 @@ void ResolveQueryAtExpressionOperands(std::vector<ContestQuery>& queries, const 
         if (!IsSameQueryLocation(query, expr.GetDebugLocation(), contestRoot)) {
             continue;
         }
-        for (auto operand : expr.GetOperands()) {
-            RecordContestSourceLineCandidate(aggregates, query, operand, state);
-        }
         RecordContestSourceLineCandidate(aggregates, query, expr.GetResult(), state);
     }
 }
@@ -1144,6 +1170,9 @@ bool IsLoopBranchConditionExpr(const Expression& expr)
 // 按查询顺序写入 output.txt，未解析项使用 fallback。
 std::string GetContestQueryOutput(const ContestQuery& query)
 {
+    if (query.hasSourceFallback && !SourceLineDeclaresVariable(query.sourceLine, query.variableName)) {
+        return query.sourceFallback;
+    }
     if (query.resolved) {
         return query.result;
     }

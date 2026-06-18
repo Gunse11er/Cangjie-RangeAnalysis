@@ -19,6 +19,7 @@
 #include "cangjie/CHIR/Utils/CHIRCasting.h"
 #include "cangjie/CHIR/Utils/Utils.h"
 
+#include <functional>
 #include <iostream>
 #include <utility>
 #include <variant>
@@ -361,6 +362,30 @@ public:
         return index < children.size() ? children[index] : nullptr;
     }
 
+    void EnsureChildren(Value* obj, size_t childrenNum, std::function<void(AbstractObject*, size_t)> setChildState)
+    {
+        if (obj == nullptr || childrenMap->find(obj) != childrenMap->end()) {
+            return;
+        }
+        CreateChildren(obj, childrenNum, std::move(setChildState));
+    }
+
+    void ForgetValueAndChildren(Value* val)
+    {
+        if (val == nullptr) {
+            return;
+        }
+        SetSelfAndChildrenStateToTop(val);
+    }
+
+    void ForgetChildren(Value* obj)
+    {
+        if (obj == nullptr) {
+            return;
+        }
+        SetNonTopChildrenStateToTop(GetChildren(obj));
+    }
+
     /**
      * @brief create ref to CHIR reference type value and set to top.
      * @param dest CHIR reference type value.
@@ -391,6 +416,17 @@ public:
         refMap.emplace(refInner, obj);
         SetToBound(obj, true);
         return obj;
+    }
+
+    void SetRefToObject(Value* dest, AbstractObject* obj, const Expression* expr = nullptr)
+    {
+        if (dest == nullptr || obj == nullptr) {
+            return;
+        }
+        CJC_ASSERT(!dest->GetType() || dest->GetType()->IsRef() || dest->GetType()->IsGeneric());
+        auto ref = CreateNewRef(expr);
+        Update(dest, ref);
+        refMap[ref] = obj;
     }
 
     /// check value is bottom
