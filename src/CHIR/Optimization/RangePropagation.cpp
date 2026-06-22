@@ -1328,6 +1328,34 @@ bool IsSameQueryLocation(const ContestQuery& query, const DebugLocation& locatio
     return !HasDirectoryPart(query.sourceFileName) && query.fileName == BaseName(location.GetFileName());
 }
 
+bool MayMatchAnyContestQuery(
+    const std::vector<ContestQuery>& queries, const DebugLocation& location, const std::filesystem::path& contestRoot)
+{
+    return std::any_of(queries.begin(), queries.end(), [&](const auto& query) {
+        return query.valid && IsSameQueryLocation(query, location, contestRoot);
+    });
+}
+
+bool FunctionMayContainContestQuery(
+    const Function* func, const std::vector<ContestQuery>& queries, const std::filesystem::path& contestRoot)
+{
+    if (func == nullptr || func->GetBody() == nullptr) {
+        return false;
+    }
+    for (auto block : func->GetBody()->GetAllBlocks()) {
+        for (auto expr : block->GetExpressions()) {
+            if (MayMatchAnyContestQuery(queries, expr->GetDebugLocation(), contestRoot)) {
+                return true;
+            }
+        }
+        if (auto terminator = block->GetTerminator();
+            terminator != nullptr && MayMatchAnyContestQuery(queries, terminator->GetDebugLocation(), contestRoot)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // 判断某个值是否已关联指定源码变量名。
 bool HasValueNameForQuery(const ValueNameMap& valueNames, Value* value, const ContestQuery& query)
 {
@@ -1655,7 +1683,7 @@ void RangePropagation::RunOnFunc(const Ptr<const Function>& func, bool isDebug)
 
 // 遍历缓存的 RangeAnalysis 状态并生成竞赛查询输出。
 void RangePropagation::EmitContestOutput(const Ptr<const Package>& package, RangeAnalysisWrapper& rangeAnalysisWrapper,
-    const std::vector<std::string>& contestRootHints)
+    const std::vector<std::string>& contestRootHints, DiagnosticEngine& diag)
 {
     auto inputContext = FindContestInputContext(contestRootHints);
     if (!inputContext.has_value()) {
@@ -1683,15 +1711,20 @@ void RangePropagation::EmitContestOutput(const Ptr<const Package>& package, Rang
     };
 
     for (auto func : package->GetGlobalFuncsWithBody()) {
-        auto result = rangeAnalysisWrapper.CheckFuncResult(func);
-        if (!result) {
+        if (!RangeAnalysis::Filter(*func) || !FunctionMayContainContestQuery(func, queries.value(), contestRoot)) {
             continue;
         }
-        resolveQueries(*result);
+        auto cachedResult = rangeAnalysisWrapper.CheckFuncResult(func);
+        if (cachedResult != nullptr) {
+            resolveQueries(*cachedResult);
+            continue;
+        }
+        auto result = rangeAnalysisWrapper.RunOnFunc(func, /* isDebug = */ false, diag);
+        if (result != nullptr) {
+            resolveQueries(*result);
+        }
+        RangeAnalysis::ClearContextSensitiveResults();
     }
-
-    RangeAnalysis::VisitContextSensitiveResults(
-        [&](const Function*, const std::string&, Results<RangeDomain>& result) { resolveQueries(result); });
 
     ApplyContestAggregates(queries.value(), aggregates);
     WriteContestOutput(queries.value(), inputContext.value());

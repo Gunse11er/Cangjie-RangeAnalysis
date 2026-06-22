@@ -619,12 +619,13 @@ void ToCHIR::RunRangePropagation()
     Utils::ProfileRecorder::Start("CHIR Opt", "Range Propagation");
     RangeAnalysis::ClearContextSensitiveResults();
     AnalysisWrapper<RangeAnalysis, RangeDomain> vra(builder);
-    vra.RunOnPackage(chirPkg, opts.chirDebugOptimizer, opts.GetJobs(), diag);
-    CHIR::RangePropagation::EmitContestOutput(chirPkg, vra, contestRootHints);
     if (hasContestInput) {
+        RangeAnalysis::InitialiseLetGVState(*chirPkg, builder);
+        CHIR::RangePropagation::EmitContestOutput(chirPkg, vra, contestRootHints, diag);
         Utils::ProfileRecorder::Stop("CHIR Opt", "Range Propagation");
         std::exit(0);
     }
+    vra.RunOnPackage(chirPkg, opts.chirDebugOptimizer, opts.GetJobs(), diag);
     if (!opts.IsCHIROptimizationLevelOverO2()) {
         Utils::ProfileRecorder::Stop("CHIR Opt", "Range Propagation");
         return;
