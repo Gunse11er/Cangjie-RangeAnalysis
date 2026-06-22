@@ -6,6 +6,8 @@
 
 #include "cangjie/CHIR/CHIR.h"
 
+#include <cstdlib>
+
 #include "cangjie/Basic/DiagnosticEngine.h"
 #include "cangjie/CHIR/Analysis/CallGraphAnalysis.h"
 #include "cangjie/CHIR/Analysis/ConstAnalysisWrapper.h"
@@ -619,7 +621,11 @@ void ToCHIR::RunRangePropagation()
     AnalysisWrapper<RangeAnalysis, RangeDomain> vra(builder);
     vra.RunOnPackage(chirPkg, opts.chirDebugOptimizer, opts.GetJobs(), diag);
     CHIR::RangePropagation::EmitContestOutput(chirPkg, vra, contestRootHints);
-    if (hasContestInput || !opts.IsCHIROptimizationLevelOverO2()) {
+    if (hasContestInput) {
+        Utils::ProfileRecorder::Stop("CHIR Opt", "Range Propagation");
+        std::exit(0);
+    }
+    if (!opts.IsCHIROptimizationLevelOverO2()) {
         Utils::ProfileRecorder::Stop("CHIR Opt", "Range Propagation");
         return;
     }
