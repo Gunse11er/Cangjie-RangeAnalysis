@@ -24,8 +24,9 @@ using LoopRangeSnapshot = std::unordered_map<Value*, std::unique_ptr<SIntDomain>
 using LoopRangeSnapshots = std::unordered_map<const Block*, LoopRangeSnapshot>;
 std::unordered_map<const RangeAnalysis*, LoopRangeSnapshots> loopRangeSnapshots;
 std::mutex loopRangeSnapshotsMtx;
-constexpr size_t MAX_CONTEXT_PER_FUNCTION = 128;
-constexpr size_t MAX_EXACT_INT_SET_SIZE = 64;
+constexpr size_t MAX_CONTEXT_PER_FUNCTION = 32;
+constexpr size_t MAX_TOTAL_CONTEXT_SUMMARIES = 512;
+constexpr size_t MAX_EXACT_INT_SET_SIZE = 32;
 
 struct StructArrayLiteralInfo {
     Value* rawArray{nullptr};
@@ -174,7 +175,6 @@ struct RangeAnalysis::ContextualSummary {
     std::optional<ContextAbstractValue> returnValue;
     std::vector<std::optional<ContextAbstractValue>> refArgValues;
     const Function* callee{nullptr};
-    std::unique_ptr<Results<RangeDomain>> results;
 };
 
 std::mutex& RangeAnalysis::GetContextSummaryMutex()
@@ -203,47 +203,7 @@ std::unordered_map<const Function*, size_t>& RangeAnalysis::GetContextCounts()
 
 void RangeAnalysis::VisitContextSensitiveResults(const ContextResultVisitor& visitor)
 {
-    if (!visitor) {
-        return;
-    }
-    std::unordered_set<std::string> visited;
-    while (true) {
-        std::vector<std::tuple<size_t, size_t, const Function*, std::string, Results<RangeDomain>*>> readyResults;
-        size_t maxPrecision = 0;
-        bool hasReadyResult = false;
-        {
-            std::lock_guard<std::mutex> lock(GetContextSummaryMutex());
-            auto& cache = GetContextSummaryCache();
-            auto& order = GetContextSummaryOrder();
-            for (size_t i = 0; i < order.size(); ++i) {
-                const auto& key = order[i];
-                if (visited.find(key) != visited.end()) {
-                    continue;
-                }
-                auto it = cache.find(key);
-                if (it == cache.end() || !it->second.ready || it->second.results == nullptr) {
-                    continue;
-                }
-                hasReadyResult = true;
-                maxPrecision = std::max(maxPrecision, it->second.precision);
-                readyResults.emplace_back(it->second.precision, i, it->second.callee, key, it->second.results.get());
-            }
-        }
-        if (!hasReadyResult) {
-            return;
-        }
-        readyResults.erase(std::remove_if(readyResults.begin(), readyResults.end(),
-                               [maxPrecision](const auto& result) { return std::get<0>(result) != maxPrecision; }),
-            readyResults.end());
-        std::stable_sort(readyResults.begin(), readyResults.end(),
-            [](const auto& lhs, const auto& rhs) { return std::get<1>(lhs) < std::get<1>(rhs); });
-        for (auto& [precision, index, callee, key, results] : readyResults) {
-            (void)precision;
-            (void)index;
-            visited.emplace(key);
-            visitor(callee, key, *results);
-        }
-    }
+    (void)visitor;
 }
 
 void RangeAnalysis::ClearContextSensitiveResults()
@@ -431,6 +391,9 @@ std::optional<RangeAnalysis::ContextAbstractValue> RangeAnalysis::AnalyzeCalleeW
             }
             return it->second.ready ? it->second.returnValue : std::nullopt;
         }
+        if (GetContextSummaryOrder().size() >= MAX_TOTAL_CONTEXT_SUMMARIES) {
+            return std::nullopt;
+        }
         auto& count = GetContextCounts()[callee];
         if (count >= MAX_CONTEXT_PER_FUNCTION) {
             return std::nullopt;
@@ -461,7 +424,6 @@ std::optional<RangeAnalysis::ContextAbstractValue> RangeAnalysis::AnalyzeCalleeW
         cached.ready = true;
         cached.returnValue = returnValue;
         cached.refArgValues = summarizedRefArgs;
-        cached.results = std::move(results);
     }
     refArgValues = std::move(summarizedRefArgs);
     return returnValue;
