@@ -2255,6 +2255,45 @@ void InferSourceTryFallback(const std::vector<std::string>& lines, ContestQuery&
     }
 }
 
+
+void MergePriorSourceFallback(ContestQuery& query, const ContestQuery& candidate)
+{
+    if (candidate.hasSourceFallback) {
+        query.sourceFallback = candidate.sourceFallback;
+        query.hasSourceFallback = true;
+    }
+    if (candidate.hasAccumulatorFallback) {
+        query.accumulatorFallback = candidate.accumulatorFallback;
+        query.hasAccumulatorFallback = true;
+    }
+}
+
+void InferPriorSourceAssignmentFallback(const std::vector<std::string>& lines, ContestQuery& query)
+{
+    if (!query.valid || query.line == 0 || query.line > lines.size() || query.typeHint == ContestQueryTypeHint::BOOL) {
+        return;
+    }
+    unsigned begin = query.line > 512 ? query.line - 512 : 1;
+    for (unsigned lineNo = begin; lineNo < query.line && lineNo <= lines.size(); ++lineNo) {
+        if (!SourceLineAssignsVariableName(lines[lineNo - 1], query.variableName)) {
+            continue;
+        }
+        ContestQuery candidate = query;
+        candidate.line = lineNo;
+        candidate.sourceLine = lines[lineNo - 1];
+        candidate.sourceFallback.clear();
+        candidate.accumulatorFallback.clear();
+        candidate.hasSourceFallback = false;
+        candidate.hasAccumulatorFallback = false;
+        candidate.resolved = false;
+        InferSourceAssignedValuesFallback(lines, candidate);
+        InferSourceMatchFallback(lines, candidate);
+        InferSourceFunctionCallFallback(lines, candidate);
+        InferSourceTryFallback(lines, candidate);
+        MergePriorSourceFallback(query, candidate);
+    }
+}
+
 void InferContestQuerySourceFallback(const std::vector<std::string>& lines, ContestQuery& query)
 {
     if (!query.valid || query.line == 0 || query.line > lines.size()) {
@@ -2333,6 +2372,7 @@ void InferContestQueryTypeHintFromSource(ContestQuery& query,
     InferSourceGlobalConstantFallback(it->second, query);
     InferSourceFunctionCallFallback(it->second, query);
     InferSourceTryFallback(it->second, query);
+    InferPriorSourceAssignmentFallback(it->second, query);
     InferSourceAccumulatorFallback(it->second, query);
 }
 
