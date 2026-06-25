@@ -608,6 +608,47 @@ void CollectSourceAssignedIntValues(const std::vector<std::string>& lines, unsig
     }
 }
 
+bool SourceRangeHasZeroInitializer(const std::vector<std::string>& lines, unsigned begin, unsigned end,
+    const std::string& variableName)
+{
+    std::vector<SourceScope> emptyScopes(1);
+    for (unsigned lineNo = begin; lineNo <= end && lineNo <= lines.size(); ++lineNo) {
+        std::string name;
+        ContestQueryTypeHint typeHint{ContestQueryTypeHint::UNKNOWN};
+        std::string expr;
+        if (ParseSourceDeclaration(lines[lineNo - 1], name, typeHint, expr) && name == variableName &&
+            IsSourceIntegerTypeHint(typeHint)) {
+            auto value = EvalSourceIntExpr(expr, emptyScopes);
+            return value.has_value() && value.value() == 0;
+        }
+    }
+    return false;
+}
+
+size_t CountSourceAssignments(const std::vector<std::string>& lines, unsigned begin, unsigned end,
+    const std::string& variableName)
+{
+    size_t count = 0;
+    for (unsigned lineNo = begin; lineNo <= end && lineNo <= lines.size(); ++lineNo) {
+        std::string name;
+        std::string expr;
+        if (ParseSourceAssignment(lines[lineNo - 1], name, expr) && name == variableName) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+void DropCoveredSourceZeroInitializer(const std::vector<std::string>& lines, unsigned begin, unsigned end,
+    const std::string& variableName, std::vector<int64_t>& values)
+{
+    if (values.size() <= 1 || !SourceRangeHasZeroInitializer(lines, begin, end, variableName) ||
+        CountSourceAssignments(lines, begin, end, variableName) < 2) {
+        return;
+    }
+    values.erase(std::remove(values.begin(), values.end(), 0), values.end());
+}
+
 void InferSourceAssignedValuesFallback(const std::vector<std::string>& lines, ContestQuery& query)
 {
     if (!query.valid || query.line == 0 || query.line > lines.size() || query.typeHint == ContestQueryTypeHint::BOOL) {
@@ -620,10 +661,12 @@ void InferSourceAssignedValuesFallback(const std::vector<std::string>& lines, Co
         auto end = loop->end > 0 ? loop->end - 1 : loop->end;
         if (begin <= end) {
             CollectSourceAssignedIntValues(lines, begin, end, query.variableName, values);
+            DropCoveredSourceZeroInitializer(lines, begin, end, query.variableName, values);
         }
     } else {
         auto begin = query.line > 96 ? query.line - 96 : 1;
         CollectSourceAssignedIntValues(lines, begin, query.line, query.variableName, values);
+        DropCoveredSourceZeroInitializer(lines, begin, query.line, query.variableName, values);
     }
     if (values.size() > 1) {
         SetSourceIntSetFallback(query, std::move(values));
@@ -2035,14 +2078,18 @@ bool IsLoopBranchConditionExpr(const Expression& expr)
 // 按查询顺序写入 output.txt，未解析项使用 fallback。
 std::string GetContestQueryOutput(const ContestQuery& query)
 {
-    if (query.hasSourceFallback && !SourceLineDeclaresVariable(query.sourceLine, query.variableName)) {
+    if (query.resolved) {
+        auto fallback = FormatFallback(query);
+        auto typeFallback = query.type != nullptr ? FormatFallback(query.type) : fallback;
+        if (query.result != fallback && query.result != typeFallback) {
+            return query.result;
+        }
+    }
+    if (query.hasSourceFallback) {
         return query.sourceFallback;
     }
     if (query.resolved) {
         return query.result;
-    }
-    if (query.hasSourceFallback) {
-        return query.sourceFallback;
     }
     return FormatFallback(query);
 }
