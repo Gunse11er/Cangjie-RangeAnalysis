@@ -148,7 +148,7 @@ struct ContestAggregate {
 };
 
 using ContestAggregateMap = std::unordered_map<std::string, ContestAggregate>;
-constexpr size_t MAX_CONTEST_EXACT_VALUES = 64;
+constexpr size_t MAX_CONTEST_EXACT_VALUES = 256;
 
 // 去除竞赛输入字段首尾空白。
 std::string Trim(const std::string& str)

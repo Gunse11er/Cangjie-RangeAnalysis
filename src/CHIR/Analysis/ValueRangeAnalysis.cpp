@@ -24,9 +24,9 @@ using LoopRangeSnapshot = std::unordered_map<Value*, std::unique_ptr<SIntDomain>
 using LoopRangeSnapshots = std::unordered_map<const Block*, LoopRangeSnapshot>;
 std::unordered_map<const RangeAnalysis*, LoopRangeSnapshots> loopRangeSnapshots;
 std::mutex loopRangeSnapshotsMtx;
-constexpr size_t MAX_CONTEXT_PER_FUNCTION = 16;
-constexpr size_t MAX_TOTAL_CONTEXT_SUMMARIES = 128;
-constexpr size_t MAX_EXACT_INT_SET_SIZE = 32;
+constexpr size_t MAX_CONTEXT_PER_FUNCTION = 32;
+constexpr size_t MAX_TOTAL_CONTEXT_SUMMARIES = 512;
+constexpr size_t MAX_EXACT_INT_SET_SIZE = 64;
 
 struct StructArrayLiteralInfo {
     Value* rawArray{nullptr};
@@ -1291,7 +1291,7 @@ std::optional<SIntDomain> TryComputeBitwiseRange(ExprKind kind, const SIntDomain
 }
 
 template <> const std::string Analysis<RangeDomain>::name = "range-analysis";
-template <> const std::optional<unsigned> Analysis<RangeDomain>::blockLimit = 128;
+template <> const std::optional<unsigned> Analysis<RangeDomain>::blockLimit = 2048;
 template <> RangeDomain::ChildrenMap ValueAnalysis<RangeValueDomain>::globalChildrenMap{};
 template <> RangeDomain::AllocatedRefMap ValueAnalysis<RangeValueDomain>::globalAllocatedRefMap{};
 template <> RangeDomain::AllocatedObjMap ValueAnalysis<RangeValueDomain>::globalAllocatedObjMap{};
