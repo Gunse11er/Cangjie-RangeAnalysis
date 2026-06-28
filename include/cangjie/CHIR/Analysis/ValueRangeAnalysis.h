@@ -251,6 +251,10 @@ private:
 
     enum class ExceptionKind : uint8_t { SUCCESS, FAIL, NA };
 
+    ExceptionKind HandleTypeCastWithException(RangeDomain& state, const TypeCastWithException* cast);
+
+    ExceptionKind HandleIntOpWithException(RangeDomain& state, const IntOpWithException* intOp);
+
     // =============== Transfer functions for TypeCast expression =============== //
     SIntDomain ComputeTypeCast(RangeDomain& state, PtrSymbol oldSymbol, const SIntDomain& v, IntWidth dstSize,
         bool dstUnsigned, OverflowStrategy ov) const;

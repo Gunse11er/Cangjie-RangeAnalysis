@@ -1003,9 +1003,14 @@ void ApplyLoopWidening(RangeDomain& state, const LoopRangeSnapshot& previousRang
     }
 }
 
+inline bool IsBasicArithmeticKind(ExprKind kind)
+{
+    return (kind >= ExprKind::ADD && kind <= ExprKind::MOD) || kind == ExprKind::EXP;
+}
+
 inline bool IsBasicBinaryExpr(const Expression& expr)
 {
-    return expr.GetExprKind() >= ExprKind::ADD && expr.GetExprKind() <= ExprKind::MOD;
+    return IsBasicArithmeticKind(expr.GetExprKind());
 }
 
 // 判断是否是整数位运算二元表达式。
@@ -1078,12 +1083,8 @@ SIntDomain ComputeBitNotRange(const SIntDomain& operand, bool isUnsigned)
 }
 
 // 从右操作数值域中提取合法常量移位量。
-std::optional<unsigned> GetShiftAmount(const SIntDomain& range, bool isUnsigned, IntWidth lhsWidth)
+std::optional<unsigned> GetShiftAmount(const SInt& value, bool isUnsigned, IntWidth lhsWidth)
 {
-    if (!range.IsSingleValue()) {
-        return std::nullopt;
-    }
-    auto value = range.NumericBound().GetSingleElement();
     if (!isUnsigned && value.Slt(0)) {
         return std::nullopt;
     }
@@ -1092,6 +1093,27 @@ std::optional<unsigned> GetShiftAmount(const SIntDomain& range, bool isUnsigned,
         return std::nullopt;
     }
     return static_cast<unsigned>(amount);
+}
+
+std::optional<unsigned> GetShiftAmount(const SIntDomain& range, bool isUnsigned, IntWidth lhsWidth)
+{
+    if (!range.IsSingleValue()) {
+        return std::nullopt;
+    }
+    return GetShiftAmount(range.NumericBound().GetSingleElement(), isUnsigned, lhsWidth);
+}
+
+std::optional<SInt> ApplyExactShift(
+    ExprKind kind, const SInt& lhs, const SInt& rhs, bool rhsUnsigned, bool destUnsigned)
+{
+    auto amount = GetShiftAmount(rhs, rhsUnsigned, lhs.Width());
+    if (!amount.has_value()) {
+        return std::nullopt;
+    }
+    if (kind == ExprKind::LSHIFT) {
+        return lhs.Shl(*amount);
+    }
+    return destUnsigned ? lhs.LShr(*amount) : lhs.Ashr(*amount);
 }
 
 // 对单点操作数精确计算位运算或移位结果。
@@ -1348,20 +1370,91 @@ const SIntRange* GetSIntRangeFromState(const RangeDomain& state, const Ptr<Value
     return StaticCast<const SIntRange*>(absVal);
 }
 
-std::optional<SIntRange> TryComputeExactBitwiseRange(
-    ExprKind kind, const SIntRange* lhs, const SIntRange* rhs, bool destUnsigned)
+std::optional<std::vector<SInt>> GetExactValuesOrSmallRange(const SIntRange* range, bool asUnsigned)
 {
-    if (!IsBitwiseBinaryExpr(kind) || lhs == nullptr || rhs == nullptr || !lhs->GetExactValues().has_value() ||
-        !rhs->GetExactValues().has_value()) {
+    if (range == nullptr) {
         return std::nullopt;
     }
-    if (lhs->GetExactValues()->size() * rhs->GetExactValues()->size() > MAX_EXACT_INT_SET_SIZE) {
+    if (range->GetExactValues().has_value()) {
+        return range->GetExactValues();
+    }
+    const auto& domain = range->GetVal();
+    if (domain.IsTop() || domain.IsBottom() || !domain.SymbolicBounds().Empty()) {
+        return std::nullopt;
+    }
+    const auto& numeric = domain.NumericBound();
+    if (numeric.IsFullSet() || numeric.IsEmptySet()) {
+        return std::nullopt;
+    }
+    auto width = domain.Width();
+    std::vector<SInt> values;
+    if (asUnsigned) {
+        if (numeric.IsWrappedSet()) {
+            return std::nullopt;
+        }
+        auto min = numeric.UMinValue().UVal();
+        auto max = numeric.UMaxValue().UVal();
+        if (max < min) {
+            return std::nullopt;
+        }
+        auto count = static_cast<unsigned __int128>(max) - static_cast<unsigned __int128>(min) + 1U;
+        if (count == 0 || count > static_cast<unsigned __int128>(MAX_EXACT_INT_SET_SIZE)) {
+            return std::nullopt;
+        }
+        values.reserve(static_cast<size_t>(count));
+        for (uint64_t value = min;; ++value) {
+            values.emplace_back(width, value);
+            if (value == max) {
+                break;
+            }
+        }
+    } else {
+        if (numeric.IsSignWrappedSet()) {
+            return std::nullopt;
+        }
+        auto min = numeric.SMinValue().SVal();
+        auto max = numeric.SMaxValue().SVal();
+        if (max < min) {
+            return std::nullopt;
+        }
+        auto count = static_cast<__int128>(max) - static_cast<__int128>(min) + 1;
+        if (count <= 0 || count > static_cast<__int128>(MAX_EXACT_INT_SET_SIZE)) {
+            return std::nullopt;
+        }
+        values.reserve(static_cast<size_t>(count));
+        for (int64_t value = min;; ++value) {
+            values.emplace_back(width, static_cast<uint64_t>(value));
+            if (value == max) {
+                break;
+            }
+        }
+    }
+    return NormalizeExactIntSet(std::move(values));
+}
+
+std::optional<SIntRange> TryComputeExactBitwiseRange(
+    ExprKind kind, const std::optional<std::vector<SInt>>& lhsValues,
+    const std::optional<std::vector<SInt>>& rhsValues, bool rhsUnsigned, bool destUnsigned)
+{
+    if ((!IsBitwiseBinaryExpr(kind) && !IsShiftBinaryExpr(kind)) || !lhsValues.has_value() ||
+        !rhsValues.has_value()) {
+        return std::nullopt;
+    }
+    if (lhsValues->size() * rhsValues->size() > MAX_EXACT_INT_SET_SIZE) {
         return std::nullopt;
     }
     std::vector<SInt> values;
-    values.reserve(lhs->GetExactValues()->size() * rhs->GetExactValues()->size());
-    for (const auto& lhsValue : *lhs->GetExactValues()) {
-        for (const auto& rhsValue : *rhs->GetExactValues()) {
+    values.reserve(lhsValues->size() * rhsValues->size());
+    for (const auto& lhsValue : *lhsValues) {
+        for (const auto& rhsValue : *rhsValues) {
+            if (IsShiftBinaryExpr(kind)) {
+                auto value = ApplyExactShift(kind, lhsValue, rhsValue, rhsUnsigned, destUnsigned);
+                if (!value.has_value()) {
+                    return std::nullopt;
+                }
+                values.emplace_back(value.value());
+                continue;
+            }
             values.emplace_back(ApplyExactBitwise(kind, lhsValue, rhsValue, destUnsigned));
         }
     }
@@ -1373,10 +1466,120 @@ std::optional<SIntRange> TryComputeExactBitwiseRange(
     return SIntRange{std::move(domain), std::move(exactValues)};
 }
 
-std::optional<SInt> ApplyExactArithmetic(ExprKind kind, const SInt& lhs, const SInt& rhs,
-    const Ptr<Type>& type, OverflowStrategy ov, bool isUnsigned)
+std::optional<SInt> ApplyExactUnsignedPower(
+    const SInt& lhs, const SInt& rhs, OverflowStrategy ov)
 {
     auto width = lhs.Width();
+    uint64_t mask = SInt::UMaxValue(width).UVal();
+    uint64_t result = 1ULL & mask;
+    uint64_t base = lhs.UVal() & mask;
+    uint64_t exponent = rhs.UVal();
+    bool overflow = false;
+    const auto multiply = [mask](uint64_t a, uint64_t b, uint64_t& out) {
+        auto product = static_cast<unsigned __int128>(a) * static_cast<unsigned __int128>(b);
+        out = static_cast<uint64_t>(product) & mask;
+        return product > static_cast<unsigned __int128>(mask);
+    };
+    while (exponent != 0) {
+        if ((exponent & 1U) != 0) {
+            overflow = multiply(result, base, result) || overflow;
+        }
+        exponent >>= 1U;
+        if (exponent != 0) {
+            overflow = multiply(base, base, base) || overflow;
+        }
+    }
+    if (overflow && ov == OverflowStrategy::THROWING) {
+        return std::nullopt;
+    }
+    if (overflow && ov == OverflowStrategy::SATURATING) {
+        return SInt::UMaxValue(width);
+    }
+    return SInt{width, result};
+}
+
+std::optional<SInt> ApplyExactSignedPower(const SInt& lhs, const SInt& rhs, OverflowStrategy ov)
+{
+    auto width = lhs.Width();
+    uint64_t exponent = rhs.UVal();
+    if (ov == OverflowStrategy::WRAPPING) {
+        uint64_t mask = SInt::UMaxValue(width).UVal();
+        uint64_t result = 1ULL & mask;
+        uint64_t base = lhs.UVal() & mask;
+        while (exponent != 0) {
+            if ((exponent & 1U) != 0) {
+                result = static_cast<uint64_t>(
+                    static_cast<unsigned __int128>(result) * static_cast<unsigned __int128>(base)) & mask;
+            }
+            exponent >>= 1U;
+            if (exponent != 0) {
+                base = static_cast<uint64_t>(
+                    static_cast<unsigned __int128>(base) * static_cast<unsigned __int128>(base)) & mask;
+            }
+        }
+        return SInt{width, result};
+    }
+
+    auto lower = static_cast<__int128>(SInt::SMinValue(width).SVal());
+    auto upper = static_cast<__int128>(SInt::SMaxValue(width).SVal());
+    auto result = static_cast<__int128>(1);
+    auto base = static_cast<__int128>(lhs.SVal());
+    auto originalExponent = exponent;
+    bool overflow = false;
+    const auto multiply = [lower, upper](__int128 a, __int128 b, __int128& out) {
+        auto product = a * b;
+        if (product < lower || product > upper) {
+            return true;
+        }
+        out = product;
+        return false;
+    };
+    while (exponent != 0) {
+        if ((exponent & 1U) != 0 && multiply(result, base, result)) {
+            overflow = true;
+            break;
+        }
+        exponent >>= 1U;
+        if (exponent != 0 && multiply(base, base, base)) {
+            overflow = true;
+            break;
+        }
+    }
+    if (!overflow) {
+        return SInt{width, static_cast<uint64_t>(static_cast<int64_t>(result))};
+    }
+    if (ov == OverflowStrategy::THROWING) {
+        return std::nullopt;
+    }
+    if (ov == OverflowStrategy::SATURATING) {
+        if (lhs.Slt(0) && (originalExponent % 2U) == 1U) {
+            return SInt::SMinValue(width);
+        }
+        return SInt::SMaxValue(width);
+    }
+    return std::nullopt;
+}
+
+std::optional<SInt> ApplyExactPower(
+    const SInt& lhs, const SInt& rhs, const Ptr<Type>& type, OverflowStrategy ov, bool isUnsigned, bool rhsUnsigned)
+{
+    if (!rhsUnsigned && rhs.Slt(0)) {
+        return std::nullopt;
+    }
+    if (isUnsigned) {
+        return ApplyExactUnsignedPower(lhs, rhs, ov);
+    }
+    (void)type;
+    return ApplyExactSignedPower(lhs, rhs, ov);
+}
+
+std::optional<SInt> ApplyExactArithmetic(ExprKind kind, const SInt& lhs, const SInt& rhs,
+    const Ptr<Type>& type, OverflowStrategy ov, bool isUnsigned, bool rhsUnsigned)
+{
+    auto width = lhs.Width();
+    if (kind == ExprKind::EXP) {
+        return ApplyExactPower(lhs, rhs, type, ov, isUnsigned, rhsUnsigned);
+    }
     if (isUnsigned) {
         auto lhsValue = lhs.UVal();
         auto rhsValue = rhs.UVal();
@@ -1404,27 +1607,58 @@ std::optional<SInt> ApplyExactArithmetic(ExprKind kind, const SInt& lhs, const S
     return SInt{width, static_cast<uint64_t>(result)};
 }
 
-std::optional<SIntRange> TryComputeExactArithmeticRange(const BinaryExpression* binaryExpr,
-    const SIntRange* lhs, const SIntRange* rhs, bool isUnsigned)
+std::optional<SInt> ApplyExactNeg(const SInt& value, const Ptr<Type>& type, OverflowStrategy ov, bool isUnsigned)
 {
-    if (binaryExpr == nullptr || lhs == nullptr || rhs == nullptr || !lhs->GetExactValues().has_value() ||
-        !rhs->GetExactValues().has_value()) {
+    auto width = value.Width();
+    if (isUnsigned) {
+        uint64_t result = 0;
+        auto overflow = OverflowChecker::IsUIntOverflow(type->GetTypeKind(), ExprKind::NEG, 0, value.UVal(), ov, &result);
+        if (overflow && ov == OverflowStrategy::THROWING) {
+            return std::nullopt;
+        }
+        return SInt{width, result};
+    }
+    int64_t result = 0;
+    auto overflow = OverflowChecker::IsIntOverflow(type->GetTypeKind(), ExprKind::NEG, 0, value.SVal(), ov, &result);
+    if (overflow && ov == OverflowStrategy::THROWING) {
         return std::nullopt;
     }
-    auto kind = binaryExpr->GetExprKind();
-    if (!IsBasicBinaryExpr(*binaryExpr)) {
+    return SInt{width, static_cast<uint64_t>(result)};
+}
+
+std::optional<SInt> ApplyExactTypeCast(const SInt& value, Type* srcType, Type* destType, OverflowStrategy ov)
+{
+    if (srcType == nullptr || destType == nullptr || !srcType->IsInteger() || !destType->IsInteger()) {
         return std::nullopt;
     }
-    if (lhs->GetExactValues()->size() * rhs->GetExactValues()->size() > MAX_EXACT_INT_SET_SIZE) {
+    SIntDomain sourceDomain{ConstantRange{value}, srcType->IsUnsignedInteger()};
+    auto numeric = ComputeTypeCastNumericBound(
+        sourceDomain, ToWidth(*destType), destType->IsUnsignedInteger(), ov);
+    if (numeric.IsEmptySet() || !numeric.IsSingleElement()) {
+        return std::nullopt;
+    }
+    return numeric.GetSingleElement();
+}
+
+std::optional<SIntRange> TryComputeExactArithmeticRange(ExprKind kind, const Ptr<Type>& type,
+    const Ptr<Type>& rhsType, OverflowStrategy ov, const std::optional<std::vector<SInt>>& lhsValues,
+    const std::optional<std::vector<SInt>>& rhsValues, bool isUnsigned)
+{
+    if (type == nullptr || rhsType == nullptr || !lhsValues.has_value() || !rhsValues.has_value()) {
+        return std::nullopt;
+    }
+    if (!IsBasicArithmeticKind(kind)) {
+        return std::nullopt;
+    }
+    if (lhsValues->size() * rhsValues->size() > MAX_EXACT_INT_SET_SIZE) {
         return std::nullopt;
     }
     std::vector<SInt> values;
-    values.reserve(lhs->GetExactValues()->size() * rhs->GetExactValues()->size());
-    for (const auto& lhsValue : *lhs->GetExactValues()) {
-        for (const auto& rhsValue : *rhs->GetExactValues()) {
-            auto value = ApplyExactArithmetic(
-                kind, lhsValue, rhsValue, binaryExpr->GetResult()->GetType(), binaryExpr->GetOverflowStrategy(),
-                isUnsigned);
+    values.reserve(lhsValues->size() * rhsValues->size());
+    for (const auto& lhsValue : *lhsValues) {
+        for (const auto& rhsValue : *rhsValues) {
+            auto value =
+                ApplyExactArithmetic(kind, lhsValue, rhsValue, type, ov, isUnsigned, rhsType->IsUnsignedInteger());
             if (!value.has_value()) {
                 return std::nullopt;
             }
@@ -1437,6 +1671,17 @@ std::optional<SIntRange> TryComputeExactArithmeticRange(const BinaryExpression* 
     }
     auto domain = DomainFromExactIntValues(*exactValues, isUnsigned);
     return SIntRange{std::move(domain), std::move(exactValues)};
+}
+
+std::optional<SIntRange> TryComputeExactArithmeticRange(const BinaryExpression* binaryExpr,
+    const std::optional<std::vector<SInt>>& lhsValues, const std::optional<std::vector<SInt>>& rhsValues,
+    bool isUnsigned)
+{
+    if (binaryExpr == nullptr) {
+        return std::nullopt;
+    }
+    return TryComputeExactArithmeticRange(binaryExpr->GetExprKind(), binaryExpr->GetResult()->GetType(),
+        binaryExpr->GetRHSOperand()->GetType(), binaryExpr->GetOverflowStrategy(), lhsValues, rhsValues, isUnsigned);
 }
 
 std::optional<SIntRange> TryComputeCountedAccumulatorUpdateRange(
@@ -1702,8 +1947,13 @@ void RangeAnalysis::HandleBinaryExpr(RangeDomain& state, const BinaryExpression*
         const auto& lRange = GetSIntDomainFromState(state, lhs);
         const auto& rRange = GetSIntDomainFromState(state, rhs);
         if (IsBitwiseBinaryExpr(kind) || IsShiftBinaryExpr(kind)) {
-            if (auto exactRes = TryComputeExactBitwiseRange(kind, GetSIntRangeFromState(state, lhs),
-                GetSIntRangeFromState(state, rhs), dest->GetType()->IsUnsignedInteger()); exactRes.has_value()) {
+            auto lhsValues = GetExactValuesOrSmallRange(
+                GetSIntRangeFromState(state, lhs), lhs->GetType()->IsUnsignedInteger());
+            auto rhsValues = GetExactValuesOrSmallRange(
+                GetSIntRangeFromState(state, rhs), rhs->GetType()->IsUnsignedInteger());
+            if (auto exactRes = TryComputeExactBitwiseRange(kind, lhsValues, rhsValues,
+                    rhs->GetType()->IsUnsignedInteger(), dest->GetType()->IsUnsignedInteger());
+                exactRes.has_value()) {
                 return state.Update(dest, std::make_unique<SIntRange>(std::move(exactRes.value())));
             }
             auto res = TryComputeBitwiseRange(kind, lRange, rRange, lhs, rhs, rhs->GetType()->IsUnsignedInteger(),
@@ -1715,10 +1965,15 @@ void RangeAnalysis::HandleBinaryExpr(RangeDomain& state, const BinaryExpression*
         }
         auto ov = binaryExpr->GetOverflowStrategy();
         auto isUnsigned = IsUnsignedArithmetic(*binaryExpr);
-        if (auto exactRes = TryComputeExactArithmeticRange(
-                binaryExpr, GetSIntRangeFromState(state, lhs), GetSIntRangeFromState(state, rhs), isUnsigned);
+        auto lhsValues = GetExactValuesOrSmallRange(GetSIntRangeFromState(state, lhs), isUnsigned);
+        auto rhsValues =
+            GetExactValuesOrSmallRange(GetSIntRangeFromState(state, rhs), rhs->GetType()->IsUnsignedInteger());
+        if (auto exactRes = TryComputeExactArithmeticRange(binaryExpr, lhsValues, rhsValues, isUnsigned);
             exactRes.has_value()) {
             return state.Update(dest, std::make_unique<SIntRange>(std::move(exactRes.value())));
+        }
+        if (kind == ExprKind::EXP) {
+            return state.SetToBound(binaryExpr->GetResult(), true);
         }
         if (lRange.IsSingleValue() && rRange.IsSingleValue()) {
             auto domain = CheckSingleValueOverflow(
@@ -1742,6 +1997,236 @@ void RangeAnalysis::HandleBinaryExpr(RangeDomain& state, const BinaryExpression*
         }
     }
     state.SetToBound(binaryExpr->GetResult(), true);
+}
+
+RangeAnalysis::ExceptionKind RangeAnalysis::HandleIntOpWithException(RangeDomain& state, const IntOpWithException* intOp)
+{
+    if (intOp == nullptr || intOp->GetResult() == nullptr) {
+        return ExceptionKind::NA;
+    }
+    auto dest = intOp->GetResult();
+    auto kind = intOp->GetOpKind();
+    if (kind == ExprKind::NOT && dest->GetType()->IsBoolean()) {
+        auto operandRange = GetBoolDomainFromState(state, intOp->GetOperand(0));
+        if (operandRange.IsNonTrivial()) {
+            state.Update(dest, std::make_unique<BoolRange>(!operandRange));
+        } else {
+            state.SetToBound(dest, true);
+        }
+        return ExceptionKind::NA;
+    }
+    if (!dest->GetType()->IsInteger()) {
+        state.SetToTopOrTopRef(dest, dest->GetType()->IsRef());
+        return ExceptionKind::NA;
+    }
+    if (kind == ExprKind::NEG || kind == ExprKind::BITNOT) {
+        auto operand = intOp->GetOperand(0);
+        if (operand == nullptr || !operand->GetType()->IsInteger()) {
+            state.SetToBound(dest, true);
+            return ExceptionKind::NA;
+        }
+        const auto& operandRange = GetSIntDomainFromState(state, operand);
+        if (kind == ExprKind::NEG) {
+            auto operandValues = GetExactValuesOrSmallRange(
+                GetSIntRangeFromState(state, operand), operand->GetType()->IsUnsignedInteger());
+            if (operandValues.has_value() && operandValues->size() <= MAX_EXACT_INT_SET_SIZE) {
+                std::vector<SInt> values;
+                bool hasSuccess = false;
+                bool hasFail = false;
+                for (const auto& operandValue : *operandValues) {
+                    auto value = ApplyExactNeg(
+                        operandValue, dest->GetType(), intOp->GetOverflowStrategy(),
+                        operand->GetType()->IsUnsignedInteger());
+                    if (value.has_value()) {
+                        hasSuccess = true;
+                        values.emplace_back(value.value());
+                    } else {
+                        hasFail = true;
+                    }
+                }
+                if (hasSuccess) {
+                    if (auto exactValues = NormalizeExactIntSet(std::move(values)); exactValues.has_value()) {
+                        auto domain = DomainFromExactIntValues(*exactValues, dest->GetType()->IsUnsignedInteger());
+                        state.Update(dest, std::make_unique<SIntRange>(std::move(domain), std::move(exactValues)));
+                    }
+                    return hasFail ? ExceptionKind::NA : ExceptionKind::SUCCESS;
+                }
+                if (hasFail) {
+                    return ExceptionKind::FAIL;
+                }
+            }
+            auto range = ComputeNegRange(operandRange, dest->GetType(), intOp->GetOverflowStrategy());
+            if (range.IsNonTrivial()) {
+                state.Update(dest, std::make_unique<SIntRange>(std::move(range)));
+            } else {
+                state.SetToBound(dest, true);
+            }
+            return ExceptionKind::NA;
+        }
+        auto range = ComputeBitNotRange(operandRange, dest->GetType()->IsUnsignedInteger());
+        if (range.IsNonTrivial()) {
+            state.Update(dest, std::make_unique<SIntRange>(std::move(range)));
+        } else {
+            state.SetToBound(dest, true);
+        }
+        return ExceptionKind::NA;
+    }
+    if (intOp->GetNumOfOperands() < 2) {
+        state.SetToBound(dest, true);
+        return ExceptionKind::NA;
+    }
+    auto lhs = intOp->GetLHSOperand();
+    auto rhs = intOp->GetRHSOperand();
+    if (lhs == nullptr || rhs == nullptr || !CanAnalyse(dest->GetType()) || !CanAnalyse(lhs->GetType()) ||
+        !CanAnalyse(rhs->GetType()) || !lhs->GetType()->IsInteger() || !rhs->GetType()->IsInteger()) {
+        state.SetToBound(dest, true);
+        return ExceptionKind::NA;
+    }
+    if (!IsBasicArithmeticKind(kind) && !IsBitwiseBinaryExpr(kind) && !IsShiftBinaryExpr(kind)) {
+        state.SetToBound(dest, true);
+        return ExceptionKind::NA;
+    }
+    const auto& lRange = GetSIntDomainFromState(state, lhs);
+    const auto& rRange = GetSIntDomainFromState(state, rhs);
+    auto destUnsigned = dest->GetType()->IsUnsignedInteger();
+    auto rhsUnsigned = rhs->GetType()->IsUnsignedInteger();
+    if (IsBitwiseBinaryExpr(kind) || IsShiftBinaryExpr(kind)) {
+        auto lhsValues = GetExactValuesOrSmallRange(
+            GetSIntRangeFromState(state, lhs), lhs->GetType()->IsUnsignedInteger());
+        auto rhsValues = GetExactValuesOrSmallRange(GetSIntRangeFromState(state, rhs), rhsUnsigned);
+        if (lhsValues.has_value() && rhsValues.has_value() &&
+            lhsValues->size() * rhsValues->size() <= MAX_EXACT_INT_SET_SIZE) {
+            std::vector<SInt> values;
+            bool hasSuccess = false;
+            bool hasFail = false;
+            values.reserve(lhsValues->size() * rhsValues->size());
+            for (const auto& lhsValue : *lhsValues) {
+                for (const auto& rhsValue : *rhsValues) {
+                    if (IsShiftBinaryExpr(kind)) {
+                        auto value = ApplyExactShift(kind, lhsValue, rhsValue, rhsUnsigned, destUnsigned);
+                        if (value.has_value()) {
+                            hasSuccess = true;
+                            values.emplace_back(value.value());
+                        } else {
+                            hasFail = true;
+                        }
+                        continue;
+                    }
+                    hasSuccess = true;
+                    values.emplace_back(ApplyExactBitwise(kind, lhsValue, rhsValue, destUnsigned));
+                }
+            }
+            if (hasSuccess) {
+                if (auto exactValues = NormalizeExactIntSet(std::move(values)); exactValues.has_value()) {
+                    auto domain = DomainFromExactIntValues(*exactValues, destUnsigned);
+                    state.Update(dest, std::make_unique<SIntRange>(std::move(domain), std::move(exactValues)));
+                }
+                return hasFail ? ExceptionKind::NA : ExceptionKind::SUCCESS;
+            }
+            if (hasFail) {
+                return ExceptionKind::FAIL;
+            }
+        }
+        auto res = TryComputeBitwiseRange(kind, lRange, rRange, lhs, rhs, rhsUnsigned, destUnsigned);
+        if (res && res->IsNonTrivial()) {
+            state.Update(dest, std::make_unique<SIntRange>(std::move(*res)));
+        } else {
+            state.SetToBound(dest, true);
+        }
+        return ExceptionKind::NA;
+    }
+    auto isUnsigned = lhs->GetType()->IsUnsignedInteger() || IsStructEnum(lhs->GetType());
+    auto ov = intOp->GetOverflowStrategy();
+    auto lhsValues = GetExactValuesOrSmallRange(GetSIntRangeFromState(state, lhs), isUnsigned);
+    auto rhsValues = GetExactValuesOrSmallRange(GetSIntRangeFromState(state, rhs), rhsUnsigned);
+    if (lhsValues.has_value() && rhsValues.has_value() &&
+        lhsValues->size() * rhsValues->size() <= MAX_EXACT_INT_SET_SIZE) {
+        std::vector<SInt> values;
+        bool hasSuccess = false;
+        bool hasFail = false;
+        values.reserve(lhsValues->size() * rhsValues->size());
+        for (const auto& lhsValue : *lhsValues) {
+            for (const auto& rhsValue : *rhsValues) {
+                auto value =
+                    ApplyExactArithmetic(kind, lhsValue, rhsValue, dest->GetType(), ov, isUnsigned, rhsUnsigned);
+                if (value.has_value()) {
+                    hasSuccess = true;
+                    values.emplace_back(value.value());
+                } else {
+                    hasFail = true;
+                }
+            }
+        }
+        if (hasSuccess) {
+            if (auto exactValues = NormalizeExactIntSet(std::move(values)); exactValues.has_value()) {
+                auto domain = DomainFromExactIntValues(*exactValues, isUnsigned);
+                state.Update(dest, std::make_unique<SIntRange>(std::move(domain), std::move(exactValues)));
+            }
+            return hasFail ? ExceptionKind::NA : ExceptionKind::SUCCESS;
+        }
+        if (hasFail) {
+            return ExceptionKind::FAIL;
+        }
+    }
+    if (kind == ExprKind::EXP) {
+        state.SetToBound(dest, true);
+        return ExceptionKind::NA;
+    }
+    auto res = ComputeArithmeticBinop(CHIRArithmeticBinopArgs{lRange, rRange, lhs, rhs, kind, ov, isUnsigned});
+    if (res.IsNonTrivial()) {
+        state.Update(dest, std::make_unique<SIntRange>(std::move(res)));
+    } else {
+        state.SetToBound(dest, true);
+    }
+    return ExceptionKind::NA;
+}
+
+RangeAnalysis::ExceptionKind RangeAnalysis::HandleTypeCastWithException(
+    RangeDomain& state, const TypeCastWithException* cast)
+{
+    if (cast == nullptr || cast->GetResult() == nullptr) {
+        return ExceptionKind::NA;
+    }
+    auto from = cast->GetSourceTy();
+    auto to = cast->GetTargetTy();
+    auto dest = cast->GetResult();
+    if (!from->IsInteger() || !to->IsInteger()) {
+        state.SetToTopOrTopRef(dest, dest->GetType()->IsRef());
+        return ExceptionKind::NA;
+    }
+    auto value = cast->GetSourceValue();
+    auto sourceValues = GetExactValuesOrSmallRange(GetSIntRangeFromState(state, value), from->IsUnsignedInteger());
+    if (sourceValues.has_value() && sourceValues->size() <= MAX_EXACT_INT_SET_SIZE) {
+        std::vector<SInt> values;
+        bool hasSuccess = false;
+        bool hasFail = false;
+        values.reserve(sourceValues->size());
+        for (const auto& sourceValue : *sourceValues) {
+            auto castValue = ApplyExactTypeCast(sourceValue, from, to, cast->GetOverflowStrategy());
+            if (castValue.has_value()) {
+                hasSuccess = true;
+                values.emplace_back(castValue.value());
+            } else {
+                hasFail = true;
+            }
+        }
+        if (hasSuccess) {
+            if (auto exactValues = NormalizeExactIntSet(std::move(values)); exactValues.has_value()) {
+                auto domain = DomainFromExactIntValues(*exactValues, to->IsUnsignedInteger());
+                state.Update(dest, std::make_unique<SIntRange>(std::move(domain), std::move(exactValues)));
+            }
+            return hasFail ? ExceptionKind::NA : ExceptionKind::SUCCESS;
+        }
+        if (hasFail) {
+            return ExceptionKind::FAIL;
+        }
+    }
+
+    const auto& sourceDomain = GetSIntDomainFromState(state, value);
+    auto res = ComputeTypeCast(
+        state, value, sourceDomain, ToWidth(*to), to->IsUnsignedInteger(), cast->GetOverflowStrategy());
+    state.Update(dest, std::make_unique<SIntRange>(res));
+    return ExceptionKind::NA;
 }
 
 // 计算整数 typecast 后的值域，并在安全时保留非负符号约束。
@@ -4869,9 +5354,11 @@ std::optional<Block*> RangeAnalysis::HandleTerminatorEffect(RangeDomain& state, 
         case ExprKind::MULTIBRANCH:
             return HandleMultiBranchTerminator(state, StaticCast<const MultiBranch*>(terminator));
         case ExprKind::TYPECAST_WITH_EXCEPTION:
-            res = HandleTypeCast(state, StaticCast<const TypeCastWithException*>(terminator));
+            res = HandleTypeCastWithException(state, StaticCast<const TypeCastWithException*>(terminator));
             break;
         case ExprKind::INT_OP_WITH_EXCEPTION:
+            res = HandleIntOpWithException(state, StaticCast<const IntOpWithException*>(terminator));
+            break;
         case ExprKind::INTRINSIC_WITH_EXCEPTION:
         default: {
             auto dest = terminator->GetResult();

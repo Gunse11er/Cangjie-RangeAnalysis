@@ -102,12 +102,128 @@ enum class ContestQueryTypeHint {
     UINT64,
 };
 
+enum class SourceOverflowStrategy {
+    NA,
+    WRAPPING,
+    SATURATING,
+    THROWING,
+};
+
 bool IsSourceIntegerTypeHint(ContestQueryTypeHint hint)
 {
     return hint == ContestQueryTypeHint::INT8 || hint == ContestQueryTypeHint::INT16 ||
         hint == ContestQueryTypeHint::INT32 || hint == ContestQueryTypeHint::INT64 ||
         hint == ContestQueryTypeHint::UINT8 || hint == ContestQueryTypeHint::UINT16 ||
         hint == ContestQueryTypeHint::UINT32 || hint == ContestQueryTypeHint::UINT64;
+}
+
+bool IsSourceUnsignedIntegerTypeHint(ContestQueryTypeHint hint)
+{
+    return hint == ContestQueryTypeHint::UINT8 || hint == ContestQueryTypeHint::UINT16 ||
+        hint == ContestQueryTypeHint::UINT32 || hint == ContestQueryTypeHint::UINT64;
+}
+
+std::optional<unsigned> GetSourceIntegerWidth(ContestQueryTypeHint hint)
+{
+    switch (hint) {
+        case ContestQueryTypeHint::INT8:
+        case ContestQueryTypeHint::UINT8:
+            return 8U;
+        case ContestQueryTypeHint::INT16:
+        case ContestQueryTypeHint::UINT16:
+            return 16U;
+        case ContestQueryTypeHint::INT32:
+        case ContestQueryTypeHint::UINT32:
+            return 32U;
+        case ContestQueryTypeHint::INT64:
+        case ContestQueryTypeHint::UINT64:
+            return 64U;
+        case ContestQueryTypeHint::UNKNOWN:
+        case ContestQueryTypeHint::BOOL:
+            return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+uint64_t GetSourceIntegerMask(unsigned width)
+{
+    return width >= 64U ? std::numeric_limits<uint64_t>::max() : ((1ULL << width) - 1ULL);
+}
+
+int64_t SignExtendSourceInteger(uint64_t bits, unsigned width)
+{
+    if (width >= 64U) {
+        return static_cast<int64_t>(bits);
+    }
+    auto mask = GetSourceIntegerMask(width);
+    auto sign = 1ULL << (width - 1U);
+    bits &= mask;
+    if ((bits & sign) == 0) {
+        return static_cast<int64_t>(bits);
+    }
+    return static_cast<int64_t>(bits | ~mask);
+}
+
+std::pair<__int128, __int128> GetSourceSignedBounds(unsigned width)
+{
+    if (width >= 64U) {
+        return {static_cast<__int128>(std::numeric_limits<int64_t>::min()),
+            static_cast<__int128>(std::numeric_limits<int64_t>::max())};
+    }
+    return {-(static_cast<__int128>(1) << (width - 1U)),
+        (static_cast<__int128>(1) << (width - 1U)) - 1};
+}
+
+std::pair<unsigned __int128, unsigned __int128> GetSourceUnsignedBounds(unsigned width)
+{
+    if (width >= 64U) {
+        return {0, static_cast<unsigned __int128>(std::numeric_limits<uint64_t>::max())};
+    }
+    return {0, (static_cast<unsigned __int128>(1) << width) - 1};
+}
+
+std::optional<int64_t> NormalizeSourceIntegerValue(
+    int64_t value, ContestQueryTypeHint hint, SourceOverflowStrategy overflowStrategy)
+{
+    auto width = GetSourceIntegerWidth(hint);
+    if (!width.has_value() || overflowStrategy == SourceOverflowStrategy::NA) {
+        return value;
+    }
+    if (IsSourceUnsignedIntegerTypeHint(hint)) {
+        auto [lower, upper] = GetSourceUnsignedBounds(*width);
+        auto unsignedValue = static_cast<unsigned __int128>(static_cast<uint64_t>(value));
+        if (overflowStrategy == SourceOverflowStrategy::SATURATING) {
+            if (value < 0) {
+                return static_cast<int64_t>(lower);
+            }
+            return static_cast<int64_t>(std::min(unsignedValue, upper));
+        }
+        if (overflowStrategy == SourceOverflowStrategy::WRAPPING) {
+            return static_cast<int64_t>(static_cast<uint64_t>(value) & GetSourceIntegerMask(*width));
+        }
+        if (value < 0 || unsignedValue > upper) {
+            return std::nullopt;
+        }
+        return value;
+    }
+    auto [lower, upper] = GetSourceSignedBounds(*width);
+    auto signedValue = static_cast<__int128>(value);
+    if (overflowStrategy == SourceOverflowStrategy::SATURATING) {
+        if (signedValue < lower) {
+            return static_cast<int64_t>(lower);
+        }
+        if (signedValue > upper) {
+            return static_cast<int64_t>(upper);
+        }
+        return value;
+    }
+    if (overflowStrategy == SourceOverflowStrategy::WRAPPING) {
+        return SignExtendSourceInteger(static_cast<uint64_t>(value), *width);
+    }
+    if (signedValue < lower || signedValue > upper) {
+        return std::nullopt;
+    }
+    return value;
 }
 
 struct ContestQuery {
@@ -141,9 +257,13 @@ std::string StripSourceEnclosingParens(std::string expr);
 bool ParseSourceDeclaration(
     const std::string& line, std::string& name, ContestQueryTypeHint& typeHint, std::string& expr);
 std::optional<int64_t> EvalSourceIntExpr(const std::string& expr, const std::vector<SourceScope>& scopes);
+std::optional<int64_t> EvalSourceIntExprWithOverflow(const std::string& expr,
+    const std::vector<SourceScope>& scopes, ContestQueryTypeHint preferredHint,
+    SourceOverflowStrategy overflowStrategy);
 std::optional<bool> EvalSourceBoolExpr(const std::string& expr, const std::vector<SourceScope>& scopes);
 bool TryEvalSourceExactValue(const std::string& expr, const std::vector<SourceScope>& scopes,
-    ContestQueryTypeHint preferredHint, SourceExactValue& value);
+    ContestQueryTypeHint preferredHint, SourceExactValue& value,
+    SourceOverflowStrategy overflowStrategy = SourceOverflowStrategy::NA);
 std::optional<int64_t> EvalSourceBinaryIntOp(int64_t lhs, int64_t rhs, const std::string& token);
 const SourceExactValue* LookupSourceValue(const std::vector<SourceScope>& scopes, const std::string& name);
 
@@ -297,6 +417,34 @@ size_t SkipSourceDeclarationModifiers(const std::string& line)
         while (pos < line.size() && std::isspace(static_cast<unsigned char>(line[pos]))) {
             ++pos;
         }
+        if (pos < line.size() && line[pos] == '@') {
+            ++pos;
+            while (pos < line.size() && (IsIdentifierChar(line[pos]) || line[pos] == '.')) {
+                ++pos;
+            }
+            while (pos < line.size() && std::isspace(static_cast<unsigned char>(line[pos]))) {
+                ++pos;
+            }
+            if (pos < line.size() && (line[pos] == '(' || line[pos] == '[')) {
+                auto open = line[pos];
+                auto close = open == '(' ? ')' : ']';
+                int depth = 0;
+                while (pos < line.size()) {
+                    if (line[pos] == open) {
+                        ++depth;
+                    } else if (line[pos] == close) {
+                        --depth;
+                        if (depth == 0) {
+                            ++pos;
+                            break;
+                        }
+                    }
+                    ++pos;
+                }
+            }
+            progressed = true;
+            continue;
+        }
         for (const auto& modifier : modifiers) {
             if (line.compare(pos, modifier.size(), modifier) == 0 &&
                 (pos + modifier.size() == line.size() || !IsIdentifierChar(line[pos + modifier.size()]))) {
@@ -310,6 +458,94 @@ size_t SkipSourceDeclarationModifiers(const std::string& line)
         ++pos;
     }
     return pos;
+}
+
+SourceOverflowStrategy ExtractSourceOverflowAnnotation(const std::string& line)
+{
+    auto trimmed = Trim(StripLineComment(line));
+    if (trimmed.find("@OverflowWrapping") != std::string::npos) {
+        return SourceOverflowStrategy::WRAPPING;
+    }
+    if (trimmed.find("@OverflowSaturating") != std::string::npos) {
+        return SourceOverflowStrategy::SATURATING;
+    }
+    if (trimmed.find("@OverflowThrowing") != std::string::npos) {
+        return SourceOverflowStrategy::THROWING;
+    }
+    return SourceOverflowStrategy::NA;
+}
+
+bool SourceLineStartsFunction(const std::string& line)
+{
+    auto trimmed = Trim(StripLineComment(line));
+    auto pos = SkipSourceDeclarationModifiers(trimmed);
+    return trimmed.compare(pos, 4, "func") == 0 &&
+        (pos + 4 == trimmed.size() || !IsIdentifierChar(trimmed[pos + 4]));
+}
+
+bool IsStandaloneSourceOverflowAnnotation(const std::string& line)
+{
+    auto trimmed = Trim(StripLineComment(line));
+    if (trimmed.rfind("@Overflow", 0) != 0) {
+        return false;
+    }
+    size_t pos = 1;
+    while (pos < trimmed.size() && IsIdentifierChar(trimmed[pos])) {
+        ++pos;
+    }
+    while (pos < trimmed.size() && std::isspace(static_cast<unsigned char>(trimmed[pos]))) {
+        ++pos;
+    }
+    return pos == trimmed.size();
+}
+
+SourceOverflowStrategy GetSourceOverflowStrategyAtLine(const std::vector<std::string>& lines, unsigned targetLine)
+{
+    SourceOverflowStrategy pending = SourceOverflowStrategy::NA;
+    SourceOverflowStrategy active = SourceOverflowStrategy::NA;
+    int activeDepth = 0;
+    bool activeSawBrace = false;
+    auto limit = std::min<unsigned>(targetLine, static_cast<unsigned>(lines.size()));
+    for (unsigned lineNo = 1; lineNo <= limit; ++lineNo) {
+        auto raw = StripLineComment(lines[lineNo - 1]);
+        auto annotation = ExtractSourceOverflowAnnotation(raw);
+        auto standaloneAnnotation = annotation != SourceOverflowStrategy::NA &&
+            IsStandaloneSourceOverflowAnnotation(raw);
+        if (standaloneAnnotation) {
+            pending = annotation;
+        }
+        auto startsFunction = SourceLineStartsFunction(raw);
+        if (startsFunction) {
+            auto strategy = annotation != SourceOverflowStrategy::NA ? annotation : pending;
+            if (strategy != SourceOverflowStrategy::NA) {
+                active = strategy;
+                activeDepth = 0;
+                activeSawBrace = false;
+            }
+            pending = SourceOverflowStrategy::NA;
+        }
+        if (lineNo == targetLine) {
+            return annotation != SourceOverflowStrategy::NA ? annotation : active;
+        }
+        if (active != SourceOverflowStrategy::NA) {
+            for (auto c : raw) {
+                if (c == '{') {
+                    ++activeDepth;
+                    activeSawBrace = true;
+                } else if (c == '}' && activeDepth > 0) {
+                    --activeDepth;
+                }
+            }
+            if (activeSawBrace && activeDepth == 0) {
+                active = SourceOverflowStrategy::NA;
+                activeSawBrace = false;
+            }
+        } else if (!standaloneAnnotation && annotation == SourceOverflowStrategy::NA && !startsFunction &&
+            !Trim(raw).empty()) {
+            pending = SourceOverflowStrategy::NA;
+        }
+    }
+    return active;
 }
 
 bool SourceLineStartsLoop(const std::string& line)
@@ -1478,10 +1714,16 @@ const SourceExactValue* LookupSourceValue(const std::vector<SourceScope>& scopes
 }
 
 bool TryEvalSourceExactValue(const std::string& expr, const std::vector<SourceScope>& scopes,
-    ContestQueryTypeHint preferredHint, SourceExactValue& value)
+    ContestQueryTypeHint preferredHint, SourceExactValue& value, SourceOverflowStrategy overflowStrategy)
 {
     if (preferredHint != ContestQueryTypeHint::BOOL) {
-        if (auto intValue = EvalSourceIntExpr(expr, scopes); intValue.has_value()) {
+        auto intValue = overflowStrategy == SourceOverflowStrategy::NA
+            ? EvalSourceIntExpr(expr, scopes)
+            : EvalSourceIntExprWithOverflow(expr, scopes, preferredHint, overflowStrategy);
+        if (intValue.has_value()) {
+            intValue = NormalizeSourceIntegerValue(*intValue, preferredHint, overflowStrategy);
+        }
+        if (intValue.has_value()) {
             value.typeHint = IsSourceIntegerTypeHint(preferredHint) ? preferredHint : ContestQueryTypeHint::INT64;
             value.intValue = intValue.value();
             return true;
@@ -1675,6 +1917,23 @@ bool IsSourceUnaryOperatorPosition(const std::string& expr, size_t pos)
 
 std::optional<size_t> FindSourceBinaryToken(const std::string& expr, const std::string& token)
 {
+    if (token == "**") {
+        int depth = 0;
+        for (size_t pos = 0; pos < expr.size(); ++pos) {
+            if (expr[pos] == '(') {
+                ++depth;
+                continue;
+            }
+            if (expr[pos] == ')') {
+                --depth;
+                continue;
+            }
+            if (depth == 0 && pos + token.size() <= expr.size() && expr.compare(pos, token.size(), token) == 0) {
+                return pos;
+            }
+        }
+        return std::nullopt;
+    }
     int depth = 0;
     for (size_t i = expr.size(); i > 0; --i) {
         auto pos = i - 1;
@@ -1687,6 +1946,10 @@ std::optional<size_t> FindSourceBinaryToken(const std::string& expr, const std::
             continue;
         }
         if (depth != 0 || pos + token.size() > expr.size() || expr.compare(pos, token.size(), token) != 0) {
+            continue;
+        }
+        if (token == "*" &&
+            ((pos > 0 && expr[pos - 1] == '*') || (pos + 1 < expr.size() && expr[pos + 1] == '*'))) {
             continue;
         }
         if ((token == "+" || token == "-") && IsSourceUnaryOperatorPosition(expr, pos)) {
@@ -1730,6 +1993,24 @@ std::optional<int64_t> EvalSourceBinaryIntOp(int64_t lhs, int64_t rhs, const std
         }
         return lhs % rhs;
     }
+    if (token == "**") {
+        if (rhs < 0) {
+            return std::nullopt;
+        }
+        int64_t value = 1;
+        int64_t base = lhs;
+        auto exponent = static_cast<uint64_t>(rhs);
+        while (exponent != 0) {
+            if ((exponent & 1U) != 0 && __builtin_mul_overflow(value, base, &value)) {
+                return std::nullopt;
+            }
+            exponent >>= 1U;
+            if (exponent != 0 && __builtin_mul_overflow(base, base, &base)) {
+                return std::nullopt;
+            }
+        }
+        return value;
+    }
     if (token == "&") {
         return lhs & rhs;
     }
@@ -1740,22 +2021,162 @@ std::optional<int64_t> EvalSourceBinaryIntOp(int64_t lhs, int64_t rhs, const std
         return lhs ^ rhs;
     }
     if (token == "<<") {
-        if (rhs < 0 || rhs >= 63) {
+        if (rhs < 0 || rhs >= 64) {
             return std::nullopt;
         }
-        auto wide = static_cast<__int128>(lhs) * (static_cast<__int128>(1) << rhs);
-        if (wide < std::numeric_limits<int64_t>::min() || wide > std::numeric_limits<int64_t>::max()) {
-            return std::nullopt;
-        }
-        return static_cast<int64_t>(wide);
+        return SInt{IntWidth::I64, static_cast<uint64_t>(lhs)}.Shl(static_cast<unsigned>(rhs)).SVal();
     }
     if (token == ">>") {
-        if (rhs < 0 || rhs >= 63) {
+        if (rhs < 0 || rhs >= 64) {
             return std::nullopt;
         }
-        return lhs >> rhs;
+        return SInt{IntWidth::I64, static_cast<uint64_t>(lhs)}.Ashr(static_cast<unsigned>(rhs)).SVal();
     }
     return std::nullopt;
+}
+
+std::optional<int64_t> EvalSourceArithmeticWithOverflow(
+    int64_t lhs, int64_t rhs, const std::string& token, ContestQueryTypeHint hint,
+    SourceOverflowStrategy overflowStrategy)
+{
+    auto width = GetSourceIntegerWidth(hint);
+    if (!width.has_value() || !IsSourceIntegerTypeHint(hint) ||
+        overflowStrategy == SourceOverflowStrategy::NA) {
+        return EvalSourceBinaryIntOp(lhs, rhs, token);
+    }
+    auto isUnsigned = IsSourceUnsignedIntegerTypeHint(hint);
+    if (token != "+" && token != "-" && token != "*" && token != "**") {
+        auto value = EvalSourceBinaryIntOp(lhs, rhs, token);
+        if (!value.has_value()) {
+            return std::nullopt;
+        }
+        return NormalizeSourceIntegerValue(*value, hint, overflowStrategy);
+    }
+    if (token == "**" && rhs < 0) {
+        return std::nullopt;
+    }
+    if (overflowStrategy == SourceOverflowStrategy::WRAPPING) {
+        auto mask = GetSourceIntegerMask(*width);
+        uint64_t result = 0;
+        if (token == "+") {
+            result = (static_cast<uint64_t>(lhs) + static_cast<uint64_t>(rhs)) & mask;
+        } else if (token == "-") {
+            result = (static_cast<uint64_t>(lhs) - static_cast<uint64_t>(rhs)) & mask;
+        } else if (token == "*") {
+            result = static_cast<uint64_t>(
+                static_cast<unsigned __int128>(static_cast<uint64_t>(lhs)) *
+                static_cast<unsigned __int128>(static_cast<uint64_t>(rhs))) & mask;
+        } else {
+            result = 1ULL & mask;
+            auto base = static_cast<uint64_t>(lhs) & mask;
+            auto exponent = static_cast<uint64_t>(rhs);
+            while (exponent != 0) {
+                if ((exponent & 1U) != 0) {
+                    result = static_cast<uint64_t>(
+                        static_cast<unsigned __int128>(result) * static_cast<unsigned __int128>(base)) & mask;
+                }
+                exponent >>= 1U;
+                if (exponent != 0) {
+                    base = static_cast<uint64_t>(
+                        static_cast<unsigned __int128>(base) * static_cast<unsigned __int128>(base)) & mask;
+                }
+            }
+        }
+        if (isUnsigned) {
+            return static_cast<int64_t>(result);
+        }
+        return SignExtendSourceInteger(result, *width);
+    }
+
+    if (isUnsigned) {
+        auto [lower, upper] = GetSourceUnsignedBounds(*width);
+        unsigned __int128 lhsValue = lhs < 0 ? 0 : static_cast<unsigned __int128>(static_cast<uint64_t>(lhs));
+        unsigned __int128 rhsValue = rhs < 0 ? 0 : static_cast<unsigned __int128>(static_cast<uint64_t>(rhs));
+        unsigned __int128 result = 0;
+        if (token == "+") {
+            result = lhsValue + rhsValue;
+        } else if (token == "-") {
+            if (lhsValue < rhsValue) {
+                if (overflowStrategy == SourceOverflowStrategy::SATURATING) {
+                    return static_cast<int64_t>(lower);
+                }
+                return std::nullopt;
+            }
+            result = lhsValue - rhsValue;
+        } else if (token == "*") {
+            result = lhsValue * rhsValue;
+        } else {
+            result = 1;
+            auto base = lhsValue;
+            auto exponent = static_cast<uint64_t>(rhs);
+            while (exponent != 0) {
+                if ((exponent & 1U) != 0) {
+                    result *= base;
+                    if (result > upper) {
+                        break;
+                    }
+                }
+                exponent >>= 1U;
+                if (exponent != 0) {
+                    base *= base;
+                    if (base > upper) {
+                        base = upper + 1;
+                    }
+                }
+            }
+        }
+        if (result > upper) {
+            if (overflowStrategy == SourceOverflowStrategy::SATURATING) {
+                return static_cast<int64_t>(upper);
+            }
+            return std::nullopt;
+        }
+        return static_cast<int64_t>(result);
+    }
+
+    auto [lower, upper] = GetSourceSignedBounds(*width);
+    __int128 lhsValue = static_cast<__int128>(lhs);
+    __int128 rhsValue = static_cast<__int128>(rhs);
+    __int128 result = 0;
+    bool overflow = false;
+    if (token == "+") {
+        result = lhsValue + rhsValue;
+    } else if (token == "-") {
+        result = lhsValue - rhsValue;
+    } else if (token == "*") {
+        result = lhsValue * rhsValue;
+    } else {
+        result = 1;
+        auto base = lhsValue;
+        auto exponent = static_cast<uint64_t>(rhs);
+        while (exponent != 0) {
+            if ((exponent & 1U) != 0) {
+                result *= base;
+                if (result < lower || result > upper) {
+                    overflow = true;
+                    break;
+                }
+            }
+            exponent >>= 1U;
+            if (exponent != 0) {
+                base *= base;
+                if (base < lower || base > upper) {
+                    base = base < 0 ? lower - 1 : upper + 1;
+                }
+            }
+        }
+    }
+    overflow = overflow || result < lower || result > upper;
+    if (overflow) {
+        if (overflowStrategy == SourceOverflowStrategy::SATURATING) {
+            if (token == "**" && lhs < 0 && (static_cast<uint64_t>(rhs) % 2U) == 1U) {
+                return static_cast<int64_t>(lower);
+            }
+            return result < lower ? static_cast<int64_t>(lower) : static_cast<int64_t>(upper);
+        }
+        return std::nullopt;
+    }
+    return static_cast<int64_t>(result);
 }
 
 std::optional<int64_t> ParseSourceNamedIntConstant(std::string text)
@@ -1815,7 +2236,7 @@ std::optional<int64_t> EvalSourceIntExpr(const std::string& expr, const std::vec
         }
     }
     const std::vector<std::vector<std::string>> precedenceGroups{{"|"}, {"^"}, {"&"}, {"<<", ">>"}, {"+", "-"},
-        {"*", "/", "%"}};
+        {"*", "/", "%"}, {"**"}};
     for (const auto& group : precedenceGroups) {
         for (const auto& token : group) {
             auto pos = FindSourceBinaryToken(trimmed, token);
@@ -1843,7 +2264,57 @@ std::optional<int64_t> EvalSourceIntExpr(const std::string& expr, const std::vec
     return std::nullopt;
 }
 
-// 保守求值源码中的简单 Bool 常量表达式。
+std::optional<int64_t> EvalSourceIntExprWithOverflow(const std::string& expr,
+    const std::vector<SourceScope>& scopes, ContestQueryTypeHint preferredHint,
+    SourceOverflowStrategy overflowStrategy)
+{
+    auto trimmed = StripSourceEnclosingParens(expr);
+    if (overflowStrategy == SourceOverflowStrategy::NA || !IsSourceIntegerTypeHint(preferredHint)) {
+        return EvalSourceIntExpr(trimmed, scopes);
+    }
+    if (trimmed.rfind("try ", 0) == 0) {
+        return EvalSourceIntExprWithOverflow(trimmed.substr(4), scopes, preferredHint, overflowStrategy);
+    }
+    for (const auto& suffix : {std::string(".get()"), std::string(".getOrThrow()")}) {
+        if (trimmed.size() > suffix.size() && trimmed.compare(trimmed.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            auto base = Trim(trimmed.substr(0, trimmed.size() - suffix.size()));
+            if (auto value = LookupSourceValue(scopes, base);
+                value != nullptr && IsSourceIntegerTypeHint(value->typeHint)) {
+                return NormalizeSourceIntegerValue(value->intValue, preferredHint, overflowStrategy);
+            }
+        }
+    }
+    const std::vector<std::vector<std::string>> precedenceGroups{{"|"}, {"^"}, {"&"}, {"<<", ">>"}, {"+", "-"},
+        {"*", "/", "%"}, {"**"}};
+    for (const auto& group : precedenceGroups) {
+        for (const auto& token : group) {
+            auto pos = FindSourceBinaryToken(trimmed, token);
+            if (!pos.has_value()) {
+                continue;
+            }
+            auto lhs = EvalSourceIntExprWithOverflow(
+                trimmed.substr(0, pos.value()), scopes, preferredHint, overflowStrategy);
+            auto rhs = EvalSourceIntExprWithOverflow(
+                trimmed.substr(pos.value() + token.size()), scopes, preferredHint, overflowStrategy);
+            if (!lhs.has_value() || !rhs.has_value()) {
+                return std::nullopt;
+            }
+            return EvalSourceArithmeticWithOverflow(lhs.value(), rhs.value(), token, preferredHint, overflowStrategy);
+        }
+    }
+    if (auto literal = ParseSourceIntLiteral(trimmed); literal.has_value()) {
+        return NormalizeSourceIntegerValue(*literal, preferredHint, overflowStrategy);
+    }
+    if (auto namedConstant = ParseSourceNamedIntConstant(trimmed); namedConstant.has_value()) {
+        return NormalizeSourceIntegerValue(*namedConstant, preferredHint, overflowStrategy);
+    }
+    if (auto value = LookupSourceValue(scopes, trimmed);
+        value != nullptr && IsSourceIntegerTypeHint(value->typeHint)) {
+        return NormalizeSourceIntegerValue(value->intValue, preferredHint, overflowStrategy);
+    }
+    return std::nullopt;
+}
+
 std::optional<bool> EvalSourceBoolExpr(const std::string& expr, const std::vector<SourceScope>& scopes)
 {
     auto trimmed = Trim(expr);
@@ -2126,7 +2597,7 @@ std::optional<std::vector<int64_t>> EvalSourceIntExprSetWithFunctions(const std:
     }
     auto trimmed = StripSourceEnclosingParens(NormalizeSourceTrailingClosureCall(expr));
     const std::vector<std::vector<std::string>> precedenceGroups{{"|"}, {"^"}, {"&"}, {"<<", ">>"}, {"+", "-"},
-        {"*", "/", "%"}};
+        {"*", "/", "%"}, {"**"}};
     for (const auto& group : precedenceGroups) {
         for (const auto& token : group) {
             auto pos = FindSourceBinaryToken(trimmed, token);
@@ -2251,6 +2722,50 @@ bool SourceExprContainsIdentifier(const std::string& expr, const std::string& na
     return false;
 }
 
+std::optional<int64_t> EvalSourceInlineSpawnExpr(
+    const std::string& expr, const std::vector<SourceScope>& scopes)
+{
+    auto trimmed = Trim(StripLineComment(expr));
+    auto spawnPos = trimmed.find("spawn");
+    if (spawnPos == std::string::npos) {
+        return std::nullopt;
+    }
+    auto open = trimmed.find('{', spawnPos);
+    if (open == std::string::npos) {
+        return std::nullopt;
+    }
+    int depth = 0;
+    size_t close = std::string::npos;
+    for (size_t pos = open; pos < trimmed.size(); ++pos) {
+        if (trimmed[pos] == '{') {
+            ++depth;
+        } else if (trimmed[pos] == '}') {
+            --depth;
+            if (depth == 0) {
+                close = pos;
+                break;
+            }
+        }
+    }
+    if (close == std::string::npos || close <= open) {
+        return std::nullopt;
+    }
+    auto body = Trim(trimmed.substr(open + 1, close - open - 1));
+    if (body.rfind("return ", 0) == 0) {
+        body = Trim(body.substr(7));
+    }
+    if (auto arrow = body.find("=>"); arrow != std::string::npos) {
+        body = TrimSourceMatchArmExpr(body.substr(arrow + 2));
+    }
+    if (auto semicolon = body.rfind(';'); semicolon != std::string::npos) {
+        body = Trim(body.substr(semicolon + 1));
+        if (body.rfind("return ", 0) == 0) {
+            body = Trim(body.substr(7));
+        }
+    }
+    return EvalSourceIntExpr(body, scopes);
+}
+
 std::optional<int64_t> EvalSourceSpawnExprBlock(
     const std::vector<std::string>& lines, unsigned startLine, const std::vector<SourceScope>& scopes)
 {
@@ -2261,20 +2776,8 @@ std::optional<int64_t> EvalSourceSpawnExprBlock(
     if (first.find("spawn") == std::string::npos) {
         return std::nullopt;
     }
-    auto firstTrimmed = Trim(first);
-    auto firstOpen = firstTrimmed.find('{');
-    auto firstClose = firstTrimmed.rfind('}');
-    if (firstOpen != std::string::npos && firstClose != std::string::npos && firstClose > firstOpen) {
-        auto body = Trim(firstTrimmed.substr(firstOpen + 1, firstClose - firstOpen - 1));
-        if (body.rfind("return ", 0) == 0) {
-            body = Trim(body.substr(7));
-        }
-        if (auto arrow = body.find("=>"); arrow != std::string::npos) {
-            body = TrimSourceMatchArmExpr(body.substr(arrow + 2));
-        }
-        if (auto value = EvalSourceIntExpr(body, scopes); value.has_value()) {
-            return value;
-        }
+    if (auto inlineValue = EvalSourceInlineSpawnExpr(first, scopes); inlineValue.has_value()) {
+        return inlineValue;
     }
     auto limit = std::min<unsigned>(static_cast<unsigned>(lines.size()), startLine + 64);
     int depth = 0;
@@ -2322,7 +2825,8 @@ std::vector<SourceScope> BuildSourceScopesBeforeLine(const std::vector<std::stri
         std::string expr;
         if (ParseSourceDeclaration(line, name, typeHint, expr)) {
             SourceExactValue exact;
-            bool hasExact = TryEvalSourceExactValue(expr, scopes, typeHint, exact);
+            auto overflowStrategy = GetSourceOverflowStrategyAtLine(lines, lineNo);
+            bool hasExact = TryEvalSourceExactValue(expr, scopes, typeHint, exact, overflowStrategy);
             if (!hasExact && expr.find("spawn") != std::string::npos) {
                 if (auto value = EvalSourceSpawnExprBlock(lines, lineNo, scopes); value.has_value()) {
                     exact.typeHint = ContestQueryTypeHint::INT64;
@@ -2337,7 +2841,8 @@ std::vector<SourceScope> BuildSourceScopesBeforeLine(const std::vector<std::stri
             SourceExactValue exact;
             auto old = LookupSourceValue(scopes, name);
             auto hint = old == nullptr ? ContestQueryTypeHint::UNKNOWN : old->typeHint;
-            bool hasExact = TryEvalSourceExactValue(expr, scopes, hint, exact);
+            auto overflowStrategy = GetSourceOverflowStrategyAtLine(lines, lineNo);
+            bool hasExact = TryEvalSourceExactValue(expr, scopes, hint, exact, overflowStrategy);
             if (!hasExact && expr.find("spawn") != std::string::npos) {
                 if (auto value = EvalSourceSpawnExprBlock(lines, lineNo, scopes); value.has_value()) {
                     exact.typeHint = ContestQueryTypeHint::INT64;
@@ -2461,12 +2966,33 @@ void CollectSourceInlineTryValues(
         }
         if (auto value = EvalSourceIntExpr(body, scopes); value.has_value()) {
             values.emplace_back(value.value());
+        } else if (auto spawnValue = EvalSourceInlineSpawnExpr(body, scopes); spawnValue.has_value()) {
+            values.emplace_back(spawnValue.value());
         }
         pos = close + 1;
         auto rest = Trim(trimmed.substr(pos));
         if (rest.rfind("catch", 0) != 0 && rest.rfind("finally", 0) != 0) {
             break;
         }
+    }
+}
+
+void AddSourceTryLineValue(const std::vector<std::string>& lines, unsigned lineNo,
+    const std::string& expr, const std::vector<SourceScope>& scopes, std::vector<int64_t>& values)
+{
+    if (auto value = EvalSourceIntExpr(expr, scopes); value.has_value()) {
+        values.emplace_back(value.value());
+        return;
+    }
+    if (expr.find("spawn") == std::string::npos) {
+        return;
+    }
+    if (auto inlineSpawn = EvalSourceInlineSpawnExpr(expr, scopes); inlineSpawn.has_value()) {
+        values.emplace_back(inlineSpawn.value());
+        return;
+    }
+    if (auto blockSpawn = EvalSourceSpawnExprBlock(lines, lineNo, scopes); blockSpawn.has_value()) {
+        values.emplace_back(blockSpawn.value());
     }
 }
 
@@ -2497,18 +3023,14 @@ void InferSourceTryFallback(const std::vector<std::string>& lines, ContestQuery&
         std::string assignedExpr;
         if (ParseSourceAssignment(raw, assigned, assignedExpr) && assigned == query.variableName) {
             CollectSourceInlineTryValues(assignedExpr, scopes, values);
-            if (auto value = EvalSourceIntExpr(assignedExpr, scopes); value.has_value()) {
-                values.emplace_back(value.value());
-            }
+            AddSourceTryLineValue(lines, lineNo, assignedExpr, scopes, values);
         }
         auto trimmed = Trim(raw);
         if (trimmed.rfind("return ", 0) == 0) {
             trimmed = Trim(trimmed.substr(7));
         }
         trimmed = TrimSourceMatchArmExpr(trimmed);
-        if (auto value = EvalSourceIntExpr(trimmed, scopes); value.has_value()) {
-            values.emplace_back(value.value());
-        }
+        AddSourceTryLineValue(lines, lineNo, trimmed, scopes, values);
         for (auto c : raw) {
             if (c == '{') {
                 ++depth;
@@ -2608,7 +3130,8 @@ void InferContestQuerySourceFallback(const std::vector<std::string>& lines, Cont
                 }
             }
             SourceExactValue value;
-            bool hasExact = TryEvalSourceExactValue(expr, scopes, typeHint, value);
+            auto overflowStrategy = GetSourceOverflowStrategyAtLine(lines, lineNo);
+            bool hasExact = TryEvalSourceExactValue(expr, scopes, typeHint, value, overflowStrategy);
             if (!hasExact && expr.find("spawn") != std::string::npos) {
                 if (auto spawnValue = EvalSourceSpawnExprBlock(lines, lineNo, scopes); spawnValue.has_value()) {
                     value.typeHint = ContestQueryTypeHint::INT64;
@@ -3431,7 +3954,13 @@ void RangePropagation::EmitContestOutput(const Ptr<const Package>& package, Rang
         }
         ResolveQueryAtExpressionOperands(queries.value(), valueNames, aggregates, *expr, state, contestRoot);
     };
-    const auto actionOnTerminator = [](const RangeDomain&, Terminator*, std::optional<Block*>) {};
+    const auto actionOnTerminator = [&queries, &valueNames, &aggregates, &contestRoot](
+                                        const RangeDomain& state, Terminator* terminator, std::optional<Block*>) {
+        if (terminator == nullptr) {
+            return;
+        }
+        ResolveQueryAtExpressionOperands(queries.value(), valueNames, aggregates, *terminator, state, contestRoot);
+    };
     auto resolveQueries = [&](Results<RangeDomain>& result) {
         result.VisitWith(actionBeforeVisitExpr, actionAfterVisitExpr, actionOnTerminator);
     };
