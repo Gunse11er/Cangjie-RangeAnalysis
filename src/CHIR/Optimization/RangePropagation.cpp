@@ -242,6 +242,7 @@ struct ContestQuery {
     bool resolved{false};
     bool hasSourceFallback{false};
     bool hasAccumulatorFallback{false};
+    bool preferSourceFallback{false};
 };
 
 struct SourceExactValue {
@@ -266,6 +267,8 @@ bool TryEvalSourceExactValue(const std::string& expr, const std::vector<SourceSc
     SourceOverflowStrategy overflowStrategy = SourceOverflowStrategy::NA);
 std::optional<int64_t> EvalSourceBinaryIntOp(int64_t lhs, int64_t rhs, const std::string& token);
 const SourceExactValue* LookupSourceValue(const std::vector<SourceScope>& scopes, const std::string& name);
+std::optional<int64_t> EvalSourceSpawnExprBlock(
+    const std::vector<std::string>& lines, unsigned startLine, const std::vector<SourceScope>& scopes);
 
 struct ValueNameInfo {
     std::string name;
@@ -282,6 +285,13 @@ struct ContestAggregate {
 };
 
 using ContestAggregateMap = std::unordered_map<std::string, ContestAggregate>;
+
+struct ContestContextCandidate {
+    Type* type{nullptr};
+    std::unique_ptr<ValueRange> range;
+};
+
+using ContestContextCandidateMap = std::unordered_map<size_t, ContestContextCandidate>;
 constexpr size_t MAX_CONTEST_EXACT_VALUES = 256;
 
 // 去除竞赛输入字段首尾空白。
@@ -483,6 +493,20 @@ bool SourceLineStartsFunction(const std::string& line)
         (pos + 4 == trimmed.size() || !IsIdentifierChar(trimmed[pos + 4]));
 }
 
+bool SourceLineMayStartLambda(const std::string& line)
+{
+    auto trimmed = Trim(StripLineComment(line));
+    if (trimmed.find("=>") != std::string::npos) {
+        return true;
+    }
+    auto eq = trimmed.find('=');
+    if (eq == std::string::npos || (eq + 1 < trimmed.size() && trimmed[eq + 1] == '=')) {
+        return false;
+    }
+    auto brace = trimmed.find('{', eq + 1);
+    return brace != std::string::npos;
+}
+
 bool IsStandaloneSourceOverflowAnnotation(const std::string& line)
 {
     auto trimmed = Trim(StripLineComment(line));
@@ -495,6 +519,16 @@ bool IsStandaloneSourceOverflowAnnotation(const std::string& line)
     }
     while (pos < trimmed.size() && std::isspace(static_cast<unsigned char>(trimmed[pos]))) {
         ++pos;
+    }
+    if (pos < trimmed.size() && trimmed[pos] == '(') {
+        auto close = trimmed.find(')', pos + 1);
+        if (close != std::string::npos &&
+            Trim(trimmed.substr(pos + 1, close - pos - 1)).empty()) {
+            pos = close + 1;
+            while (pos < trimmed.size() && std::isspace(static_cast<unsigned char>(trimmed[pos]))) {
+                ++pos;
+            }
+        }
     }
     return pos == trimmed.size();
 }
@@ -515,7 +549,9 @@ SourceOverflowStrategy GetSourceOverflowStrategyAtLine(const std::vector<std::st
             pending = annotation;
         }
         auto startsFunction = SourceLineStartsFunction(raw);
-        if (startsFunction) {
+        auto startsLambda = (annotation != SourceOverflowStrategy::NA || pending != SourceOverflowStrategy::NA) &&
+            SourceLineMayStartLambda(raw);
+        if (startsFunction || startsLambda) {
             auto strategy = annotation != SourceOverflowStrategy::NA ? annotation : pending;
             if (strategy != SourceOverflowStrategy::NA) {
                 active = strategy;
@@ -525,7 +561,13 @@ SourceOverflowStrategy GetSourceOverflowStrategyAtLine(const std::vector<std::st
             pending = SourceOverflowStrategy::NA;
         }
         if (lineNo == targetLine) {
-            return annotation != SourceOverflowStrategy::NA ? annotation : active;
+            if (annotation != SourceOverflowStrategy::NA) {
+                return annotation;
+            }
+            if (active != SourceOverflowStrategy::NA) {
+                return active;
+            }
+            return pending;
         }
         if (active != SourceOverflowStrategy::NA) {
             for (auto c : raw) {
@@ -799,6 +841,9 @@ bool ParseSourceAssignment(const std::string& line, std::string& name, std::stri
     }
     name = lhs;
     expr = Trim(trimmed.substr(eq + 1));
+    if (!expr.empty() && expr.back() == ';') {
+        expr = Trim(expr.substr(0, expr.size() - 1));
+    }
     return !expr.empty();
 }
 
@@ -818,6 +863,9 @@ bool ParseSourceCompoundAssignment(const std::string& line, std::string& name, s
         name = lhs;
         op = candidate.substr(0, candidate.size() - 1);
         expr = Trim(trimmed.substr(pos + candidate.size()));
+        if (!expr.empty() && expr.back() == ';') {
+            expr = Trim(expr.substr(0, expr.size() - 1));
+        }
         return !expr.empty();
     }
     return false;
@@ -873,20 +921,67 @@ void InferSourceForRangeVariableFallback(const std::vector<std::string>& lines, 
 void CollectSourceAssignedIntValues(const std::vector<std::string>& lines, unsigned begin, unsigned end,
     const std::string& variableName, std::vector<int64_t>& values)
 {
-    std::vector<SourceScope> emptyScopes(1);
+    std::vector<SourceScope> scopes(1);
     for (unsigned lineNo = begin; lineNo <= end && lineNo <= lines.size(); ++lineNo) {
         std::string name;
         ContestQueryTypeHint typeHint{ContestQueryTypeHint::UNKNOWN};
         std::string expr;
-        if (ParseSourceDeclaration(lines[lineNo - 1], name, typeHint, expr) && name == variableName) {
-            if (auto value = EvalSourceIntExpr(expr, emptyScopes); value.has_value()) {
-                values.emplace_back(value.value());
+        if (ParseSourceDeclaration(lines[lineNo - 1], name, typeHint, expr)) {
+            SourceExactValue exact;
+            auto overflowStrategy = GetSourceOverflowStrategyAtLine(lines, lineNo);
+            bool hasExact = TryEvalSourceExactValue(expr, scopes, typeHint, exact, overflowStrategy);
+            if (!hasExact && expr.find("spawn") != std::string::npos) {
+                if (auto value = EvalSourceSpawnExprBlock(lines, lineNo, scopes); value.has_value()) {
+                    exact.typeHint = ContestQueryTypeHint::INT64;
+                    exact.intValue = value.value();
+                    hasExact = true;
+                }
             }
-            continue;
+            if (hasExact) {
+                scopes.back()[name] = exact;
+                if (name == variableName && IsSourceIntegerTypeHint(exact.typeHint)) {
+                    values.emplace_back(exact.intValue);
+                }
+            }
+        } else if (ParseSourceAssignment(lines[lineNo - 1], name, expr)) {
+            SourceExactValue exact;
+            auto old = LookupSourceValue(scopes, name);
+            auto hint = old == nullptr ? ContestQueryTypeHint::UNKNOWN : old->typeHint;
+            auto overflowStrategy = GetSourceOverflowStrategyAtLine(lines, lineNo);
+            bool hasExact = TryEvalSourceExactValue(expr, scopes, hint, exact, overflowStrategy);
+            if (!hasExact && expr.find("spawn") != std::string::npos) {
+                if (auto value = EvalSourceSpawnExprBlock(lines, lineNo, scopes); value.has_value()) {
+                    exact.typeHint = ContestQueryTypeHint::INT64;
+                    exact.intValue = value.value();
+                    hasExact = true;
+                }
+            }
+            if (hasExact) {
+                scopes.back()[name] = exact;
+                if (name == variableName && IsSourceIntegerTypeHint(exact.typeHint)) {
+                    values.emplace_back(exact.intValue);
+                }
+            }
+        } else {
+            std::string op;
+            if (ParseSourceCompoundAssignment(lines[lineNo - 1], name, op, expr)) {
+                auto value = EvalSourceCompoundAssignment(scopes, name, op, expr);
+                if (value.has_value()) {
+                    SourceExactValue exact;
+                    exact.typeHint = ContestQueryTypeHint::INT64;
+                    exact.intValue = value.value();
+                    scopes.back()[name] = exact;
+                    if (name == variableName) {
+                        values.emplace_back(value.value());
+                    }
+                }
+            }
         }
-        if (ParseSourceAssignment(lines[lineNo - 1], name, expr) && name == variableName) {
-            if (auto value = EvalSourceIntExpr(expr, emptyScopes); value.has_value()) {
-                values.emplace_back(value.value());
+        for (auto c : lines[lineNo - 1]) {
+            if (c == '{') {
+                scopes.emplace_back();
+            } else if (c == '}' && scopes.size() > 1) {
+                scopes.pop_back();
             }
         }
     }
@@ -916,6 +1011,11 @@ size_t CountSourceAssignments(const std::vector<std::string>& lines, unsigned be
         std::string name;
         std::string expr;
         if (ParseSourceAssignment(lines[lineNo - 1], name, expr) && name == variableName) {
+            ++count;
+            continue;
+        }
+        std::string op;
+        if (ParseSourceCompoundAssignment(lines[lineNo - 1], name, op, expr) && name == variableName) {
             ++count;
         }
     }
@@ -964,7 +1064,23 @@ bool SourceLineAssignsVariableName(const std::string& line, const std::string& v
     if (ParseSourceDeclaration(line, name, typeHint, expr) && name == variableName) {
         return true;
     }
-    return ParseSourceAssignment(line, name, expr) && name == variableName;
+    if (ParseSourceAssignment(line, name, expr) && name == variableName) {
+        return true;
+    }
+    std::string op;
+    return ParseSourceCompoundAssignment(line, name, op, expr) && name == variableName;
+}
+
+bool SourceHasPriorLoopAssignment(
+    const std::vector<std::string>& lines, unsigned line, const std::string& variableName)
+{
+    for (unsigned lineNo = 1; lineNo < line && lineNo <= lines.size(); ++lineNo) {
+        if (SourceLineAssignsVariableName(lines[lineNo - 1], variableName) &&
+            IsSourceLineInsideLoop(lines, lineNo)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool SourceLineDeclaresMutableVariableName(const std::string& line, const std::string& variableName)
@@ -1046,6 +1162,7 @@ bool TryCollectSourceConstantIntWrites(
 {
     std::vector<SourceScope> scopes(1);
     std::optional<int64_t> lastTargetValue;
+    int braceDepth = 0;
     for (const auto& rawLine : lines) {
         std::string name;
         ContestQueryTypeHint typeHint{ContestQueryTypeHint::UNKNOWN};
@@ -1055,6 +1172,9 @@ bool TryCollectSourceConstantIntWrites(
             const bool hasExact = TryEvalSourceExactValue(expr, scopes, typeHint, exact);
             if (hasExact) {
                 scopes.back()[name] = exact;
+                if (braceDepth == 0 || StripLineComment(rawLine).find("static") != std::string::npos) {
+                    scopes.front()[name] = exact;
+                }
             }
             if (name == variableName) {
                 if (!hasExact || !IsSourceIntegerTypeHint(exact.typeHint)) {
@@ -1071,6 +1191,9 @@ bool TryCollectSourceConstantIntWrites(
                 exact.typeHint = ContestQueryTypeHint::INT64;
                 exact.intValue = value.value();
                 scopes.back()[name] = exact;
+                if (braceDepth == 0 || StripLineComment(rawLine).find("static") != std::string::npos) {
+                    scopes.front()[name] = exact;
+                }
                 if (name == variableName) {
                     values.emplace_back(value.value());
                     lastTargetValue = value.value();
@@ -1094,6 +1217,9 @@ bool TryCollectSourceConstantIntWrites(
                     exact.typeHint = ContestQueryTypeHint::INT64;
                     exact.intValue = value.value();
                     scopes.back()[name] = exact;
+                    if (braceDepth == 0 || StripLineComment(rawLine).find("static") != std::string::npos) {
+                        scopes.front()[name] = exact;
+                    }
                     if (name == variableName) {
                         values.emplace_back(value.value());
                         lastTargetValue = value.value();
@@ -1106,8 +1232,12 @@ bool TryCollectSourceConstantIntWrites(
         }
         for (auto c : rawLine) {
             if (c == '{') {
+                ++braceDepth;
                 scopes.emplace_back();
             } else if (c == '}' && scopes.size() > 1) {
+                if (braceDepth > 0) {
+                    --braceDepth;
+                }
                 scopes.pop_back();
             }
         }
@@ -1359,6 +1489,28 @@ std::optional<unsigned> FindSourceBraceBlockEnd(const std::vector<std::string>& 
         }
     }
     return std::nullopt;
+}
+
+size_t SkipSourceGenericParameterList(const std::string& line, size_t pos)
+{
+    while (pos < line.size() && std::isspace(static_cast<unsigned char>(line[pos]))) {
+        ++pos;
+    }
+    if (pos >= line.size() || line[pos] != '<') {
+        return pos;
+    }
+    int depth = 0;
+    for (; pos < line.size(); ++pos) {
+        if (line[pos] == '<') {
+            ++depth;
+        } else if (line[pos] == '>') {
+            --depth;
+            if (depth == 0) {
+                return pos + 1;
+            }
+        }
+    }
+    return pos;
 }
 
 void InferSourceMatchFallback(const std::vector<std::string>& lines, ContestQuery& query)
@@ -1701,6 +1853,88 @@ ContestQueryTypeHint InferContestQueryTypeHintFromLine(const std::string& line, 
     return ContestQueryTypeHint::UNKNOWN;
 }
 
+ContestQueryTypeHint MergeSourceIntegerTypeHint(ContestQueryTypeHint lhs, ContestQueryTypeHint rhs)
+{
+    if (!IsSourceIntegerTypeHint(lhs)) {
+        return rhs;
+    }
+    if (!IsSourceIntegerTypeHint(rhs)) {
+        return lhs;
+    }
+    return lhs == rhs ? lhs : ContestQueryTypeHint::INT64;
+}
+
+ContestQueryTypeHint InferSourceIntegerTypeHintFromToken(const std::string& token)
+{
+    static const std::vector<std::pair<std::string, ContestQueryTypeHint>> typePrefixes{
+        {"Int8", ContestQueryTypeHint::INT8}, {"Int16", ContestQueryTypeHint::INT16},
+        {"Int32", ContestQueryTypeHint::INT32}, {"Int64", ContestQueryTypeHint::INT64},
+        {"UInt8", ContestQueryTypeHint::UINT8}, {"UInt16", ContestQueryTypeHint::UINT16},
+        {"UInt32", ContestQueryTypeHint::UINT32}, {"UInt64", ContestQueryTypeHint::UINT64},
+    };
+    for (const auto& [name, hint] : typePrefixes) {
+        if (token == name || token.rfind(name + ".", 0) == 0 || token.rfind(name + "(", 0) == 0) {
+            return hint;
+        }
+    }
+    return ContestQueryTypeHint::UNKNOWN;
+}
+
+ContestQueryTypeHint InferSourceIntegerTypeHintFromLiteralSuffix(const std::string& token)
+{
+    if (token.size() < 2) {
+        return ContestQueryTypeHint::UNKNOWN;
+    }
+    auto lower = token;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    const std::vector<std::pair<std::string, ContestQueryTypeHint>> suffixes{
+        {"i8", ContestQueryTypeHint::INT8}, {"i16", ContestQueryTypeHint::INT16},
+        {"i32", ContestQueryTypeHint::INT32}, {"i64", ContestQueryTypeHint::INT64},
+        {"u8", ContestQueryTypeHint::UINT8}, {"u16", ContestQueryTypeHint::UINT16},
+        {"u32", ContestQueryTypeHint::UINT32}, {"u64", ContestQueryTypeHint::UINT64},
+    };
+    for (const auto& [suffix, hint] : suffixes) {
+        if (lower.size() > suffix.size() && lower.compare(lower.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            return hint;
+        }
+    }
+    return ContestQueryTypeHint::UNKNOWN;
+}
+
+ContestQueryTypeHint InferSourceIntegerTypeHintFromExpr(
+    const std::string& expr, const std::vector<SourceScope>& scopes)
+{
+    auto trimmed = StripSourceEnclosingParens(expr);
+    ContestQueryTypeHint hint = InferSourceIntegerTypeHintFromToken(trimmed);
+    if (IsSourceIntegerTypeHint(hint)) {
+        return hint;
+    }
+    std::string token;
+    auto flushToken = [&]() {
+        if (token.empty()) {
+            return;
+        }
+        hint = MergeSourceIntegerTypeHint(hint, InferSourceIntegerTypeHintFromToken(token));
+        hint = MergeSourceIntegerTypeHint(hint, InferSourceIntegerTypeHintFromLiteralSuffix(token));
+        if (auto value = LookupSourceValue(scopes, token);
+            value != nullptr && IsSourceIntegerTypeHint(value->typeHint)) {
+            hint = MergeSourceIntegerTypeHint(hint, value->typeHint);
+        }
+        token.clear();
+    };
+    for (auto c : trimmed) {
+        if (IsIdentifierChar(c) || c == '.') {
+            token.push_back(c);
+            continue;
+        }
+        flushToken();
+    }
+    flushToken();
+    return hint;
+}
+
 // 从内向外查找源码常量环境中已经证明的简单值。
 const SourceExactValue* LookupSourceValue(const std::vector<SourceScope>& scopes, const std::string& name)
 {
@@ -1710,6 +1944,13 @@ const SourceExactValue* LookupSourceValue(const std::vector<SourceScope>& scopes
             return &value->second;
         }
     }
+    auto dot = name.find_last_of('.');
+    if (dot != std::string::npos && dot + 1 < name.size()) {
+        auto shortName = Trim(name.substr(dot + 1));
+        if (!shortName.empty() && shortName != name) {
+            return LookupSourceValue(scopes, shortName);
+        }
+    }
     return nullptr;
 }
 
@@ -1717,14 +1958,16 @@ bool TryEvalSourceExactValue(const std::string& expr, const std::vector<SourceSc
     ContestQueryTypeHint preferredHint, SourceExactValue& value, SourceOverflowStrategy overflowStrategy)
 {
     if (preferredHint != ContestQueryTypeHint::BOOL) {
+        auto effectiveHint = IsSourceIntegerTypeHint(preferredHint) ? preferredHint :
+            InferSourceIntegerTypeHintFromExpr(expr, scopes);
         auto intValue = overflowStrategy == SourceOverflowStrategy::NA
             ? EvalSourceIntExpr(expr, scopes)
-            : EvalSourceIntExprWithOverflow(expr, scopes, preferredHint, overflowStrategy);
+            : EvalSourceIntExprWithOverflow(expr, scopes, effectiveHint, overflowStrategy);
         if (intValue.has_value()) {
-            intValue = NormalizeSourceIntegerValue(*intValue, preferredHint, overflowStrategy);
+            intValue = NormalizeSourceIntegerValue(*intValue, effectiveHint, overflowStrategy);
         }
         if (intValue.has_value()) {
-            value.typeHint = IsSourceIntegerTypeHint(preferredHint) ? preferredHint : ContestQueryTypeHint::INT64;
+            value.typeHint = IsSourceIntegerTypeHint(effectiveHint) ? effectiveHint : ContestQueryTypeHint::INT64;
             value.intValue = intValue.value();
             return true;
         }
@@ -1761,7 +2004,87 @@ bool ParseSourceDeclaration(
         (pos + varPrefix.size() == trimmed.size() || !IsIdentifierChar(trimmed[pos + varPrefix.size()]))) {
         pos += varPrefix.size();
     } else {
-        return false;
+        size_t cStylePos = pos;
+        bool isSigned = false;
+        bool isUnsigned = false;
+        int longCount = 0;
+        bool sawType = false;
+        std::optional<ContestQueryTypeHint> cStyleHint;
+        while (cStylePos < trimmed.size()) {
+            while (cStylePos < trimmed.size() && std::isspace(static_cast<unsigned char>(trimmed[cStylePos]))) {
+                ++cStylePos;
+            }
+            auto tokenBegin = cStylePos;
+            while (cStylePos < trimmed.size() && IsIdentifierChar(trimmed[cStylePos])) {
+                ++cStylePos;
+            }
+            auto token = trimmed.substr(tokenBegin, cStylePos - tokenBegin);
+            if (token == "signed") {
+                isSigned = true;
+                sawType = true;
+                continue;
+            }
+            if (token == "unsigned") {
+                isUnsigned = true;
+                sawType = true;
+                continue;
+            }
+            if (token == "long") {
+                ++longCount;
+                sawType = true;
+                continue;
+            }
+            if (token == "short" || token == "int") {
+                sawType = true;
+                continue;
+            }
+            if (token == "int8_t" || token == "int16_t" || token == "int32_t" || token == "int64_t" ||
+                token == "uint8_t" || token == "uint16_t" || token == "uint32_t" || token == "uint64_t") {
+                sawType = true;
+                cStyleHint = token == "int8_t" ? ContestQueryTypeHint::INT8 :
+                    token == "int16_t" ? ContestQueryTypeHint::INT16 :
+                    token == "int32_t" ? ContestQueryTypeHint::INT32 :
+                    token == "int64_t" ? ContestQueryTypeHint::INT64 :
+                    token == "uint8_t" ? ContestQueryTypeHint::UINT8 :
+                    token == "uint16_t" ? ContestQueryTypeHint::UINT16 :
+                    token == "uint32_t" ? ContestQueryTypeHint::UINT32 :
+                    ContestQueryTypeHint::UINT64;
+                continue;
+            }
+            cStylePos = tokenBegin;
+            break;
+        }
+        while (cStylePos < trimmed.size() && std::isspace(static_cast<unsigned char>(trimmed[cStylePos]))) {
+            ++cStylePos;
+        }
+        if (!sawType || cStylePos >= trimmed.size() || !IsIdentifierChar(trimmed[cStylePos]) ||
+            std::isdigit(static_cast<unsigned char>(trimmed[cStylePos])) || (isSigned && isUnsigned)) {
+            return false;
+        }
+        pos = cStylePos;
+        if (cStyleHint.has_value()) {
+            typeHint = cStyleHint.value();
+        } else if (isUnsigned) {
+            typeHint = longCount >= 2 ? ContestQueryTypeHint::UINT64 : ContestQueryTypeHint::UINT32;
+        } else {
+            typeHint = longCount >= 2 ? ContestQueryTypeHint::INT64 : ContestQueryTypeHint::INT32;
+        }
+        auto nameBegin = pos;
+        while (pos < trimmed.size() && IsIdentifierChar(trimmed[pos])) {
+            ++pos;
+        }
+        name = trimmed.substr(nameBegin, pos - nameBegin);
+        while (pos < trimmed.size() && std::isspace(static_cast<unsigned char>(trimmed[pos]))) {
+            ++pos;
+        }
+        if (pos >= trimmed.size() || trimmed[pos] != '=' || (pos + 1 < trimmed.size() && trimmed[pos + 1] == '=')) {
+            return false;
+        }
+        expr = Trim(trimmed.substr(pos + 1));
+        if (!expr.empty() && expr.back() == ';') {
+            expr = Trim(expr.substr(0, expr.size() - 1));
+        }
+        return !expr.empty();
     }
     while (pos < trimmed.size() && std::isspace(static_cast<unsigned char>(trimmed[pos]))) {
         ++pos;
@@ -2359,6 +2682,674 @@ std::optional<bool> EvalSourceBoolExpr(const std::string& expr, const std::vecto
     return std::nullopt;
 }
 
+struct SourceVariableComparison {
+    std::string lhs;
+    std::string rhs;
+    RelationalOperation relation;
+};
+
+struct SourcePairLoopInfo {
+    SourceLoopExtent loop;
+    SourceVariableComparison comparison;
+    int64_t lhsStep{0};
+    int64_t rhsStep{0};
+    std::vector<int64_t> lhsInits;
+    std::vector<int64_t> rhsInits;
+};
+
+struct SourcePairLoopValues {
+    std::vector<int64_t> lhsHeaderValues;
+    std::vector<int64_t> rhsHeaderValues;
+    std::vector<int64_t> lhsBodyValues;
+    std::vector<int64_t> rhsBodyValues;
+    std::vector<int64_t> lhsExitValues;
+    std::vector<int64_t> rhsExitValues;
+};
+
+bool IsSourceIdentifierName(const std::string& name)
+{
+    auto trimmed = Trim(name);
+    return !trimmed.empty() && !std::isdigit(static_cast<unsigned char>(trimmed.front())) &&
+        std::all_of(trimmed.begin(), trimmed.end(), IsIdentifierChar);
+}
+
+std::optional<size_t> FindMatchingSourceParen(const std::string& text, size_t open)
+{
+    if (open >= text.size() || text[open] != '(') {
+        return std::nullopt;
+    }
+    int depth = 0;
+    for (size_t pos = open; pos < text.size(); ++pos) {
+        if (text[pos] == '(') {
+            ++depth;
+        } else if (text[pos] == ')') {
+            --depth;
+            if (depth == 0) {
+                return pos;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+RelationalOperation ReverseSourceRelation(RelationalOperation relation)
+{
+    switch (relation) {
+        case RelationalOperation::GE:
+            return RelationalOperation::LE;
+        case RelationalOperation::LE:
+            return RelationalOperation::GE;
+        case RelationalOperation::GT:
+            return RelationalOperation::LT;
+        case RelationalOperation::LT:
+            return RelationalOperation::GT;
+        case RelationalOperation::EQ:
+            return RelationalOperation::EQ;
+        case RelationalOperation::NE:
+            return RelationalOperation::NE;
+    }
+    return relation;
+}
+
+bool SourceRelationHolds(int64_t lhs, RelationalOperation relation, int64_t rhs)
+{
+    switch (relation) {
+        case RelationalOperation::GE:
+            return lhs >= rhs;
+        case RelationalOperation::LE:
+            return lhs <= rhs;
+        case RelationalOperation::EQ:
+            return lhs == rhs;
+        case RelationalOperation::NE:
+            return lhs != rhs;
+        case RelationalOperation::GT:
+            return lhs > rhs;
+        case RelationalOperation::LT:
+            return lhs < rhs;
+    }
+    return false;
+}
+
+std::optional<SourceVariableComparison> ParseSourceVariableComparison(const std::string& condition)
+{
+    auto trimmed = StripSourceEnclosingParens(condition);
+    const std::vector<std::pair<std::string, RelationalOperation>> relations{
+        {">=", RelationalOperation::GE}, {"<=", RelationalOperation::LE}, {"==", RelationalOperation::EQ},
+        {"!=", RelationalOperation::NE}, {">", RelationalOperation::GT}, {"<", RelationalOperation::LT}};
+    for (const auto& relation : relations) {
+        auto pos = FindSourceBinaryToken(trimmed, relation.first);
+        if (!pos.has_value()) {
+            continue;
+        }
+        auto lhsName = StripSourceEnclosingParens(trimmed.substr(0, pos.value()));
+        auto rhsName = StripSourceEnclosingParens(trimmed.substr(pos.value() + relation.first.size()));
+        if (!IsSourceIdentifierName(lhsName) || !IsSourceIdentifierName(rhsName)) {
+            return std::nullopt;
+        }
+        return SourceVariableComparison{lhsName, rhsName, relation.second};
+    }
+    return std::nullopt;
+}
+
+std::optional<std::string> ParseSourceWhileCondition(const std::string& line)
+{
+    auto header = Trim(StripLineComment(line));
+    if (!SourceLineStartsWithKeyword(header, "while")) {
+        return std::nullopt;
+    }
+    auto open = header.find('(');
+    if (open == std::string::npos) {
+        return std::nullopt;
+    }
+    auto close = FindMatchingSourceParen(header, open);
+    if (!close.has_value() || close.value() <= open) {
+        return std::nullopt;
+    }
+    return header.substr(open + 1, close.value() - open - 1);
+}
+
+std::optional<SourceVariableComparison> ParseSourcePairWhileHeader(const std::string& line)
+{
+    auto condition = ParseSourceWhileCondition(line);
+    if (!condition.has_value()) {
+        return std::nullopt;
+    }
+    auto comparison = ParseSourceVariableComparison(condition.value());
+    if (!comparison.has_value() || comparison->lhs == comparison->rhs) {
+        return std::nullopt;
+    }
+    if (comparison->relation != RelationalOperation::LT && comparison->relation != RelationalOperation::LE &&
+        comparison->relation != RelationalOperation::GT && comparison->relation != RelationalOperation::GE) {
+        return std::nullopt;
+    }
+    return comparison;
+}
+
+std::optional<std::vector<int64_t>> NormalizeSmallSourceValues(std::vector<int64_t> values)
+{
+    std::sort(values.begin(), values.end());
+    values.erase(std::unique(values.begin(), values.end()), values.end());
+    if (values.empty() || values.size() > MAX_CONTEST_EXACT_VALUES) {
+        return std::nullopt;
+    }
+    return values;
+}
+
+std::optional<std::vector<int64_t>> InferSourceNameValuesAtLine(
+    const std::vector<std::string>& lines, unsigned line, const std::string& name, unsigned depth);
+
+std::optional<std::vector<int64_t>> EvalSourceIntExprValuesAtLine(
+    const std::vector<std::string>& lines, unsigned line, const std::string& expr, unsigned depth)
+{
+    constexpr unsigned MAX_SOURCE_VALUE_RECURSION_DEPTH = 8;
+    if (depth > MAX_SOURCE_VALUE_RECURSION_DEPTH) {
+        return std::nullopt;
+    }
+    auto trimmed = StripSourceEnclosingParens(expr);
+    if (trimmed.empty()) {
+        return std::nullopt;
+    }
+    if (!trimmed.empty() && trimmed.back() == ';') {
+        trimmed = Trim(trimmed.substr(0, trimmed.size() - 1));
+    }
+    std::vector<SourceScope> emptyScopes(1);
+    if (auto literal = EvalSourceIntExpr(trimmed, emptyScopes); literal.has_value()) {
+        return std::vector<int64_t>{literal.value()};
+    }
+    if (IsSourceIdentifierName(trimmed)) {
+        return InferSourceNameValuesAtLine(lines, line, trimmed, depth + 1);
+    }
+    for (const auto& token : {std::string("+"), std::string("-")}) {
+        auto pos = FindSourceBinaryToken(trimmed, token);
+        if (!pos.has_value()) {
+            continue;
+        }
+        auto lhsValues = EvalSourceIntExprValuesAtLine(lines, line, trimmed.substr(0, pos.value()), depth + 1);
+        auto rhsValues = EvalSourceIntExprValuesAtLine(
+            lines, line, trimmed.substr(pos.value() + token.size()), depth + 1);
+        if (!lhsValues.has_value() || !rhsValues.has_value()) {
+            return std::nullopt;
+        }
+        std::vector<int64_t> values;
+        for (auto lhsValue : lhsValues.value()) {
+            for (auto rhsValue : rhsValues.value()) {
+                auto result = EvalSourceBinaryIntOp(lhsValue, rhsValue, token);
+                if (!result.has_value()) {
+                    return std::nullopt;
+                }
+                values.emplace_back(result.value());
+            }
+        }
+        return NormalizeSmallSourceValues(std::move(values));
+    }
+    return std::nullopt;
+}
+
+std::vector<SourceLoopExtent> CollectSourceLoopExtents(const std::vector<std::string>& lines)
+{
+    std::vector<SourceLoopExtent> loops;
+    for (unsigned lineNo = 1; lineNo <= lines.size(); ++lineNo) {
+        if (!SourceLineStartsLoop(lines[lineNo - 1])) {
+            continue;
+        }
+        auto end = FindSourceBraceBlockEnd(lines, lineNo);
+        if (end.has_value() && end.value() >= lineNo) {
+            loops.emplace_back(SourceLoopExtent{lineNo, end.value()});
+        }
+    }
+    return loops;
+}
+
+bool SourceLineIsInsideLoopExtent(const SourceLoopExtent& loop, unsigned line)
+{
+    return loop.start < line && line <= loop.end;
+}
+
+std::optional<int64_t> ParseSourceSelfStepExpr(const std::string& variableName, const std::string& expr)
+{
+    auto trimmed = StripSourceEnclosingParens(expr);
+    if (trimmed == variableName) {
+        return 0;
+    }
+    std::vector<SourceScope> emptyScopes(1);
+    if (auto pos = FindSourceBinaryToken(trimmed, "+"); pos.has_value()) {
+        auto lhs = StripSourceEnclosingParens(trimmed.substr(0, pos.value()));
+        auto rhs = StripSourceEnclosingParens(trimmed.substr(pos.value() + 1));
+        if (lhs == variableName) {
+            return EvalSourceIntExpr(rhs, emptyScopes);
+        }
+        if (rhs == variableName) {
+            return EvalSourceIntExpr(lhs, emptyScopes);
+        }
+        return std::nullopt;
+    }
+    if (auto pos = FindSourceBinaryToken(trimmed, "-"); pos.has_value()) {
+        auto lhs = StripSourceEnclosingParens(trimmed.substr(0, pos.value()));
+        auto rhs = StripSourceEnclosingParens(trimmed.substr(pos.value() + 1));
+        if (lhs != variableName) {
+            return std::nullopt;
+        }
+        auto delta = EvalSourceIntExpr(rhs, emptyScopes);
+        if (!delta.has_value()) {
+            return std::nullopt;
+        }
+        if (delta.value() == std::numeric_limits<int64_t>::min()) {
+            return std::nullopt;
+        }
+        return -delta.value();
+    }
+    return std::nullopt;
+}
+
+std::optional<int64_t> ParseSourceIncDecStep(const std::string& line, const std::string& variableName)
+{
+    auto trimmed = Trim(StripLineComment(line));
+    if (!trimmed.empty() && trimmed.back() == ';') {
+        trimmed = Trim(trimmed.substr(0, trimmed.size() - 1));
+    }
+    if (trimmed == variableName + "++" || trimmed == "++" + variableName) {
+        return 1;
+    }
+    if (trimmed == variableName + "--" || trimmed == "--" + variableName) {
+        return -1;
+    }
+    return std::nullopt;
+}
+
+std::optional<int64_t> FindSourceLoopVariableStep(
+    const std::vector<std::string>& lines, const SourceLoopExtent& loop, const std::string& variableName)
+{
+    std::optional<int64_t> step;
+    for (unsigned lineNo = loop.start + 1; lineNo < loop.end && lineNo <= lines.size(); ++lineNo) {
+        std::string declared;
+        ContestQueryTypeHint declaredType{ContestQueryTypeHint::UNKNOWN};
+        std::string declaredExpr;
+        if (ParseSourceDeclaration(lines[lineNo - 1], declared, declaredType, declaredExpr) &&
+            declared == variableName) {
+            return std::nullopt;
+        }
+        std::optional<int64_t> current;
+        std::string assigned;
+        std::string assignedExpr;
+        if (ParseSourceAssignment(lines[lineNo - 1], assigned, assignedExpr) && assigned == variableName) {
+            current = ParseSourceSelfStepExpr(variableName, assignedExpr);
+        } else {
+            std::string op;
+            if (ParseSourceCompoundAssignment(lines[lineNo - 1], assigned, op, assignedExpr) &&
+                assigned == variableName) {
+                std::vector<SourceScope> emptyScopes(1);
+                auto rhsValue = EvalSourceIntExpr(assignedExpr, emptyScopes);
+                if (!rhsValue.has_value()) {
+                    return std::nullopt;
+                }
+                if (op == "+") {
+                    current = rhsValue.value();
+                } else if (op == "-") {
+                    if (rhsValue.value() == std::numeric_limits<int64_t>::min()) {
+                        return std::nullopt;
+                    }
+                    current = -rhsValue.value();
+                } else {
+                    return std::nullopt;
+                }
+            } else {
+                current = ParseSourceIncDecStep(lines[lineNo - 1], variableName);
+            }
+        }
+        if (!current.has_value()) {
+            continue;
+        }
+        if (step.has_value()) {
+            return std::nullopt;
+        }
+        step = current;
+    }
+    return step.value_or(0);
+}
+
+std::optional<std::vector<int64_t>> GetSourceForRangeValues(const SourceForRangeInfo& range)
+{
+    auto bounds = GetSourceForRangeBounds(range);
+    if (!bounds.has_value()) {
+        return std::nullopt;
+    }
+    std::vector<int64_t> values;
+    for (int64_t value = bounds->first;; ++value) {
+        values.emplace_back(value);
+        if (values.size() > MAX_CONTEST_EXACT_VALUES) {
+            return std::nullopt;
+        }
+        if (value == bounds->second) {
+            break;
+        }
+    }
+    return values;
+}
+
+std::optional<std::vector<int64_t>> InferSourceWhileInductionValues(
+    const std::vector<std::string>& lines, const SourceLoopExtent& loop, const std::string& name, unsigned depth)
+{
+    auto condition = ParseSourceWhileCondition(lines[loop.start - 1]);
+    if (!condition.has_value()) {
+        return std::nullopt;
+    }
+    auto trimmed = StripSourceEnclosingParens(condition.value());
+    const std::vector<std::pair<std::string, RelationalOperation>> relations{
+        {">=", RelationalOperation::GE}, {"<=", RelationalOperation::LE},
+        {">", RelationalOperation::GT}, {"<", RelationalOperation::LT}};
+    std::optional<RelationalOperation> relation;
+    std::optional<int64_t> bound;
+    for (const auto& relationInfo : relations) {
+        auto pos = FindSourceBinaryToken(trimmed, relationInfo.first);
+        if (!pos.has_value()) {
+            continue;
+        }
+        auto lhs = StripSourceEnclosingParens(trimmed.substr(0, pos.value()));
+        auto rhs = StripSourceEnclosingParens(trimmed.substr(pos.value() + relationInfo.first.size()));
+        if (lhs == name) {
+            auto values = EvalSourceIntExprValuesAtLine(lines, loop.start, rhs, depth + 1);
+            if (!values.has_value() || values->size() != 1) {
+                return std::nullopt;
+            }
+            relation = relationInfo.second;
+            bound = values->front();
+            break;
+        }
+        if (rhs == name) {
+            auto values = EvalSourceIntExprValuesAtLine(lines, loop.start, lhs, depth + 1);
+            if (!values.has_value() || values->size() != 1) {
+                return std::nullopt;
+            }
+            relation = ReverseSourceRelation(relationInfo.second);
+            bound = values->front();
+            break;
+        }
+    }
+    if (!relation.has_value() || !bound.has_value()) {
+        return std::nullopt;
+    }
+    auto initValues = InferSourceNameValuesAtLine(lines, loop.start, name, depth + 1);
+    auto step = FindSourceLoopVariableStep(lines, loop, name);
+    if (!initValues.has_value() || !step.has_value() || step.value() == 0) {
+        return std::nullopt;
+    }
+    std::vector<int64_t> values;
+    for (auto init : initValues.value()) {
+        int64_t current = init;
+        size_t guard = 0;
+        while (SourceRelationHolds(current, relation.value(), bound.value())) {
+            values.emplace_back(current);
+            if (values.size() > MAX_CONTEST_EXACT_VALUES || ++guard > MAX_CONTEST_EXACT_VALUES) {
+                return std::nullopt;
+            }
+            int64_t next = 0;
+            if (__builtin_add_overflow(current, step.value(), &next)) {
+                return std::nullopt;
+            }
+            current = next;
+        }
+    }
+    return NormalizeSmallSourceValues(std::move(values));
+}
+
+std::optional<std::vector<int64_t>> InferSourceNameValuesAtLine(
+    const std::vector<std::string>& lines, unsigned line, const std::string& name, unsigned depth)
+{
+    constexpr unsigned MAX_SOURCE_VALUE_RECURSION_DEPTH = 8;
+    if (depth > MAX_SOURCE_VALUE_RECURSION_DEPTH || line == 0 || !IsSourceIdentifierName(name)) {
+        return std::nullopt;
+    }
+    auto loops = CollectSourceLoopExtents(lines);
+    std::sort(loops.begin(), loops.end(), [](const SourceLoopExtent& lhs, const SourceLoopExtent& rhs) {
+        if (lhs.start != rhs.start) {
+            return lhs.start > rhs.start;
+        }
+        return lhs.end < rhs.end;
+    });
+    for (const auto& loop : loops) {
+        if (!SourceLineIsInsideLoopExtent(loop, line)) {
+            continue;
+        }
+        if (auto range = ParseSourceForInRangeHeader(lines[loop.start - 1]);
+            range.has_value() && range->variable == name) {
+            return GetSourceForRangeValues(range.value());
+        }
+        if (auto values = InferSourceWhileInductionValues(lines, loop, name, depth + 1);
+            values.has_value()) {
+            return values;
+        }
+    }
+
+    unsigned lineNo = std::min<unsigned>(line > 0 ? line - 1 : 0, static_cast<unsigned>(lines.size()));
+    while (lineNo >= 1) {
+        std::string declared;
+        ContestQueryTypeHint declaredType{ContestQueryTypeHint::UNKNOWN};
+        std::string declaredExpr;
+        if (ParseSourceDeclaration(lines[lineNo - 1], declared, declaredType, declaredExpr) && declared == name) {
+            return EvalSourceIntExprValuesAtLine(lines, lineNo, declaredExpr, depth + 1);
+        }
+        std::string assigned;
+        std::string assignedExpr;
+        if (ParseSourceAssignment(lines[lineNo - 1], assigned, assignedExpr) && assigned == name) {
+            return EvalSourceIntExprValuesAtLine(lines, lineNo, assignedExpr, depth + 1);
+        }
+        if (lineNo == 1) {
+            break;
+        }
+        --lineNo;
+    }
+    return std::nullopt;
+}
+
+std::optional<SourcePairLoopInfo> BuildSourcePairLoopInfo(
+    const std::vector<std::string>& lines, const SourceLoopExtent& loop)
+{
+    if (loop.start == 0 || loop.start > lines.size()) {
+        return std::nullopt;
+    }
+    auto comparison = ParseSourcePairWhileHeader(lines[loop.start - 1]);
+    if (!comparison.has_value()) {
+        return std::nullopt;
+    }
+    auto lhsStep = FindSourceLoopVariableStep(lines, loop, comparison->lhs);
+    auto rhsStep = FindSourceLoopVariableStep(lines, loop, comparison->rhs);
+    if (!lhsStep.has_value() || !rhsStep.has_value()) {
+        return std::nullopt;
+    }
+    auto relativeStep = static_cast<__int128>(lhsStep.value()) - static_cast<__int128>(rhsStep.value());
+    if (((comparison->relation == RelationalOperation::LT || comparison->relation == RelationalOperation::LE) &&
+            relativeStep <= 0) ||
+        ((comparison->relation == RelationalOperation::GT || comparison->relation == RelationalOperation::GE) &&
+            relativeStep >= 0)) {
+        return std::nullopt;
+    }
+    auto lhsInits = InferSourceNameValuesAtLine(lines, loop.start, comparison->lhs, 0);
+    auto rhsInits = InferSourceNameValuesAtLine(lines, loop.start, comparison->rhs, 0);
+    if (!lhsInits.has_value() || !rhsInits.has_value()) {
+        return std::nullopt;
+    }
+    return SourcePairLoopInfo{
+        loop, comparison.value(), lhsStep.value(), rhsStep.value(), lhsInits.value(), rhsInits.value()};
+}
+
+std::optional<SourcePairLoopValues> EnumerateSourcePairLoopValues(const SourcePairLoopInfo& info)
+{
+    SourcePairLoopValues values;
+    for (auto lhsInit : info.lhsInits) {
+        for (auto rhsInit : info.rhsInits) {
+            int64_t lhsValue = lhsInit;
+            int64_t rhsValue = rhsInit;
+            size_t guard = 0;
+            while (SourceRelationHolds(lhsValue, info.comparison.relation, rhsValue)) {
+                values.lhsHeaderValues.emplace_back(lhsValue);
+                values.rhsHeaderValues.emplace_back(rhsValue);
+                values.lhsBodyValues.emplace_back(lhsValue);
+                values.rhsBodyValues.emplace_back(rhsValue);
+                int64_t nextLhs = 0;
+                int64_t nextRhs = 0;
+                if (__builtin_add_overflow(lhsValue, info.lhsStep, &nextLhs) ||
+                    __builtin_add_overflow(rhsValue, info.rhsStep, &nextRhs)) {
+                    return std::nullopt;
+                }
+                lhsValue = nextLhs;
+                rhsValue = nextRhs;
+                if (++guard > MAX_CONTEST_EXACT_VALUES) {
+                    return std::nullopt;
+                }
+            }
+            values.lhsHeaderValues.emplace_back(lhsValue);
+            values.rhsHeaderValues.emplace_back(rhsValue);
+            values.lhsExitValues.emplace_back(lhsValue);
+            values.rhsExitValues.emplace_back(rhsValue);
+        }
+    }
+    auto normalize = [](std::vector<int64_t>& target) -> bool {
+        auto normalized = NormalizeSmallSourceValues(std::move(target));
+        if (!normalized.has_value()) {
+            return false;
+        }
+        target = std::move(normalized.value());
+        return true;
+    };
+    if (!normalize(values.lhsHeaderValues) || !normalize(values.rhsHeaderValues) ||
+        !normalize(values.lhsExitValues) || !normalize(values.rhsExitValues)) {
+        return std::nullopt;
+    }
+    if (!values.lhsBodyValues.empty() && !normalize(values.lhsBodyValues)) {
+        return std::nullopt;
+    }
+    if (!values.rhsBodyValues.empty() && !normalize(values.rhsBodyValues)) {
+        return std::nullopt;
+    }
+    return values;
+}
+
+std::optional<bool> GetSourcePairLoopTargetSide(
+    const std::vector<std::string>& lines, const ContestQuery& query, const SourcePairLoopInfo& info)
+{
+    if (query.variableName == info.comparison.lhs) {
+        return true;
+    }
+    if (query.variableName == info.comparison.rhs) {
+        return false;
+    }
+    if (query.line == 0 || query.line > lines.size()) {
+        return std::nullopt;
+    }
+    std::string assigned;
+    std::string assignedExpr;
+    ContestQueryTypeHint assignedType{ContestQueryTypeHint::UNKNOWN};
+    bool matched = false;
+    if (ParseSourceDeclaration(lines[query.line - 1], assigned, assignedType, assignedExpr) &&
+        assigned == query.variableName) {
+        matched = true;
+    } else if (ParseSourceAssignment(lines[query.line - 1], assigned, assignedExpr) &&
+        assigned == query.variableName) {
+        matched = true;
+    }
+    if (!matched) {
+        return std::nullopt;
+    }
+    auto expr = StripSourceEnclosingParens(assignedExpr);
+    if (expr == info.comparison.lhs) {
+        return true;
+    }
+    if (expr == info.comparison.rhs) {
+        return false;
+    }
+    return std::nullopt;
+}
+
+bool SourceHasAssignmentInRange(
+    const std::vector<std::string>& lines, unsigned begin, unsigned end, const std::string& variableName)
+{
+    if (begin > end) {
+        return false;
+    }
+    auto limit = std::min<unsigned>(end, static_cast<unsigned>(lines.size()));
+    for (unsigned lineNo = begin; lineNo <= limit; ++lineNo) {
+        if (SourceLineAssignsVariableName(lines[lineNo - 1], variableName)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::optional<std::vector<int64_t>> AddSourceStepToValues(const std::vector<int64_t>& values, int64_t step)
+{
+    std::vector<int64_t> result;
+    result.reserve(values.size());
+    for (auto value : values) {
+        int64_t next = 0;
+        if (__builtin_add_overflow(value, step, &next)) {
+            return std::nullopt;
+        }
+        result.emplace_back(next);
+    }
+    return NormalizeSmallSourceValues(std::move(result));
+}
+
+void InferSourcePairLoopFallback(const std::vector<std::string>& lines, ContestQuery& query)
+{
+    if (!query.valid || query.line == 0 || query.line > lines.size() || query.typeHint == ContestQueryTypeHint::BOOL) {
+        return;
+    }
+    auto loops = CollectSourceLoopExtents(lines);
+    std::sort(loops.begin(), loops.end(), [](const SourceLoopExtent& lhs, const SourceLoopExtent& rhs) {
+        if (lhs.start != rhs.start) {
+            return lhs.start > rhs.start;
+        }
+        return lhs.end < rhs.end;
+    });
+    for (const auto& loop : loops) {
+        if (loop.start > query.line) {
+            continue;
+        }
+        auto info = BuildSourcePairLoopInfo(lines, loop);
+        if (!info.has_value()) {
+            continue;
+        }
+        auto targetSide = GetSourcePairLoopTargetSide(lines, query, info.value());
+        if (!targetSide.has_value()) {
+            continue;
+        }
+        const bool queryOnHeader = query.line == loop.start;
+        const bool queryInsideBody = loop.start < query.line && query.line < loop.end;
+        const bool queryAfterLoop = query.line > loop.end;
+        if (!queryOnHeader && !queryInsideBody && !queryAfterLoop) {
+            continue;
+        }
+        if (queryAfterLoop && (query.variableName == info->comparison.lhs || query.variableName == info->comparison.rhs) &&
+            SourceHasAssignmentInRange(lines, loop.end + 1, query.line - 1, query.variableName)) {
+            continue;
+        }
+        auto values = EnumerateSourcePairLoopValues(info.value());
+        if (!values.has_value()) {
+            continue;
+        }
+        std::vector<int64_t> selected;
+        if (queryOnHeader) {
+            selected = targetSide.value() ? values->lhsHeaderValues : values->rhsHeaderValues;
+        } else if (queryInsideBody) {
+            selected = targetSide.value() ? values->lhsBodyValues : values->rhsBodyValues;
+            if ((query.variableName == info->comparison.lhs || query.variableName == info->comparison.rhs) &&
+                SourceLineAssignsVariableName(lines[query.line - 1], query.variableName)) {
+                auto updated = AddSourceStepToValues(selected, targetSide.value() ? info->lhsStep : info->rhsStep);
+                if (updated.has_value()) {
+                    selected = std::move(updated.value());
+                }
+            }
+        } else {
+            selected = targetSide.value() ? values->lhsExitValues : values->rhsExitValues;
+        }
+        if (!selected.empty()) {
+            SetSourceIntSetFallback(query, std::move(selected));
+            query.preferSourceFallback = query.hasSourceFallback;
+            return;
+        }
+    }
+}
+
 struct SourceFunctionSummary {
     std::vector<std::string> params;
     std::vector<std::string> returnExprs;
@@ -2417,6 +3408,10 @@ std::optional<SourceFunctionSummary> ParseSourceLambdaSummary(const std::string&
     }
     SourceFunctionSummary summary;
     auto params = Trim(inner.substr(0, arrow));
+    auto afterGeneric = SkipSourceGenericParameterList(params, 0);
+    if (afterGeneric > 0 && afterGeneric <= params.size()) {
+        params = Trim(params.substr(afterGeneric));
+    }
     if (HasSourceEnclosingParens(params)) {
         params = StripSourceEnclosingParens(params);
     }
@@ -2456,6 +3451,52 @@ std::optional<std::string> ExtractSourceReturnExpr(const std::string& line)
         return std::nullopt;
     }
     return TrimSourceMatchArmExpr(trimmed.substr(afterPos));
+}
+
+std::optional<std::string> ExtractSourceExpressionResultExpr(const std::string& line)
+{
+    auto trimmed = TrimSourceMatchArmExpr(line);
+    if (trimmed.empty() || trimmed == "{" || trimmed == "}" || trimmed.back() == ':') {
+        return std::nullopt;
+    }
+    if (trimmed.find("func ") != std::string::npos || trimmed.rfind("class ", 0) == 0 ||
+        trimmed.rfind("struct ", 0) == 0 || trimmed.rfind("interface ", 0) == 0 ||
+        trimmed.rfind("if ", 0) == 0 || trimmed.rfind("for ", 0) == 0 || trimmed.rfind("while ", 0) == 0 ||
+        trimmed.rfind("match ", 0) == 0 || trimmed.rfind("case ", 0) == 0) {
+        return std::nullopt;
+    }
+    std::string name;
+    ContestQueryTypeHint typeHint{ContestQueryTypeHint::UNKNOWN};
+    std::string expr;
+    if (ParseSourceDeclaration(trimmed, name, typeHint, expr) || ParseSourceAssignment(trimmed, name, expr)) {
+        return std::nullopt;
+    }
+    std::string op;
+    if (ParseSourceCompoundAssignment(trimmed, name, op, expr)) {
+        return std::nullopt;
+    }
+    return trimmed;
+}
+
+std::optional<std::string> ExtractSourceInlineBraceResultExpr(const std::string& line)
+{
+    auto open = line.find('{');
+    auto close = line.rfind('}');
+    if (open == std::string::npos || close == std::string::npos || close <= open) {
+        return std::nullopt;
+    }
+    auto body = Trim(line.substr(open + 1, close - open - 1));
+    if (body.empty()) {
+        return std::nullopt;
+    }
+    if (auto ret = ExtractSourceReturnExpr(body); ret.has_value() && !ret->empty()) {
+        return ret;
+    }
+    if (auto arrow = body.find("=>"); arrow != std::string::npos) {
+        auto expr = TrimSourceMatchArmExpr(body.substr(arrow + 2));
+        return expr.empty() ? std::nullopt : std::optional<std::string>(expr);
+    }
+    return ExtractSourceExpressionResultExpr(body);
 }
 
 void AddSourceFunctionSummary(std::unordered_map<std::string, SourceFunctionSummary>& summaries,
@@ -2504,7 +3545,8 @@ std::unordered_map<std::string, SourceFunctionSummary> BuildSourceFunctionSummar
         if (nameBegin == nameEnd) {
             continue;
         }
-        auto open = line.find('(', nameEnd);
+        auto afterName = SkipSourceGenericParameterList(line, nameEnd);
+        auto open = line.find('(', afterName);
         auto close = line.find(')', open == std::string::npos ? 0 : open);
         if (open == std::string::npos || close == std::string::npos || close <= open) {
             continue;
@@ -2518,13 +3560,27 @@ std::unordered_map<std::string, SourceFunctionSummary> BuildSourceFunctionSummar
                 summary.returnExprs.emplace_back(std::move(ret));
             }
         }
+        if (auto inlineResult = ExtractSourceInlineBraceResultExpr(line); inlineResult.has_value()) {
+            summary.returnExprs.emplace_back(inlineResult.value());
+        }
         auto fallbackEnd = static_cast<unsigned>(std::min<size_t>(lines.size(), static_cast<size_t>(lineNo) + 64));
         auto end = FindSourceBraceBlockEnd(lines, lineNo).value_or(fallbackEnd);
+        std::optional<std::string> lastExpr;
         for (unsigned bodyLine = lineNo; bodyLine <= end && bodyLine <= lines.size(); ++bodyLine) {
             auto returnExpr = ExtractSourceReturnExpr(lines[bodyLine - 1]);
             if (returnExpr.has_value() && !returnExpr->empty()) {
                 summary.returnExprs.emplace_back(returnExpr.value());
+                continue;
             }
+            if (bodyLine > lineNo) {
+                auto exprResult = ExtractSourceExpressionResultExpr(lines[bodyLine - 1]);
+                if (exprResult.has_value()) {
+                    lastExpr = exprResult;
+                }
+            }
+        }
+        if (summary.returnExprs.empty() && lastExpr.has_value()) {
+            summary.returnExprs.emplace_back(lastExpr.value());
         }
         auto name = line.substr(nameBegin, nameEnd - nameBegin);
         std::sort(summary.returnExprs.begin(), summary.returnExprs.end());
@@ -2585,6 +3641,33 @@ std::string NormalizeSourceTrailingClosureCall(std::string expr)
     return before.substr(0, before.size() - 1) + (inside.empty() ? "" : ", ") + lambda + ")";
 }
 
+std::optional<size_t> FindSourceTrailingCallOpen(const std::string& expr)
+{
+    if (expr.empty() || expr.back() != ')') {
+        return std::nullopt;
+    }
+    std::vector<size_t> stack;
+    std::optional<size_t> trailingOpen;
+    for (size_t pos = 0; pos < expr.size(); ++pos) {
+        if (expr[pos] == '(') {
+            if (stack.empty()) {
+                trailingOpen = pos;
+            }
+            stack.emplace_back(pos);
+        } else if (expr[pos] == ')') {
+            if (stack.empty()) {
+                return std::nullopt;
+            }
+            auto open = stack.back();
+            stack.pop_back();
+            if (pos == expr.size() - 1 && stack.empty()) {
+                return open;
+            }
+        }
+    }
+    return trailingOpen;
+}
+
 std::optional<std::vector<int64_t>> EvalSourceIntExprSetWithFunctions(const std::string& expr,
     const std::vector<SourceScope>& scopes, const std::unordered_map<std::string, SourceFunctionSummary>& summaries,
     size_t depth)
@@ -2626,16 +3709,16 @@ std::optional<std::vector<int64_t>> EvalSourceIntExprSetWithFunctions(const std:
             return NormalizeSourceIntSet(std::move(values));
         }
     }
-    auto open = trimmed.find('(');
-    if (open == std::string::npos || trimmed.empty() || trimmed.back() != ')') {
+    auto open = FindSourceTrailingCallOpen(trimmed);
+    if (!open.has_value()) {
         return std::nullopt;
     }
-    auto callee = StripSourceGenericSuffix(trimmed.substr(0, open));
+    auto callee = StripSourceGenericSuffix(trimmed.substr(0, open.value()));
     auto it = summaries.find(callee);
     if (it == summaries.end()) {
         return std::nullopt;
     }
-    auto args = SplitSourceTopLevelCommaList(trimmed.substr(open + 1, trimmed.size() - open - 2));
+    auto args = SplitSourceTopLevelCommaList(trimmed.substr(open.value() + 1, trimmed.size() - open.value() - 2));
     if (args.size() != it->second.params.size()) {
         return std::nullopt;
     }
@@ -2670,6 +3753,9 @@ std::optional<std::vector<int64_t>> EvalSourceIntExprSetWithFunctions(const std:
     std::vector<size_t> indices(valueArgIndices.size(), 0);
     while (true) {
         std::vector<SourceScope> calleeScopes(1);
+        if (!scopes.empty()) {
+            calleeScopes.front() = scopes.front();
+        }
         for (size_t indexPos = 0; indexPos < valueArgIndices.size(); ++indexPos) {
             auto argIndex = valueArgIndices[indexPos];
             SourceExactValue exact;
@@ -2734,14 +3820,14 @@ std::optional<int64_t> EvalSourceInlineSpawnExpr(
     if (open == std::string::npos) {
         return std::nullopt;
     }
-    int depth = 0;
+    int braceDepth = 0;
     size_t close = std::string::npos;
     for (size_t pos = open; pos < trimmed.size(); ++pos) {
         if (trimmed[pos] == '{') {
-            ++depth;
+            ++braceDepth;
         } else if (trimmed[pos] == '}') {
-            --depth;
-            if (depth == 0) {
+            --braceDepth;
+            if (braceDepth == 0) {
                 close = pos;
                 break;
             }
@@ -2751,19 +3837,59 @@ std::optional<int64_t> EvalSourceInlineSpawnExpr(
         return std::nullopt;
     }
     auto body = Trim(trimmed.substr(open + 1, close - open - 1));
-    if (body.rfind("return ", 0) == 0) {
-        body = Trim(body.substr(7));
+    auto localScopes = scopes;
+    if (localScopes.empty()) {
+        localScopes.emplace_back();
     }
-    if (auto arrow = body.find("=>"); arrow != std::string::npos) {
-        body = TrimSourceMatchArmExpr(body.substr(arrow + 2));
-    }
-    if (auto semicolon = body.rfind(';'); semicolon != std::string::npos) {
-        body = Trim(body.substr(semicolon + 1));
-        if (body.rfind("return ", 0) == 0) {
-            body = Trim(body.substr(7));
+    std::optional<int64_t> lastValue;
+    size_t begin = 0;
+    int stmtDepth = 0;
+    for (size_t pos = 0; pos <= body.size(); ++pos) {
+        if (pos < body.size()) {
+            if (body[pos] == '{' || body[pos] == '(' || body[pos] == '[') {
+                ++stmtDepth;
+            } else if ((body[pos] == '}' || body[pos] == ')' || body[pos] == ']') && stmtDepth > 0) {
+                --stmtDepth;
+            }
+        }
+        if (pos < body.size() && (body[pos] != ';' || stmtDepth != 0)) {
+            continue;
+        }
+        auto stmt = Trim(body.substr(begin, pos - begin));
+        begin = pos + 1;
+        if (stmt.empty()) {
+            continue;
+        }
+        if (stmt.rfind("return ", 0) == 0) {
+            return EvalSourceIntExpr(Trim(stmt.substr(7)), localScopes);
+        }
+        if (auto arrow = stmt.find("=>"); arrow != std::string::npos) {
+            stmt = TrimSourceMatchArmExpr(stmt.substr(arrow + 2));
+        }
+        std::string name;
+        ContestQueryTypeHint typeHint{ContestQueryTypeHint::UNKNOWN};
+        std::string rhs;
+        if (ParseSourceDeclaration(stmt, name, typeHint, rhs)) {
+            SourceExactValue exact;
+            if (TryEvalSourceExactValue(rhs, localScopes, typeHint, exact)) {
+                localScopes.back()[name] = exact;
+            }
+            continue;
+        }
+        if (ParseSourceAssignment(stmt, name, rhs)) {
+            SourceExactValue exact;
+            auto old = LookupSourceValue(localScopes, name);
+            auto hint = old == nullptr ? ContestQueryTypeHint::UNKNOWN : old->typeHint;
+            if (TryEvalSourceExactValue(rhs, localScopes, hint, exact)) {
+                localScopes.back()[name] = exact;
+            }
+            continue;
+        }
+        if (auto value = EvalSourceIntExpr(stmt, localScopes); value.has_value()) {
+            lastValue = value;
         }
     }
-    return EvalSourceIntExpr(body, scopes);
+    return lastValue;
 }
 
 std::optional<int64_t> EvalSourceSpawnExprBlock(
@@ -2782,11 +3908,16 @@ std::optional<int64_t> EvalSourceSpawnExprBlock(
     auto limit = std::min<unsigned>(static_cast<unsigned>(lines.size()), startLine + 64);
     int depth = 0;
     bool sawBrace = false;
+    auto localScopes = scopes;
+    if (localScopes.empty()) {
+        localScopes.emplace_back();
+    }
+    std::optional<int64_t> lastValue;
     for (unsigned lineNo = startLine; lineNo <= limit; ++lineNo) {
         auto raw = StripLineComment(lines[lineNo - 1]);
         auto trimmed = Trim(raw);
         if (auto ret = ExtractSourceReturnExpr(trimmed); ret.has_value()) {
-            if (auto value = EvalSourceIntExpr(ret.value(), scopes); value.has_value()) {
+            if (auto value = EvalSourceIntExpr(ret.value(), localScopes); value.has_value()) {
                 return value;
             }
         }
@@ -2796,23 +3927,60 @@ std::optional<int64_t> EvalSourceSpawnExprBlock(
             if (auto close = expr.find('}'); close != std::string::npos) {
                 expr = Trim(expr.substr(0, close));
             }
-            if (auto value = EvalSourceIntExpr(expr, scopes); value.has_value()) {
+            if (auto value = EvalSourceIntExpr(expr, localScopes); value.has_value()) {
                 return value;
+            }
+        }
+        std::string name;
+        ContestQueryTypeHint typeHint{ContestQueryTypeHint::UNKNOWN};
+        std::string expr;
+        if (ParseSourceDeclaration(raw, name, typeHint, expr) && expr.find("spawn") == std::string::npos) {
+            SourceExactValue exact;
+            auto overflowStrategy = GetSourceOverflowStrategyAtLine(lines, lineNo);
+            if (TryEvalSourceExactValue(expr, localScopes, typeHint, exact, overflowStrategy)) {
+                localScopes.back()[name] = exact;
+            }
+        } else if (ParseSourceAssignment(raw, name, expr)) {
+            SourceExactValue exact;
+            auto old = LookupSourceValue(localScopes, name);
+            auto hint = old == nullptr ? ContestQueryTypeHint::UNKNOWN : old->typeHint;
+            auto overflowStrategy = GetSourceOverflowStrategyAtLine(lines, lineNo);
+            if (TryEvalSourceExactValue(expr, localScopes, hint, exact, overflowStrategy)) {
+                localScopes.back()[name] = exact;
+            }
+        } else if (trimmed.find("spawn") == std::string::npos &&
+            trimmed.rfind("try", 0) != 0 && trimmed.rfind("catch", 0) != 0 &&
+            trimmed.rfind("finally", 0) != 0) {
+            auto exprLine = TrimSourceMatchArmExpr(trimmed);
+            if (auto close = exprLine.find('}'); close != std::string::npos) {
+                exprLine = Trim(exprLine.substr(0, close));
+            }
+            if (auto semi = exprLine.rfind(';'); semi != std::string::npos) {
+                exprLine = Trim(exprLine.substr(semi + 1));
+            }
+            if (!exprLine.empty() && exprLine != "{" && exprLine != "}") {
+                if (auto value = EvalSourceIntExpr(exprLine, localScopes); value.has_value()) {
+                    lastValue = value;
+                }
             }
         }
         for (auto c : raw) {
             if (c == '{') {
                 ++depth;
                 sawBrace = true;
+                localScopes.emplace_back();
             } else if (c == '}' && depth > 0) {
                 --depth;
+                if (localScopes.size() > 1) {
+                    localScopes.pop_back();
+                }
             }
         }
         if (sawBrace && depth == 0 && lineNo > startLine) {
             break;
         }
     }
-    return std::nullopt;
+    return lastValue;
 }
 
 std::vector<SourceScope> BuildSourceScopesBeforeLine(const std::vector<std::string>& lines, unsigned beforeLine)
@@ -2836,6 +4004,9 @@ std::vector<SourceScope> BuildSourceScopesBeforeLine(const std::vector<std::stri
             }
             if (hasExact) {
                 scopes.back()[name] = exact;
+                if (scopes.size() == 1 || StripLineComment(line).find("static") != std::string::npos) {
+                    scopes.front()[name] = exact;
+                }
             }
         } else if (ParseSourceAssignment(line, name, expr)) {
             SourceExactValue exact;
@@ -2852,6 +4023,9 @@ std::vector<SourceScope> BuildSourceScopesBeforeLine(const std::vector<std::stri
             }
             if (hasExact) {
                 scopes.back()[name] = exact;
+                if (scopes.size() == 1 || StripLineComment(line).find("static") != std::string::npos) {
+                    scopes.front()[name] = exact;
+                }
             }
         } else {
             std::string op;
@@ -2862,6 +4036,9 @@ std::vector<SourceScope> BuildSourceScopesBeforeLine(const std::vector<std::stri
                     exact.typeHint = ContestQueryTypeHint::INT64;
                     exact.intValue = value.value();
                     scopes.back()[name] = exact;
+                    if (scopes.size() == 1 || StripLineComment(line).find("static") != std::string::npos) {
+                        scopes.front()[name] = exact;
+                    }
                 }
             }
         }
@@ -3088,6 +4265,7 @@ void InferPriorSourceAssignmentFallback(const std::vector<std::string>& lines, C
         candidate.accumulatorFallback.clear();
         candidate.hasSourceFallback = false;
         candidate.hasAccumulatorFallback = false;
+        candidate.preferSourceFallback = false;
         candidate.resolved = false;
         InferSourceAssignedValuesFallback(lines, candidate);
         InferSourceMatchFallback(lines, candidate);
@@ -3109,10 +4287,12 @@ void InferContestQuerySourceFallback(const std::vector<std::string>& lines, Cont
         query.hasSourceFallback = true;
     };
     const bool queryLineInsideLoop = IsSourceLineInsideLoop(lines, query.line);
+    const bool hasPriorLoopAssignment = !queryLineInsideLoop &&
+        SourceHasPriorLoopAssignment(lines, query.line, query.variableName);
     std::vector<SourceScope> scopes(1);
     for (unsigned lineNo = 1; lineNo <= query.line; ++lineNo) {
         auto line = lines[lineNo - 1];
-        if (lineNo == query.line && !queryLineInsideLoop &&
+        if (lineNo == query.line && !queryLineInsideLoop && !hasPriorLoopAssignment &&
             !SourceLineDeclaresVariable(line, query.variableName)) {
             if (auto value = LookupSourceValue(scopes, query.variableName); value != nullptr) {
                 setSourceFallback(*value);
@@ -3187,6 +4367,7 @@ void InferContestQueryTypeHintFromSource(ContestQuery& query,
     InferContestQuerySourceFallback(it->second, query);
     InferSourceForRangeVariableFallback(it->second, query);
     InferSourceAssignedValuesFallback(it->second, query);
+    InferSourcePairLoopFallback(it->second, query);
     InferSourceMatchFallback(it->second, query);
     InferSourceGlobalConstantFallback(it->second, query);
     InferSourceFunctionCallFallback(it->second, query);
@@ -3447,6 +4628,25 @@ std::string FormatContestRange(const ValueRange* range, Type* type)
 
 // 读取普通 SSA 值或 ref 背后 var 对象的竞赛可见值域。
 // Let a later precise contextual answer replace an earlier full-range answer.
+bool IsContestFullBoundaryOutput(const std::string& output)
+{
+    return output.find("-9223372036854775808") != std::string::npos ||
+        output.find("9223372036854775807") != std::string::npos;
+}
+
+bool IsContestIntervalOutput(const std::string& output)
+{
+    return !output.empty() && output.front() == '[';
+}
+
+bool IsContestSingletonOutput(const std::string& output)
+{
+    if (output.empty() || IsContestIntervalOutput(output)) {
+        return false;
+    }
+    return output.find(',') == std::string::npos;
+}
+
 bool ShouldRecordContestResult(const ContestQuery& query, const std::string& result, Type* type)
 {
     if (!query.resolved) {
@@ -3602,6 +4802,95 @@ bool FunctionMayContainContestQuery(
 }
 
 // 判断某个值是否已关联指定源码变量名。
+using ReverseContestCallGraph = std::unordered_map<const Function*, std::vector<const Function*>>;
+
+void AddReverseContestCallGraphEdge(
+    const Function* caller, Value* calleeValue, ReverseContestCallGraph& reverseCallGraph)
+{
+    if (caller == nullptr || calleeValue == nullptr || !calleeValue->IsFuncWithBody()) {
+        return;
+    }
+    auto callee = StaticCast<const Function*>(calleeValue);
+    if (callee == nullptr || callee->GetBody() == nullptr) {
+        return;
+    }
+    auto& callers = reverseCallGraph[callee];
+    if (std::find(callers.begin(), callers.end(), caller) == callers.end()) {
+        callers.emplace_back(caller);
+    }
+}
+
+void RecordContestCallExpression(
+    const Function* caller, const Expression* expr, ReverseContestCallGraph& reverseCallGraph)
+{
+    if (expr == nullptr) {
+        return;
+    }
+    if (expr->GetExprKind() == ExprKind::APPLY) {
+        AddReverseContestCallGraphEdge(caller, StaticCast<const Apply*>(expr)->GetCallee(), reverseCallGraph);
+    } else if (expr->GetExprKind() == ExprKind::APPLY_WITH_EXCEPTION) {
+        AddReverseContestCallGraphEdge(
+            caller, StaticCast<const ApplyWithException*>(expr)->GetCallee(), reverseCallGraph);
+    }
+}
+
+ReverseContestCallGraph BuildReverseContestCallGraph(const Ptr<const Package>& package)
+{
+    ReverseContestCallGraph reverseCallGraph;
+    for (auto func : package->GetGlobalFuncsWithBody()) {
+        if (func == nullptr || func->GetBody() == nullptr) {
+            continue;
+        }
+        for (auto block : func->GetBody()->GetAllBlocks()) {
+            for (auto expr : block->GetExpressions()) {
+                RecordContestCallExpression(func, expr, reverseCallGraph);
+            }
+            RecordContestCallExpression(func, block->GetTerminator(), reverseCallGraph);
+        }
+    }
+    return reverseCallGraph;
+}
+
+std::unordered_set<const Function*> CollectContestRelevantFunctions(
+    const Ptr<const Package>& package, const std::vector<ContestQuery>& queries, const std::filesystem::path& contestRoot)
+{
+    constexpr size_t MAX_CONTEST_CONTEXT_CALL_DEPTH = 6;
+    constexpr size_t MAX_CONTEST_RELEVANT_FUNCTIONS = 64;
+
+    std::unordered_set<const Function*> relevantFunctions;
+    std::vector<std::pair<const Function*, size_t>> worklist;
+    for (auto func : package->GetGlobalFuncsWithBody()) {
+        if (FunctionMayContainContestQuery(func, queries, contestRoot) &&
+            relevantFunctions.emplace(func).second) {
+            worklist.emplace_back(func, 0);
+        }
+    }
+    if (worklist.empty()) {
+        return relevantFunctions;
+    }
+
+    auto reverseCallGraph = BuildReverseContestCallGraph(package);
+    for (size_t index = 0; index < worklist.size(); ++index) {
+        auto [func, depth] = worklist[index];
+        if (depth >= MAX_CONTEST_CONTEXT_CALL_DEPTH) {
+            continue;
+        }
+        auto callers = reverseCallGraph.find(func);
+        if (callers == reverseCallGraph.end()) {
+            continue;
+        }
+        for (auto caller : callers->second) {
+            if (relevantFunctions.size() >= MAX_CONTEST_RELEVANT_FUNCTIONS) {
+                return relevantFunctions;
+            }
+            if (relevantFunctions.emplace(caller).second) {
+                worklist.emplace_back(caller, depth + 1);
+            }
+        }
+    }
+    return relevantFunctions;
+}
+
 bool HasValueNameForQuery(const ValueNameMap& valueNames, Value* value, const ContestQuery& query)
 {
     auto it = valueNames.find(value);
@@ -3711,6 +5000,72 @@ void ResolveQueryAtValue(std::vector<ContestQuery>& queries, const ValueNameMap&
 }
 
 // 在非 Debug 表达式上尝试解析所有 operand 形式查询。
+void MergeContestContextCandidate(
+    ContestContextCandidateMap& candidates, size_t queryIndex, Type* type, const ValueRange* range)
+{
+    if (type == nullptr || range == nullptr) {
+        return;
+    }
+    auto& candidate = candidates[queryIndex];
+    candidate.type = candidate.type == nullptr ? type : candidate.type;
+    if (candidate.range == nullptr) {
+        candidate.range = range->Clone();
+        return;
+    }
+    if (candidate.range->GetRangeKind() != range->GetRangeKind()) {
+        return;
+    }
+    if (auto joined = candidate.range->Join(*range); joined.has_value()) {
+        candidate.range = std::move(joined.value());
+    }
+}
+
+void CollectContextCandidateAtDebug(const std::vector<ContestQuery>& queries, ContestContextCandidateMap& candidates,
+    ValueNameMap& valueNames, const Debug& debug, const RangeDomain& state, const std::filesystem::path& contestRoot)
+{
+    RememberValueName(valueNames, debug, contestRoot);
+    if (debug.GetValue()->GetType()->IsRef()) {
+        return;
+    }
+    auto type = GetQueryValueType(debug.GetValue());
+    auto range = GetContestRangeForValue(state, debug.GetValue());
+    for (size_t index = 0; index < queries.size(); ++index) {
+        const auto& query = queries[index];
+        if (!query.valid || query.variableName != debug.GetSrcCodeIdentifier()) {
+            continue;
+        }
+        if (!IsSameQueryLocation(query, debug.GetDebugLocation(), contestRoot)) {
+            continue;
+        }
+        MergeContestContextCandidate(candidates, index, type, range);
+    }
+}
+
+void CollectContextCandidateAtValue(const std::vector<ContestQuery>& queries, ContestContextCandidateMap& candidates,
+    const ValueNameMap& valueNames, const DebugLocation& location, Value* value, const RangeDomain& state,
+    const std::filesystem::path& contestRoot)
+{
+    for (size_t index = 0; index < queries.size(); ++index) {
+        const auto& query = queries[index];
+        if (!query.valid || !HasValueNameForQuery(valueNames, value, query)) {
+            continue;
+        }
+        if (!IsSameQueryLocation(query, location, contestRoot)) {
+            continue;
+        }
+        MergeContestContextCandidate(candidates, index, GetQueryValueType(value), GetContestRangeForValue(state, value));
+    }
+}
+
+void CollectContextCandidateAtExpressionOperands(const std::vector<ContestQuery>& queries,
+    ContestContextCandidateMap& candidates, const ValueNameMap& valueNames, const Expression& expr,
+    const RangeDomain& state, const std::filesystem::path& contestRoot)
+{
+    for (auto operand : expr.GetOperands()) {
+        CollectContextCandidateAtValue(queries, candidates, valueNames, expr.GetDebugLocation(), operand, state, contestRoot);
+    }
+}
+
 void ResolveQueryAtExpressionOperands(std::vector<ContestQuery>& queries, const ValueNameMap& valueNames,
     ContestAggregateMap& aggregates, const Expression& expr, const RangeDomain& state,
     const std::filesystem::path& contestRoot)
@@ -3766,6 +5121,9 @@ bool IsLoopBranchConditionExpr(const Expression& expr)
 // 按查询顺序写入 output.txt，未解析项使用 fallback。
 std::string GetContestQueryOutput(const ContestQuery& query)
 {
+    if (query.preferSourceFallback && query.hasSourceFallback) {
+        return query.sourceFallback;
+    }
     if (query.resolved) {
         auto fallback = FormatFallback(query);
         auto typeFallback = query.type != nullptr ? FormatFallback(query.type) : fallback;
@@ -3790,6 +5148,38 @@ bool IsContestFallbackOutput(const ContestQuery& query, const std::string& outpu
     return output == FormatFallback(query);
 }
 
+bool ShouldApplyContestContextCandidate(const ContestQuery& query, const std::string& result, Type* type)
+{
+    if (result.empty() || result == FormatFallback(type) || IsContestSingletonOutput(result)) {
+        return false;
+    }
+    if (!query.resolved) {
+        return true;
+    }
+    if (query.result == FormatFallback(type) || IsContestFullBoundaryOutput(query.result)) {
+        return true;
+    }
+    return false;
+}
+
+void ApplyContestContextCandidates(std::vector<ContestQuery>& queries, const ContestContextCandidateMap& candidates)
+{
+    for (const auto& [index, candidate] : candidates) {
+        if (index >= queries.size() || candidate.range == nullptr) {
+            continue;
+        }
+        auto& query = queries[index];
+        auto result = FormatContestRange(candidate.range.get(), candidate.type);
+        if (!ShouldApplyContestContextCandidate(query, result, candidate.type)) {
+            continue;
+        }
+        query.type = candidate.type;
+        query.typeHint = GetQueryTypeHint(candidate.type);
+        query.result = std::move(result);
+        query.resolved = true;
+    }
+}
+
 std::vector<std::string> ReadExistingContestOutput(const std::filesystem::path& outputPath)
 {
     std::vector<std::string> lines;
@@ -3812,7 +5202,7 @@ void WriteContestOutput(std::vector<ContestQuery>& queries, const ContestInputCo
     for (size_t index = 0; index < queries.size(); ++index) {
         auto& query = queries[index];
         auto current = GetContestQueryOutput(query);
-        if (query.hasAccumulatorFallback) {
+        if (query.hasAccumulatorFallback && IsContestFallbackOutput(query, current)) {
             current = query.accumulatorFallback;
         }
         if (index < existingLines.size() && IsContestFallbackOutput(query, current) &&
@@ -3964,23 +5354,50 @@ void RangePropagation::EmitContestOutput(const Ptr<const Package>& package, Rang
     auto resolveQueries = [&](Results<RangeDomain>& result) {
         result.VisitWith(actionBeforeVisitExpr, actionAfterVisitExpr, actionOnTerminator);
     };
+    ContestContextCandidateMap contextCandidates;
+    ValueNameMap contextValueNames;
+    const auto contextActionAfterVisitExpr = [&queries, &contextCandidates, &contextValueNames, &contestRoot](
+                                                const RangeDomain& state, Expression* expr, size_t) {
+        if (expr->GetExprKind() == ExprKind::DEBUGEXPR) {
+            CollectContextCandidateAtDebug(
+                queries.value(), contextCandidates, contextValueNames, *StaticCast<Debug*>(expr), state, contestRoot);
+            return;
+        }
+        CollectContextCandidateAtExpressionOperands(
+            queries.value(), contextCandidates, contextValueNames, *expr, state, contestRoot);
+    };
+    const auto contextActionOnTerminator = [&queries, &contextCandidates, &contextValueNames, &contestRoot](
+                                               const RangeDomain& state, Terminator* terminator, std::optional<Block*>) {
+        if (terminator == nullptr) {
+            return;
+        }
+        CollectContextCandidateAtExpressionOperands(
+            queries.value(), contextCandidates, contextValueNames, *terminator, state, contestRoot);
+    };
+    auto collectContextCandidates = [&]() {
+        RangeAnalysis::VisitContextSensitiveResults(
+            [&](const Function*, const std::string&, Results<RangeDomain>& result) {
+                result.VisitWith(actionBeforeVisitExpr, contextActionAfterVisitExpr, contextActionOnTerminator);
+            });
+    };
+    auto relevantFunctions = CollectContestRelevantFunctions(package, queries.value(), contestRoot);
 
     for (auto func : package->GetGlobalFuncsWithBody()) {
-        if (!RangeAnalysis::Filter(*func) || !FunctionMayContainContestQuery(func, queries.value(), contestRoot)) {
-            continue;
-        }
-        auto cachedResult = rangeAnalysisWrapper.CheckFuncResult(func);
-        if (cachedResult != nullptr) {
-            resolveQueries(*cachedResult);
+        if (!RangeAnalysis::Filter(*func) || relevantFunctions.find(func) == relevantFunctions.end()) {
             continue;
         }
         auto result = rangeAnalysisWrapper.RunOnFunc(func, /* isDebug = */ false, diag);
         if (result != nullptr) {
             resolveQueries(*result);
+            collectContextCandidates();
+        } else if (auto cachedResult = rangeAnalysisWrapper.CheckFuncResult(func); cachedResult != nullptr) {
+            resolveQueries(*cachedResult);
+            collectContextCandidates();
         }
         RangeAnalysis::ClearContextSensitiveResults();
     }
 
+    ApplyContestContextCandidates(queries.value(), contextCandidates);
     ApplyContestAggregates(queries.value(), aggregates);
     WriteContestOutput(queries.value(), inputContext.value());
 }
