@@ -1457,7 +1457,13 @@ void CollectSourceMatchArmIntValues(const std::vector<std::string>& lines, unsig
         while ((pos = line.find("=>", pos)) != std::string::npos) {
             auto armScopes = BuildSourceMatchArmScopes(line.substr(0, pos), enumPayload);
             auto expr = TrimSourceMatchArmExpr(line.substr(pos + 2));
-            if (auto value = EvalSourceIntExpr(expr, armScopes); value.has_value()) {
+            std::string inlineAssigned;
+            std::string inlineAssignedExpr;
+            if (ParseSourceAssignment(expr, inlineAssigned, inlineAssignedExpr) && inlineAssigned == variableName) {
+                if (auto value = EvalSourceIntExpr(inlineAssignedExpr, armScopes); value.has_value()) {
+                    values.emplace_back(value.value());
+                }
+            } else if (auto value = EvalSourceIntExpr(expr, armScopes); value.has_value()) {
                 values.emplace_back(value.value());
             } else {
                 CollectSourceMatchArmFollowupValues(lines, lineNo + 1, end, variableName, armScopes, values);
@@ -1518,19 +1524,40 @@ void InferSourceMatchFallback(const std::vector<std::string>& lines, ContestQuer
     if (!query.valid || query.line == 0 || query.line > lines.size() || query.typeHint == ContestQueryTypeHint::BOOL) {
         return;
     }
+    auto collectFromMatch = [&lines, &query](unsigned matchLine, unsigned end, std::vector<int64_t>& values) {
+        auto scrutinee = ParseSourceMatchScrutinee(lines[matchLine - 1]);
+        auto enumPayload = scrutinee.has_value() ? FindSourceEnumPayloadForScrutinee(lines, matchLine, scrutinee.value()) :
+            std::optional<SourceEnumPayloadValue>{};
+        CollectSourceMatchArmIntValues(lines, matchLine, end, query.variableName, enumPayload, values);
+    };
     auto line = StripLineComment(lines[query.line - 1]);
-    if (line.find("match") == std::string::npos || !SourceLineAssignsVariableName(line, query.variableName)) {
-        return;
-    }
-    auto fallbackEnd = static_cast<unsigned>(std::min<size_t>(lines.size(), static_cast<size_t>(query.line) + 64));
-    auto end = FindSourceBraceBlockEnd(lines, query.line).value_or(fallbackEnd);
     std::vector<int64_t> values;
-    auto scrutinee = ParseSourceMatchScrutinee(lines[query.line - 1]);
-    auto enumPayload = scrutinee.has_value() ? FindSourceEnumPayloadForScrutinee(lines, query.line, scrutinee.value()) :
-        std::optional<SourceEnumPayloadValue>{};
-    CollectSourceMatchArmIntValues(lines, query.line, end, query.variableName, enumPayload, values);
+    unsigned matchLine = query.line;
+    unsigned end = query.line;
+    if (line.find("match") != std::string::npos && SourceLineAssignsVariableName(line, query.variableName)) {
+        auto fallbackEnd = static_cast<unsigned>(std::min<size_t>(lines.size(), static_cast<size_t>(query.line) + 64));
+        end = FindSourceBraceBlockEnd(lines, query.line).value_or(fallbackEnd);
+        collectFromMatch(query.line, end, values);
+    } else {
+        auto begin = query.line > 128 ? query.line - 128 : 1;
+        for (unsigned lineNo = begin; lineNo < query.line && lineNo <= lines.size(); ++lineNo) {
+            auto candidate = StripLineComment(lines[lineNo - 1]);
+            if (candidate.find("match") == std::string::npos) {
+                continue;
+            }
+            auto fallbackEnd = static_cast<unsigned>(std::min<size_t>(lines.size(), static_cast<size_t>(lineNo) + 64));
+            auto candidateEnd = FindSourceBraceBlockEnd(lines, lineNo).value_or(fallbackEnd);
+            std::vector<int64_t> candidateValues;
+            collectFromMatch(lineNo, candidateEnd, candidateValues);
+            if (!candidateValues.empty()) {
+                matchLine = lineNo;
+                end = candidateEnd;
+                values = std::move(candidateValues);
+            }
+        }
+    }
     if (!values.empty()) {
-        DropCoveredSourceZeroInitializer(lines, query.line > 96 ? query.line - 96 : 1, end, query.variableName, values);
+        DropCoveredSourceZeroInitializer(lines, matchLine > 96 ? matchLine - 96 : 1, end, query.variableName, values);
         SetSourceIntSetFallback(query, std::move(values));
         query.preferSourceFallback = query.hasSourceFallback;
     }
@@ -4243,6 +4270,7 @@ void MergePriorSourceFallback(ContestQuery& query, const ContestQuery& candidate
     if (candidate.hasSourceFallback) {
         query.sourceFallback = candidate.sourceFallback;
         query.hasSourceFallback = true;
+        query.preferSourceFallback = query.preferSourceFallback || candidate.preferSourceFallback;
     }
     if (candidate.hasAccumulatorFallback) {
         query.accumulatorFallback = candidate.accumulatorFallback;
