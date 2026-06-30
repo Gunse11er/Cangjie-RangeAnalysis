@@ -1530,7 +1530,9 @@ void InferSourceMatchFallback(const std::vector<std::string>& lines, ContestQuer
         std::optional<SourceEnumPayloadValue>{};
     CollectSourceMatchArmIntValues(lines, query.line, end, query.variableName, enumPayload, values);
     if (!values.empty()) {
+        DropCoveredSourceZeroInitializer(lines, query.line > 96 ? query.line - 96 : 1, end, query.variableName, values);
         SetSourceIntSetFallback(query, std::move(values));
+        query.preferSourceFallback = query.hasSourceFallback;
     }
 }
 
