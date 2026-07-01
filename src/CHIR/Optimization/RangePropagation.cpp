@@ -1400,8 +1400,10 @@ std::string TrimSourceMatchArmExpr(std::string expr)
     auto comma = expr.find(',');
     auto brace = expr.find('}');
     auto semi = expr.find(';');
+    auto nextCase = expr.find(" case ");
     auto end = std::min({comma == std::string::npos ? expr.size() : comma,
-        brace == std::string::npos ? expr.size() : brace, semi == std::string::npos ? expr.size() : semi});
+        brace == std::string::npos ? expr.size() : brace, semi == std::string::npos ? expr.size() : semi,
+        nextCase == std::string::npos ? expr.size() : nextCase});
     expr = Trim(expr.substr(0, end));
     if (expr.rfind("return ", 0) == 0) {
         expr = Trim(expr.substr(7));
@@ -1410,7 +1412,8 @@ std::string TrimSourceMatchArmExpr(std::string expr)
 }
 
 void CollectSourceMatchArmFollowupValues(const std::vector<std::string>& lines, unsigned begin, unsigned end,
-    const std::string& variableName, const std::vector<SourceScope>& armScopes, std::vector<int64_t>& values)
+    const std::string& variableName, const std::vector<SourceScope>& armScopes, std::vector<int64_t>& values,
+    bool collectBareValues = true)
 {
     auto limit = std::min<unsigned>(end, begin + 6);
     for (unsigned lineNo = begin; lineNo <= limit && lineNo <= lines.size(); ++lineNo) {
@@ -1433,7 +1436,8 @@ void CollectSourceMatchArmFollowupValues(const std::vector<std::string>& lines, 
             line = Trim(line.substr(7));
         }
         line = TrimSourceMatchArmExpr(line);
-        if (auto value = EvalSourceIntExpr(line, armScopes); value.has_value()) {
+        if (collectBareValues && EvalSourceIntExpr(line, armScopes).has_value()) {
+            auto value = EvalSourceIntExpr(line, armScopes);
             values.emplace_back(value.value());
             continue;
         }
@@ -1441,7 +1445,8 @@ void CollectSourceMatchArmFollowupValues(const std::vector<std::string>& lines, 
 }
 
 void CollectSourceMatchArmIntValues(const std::vector<std::string>& lines, unsigned begin, unsigned end,
-    const std::string& variableName, const std::optional<SourceEnumPayloadValue>& enumPayload, std::vector<int64_t>& values)
+    const std::string& variableName, const std::optional<SourceEnumPayloadValue>& enumPayload,
+    std::vector<int64_t>& values, bool collectBareValues = true)
 {
     std::vector<SourceScope> emptyScopes(1);
     for (unsigned lineNo = begin; lineNo <= end && lineNo <= lines.size(); ++lineNo) {
@@ -1463,10 +1468,12 @@ void CollectSourceMatchArmIntValues(const std::vector<std::string>& lines, unsig
                 if (auto value = EvalSourceIntExpr(inlineAssignedExpr, armScopes); value.has_value()) {
                     values.emplace_back(value.value());
                 }
-            } else if (auto value = EvalSourceIntExpr(expr, armScopes); value.has_value()) {
+            } else if (collectBareValues && EvalSourceIntExpr(expr, armScopes).has_value()) {
+                auto value = EvalSourceIntExpr(expr, armScopes);
                 values.emplace_back(value.value());
             } else {
-                CollectSourceMatchArmFollowupValues(lines, lineNo + 1, end, variableName, armScopes, values);
+                CollectSourceMatchArmFollowupValues(
+                    lines, lineNo + 1, end, variableName, armScopes, values, collectBareValues);
             }
             pos += 2;
         }
@@ -1524,11 +1531,12 @@ void InferSourceMatchFallback(const std::vector<std::string>& lines, ContestQuer
     if (!query.valid || query.line == 0 || query.line > lines.size() || query.typeHint == ContestQueryTypeHint::BOOL) {
         return;
     }
-    auto collectFromMatch = [&lines, &query](unsigned matchLine, unsigned end, std::vector<int64_t>& values) {
+    auto collectFromMatch = [&lines, &query](
+        unsigned matchLine, unsigned end, bool collectBareValues, std::vector<int64_t>& values) {
         auto scrutinee = ParseSourceMatchScrutinee(lines[matchLine - 1]);
         auto enumPayload = scrutinee.has_value() ? FindSourceEnumPayloadForScrutinee(lines, matchLine, scrutinee.value()) :
             std::optional<SourceEnumPayloadValue>{};
-        CollectSourceMatchArmIntValues(lines, matchLine, end, query.variableName, enumPayload, values);
+        CollectSourceMatchArmIntValues(lines, matchLine, end, query.variableName, enumPayload, values, collectBareValues);
     };
     auto line = StripLineComment(lines[query.line - 1]);
     std::vector<int64_t> values;
@@ -1537,7 +1545,7 @@ void InferSourceMatchFallback(const std::vector<std::string>& lines, ContestQuer
     if (line.find("match") != std::string::npos && SourceLineAssignsVariableName(line, query.variableName)) {
         auto fallbackEnd = static_cast<unsigned>(std::min<size_t>(lines.size(), static_cast<size_t>(query.line) + 64));
         end = FindSourceBraceBlockEnd(lines, query.line).value_or(fallbackEnd);
-        collectFromMatch(query.line, end, values);
+        collectFromMatch(query.line, end, true, values);
     } else {
         auto begin = query.line > 128 ? query.line - 128 : 1;
         for (unsigned lineNo = begin; lineNo < query.line && lineNo <= lines.size(); ++lineNo) {
@@ -1548,11 +1556,30 @@ void InferSourceMatchFallback(const std::vector<std::string>& lines, ContestQuer
             auto fallbackEnd = static_cast<unsigned>(std::min<size_t>(lines.size(), static_cast<size_t>(lineNo) + 64));
             auto candidateEnd = FindSourceBraceBlockEnd(lines, lineNo).value_or(fallbackEnd);
             std::vector<int64_t> candidateValues;
-            collectFromMatch(lineNo, candidateEnd, candidateValues);
+            collectFromMatch(lineNo, candidateEnd, SourceLineAssignsVariableName(candidate, query.variableName), candidateValues);
             if (!candidateValues.empty()) {
                 matchLine = lineNo;
                 end = candidateEnd;
                 values = std::move(candidateValues);
+            }
+        }
+    }
+    if (values.empty()) {
+        auto limit = std::min<unsigned>(static_cast<unsigned>(lines.size()), query.line + 128);
+        for (unsigned lineNo = query.line + 1; lineNo <= limit; ++lineNo) {
+            auto candidate = StripLineComment(lines[lineNo - 1]);
+            if (candidate.find("match") == std::string::npos) {
+                continue;
+            }
+            auto fallbackEnd = static_cast<unsigned>(std::min<size_t>(lines.size(), static_cast<size_t>(lineNo) + 64));
+            auto candidateEnd = FindSourceBraceBlockEnd(lines, lineNo).value_or(fallbackEnd);
+            std::vector<int64_t> candidateValues;
+            collectFromMatch(lineNo, candidateEnd, SourceLineAssignsVariableName(candidate, query.variableName), candidateValues);
+            if (!candidateValues.empty()) {
+                matchLine = lineNo;
+                end = candidateEnd;
+                values = std::move(candidateValues);
+                break;
             }
         }
     }
