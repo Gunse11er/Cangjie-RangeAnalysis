@@ -3774,10 +3774,23 @@ std::unordered_map<std::string, SourceFunctionSummary> BuildSourceFunctionSummar
             }
         }
         auto funcPos = line.find("func ");
-        if (funcPos == std::string::npos) {
-            continue;
+        size_t nameBegin = std::string::npos;
+        if (funcPos != std::string::npos) {
+            nameBegin = funcPos + 5;
+        } else {
+            size_t first = 0;
+            while (first < line.size() && std::isspace(static_cast<unsigned char>(line[first]))) {
+                ++first;
+            }
+            if (line.compare(first, 4, "main") != 0) {
+                continue;
+            }
+            auto afterMain = first + 4;
+            if (afterMain < line.size() && IsIdentifierChar(line[afterMain])) {
+                continue;
+            }
+            nameBegin = first;
         }
-        auto nameBegin = funcPos + 5;
         while (nameBegin < line.size() && std::isspace(static_cast<unsigned char>(line[nameBegin]))) {
             ++nameBegin;
         }
@@ -4751,6 +4764,60 @@ void CollectSourceFunctionContextValuesFromExpr(const std::string& expr, const s
     }
 }
 
+bool SourceSummaryPrefixUnsupportedForLocalSimulation(const SourceFunctionSummary& summary, unsigned queryLine)
+{
+    if (summary.startLine == 0 || queryLine <= summary.startLine) {
+        return true;
+    }
+    for (size_t index = 0; index < summary.bodyLines.size(); ++index) {
+        auto bodyLine = summary.startLine + 1 + static_cast<unsigned>(index);
+        if (bodyLine >= queryLine) {
+            break;
+        }
+        auto trimmed = Trim(StripLineComment(summary.bodyLines[index]));
+        if (trimmed.empty()) {
+            continue;
+        }
+        if (SourceLineStartsWithKeyword(trimmed, "for") || SourceLineStartsWithKeyword(trimmed, "match") ||
+            SourceLineStartsWithKeyword(trimmed, "try") || SourceLineStartsWithKeyword(trimmed, "catch") ||
+            SourceLineStartsWithKeyword(trimmed, "finally") || SourceLineStartsWithKeyword(trimmed, "else") ||
+            trimmed.find(" spawn") != std::string::npos || trimmed.rfind("spawn", 0) == 0 ||
+            trimmed == "break" || trimmed == "break;" || trimmed == "continue" || trimmed == "continue;") {
+            return true;
+        }
+    }
+    return false;
+}
+
+void InferSourceLocalSimulationFallback(const std::vector<std::string>& lines, ContestQuery& query)
+{
+    if (!query.valid || query.line == 0 || query.line > lines.size() || query.typeHint == ContestQueryTypeHint::BOOL) {
+        return;
+    }
+    auto summaries = BuildSourceFunctionSummaries(lines);
+    if (summaries.empty()) {
+        return;
+    }
+    for (const auto& [name, summary] : summaries) {
+        (void)name;
+        if (!summary.params.empty() || summary.startLine == 0 || summary.endLine == 0 ||
+            !(summary.startLine < query.line && query.line < summary.endLine)) {
+            continue;
+        }
+        if (SourceSummaryPrefixUnsupportedForLocalSimulation(summary, query.line)) {
+            continue;
+        }
+        std::vector<SourceScope> scopes(1);
+        auto observed = SimulateSourceFunctionSummaryAtLine(summary, scopes, summaries, query.line, query.variableName, 0);
+        if (!observed.has_value()) {
+            continue;
+        }
+        SetSourceIntSetFallback(query, std::move(observed.value()));
+        query.preferSourceFallback = query.hasSourceFallback;
+        return;
+    }
+}
+
 void InferSourceFunctionContextQueryFallback(const std::vector<std::string>& lines, ContestQuery& query)
 {
     if (!query.valid || query.line == 0 || query.line > lines.size() || query.typeHint == ContestQueryTypeHint::BOOL) {
@@ -5156,6 +5223,7 @@ void InferContestQueryTypeHintFromSource(ContestQuery& query,
     InferSourceGlobalConstantFallback(it->second, query);
     InferSourceFunctionCallFallback(it->second, query);
     InferSourceFunctionContextQueryFallback(it->second, query);
+    InferSourceLocalSimulationFallback(it->second, query);
     InferSourceTryFallback(it->second, query);
     InferPriorSourceAssignmentFallback(it->second, query);
     InferSourceAccumulatorFallback(it->second, query);
