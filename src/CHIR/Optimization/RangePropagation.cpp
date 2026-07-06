@@ -244,6 +244,7 @@ struct ContestQuery {
     bool hasAccumulatorFallback{false};
     bool preferSourceFallback{false};
     bool sourceFallbackMayBeLoopNarrow{false};
+    bool hasLineSensitiveLoopFallback{false};
     bool suppressNarrowLoopOutput{false};
 };
 
@@ -2853,6 +2854,8 @@ struct SourcePairLoopValues {
     std::vector<int64_t> rhsHeaderValues;
     std::vector<int64_t> lhsBodyValues;
     std::vector<int64_t> rhsBodyValues;
+    std::vector<int64_t> lhsPostBodyValues;
+    std::vector<int64_t> rhsPostBodyValues;
     std::vector<int64_t> lhsExitValues;
     std::vector<int64_t> rhsExitValues;
 };
@@ -3161,6 +3164,42 @@ std::optional<int64_t> FindSourceLoopVariableStep(
     return step.value_or(0);
 }
 
+std::optional<unsigned> FindSourceLoopVariableUpdateLine(
+    const std::vector<std::string>& lines, const SourceLoopExtent& loop, const std::string& variableName)
+{
+    std::optional<unsigned> updateLine;
+    for (unsigned lineNo = loop.start + 1; lineNo < loop.end && lineNo <= lines.size(); ++lineNo) {
+        std::string declared;
+        ContestQueryTypeHint declaredType{ContestQueryTypeHint::UNKNOWN};
+        std::string declaredExpr;
+        if (ParseSourceDeclaration(lines[lineNo - 1], declared, declaredType, declaredExpr) &&
+            declared == variableName) {
+            return std::nullopt;
+        }
+
+        bool updatesVariable = false;
+        std::string assigned;
+        std::string assignedExpr;
+        if (ParseSourceAssignment(lines[lineNo - 1], assigned, assignedExpr) && assigned == variableName) {
+            updatesVariable = true;
+        } else {
+            std::string op;
+            updatesVariable =
+                (ParseSourceCompoundAssignment(lines[lineNo - 1], assigned, op, assignedExpr) &&
+                    assigned == variableName) ||
+                ParseSourceIncDecStep(lines[lineNo - 1], variableName).has_value();
+        }
+        if (!updatesVariable) {
+            continue;
+        }
+        if (updateLine.has_value()) {
+            return std::nullopt;
+        }
+        updateLine = lineNo;
+    }
+    return updateLine;
+}
+
 std::optional<std::vector<int64_t>> GetSourceForRangeValues(const SourceForRangeInfo& range)
 {
     auto bounds = GetSourceForRangeBounds(range);
@@ -3349,6 +3388,8 @@ std::optional<SourcePairLoopValues> EnumerateSourcePairLoopValues(const SourcePa
                     __builtin_add_overflow(rhsValue, info.rhsStep, &nextRhs)) {
                     return std::nullopt;
                 }
+                values.lhsPostBodyValues.emplace_back(nextLhs);
+                values.rhsPostBodyValues.emplace_back(nextRhs);
                 lhsValue = nextLhs;
                 rhsValue = nextRhs;
                 if (++guard > MAX_CONTEST_EXACT_VALUES) {
@@ -3377,6 +3418,12 @@ std::optional<SourcePairLoopValues> EnumerateSourcePairLoopValues(const SourcePa
         return std::nullopt;
     }
     if (!values.rhsBodyValues.empty() && !normalize(values.rhsBodyValues)) {
+        return std::nullopt;
+    }
+    if (!values.lhsPostBodyValues.empty() && !normalize(values.lhsPostBodyValues)) {
+        return std::nullopt;
+    }
+    if (!values.rhsPostBodyValues.empty() && !normalize(values.rhsPostBodyValues)) {
         return std::nullopt;
     }
     return values;
@@ -3431,20 +3478,6 @@ bool SourceHasAssignmentInRange(
         }
     }
     return false;
-}
-
-std::optional<std::vector<int64_t>> AddSourceStepToValues(const std::vector<int64_t>& values, int64_t step)
-{
-    std::vector<int64_t> result;
-    result.reserve(values.size());
-    for (auto value : values) {
-        int64_t next = 0;
-        if (__builtin_add_overflow(value, step, &next)) {
-            return std::nullopt;
-        }
-        result.emplace_back(next);
-    }
-    return NormalizeSmallSourceValues(std::move(result));
 }
 
 std::optional<int64_t> ComputeSourceLinearLoopExitValue(
@@ -3599,11 +3632,13 @@ std::optional<std::vector<int64_t>> InferSourceLoopAllValuesForVariable(
             std::vector<int64_t> selected;
             if (variableName == info->comparison.lhs) {
                 selected = values->lhsBodyValues;
+                selected.insert(selected.end(), values->lhsPostBodyValues.begin(), values->lhsPostBodyValues.end());
                 selected.insert(selected.end(), values->lhsExitValues.begin(), values->lhsExitValues.end());
                 return NormalizeSmallSourceValues(std::move(selected));
             }
             if (variableName == info->comparison.rhs) {
                 selected = values->rhsBodyValues;
+                selected.insert(selected.end(), values->rhsPostBodyValues.begin(), values->rhsPostBodyValues.end());
                 selected.insert(selected.end(), values->rhsExitValues.begin(), values->rhsExitValues.end());
                 return NormalizeSmallSourceValues(std::move(selected));
             }
@@ -3772,13 +3807,12 @@ void InferSourcePairLoopFallback(const std::vector<std::string>& lines, ContestQ
         if (queryOnHeader) {
             selected = targetSide.value() ? values->lhsHeaderValues : values->rhsHeaderValues;
         } else if (queryInsideBody) {
-            selected = targetSide.value() ? values->lhsBodyValues : values->rhsBodyValues;
-            if ((query.variableName == info->comparison.lhs || query.variableName == info->comparison.rhs) &&
-                SourceLineAssignsVariableName(lines[query.line - 1], query.variableName)) {
-                auto updated = AddSourceStepToValues(selected, targetSide.value() ? info->lhsStep : info->rhsStep);
-                if (updated.has_value()) {
-                    selected = std::move(updated.value());
-                }
+            auto updateLine = FindSourceLoopVariableUpdateLine(
+                lines, loop, targetSide.value() ? info->comparison.lhs : info->comparison.rhs);
+            if (updateLine.has_value() && updateLine.value() <= query.line) {
+                selected = targetSide.value() ? values->lhsPostBodyValues : values->rhsPostBodyValues;
+            } else {
+                selected = targetSide.value() ? values->lhsBodyValues : values->rhsBodyValues;
             }
         } else {
             selected = targetSide.value() ? values->lhsExitValues : values->rhsExitValues;
@@ -3787,6 +3821,7 @@ void InferSourcePairLoopFallback(const std::vector<std::string>& lines, ContestQ
             SetSourceIntSetFallback(query, std::move(selected));
             query.preferSourceFallback = query.hasSourceFallback;
             query.sourceFallbackMayBeLoopNarrow = query.hasSourceFallback;
+            query.hasLineSensitiveLoopFallback = query.hasSourceFallback && queryInsideBody;
             return;
         }
     }
@@ -5081,6 +5116,9 @@ void InferSourceLocalSimulationFallback(const std::vector<std::string>& lines, C
     if (!query.valid || query.line == 0 || query.line > lines.size() || query.typeHint == ContestQueryTypeHint::BOOL) {
         return;
     }
+    if (query.hasLineSensitiveLoopFallback) {
+        return;
+    }
     if (SourceLineDeclaresMutableVariableName(lines[query.line - 1], query.variableName)) {
         auto loop = FindInnermostSourceLoop(lines, query.line);
         auto end = loop.has_value() && loop->end > query.line ? loop->end - 1 : static_cast<unsigned>(lines.size());
@@ -5119,6 +5157,9 @@ void InferSourceLocalSimulationFallback(const std::vector<std::string>& lines, C
 void InferSourceEntrySimulationFallback(const std::vector<std::string>& lines, ContestQuery& query)
 {
     if (!query.valid || query.line == 0 || query.line > lines.size() || query.typeHint == ContestQueryTypeHint::BOOL) {
+        return;
+    }
+    if (query.hasLineSensitiveLoopFallback) {
         return;
     }
     auto summaries = BuildSourceFunctionSummaries(lines);
