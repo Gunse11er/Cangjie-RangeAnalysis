@@ -243,6 +243,7 @@ struct ContestQuery {
     bool hasSourceFallback{false};
     bool hasAccumulatorFallback{false};
     bool preferSourceFallback{false};
+    bool sourceFallbackMayBeLoopNarrow{false};
     bool suppressNarrowLoopOutput{false};
 };
 
@@ -1643,12 +1644,20 @@ std::vector<std::string> SplitSourceAddTerms(const std::string& expr)
     return terms;
 }
 
+std::optional<std::vector<int64_t>> InferSourceWhileInductionValues(
+    const std::vector<std::string>& lines, const SourceLoopExtent& loop, const std::string& name, unsigned depth);
+std::optional<std::vector<int64_t>> NormalizeSourceIntSet(std::vector<int64_t> values);
+
 std::optional<std::pair<int64_t, int64_t>> InferSourceNameIntervalInLoop(
     const std::vector<std::string>& lines, const SourceLoopExtent& loop, const std::string& name, unsigned beforeLine)
 {
     if (auto forRange = ParseSourceForInRangeHeader(lines[loop.start - 1]);
         forRange.has_value() && forRange->variable == name) {
         return GetSourceForRangeBounds(forRange.value());
+    }
+    if (auto values = InferSourceWhileInductionValues(lines, loop, name, 0); values.has_value() && !values->empty()) {
+        auto [minIt, maxIt] = std::minmax_element(values->begin(), values->end());
+        return std::make_pair(*minIt, *maxIt);
     }
     std::vector<int64_t> values;
     std::vector<SourceScope> emptyScopes(1);
@@ -1822,6 +1831,10 @@ std::optional<std::vector<int64_t>> InferSourceAccumulatorExactValues(const std:
             return std::nullopt;
         }
         current = next;
+        values.emplace_back(current);
+        if (values.size() > MAX_CONTEST_EXACT_VALUES) {
+            return std::nullopt;
+        }
     }
     return values;
 }
@@ -1875,11 +1888,19 @@ void InferSourceAccumulatorFallback(const std::vector<std::string>& lines, Conte
     if (!delta.has_value()) {
         return;
     }
-    auto lower = init.value();
-    auto upper = init.value() + (tripCount.value() - 1) * std::max<int64_t>(delta->second, 0);
-    if (upper < lower) {
-        std::swap(lower, upper);
+    std::vector<int64_t> candidates{init.value()};
+    for (auto step : {delta->first, delta->second}) {
+        for (auto count : {tripCount.value() - 1, tripCount.value()}) {
+            int64_t value = 0;
+            if (count >= 0 && !__builtin_mul_overflow(count, step, &value) &&
+                !__builtin_add_overflow(init.value(), value, &value)) {
+                candidates.emplace_back(value);
+            }
+        }
     }
+    auto [lowerIt, upperIt] = std::minmax_element(candidates.begin(), candidates.end());
+    auto lower = *lowerIt;
+    auto upper = *upperIt;
     query.accumulatorFallback = "[" + std::to_string(lower) + ", " + std::to_string(upper) + ":1]";
     query.hasAccumulatorFallback = true;
 }
@@ -3221,6 +3242,10 @@ std::optional<std::vector<int64_t>> InferSourceWhileInductionValues(
             }
             current = next;
         }
+        values.emplace_back(current);
+        if (values.size() > MAX_CONTEST_EXACT_VALUES) {
+            return std::nullopt;
+        }
     }
     return NormalizeSmallSourceValues(std::move(values));
 }
@@ -3566,6 +3591,79 @@ std::optional<std::vector<int64_t>> InferSourceLoopExitValuesForVariable(
     return InferSourceLinearLoopExitValues(lines, loop, variableName);
 }
 
+std::optional<std::vector<int64_t>> InferSourceLoopAllValuesForVariable(
+    const std::vector<std::string>& lines, const SourceLoopExtent& loop, const std::string& variableName)
+{
+    if (auto info = BuildSourcePairLoopInfo(lines, loop); info.has_value()) {
+        if (auto values = EnumerateSourcePairLoopValues(info.value()); values.has_value()) {
+            std::vector<int64_t> selected;
+            if (variableName == info->comparison.lhs) {
+                selected = values->lhsBodyValues;
+                selected.insert(selected.end(), values->lhsExitValues.begin(), values->lhsExitValues.end());
+                return NormalizeSmallSourceValues(std::move(selected));
+            }
+            if (variableName == info->comparison.rhs) {
+                selected = values->rhsBodyValues;
+                selected.insert(selected.end(), values->rhsExitValues.begin(), values->rhsExitValues.end());
+                return NormalizeSmallSourceValues(std::move(selected));
+            }
+        }
+    }
+    return InferSourceWhileInductionValues(lines, loop, variableName, 0);
+}
+
+std::optional<std::string> InferSourcePriorLoopAccumulatorOutput(
+    const std::vector<std::string>& lines, const SourceLoopExtent& loop, const std::string& variableName)
+{
+    auto init = InferSourceAccumulatorInit(lines, loop, variableName);
+    auto tripCount = ParseSourceTripCount(lines, loop);
+    if (!init.has_value() || !tripCount.has_value() || tripCount.value() <= 0) {
+        return std::nullopt;
+    }
+
+    std::optional<std::pair<int64_t, int64_t>> delta;
+    for (unsigned lineNo = loop.start + 1; lineNo < loop.end && lineNo <= lines.size(); ++lineNo) {
+        std::string assigned;
+        std::string expr;
+        if (!ParseSourceAssignment(lines[lineNo - 1], assigned, expr) || assigned != variableName) {
+            continue;
+        }
+        if (auto exactValues = InferSourceAccumulatorExactValues(lines, loop, variableName, init.value(), lineNo);
+            exactValues.has_value() && !exactValues->empty() && exactValues->size() <= MAX_CONTEST_EXACT_VALUES) {
+            auto normalized = NormalizeSourceIntSet(std::move(exactValues.value()));
+            if (normalized.has_value()) {
+                return FormatSourceIntValues(std::move(normalized.value()));
+            }
+        }
+        auto current = InferSourceDeltaInterval(lines, loop, variableName, expr, lineNo);
+        if (!current.has_value()) {
+            continue;
+        }
+        if (!delta.has_value()) {
+            delta = current;
+        } else {
+            delta->first = std::min(delta->first, current->first);
+            delta->second = std::max(delta->second, current->second);
+        }
+    }
+    if (!delta.has_value()) {
+        return std::nullopt;
+    }
+
+    std::vector<int64_t> candidates{init.value()};
+    for (auto step : {delta->first, delta->second}) {
+        for (auto count : {tripCount.value() - 1, tripCount.value()}) {
+            int64_t value = 0;
+            if (count >= 0 && !__builtin_mul_overflow(count, step, &value) &&
+                !__builtin_add_overflow(init.value(), value, &value)) {
+                candidates.emplace_back(value);
+            }
+        }
+    }
+    auto [lowerIt, upperIt] = std::minmax_element(candidates.begin(), candidates.end());
+    return "[" + std::to_string(*lowerIt) + ", " + std::to_string(*upperIt) + ":1]";
+}
+
 bool SourceHasUnsafePriorLoopAssignment(
     const std::vector<std::string>& lines, unsigned line, const std::string& variableName)
 {
@@ -3592,6 +3690,44 @@ bool SourceHasUnsafePriorLoopAssignment(
         }
     }
     return false;
+}
+
+void InferSourcePriorLoopValueFallback(const std::vector<std::string>& lines, ContestQuery& query)
+{
+    if (!query.valid || query.line == 0 || query.line > lines.size() || query.typeHint == ContestQueryTypeHint::BOOL ||
+        IsSourceLineInsideLoop(lines, query.line)) {
+        return;
+    }
+    auto loops = CollectSourceLoopExtents(lines);
+    std::sort(loops.begin(), loops.end(), [](const SourceLoopExtent& lhs, const SourceLoopExtent& rhs) {
+        if (lhs.end != rhs.end) {
+            return lhs.end > rhs.end;
+        }
+        return lhs.start > rhs.start;
+    });
+    for (const auto& loop : loops) {
+        if (loop.end >= query.line ||
+            !SourceHasAssignmentInRange(lines, loop.start + 1, loop.end - 1, query.variableName) ||
+            SourceHasAssignmentInRange(lines, loop.end + 1, query.line - 1, query.variableName)) {
+            continue;
+        }
+        auto values = InferSourceLoopAllValuesForVariable(lines, loop, query.variableName);
+        if (!values.has_value() || values->empty()) {
+            if (auto accumulatorOutput = InferSourcePriorLoopAccumulatorOutput(lines, loop, query.variableName);
+                accumulatorOutput.has_value()) {
+                query.sourceFallback = std::move(accumulatorOutput.value());
+                query.hasSourceFallback = true;
+                query.preferSourceFallback = true;
+                query.sourceFallbackMayBeLoopNarrow = true;
+                return;
+            }
+            continue;
+        }
+        SetSourceIntSetFallback(query, std::move(values.value()));
+        query.preferSourceFallback = query.hasSourceFallback;
+        query.sourceFallbackMayBeLoopNarrow = query.hasSourceFallback;
+        return;
+    }
 }
 
 void InferSourcePairLoopFallback(const std::vector<std::string>& lines, ContestQuery& query)
@@ -3650,6 +3786,7 @@ void InferSourcePairLoopFallback(const std::vector<std::string>& lines, ContestQ
         if (!selected.empty()) {
             SetSourceIntSetFallback(query, std::move(selected));
             query.preferSourceFallback = query.hasSourceFallback;
+            query.sourceFallbackMayBeLoopNarrow = query.hasSourceFallback;
             return;
         }
     }
@@ -4974,6 +5111,7 @@ void InferSourceLocalSimulationFallback(const std::vector<std::string>& lines, C
         }
         SetSourceIntSetFallback(query, std::move(observed.value()));
         query.preferSourceFallback = query.hasSourceFallback;
+        query.sourceFallbackMayBeLoopNarrow = query.hasSourceFallback;
         return;
     }
 }
@@ -5014,6 +5152,7 @@ void InferSourceEntrySimulationFallback(const std::vector<std::string>& lines, C
     }
     SetSourceIntSetFallback(query, std::move(observed.value()));
     query.preferSourceFallback = query.hasSourceFallback;
+    query.sourceFallbackMayBeLoopNarrow = query.hasSourceFallback;
 }
 
 void InferSourceFunctionContextQueryFallback(const std::vector<std::string>& lines, ContestQuery& query)
@@ -5289,6 +5428,8 @@ void MergePriorSourceFallback(ContestQuery& query, const ContestQuery& candidate
         query.sourceFallback = candidate.sourceFallback;
         query.hasSourceFallback = true;
         query.preferSourceFallback = query.preferSourceFallback || candidate.preferSourceFallback;
+        query.sourceFallbackMayBeLoopNarrow =
+            query.sourceFallbackMayBeLoopNarrow || candidate.sourceFallbackMayBeLoopNarrow;
     }
     if (candidate.hasAccumulatorFallback) {
         query.accumulatorFallback = candidate.accumulatorFallback;
@@ -5314,6 +5455,7 @@ void InferPriorSourceAssignmentFallback(const std::vector<std::string>& lines, C
         candidate.hasSourceFallback = false;
         candidate.hasAccumulatorFallback = false;
         candidate.preferSourceFallback = false;
+        candidate.sourceFallbackMayBeLoopNarrow = false;
         candidate.resolved = false;
         InferSourceAssignedValuesFallback(lines, candidate);
         InferSourceMatchFallback(lines, candidate);
@@ -5423,6 +5565,7 @@ void InferContestQueryTypeHintFromSource(ContestQuery& query,
     InferSourceFunctionContextQueryFallback(it->second, query);
     InferSourceLocalSimulationFallback(it->second, query);
     InferSourceEntrySimulationFallback(it->second, query);
+    InferSourcePriorLoopValueFallback(it->second, query);
     InferSourceTryFallback(it->second, query);
     InferPriorSourceAssignmentFallback(it->second, query);
     InferSourceAccumulatorFallback(it->second, query);
@@ -5706,6 +5849,16 @@ bool ShouldRecordContestResult(const ContestQuery& query, const std::string& res
     }
     auto fallback = FormatFallback(type);
     return query.result == fallback && result != fallback;
+}
+
+bool HasUsableResolvedContestOutput(const ContestQuery& query)
+{
+    if (!query.resolved) {
+        return false;
+    }
+    auto fallback = FormatFallback(query);
+    auto typeFallback = query.type != nullptr ? FormatFallback(query.type) : fallback;
+    return query.result != fallback && query.result != typeFallback && !IsContestFullBoundaryOutput(query.result);
 }
 
 const ValueRange* GetContestRangeForValue(const RangeDomain& state, Value* value)
@@ -6173,7 +6326,15 @@ bool IsLoopBranchConditionExpr(const Expression& expr)
 // 按查询顺序写入 output.txt，未解析项使用 fallback。
 std::string GetContestQueryOutput(const ContestQuery& query)
 {
+    if (query.sourceFallbackMayBeLoopNarrow && query.hasAccumulatorFallback &&
+        (!query.hasSourceFallback || IsContestSingletonOutput(query.sourceFallback))) {
+        return query.accumulatorFallback;
+    }
     if (query.preferSourceFallback && query.hasSourceFallback) {
+        if (query.sourceFallbackMayBeLoopNarrow && IsContestSingletonOutput(query.sourceFallback) &&
+            HasUsableResolvedContestOutput(query)) {
+            return query.result;
+        }
         return query.sourceFallback;
     }
     if (query.suppressNarrowLoopOutput) {
@@ -6201,6 +6362,17 @@ bool IsContestFallbackOutput(const ContestQuery& query, const std::string& outpu
         return true;
     }
     return output == FormatFallback(query);
+}
+
+bool ShouldUseAccumulatorFallback(const ContestQuery& query, const std::string& current)
+{
+    if (!query.hasAccumulatorFallback) {
+        return false;
+    }
+    if (IsContestFallbackOutput(query, current)) {
+        return true;
+    }
+    return query.sourceFallbackMayBeLoopNarrow && IsContestSingletonOutput(current);
 }
 
 bool ShouldApplyContestContextCandidate(const ContestQuery& query, const std::string& result, Type* type)
@@ -6257,7 +6429,7 @@ void WriteContestOutput(std::vector<ContestQuery>& queries, const ContestInputCo
     for (size_t index = 0; index < queries.size(); ++index) {
         auto& query = queries[index];
         auto current = GetContestQueryOutput(query);
-        if (query.hasAccumulatorFallback && IsContestFallbackOutput(query, current)) {
+        if (ShouldUseAccumulatorFallback(query, current)) {
             current = query.accumulatorFallback;
         }
         if (index < existingLines.size() && IsContestFallbackOutput(query, current) &&
