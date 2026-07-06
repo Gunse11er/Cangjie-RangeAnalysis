@@ -3542,6 +3542,30 @@ std::optional<std::vector<int64_t>> TryEnumerateInclusiveUntilBound(
     return values;
 }
 
+std::optional<std::vector<int64_t>> AddLoopConditionExitValue(
+    std::vector<int64_t> values, Value* value, int64_t init, int64_t step,
+    RelationalOperation relation, int64_t bound, IntWidth width)
+{
+    if (!IsLoopConditionLoadForWidening(value)) {
+        return values;
+    }
+    auto exit = ComputeExactInductionExit(init, step, relation, bound, width);
+    if (!exit.has_value()) {
+        return std::nullopt;
+    }
+    auto exitValue = exit->SVal();
+    if (std::find(values.begin(), values.end(), exitValue) != values.end()) {
+        return values;
+    }
+    if (values.size() >= MAX_EXACT_INT_SET_SIZE) {
+        return std::nullopt;
+    }
+    values.emplace_back(exitValue);
+    std::sort(values.begin(), values.end());
+    values.erase(std::unique(values.begin(), values.end()), values.end());
+    return values;
+}
+
 bool IsLoopExitSuccessor(const Branch* branch, const Block* successor)
 {
     if (branch != nullptr &&
@@ -3868,7 +3892,8 @@ std::optional<std::vector<int64_t>> TryEnumerateSimpleLoopLoadValues(const Range
             auto values = TryEnumerateInductionValues(
                 init.value(), step.value(), condition->relation, condition->bound, ToWidth(*value->GetType()));
             if (values.has_value()) {
-                return values;
+                return AddLoopConditionExitValue(std::move(values.value()), value, init.value(), step.value(),
+                    condition->relation, condition->bound, ToWidth(*value->GetType()));
             }
         }
     }

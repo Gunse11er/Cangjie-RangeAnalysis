@@ -956,7 +956,12 @@ void InferSourceForRangeVariableFallback(const std::vector<std::string>& lines, 
     if (!bounds.has_value()) {
         return;
     }
-    query.sourceFallback = FormatSourceIntInterval(bounds->first, bounds->second);
+    auto upper = bounds->second;
+    if (query.line == loop->start && upper != std::numeric_limits<int64_t>::max()) {
+        ++upper;
+        query.preferSourceFallback = true;
+    }
+    query.sourceFallback = FormatSourceIntInterval(bounds->first, upper);
     query.hasSourceFallback = true;
 }
 
