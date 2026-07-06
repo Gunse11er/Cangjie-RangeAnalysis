@@ -4142,6 +4142,15 @@ SourceSimulationResult ExecuteSourceSummaryBlock(const std::vector<std::string>&
         }
         result.observedValues.emplace_back(exact->intValue);
     };
+    auto observeTargetCurrent = [&](unsigned currentLine) {
+        if (target == nullptr || target->sourceLine != currentLine) {
+            return;
+        }
+        auto value = LookupSourceValue(scopes, target->variableName);
+        if (value != nullptr && IsSourceIntegerTypeHint(value->typeHint)) {
+            result.observedValues.emplace_back(value->intValue);
+        }
+    };
     for (size_t index = begin; index <= end; ++index) {
         if (budget == 0) {
             result.failed = true;
@@ -4150,11 +4159,9 @@ SourceSimulationResult ExecuteSourceSummaryBlock(const std::vector<std::string>&
         --budget;
         if (target != nullptr && target->sourceLine == baseSourceLine + index) {
             auto value = LookupSourceValue(scopes, target->variableName);
-            if (value == nullptr || !IsSourceIntegerTypeHint(value->typeHint)) {
-                result.failed = true;
-                return result;
+            if (value != nullptr && IsSourceIntegerTypeHint(value->typeHint)) {
+                result.observedValues.emplace_back(value->intValue);
             }
-            result.observedValues.emplace_back(value->intValue);
         }
         auto trimmed = Trim(StripLineComment(lines[index]));
         if (trimmed.empty() || trimmed == "{" || trimmed == "}") {
@@ -4187,10 +4194,7 @@ SourceSimulationResult ExecuteSourceSummaryBlock(const std::vector<std::string>&
                 exact.typeHint = ContestQueryTypeHint::INT64;
                 exact.intValue = iterValue;
                 scopes.back()[forRange->variable] = exact;
-                if (target != nullptr && target->sourceLine == baseSourceLine + static_cast<unsigned>(index) &&
-                    target->variableName == forRange->variable) {
-                    result.observedValues.emplace_back(iterValue);
-                }
+                observeTargetCurrent(baseSourceLine + static_cast<unsigned>(index));
                 auto inner = ExecuteSourceSummaryBlock(
                     lines, index + 1, blockEnd.value() - 1, scopes, summaries, depth + 1, budget, baseSourceLine, target);
                 if (scopes.size() > 1) {
@@ -4222,6 +4226,7 @@ SourceSimulationResult ExecuteSourceSummaryBlock(const std::vector<std::string>&
             }
             size_t iterations = 0;
             while (true) {
+                observeTargetCurrent(baseSourceLine + static_cast<unsigned>(index));
                 auto conditionValue = EvalSourceBoolExpr(condition.value(), scopes);
                 if (!conditionValue.has_value()) {
                     result.failed = true;
@@ -4973,6 +4978,44 @@ void InferSourceLocalSimulationFallback(const std::vector<std::string>& lines, C
     }
 }
 
+void InferSourceEntrySimulationFallback(const std::vector<std::string>& lines, ContestQuery& query)
+{
+    if (!query.valid || query.line == 0 || query.line > lines.size() || query.typeHint == ContestQueryTypeHint::BOOL) {
+        return;
+    }
+    auto summaries = BuildSourceFunctionSummaries(lines);
+    if (summaries.empty()) {
+        return;
+    }
+    bool queryInsideKnownFunction = false;
+    for (const auto& [name, summary] : summaries) {
+        (void)name;
+        if (summary.startLine != 0 && summary.endLine != 0 &&
+            summary.startLine < query.line && query.line < summary.endLine) {
+            queryInsideKnownFunction = true;
+            break;
+        }
+    }
+    if (!queryInsideKnownFunction) {
+        return;
+    }
+    auto mainIt = summaries.find("main");
+    if (mainIt == summaries.end() || !mainIt->second.params.empty() || mainIt->second.endLine == 0) {
+        return;
+    }
+    if (SourceSummaryPrefixUnsupportedForLocalSimulation(mainIt->second, mainIt->second.endLine)) {
+        return;
+    }
+    std::vector<SourceScope> scopes(1);
+    auto observed = SimulateSourceFunctionSummaryAtLine(
+        mainIt->second, scopes, summaries, query.line, query.variableName, 0);
+    if (!observed.has_value()) {
+        return;
+    }
+    SetSourceIntSetFallback(query, std::move(observed.value()));
+    query.preferSourceFallback = query.hasSourceFallback;
+}
+
 void InferSourceFunctionContextQueryFallback(const std::vector<std::string>& lines, ContestQuery& query)
 {
     if (!query.valid || query.line == 0 || query.line > lines.size() || query.typeHint == ContestQueryTypeHint::BOOL) {
@@ -5379,6 +5422,7 @@ void InferContestQueryTypeHintFromSource(ContestQuery& query,
     InferSourceFunctionCallFallback(it->second, query);
     InferSourceFunctionContextQueryFallback(it->second, query);
     InferSourceLocalSimulationFallback(it->second, query);
+    InferSourceEntrySimulationFallback(it->second, query);
     InferSourceTryFallback(it->second, query);
     InferPriorSourceAssignmentFallback(it->second, query);
     InferSourceAccumulatorFallback(it->second, query);
