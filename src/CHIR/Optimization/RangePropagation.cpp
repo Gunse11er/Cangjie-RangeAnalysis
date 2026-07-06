@@ -4386,6 +4386,10 @@ SourceSimulationResult ExecuteSourceSummaryBlock(const std::vector<std::string>&
                     break;
                 }
             }
+            if (target != nullptr && target->sourceLine == baseSourceLine + static_cast<unsigned>(index) &&
+                target->variableName == forRange->variable && bounds->second != std::numeric_limits<int64_t>::max()) {
+                result.observedValues.emplace_back(bounds->second + 1);
+            }
             index = blockEnd.value();
             continue;
         }
