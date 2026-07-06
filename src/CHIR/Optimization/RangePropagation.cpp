@@ -711,6 +711,45 @@ std::optional<SourceForRangeInfo> ParseSourceForInRangeHeader(const std::string&
     return SourceForRangeInfo{variable, start.value(), end.value(), inclusive};
 }
 
+std::optional<SourceForRangeInfo> ParseSourceForInRangeHeaderWithScopes(
+    const std::string& line, const std::vector<SourceScope>& scopes)
+{
+    auto header = Trim(StripLineComment(line));
+    if (!SourceLineStartsWithKeyword(header, "for")) {
+        return std::nullopt;
+    }
+    auto open = header.find('(');
+    auto inPos = header.find(" in ", open == std::string::npos ? 0 : open);
+    if (open == std::string::npos || inPos == std::string::npos) {
+        return std::nullopt;
+    }
+    auto variable = Trim(header.substr(open + 1, inPos - open - 1));
+    if (variable.empty() || !std::all_of(variable.begin(), variable.end(), IsIdentifierChar)) {
+        return std::nullopt;
+    }
+    auto inclusivePos = header.find("..=", inPos + 4);
+    auto exclusivePos = header.find("..", inPos + 4);
+    bool inclusive = inclusivePos != std::string::npos;
+    auto rangePos = inclusive ? inclusivePos : exclusivePos;
+    if (rangePos == std::string::npos) {
+        return std::nullopt;
+    }
+    auto startExpr = header.substr(inPos + 4, rangePos - (inPos + 4));
+    auto endBegin = rangePos + (inclusive ? 3 : 2);
+    auto endPos = header.find(')', endBegin);
+    auto bracePos = header.find('{', endBegin);
+    if (endPos == std::string::npos || (bracePos != std::string::npos && bracePos < endPos)) {
+        endPos = bracePos;
+    }
+    auto endExpr = header.substr(endBegin, endPos == std::string::npos ? std::string::npos : endPos - endBegin);
+    auto start = EvalSourceIntExpr(startExpr, scopes);
+    auto end = EvalSourceIntExpr(endExpr, scopes);
+    if (!start.has_value() || !end.has_value()) {
+        return std::nullopt;
+    }
+    return SourceForRangeInfo{variable, start.value(), end.value(), inclusive};
+}
+
 std::optional<std::pair<int64_t, int64_t>> GetSourceForRangeBounds(const SourceForRangeInfo& range)
 {
     if (range.inclusive) {
@@ -4125,6 +4164,55 @@ SourceSimulationResult ExecuteSourceSummaryBlock(const std::vector<std::string>&
             result.failed = true;
             return result;
         }
+        if (SourceLineStartsWithKeyword(trimmed, "for")) {
+            auto forRange = ParseSourceForInRangeHeaderWithScopes(trimmed, scopes);
+            auto blockEnd = FindSourceVectorBlockEnd(lines, index);
+            if (!forRange.has_value() || !blockEnd.has_value() || blockEnd.value() <= index) {
+                result.failed = true;
+                return result;
+            }
+            auto bounds = GetSourceForRangeBounds(forRange.value());
+            if (!bounds.has_value()) {
+                result.failed = true;
+                return result;
+            }
+            size_t iterations = 0;
+            for (int64_t iterValue = bounds->first; iterValue <= bounds->second; ++iterValue) {
+                if (++iterations > 1024) {
+                    result.failed = true;
+                    return result;
+                }
+                scopes.emplace_back();
+                SourceExactValue exact;
+                exact.typeHint = ContestQueryTypeHint::INT64;
+                exact.intValue = iterValue;
+                scopes.back()[forRange->variable] = exact;
+                if (target != nullptr && target->sourceLine == baseSourceLine + static_cast<unsigned>(index) &&
+                    target->variableName == forRange->variable) {
+                    result.observedValues.emplace_back(iterValue);
+                }
+                auto inner = ExecuteSourceSummaryBlock(
+                    lines, index + 1, blockEnd.value() - 1, scopes, summaries, depth + 1, budget, baseSourceLine, target);
+                if (scopes.size() > 1) {
+                    scopes.pop_back();
+                }
+                result.observedValues.insert(
+                    result.observedValues.end(), inner.observedValues.begin(), inner.observedValues.end());
+                if (inner.failed) {
+                    result.failed = true;
+                    return result;
+                }
+                if (inner.returnValue.has_value()) {
+                    result.returnValue = inner.returnValue;
+                    return result;
+                }
+                if (iterValue == bounds->second) {
+                    break;
+                }
+            }
+            index = blockEnd.value();
+            continue;
+        }
         if (SourceLineStartsWithKeyword(trimmed, "while")) {
             auto condition = ParseSourceControlCondition(trimmed, "while");
             auto blockEnd = FindSourceVectorBlockEnd(lines, index);
@@ -4817,8 +4905,7 @@ bool SourceSummaryPrefixUnsupportedForLocalSimulation(const SourceFunctionSummar
         if (trimmed.empty()) {
             continue;
         }
-        if (SourceLineStartsWithKeyword(trimmed, "for") || SourceLineStartsWithKeyword(trimmed, "match") ||
-            SourceLineStartsWithKeyword(trimmed, "try") ||
+        if (SourceLineStartsWithKeyword(trimmed, "match") || SourceLineStartsWithKeyword(trimmed, "try") ||
             SourceLineStartsWithKeyword(trimmed, "catch") || SourceLineStartsWithKeyword(trimmed, "finally") ||
             trimmed.find("else") != std::string::npos || trimmed.find(" spawn") != std::string::npos ||
             trimmed.rfind("spawn", 0) == 0 ||
@@ -4829,7 +4916,7 @@ bool SourceSummaryPrefixUnsupportedForLocalSimulation(const SourceFunctionSummar
     return false;
 }
 
-bool SourceSummaryPrefixHasWhileForLocalSimulation(const SourceFunctionSummary& summary, unsigned queryLine)
+bool SourceSummaryPrefixHasLoopForLocalSimulation(const SourceFunctionSummary& summary, unsigned queryLine)
 {
     if (summary.startLine == 0 || queryLine <= summary.startLine) {
         return false;
@@ -4839,7 +4926,8 @@ bool SourceSummaryPrefixHasWhileForLocalSimulation(const SourceFunctionSummary& 
         if (bodyLine >= queryLine) {
             break;
         }
-        if (SourceLineStartsWithKeyword(Trim(StripLineComment(summary.bodyLines[index])), "while")) {
+        auto trimmed = Trim(StripLineComment(summary.bodyLines[index]));
+        if (SourceLineStartsWithKeyword(trimmed, "while") || SourceLineStartsWithKeyword(trimmed, "for")) {
             return true;
         }
     }
@@ -4871,7 +4959,7 @@ void InferSourceLocalSimulationFallback(const std::vector<std::string>& lines, C
         if (SourceSummaryPrefixUnsupportedForLocalSimulation(summary, query.line)) {
             continue;
         }
-        if (!SourceSummaryPrefixHasWhileForLocalSimulation(summary, query.line)) {
+        if (!SourceSummaryPrefixHasLoopForLocalSimulation(summary, query.line)) {
             continue;
         }
         std::vector<SourceScope> scopes(1);
