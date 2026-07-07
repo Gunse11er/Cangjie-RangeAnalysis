@@ -1302,7 +1302,6 @@ void InferSourceGlobalConstantFallback(const std::vector<std::string>& lines, Co
     if (!TryCollectSourceConstantIntWrites(lines, query.variableName, values)) {
         return;
     }
-    DropCoveredSourceZeroInitializer(lines, 1, static_cast<unsigned>(lines.size()), query.variableName, values);
     SetSourceIntSetFallback(query, std::move(values));
 }
 
@@ -5541,11 +5540,48 @@ void InferSourceTryFallback(const std::vector<std::string>& lines, ContestQuery&
 }
 
 
+bool TryParseSourceIntSetFallback(const std::string& text, std::vector<int64_t>& values)
+{
+    if (text.empty() || text.find('[') != std::string::npos ||
+        text.find("true") != std::string::npos || text.find("false") != std::string::npos) {
+        return false;
+    }
+    std::stringstream ss(text);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        auto trimmed = Trim(item);
+        if (trimmed.empty()) {
+            return false;
+        }
+        try {
+            size_t parsed = 0;
+            auto value = std::stoll(trimmed, &parsed, 10);
+            if (parsed != trimmed.size()) {
+                return false;
+            }
+            values.emplace_back(value);
+        } catch (...) {
+            return false;
+        }
+    }
+    return !values.empty();
+}
+
 void MergePriorSourceFallback(ContestQuery& query, const ContestQuery& candidate)
 {
     if (candidate.hasSourceFallback) {
-        query.sourceFallback = candidate.sourceFallback;
-        query.hasSourceFallback = true;
+        if (query.hasSourceFallback) {
+            std::vector<int64_t> values;
+            std::vector<int64_t> candidateValues;
+            if (TryParseSourceIntSetFallback(query.sourceFallback, values) &&
+                TryParseSourceIntSetFallback(candidate.sourceFallback, candidateValues)) {
+                values.insert(values.end(), candidateValues.begin(), candidateValues.end());
+                query.sourceFallback = FormatSourceIntValues(std::move(values));
+            }
+        } else {
+            query.sourceFallback = candidate.sourceFallback;
+            query.hasSourceFallback = true;
+        }
         query.preferSourceFallback = query.preferSourceFallback || candidate.preferSourceFallback;
         query.sourceFallbackMayBeLoopNarrow =
             query.sourceFallbackMayBeLoopNarrow || candidate.sourceFallbackMayBeLoopNarrow;
