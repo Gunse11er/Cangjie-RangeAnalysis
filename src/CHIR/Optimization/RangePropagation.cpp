@@ -3987,7 +3987,7 @@ std::optional<std::string> ExtractSourceInlineBraceResultExpr(const std::string&
 void AddSourceFunctionSummary(std::unordered_map<std::string, SourceFunctionSummary>& summaries,
     const std::string& name, SourceFunctionSummary summary)
 {
-    if (name.empty() || summary.returnExprs.empty()) {
+    if (name.empty() || (summary.returnExprs.empty() && summary.bodyLines.empty())) {
         return;
     }
     auto it = summaries.find(name);
@@ -4197,6 +4197,58 @@ void EraseSourceValueFromScopes(std::vector<SourceScope>& scopes, const std::str
     }
 }
 
+std::vector<SourceScope> BuildSourceGlobalScopes(const std::vector<std::string>& lines)
+{
+    std::vector<SourceScope> scopes(1);
+    int braceDepth = 0;
+    for (unsigned lineNo = 1; lineNo <= lines.size(); ++lineNo) {
+        auto line = lines[lineNo - 1];
+        auto stripped = StripLineComment(line);
+        const bool isGlobalLike = braceDepth == 0 || stripped.find("static") != std::string::npos;
+        if (isGlobalLike) {
+            std::string name;
+            ContestQueryTypeHint typeHint{ContestQueryTypeHint::UNKNOWN};
+            std::string expr;
+            if (ParseSourceDeclaration(line, name, typeHint, expr)) {
+                SourceExactValue exact;
+                auto overflowStrategy = GetSourceOverflowStrategyAtLine(lines, lineNo);
+                if (TryEvalSourceExactValue(expr, scopes, typeHint, exact, overflowStrategy)) {
+                    scopes.front()[name] = exact;
+                }
+            } else if (ParseSourceAssignment(line, name, expr)) {
+                SourceExactValue exact;
+                auto old = LookupSourceValue(scopes, name);
+                auto hint = old == nullptr ? ContestQueryTypeHint::UNKNOWN : old->typeHint;
+                auto overflowStrategy = GetSourceOverflowStrategyAtLine(lines, lineNo);
+                if (TryEvalSourceExactValue(expr, scopes, hint, exact, overflowStrategy)) {
+                    scopes.front()[name] = exact;
+                }
+            } else {
+                std::string compoundName;
+                std::string op;
+                std::string compoundExpr;
+                if (ParseSourceCompoundAssignment(line, compoundName, op, compoundExpr)) {
+                    auto value = EvalSourceCompoundAssignment(scopes, compoundName, op, compoundExpr);
+                    if (value.has_value()) {
+                        SourceExactValue exact;
+                        exact.typeHint = ContestQueryTypeHint::INT64;
+                        exact.intValue = value.value();
+                        scopes.front()[compoundName] = exact;
+                    }
+                }
+            }
+        }
+        for (auto c : stripped) {
+            if (c == '{') {
+                ++braceDepth;
+            } else if (c == '}' && braceDepth > 0) {
+                --braceDepth;
+            }
+        }
+    }
+    return scopes;
+}
+
 std::optional<std::string> ParseSourceControlCondition(const std::string& line, const std::string& keyword)
 {
     auto trimmed = Trim(StripLineComment(line));
@@ -4283,6 +4335,9 @@ SourceSimulationResult ExecuteSourceSummaryBlock(const std::vector<std::string>&
     SourceSimulationResult result;
     auto simulateDirectCall = [&](const std::string& expr) -> std::optional<SourceSimulationResult> {
         auto normalized = StripSourceEnclosingParens(NormalizeSourceTrailingClosureCall(expr));
+        if (!normalized.empty() && normalized.back() == ';') {
+            normalized = Trim(normalized.substr(0, normalized.size() - 1));
+        }
         auto open = FindSourceTrailingCallOpen(normalized);
         if (!open.has_value()) {
             return std::nullopt;
@@ -4301,6 +4356,7 @@ SourceSimulationResult ExecuteSourceSummaryBlock(const std::vector<std::string>&
         if (!scopes.empty()) {
             calleeScopes.front() = scopes.front();
         }
+        calleeScopes.emplace_back();
         for (size_t i = 0; i < args.size(); ++i) {
             auto exact = EvalSourceExactForSimulation(args[i], scopes, summaries, ContestQueryTypeHint::INT64, depth + 1);
             if (!exact.has_value() || !IsSourceIntegerTypeHint(exact->typeHint)) {
@@ -4308,8 +4364,12 @@ SourceSimulationResult ExecuteSourceSummaryBlock(const std::vector<std::string>&
             }
             calleeScopes.back()[summaryIt->second.params[i]] = exact.value();
         }
-        return ExecuteSourceSummaryBlock(summaryIt->second.bodyLines, 0, summaryIt->second.bodyLines.size() - 1,
+        auto callResult = ExecuteSourceSummaryBlock(summaryIt->second.bodyLines, 0, summaryIt->second.bodyLines.size() - 1,
             calleeScopes, summaries, depth + 1, budget, summaryIt->second.startLine + 1, target);
+        if (!callResult.failed && !scopes.empty() && !calleeScopes.empty()) {
+            scopes.front() = calleeScopes.front();
+        }
+        return callResult;
     };
     auto observeTargetWrite = [&](unsigned currentLine, const std::string& name,
                                   const std::optional<SourceExactValue>& exact) {
@@ -4471,6 +4531,15 @@ SourceSimulationResult ExecuteSourceSummaryBlock(const std::vector<std::string>&
                 }
             }
             index = blockEnd.value();
+            continue;
+        }
+        if (auto direct = simulateDirectCall(trimmed); direct.has_value()) {
+            result.observedValues.insert(
+                result.observedValues.end(), direct->observedValues.begin(), direct->observedValues.end());
+            if (direct->failed) {
+                result.failed = true;
+                return result;
+            }
             continue;
         }
         if (auto ret = ExtractSourceReturnExpr(trimmed); ret.has_value() && !ret->empty()) {
@@ -5151,7 +5220,7 @@ void InferSourceLocalSimulationFallback(const std::vector<std::string>& lines, C
         if (!SourceSummaryPrefixHasLoopForLocalSimulation(summary, query.line)) {
             continue;
         }
-        std::vector<SourceScope> scopes(1);
+        auto scopes = BuildSourceGlobalScopes(lines);
         auto observed = SimulateSourceFunctionSummaryAtLine(summary, scopes, summaries, query.line, query.variableName, 0);
         if (!observed.has_value()) {
             continue;
@@ -5194,7 +5263,7 @@ void InferSourceEntrySimulationFallback(const std::vector<std::string>& lines, C
     if (SourceSummaryPrefixUnsupportedForLocalSimulation(mainIt->second, mainIt->second.endLine)) {
         return;
     }
-    std::vector<SourceScope> scopes(1);
+    auto scopes = BuildSourceGlobalScopes(lines);
     auto observed = SimulateSourceFunctionSummaryAtLine(
         mainIt->second, scopes, summaries, query.line, query.variableName, 0);
     if (!observed.has_value()) {
