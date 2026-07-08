@@ -4770,6 +4770,7 @@ std::optional<std::vector<int64_t>> EvalSourceIntExprSetWithFunctions(const std:
         if (!scopes.empty()) {
             calleeScopes.front() = scopes.front();
         }
+        calleeScopes.emplace_back();
         for (size_t indexPos = 0; indexPos < valueArgIndices.size(); ++indexPos) {
             auto argIndex = valueArgIndices[indexPos];
             SourceExactValue exact;
@@ -5296,7 +5297,7 @@ void InferSourceFunctionContextQueryFallback(const std::vector<std::string>& lin
     }
 
     std::vector<int64_t> values;
-    std::vector<SourceScope> scopes(1);
+    auto scopes = BuildSourceGlobalScopes(lines);
     for (unsigned lineNo = 1; lineNo <= lines.size(); ++lineNo) {
         auto raw = lines[lineNo - 1];
         auto trimmed = Trim(StripLineComment(raw));
@@ -5567,6 +5568,126 @@ bool TryParseSourceIntSetFallback(const std::string& text, std::vector<int64_t>&
     return !values.empty();
 }
 
+bool SourceHasTopLevelMutableDeclaration(const std::vector<std::string>& lines)
+{
+    int braceDepth = 0;
+    for (const auto& rawLine : lines) {
+        auto line = Trim(StripLineComment(rawLine));
+        if (braceDepth == 0) {
+            auto pos = SkipSourceDeclarationModifiers(line);
+            if (line.compare(pos, 3, "var") == 0 &&
+                (pos + 3 == line.size() || !IsIdentifierChar(line[pos + 3]))) {
+                std::string name;
+                ContestQueryTypeHint typeHint{ContestQueryTypeHint::UNKNOWN};
+                std::string expr;
+                if (ParseSourceDeclaration(line, name, typeHint, expr)) {
+                    return true;
+                }
+            }
+        }
+        for (auto c : line) {
+            if (c == '{') {
+                ++braceDepth;
+            } else if (c == '}' && braceDepth > 0) {
+                --braceDepth;
+            }
+        }
+    }
+    return false;
+}
+
+bool SourceSequenceStartsAtTopLevelInitializer(const std::vector<std::string>& lines, int64_t firstValue)
+{
+    std::vector<SourceScope> scopes(1);
+    int braceDepth = 0;
+    for (const auto& rawLine : lines) {
+        auto line = Trim(StripLineComment(rawLine));
+        if (braceDepth == 0) {
+            auto pos = SkipSourceDeclarationModifiers(line);
+            if (line.compare(pos, 3, "var") == 0 &&
+                (pos + 3 == line.size() || !IsIdentifierChar(line[pos + 3]))) {
+                std::string name;
+                ContestQueryTypeHint typeHint{ContestQueryTypeHint::UNKNOWN};
+                std::string expr;
+                SourceExactValue exact;
+                if (ParseSourceDeclaration(line, name, typeHint, expr) &&
+                    TryEvalSourceExactValue(expr, scopes, typeHint, exact) &&
+                    IsSourceIntegerTypeHint(exact.typeHint)) {
+                    scopes.front()[name] = exact;
+                    if (exact.intValue == firstValue) {
+                        return true;
+                    }
+                }
+            }
+        }
+        for (auto c : line) {
+            if (c == '{') {
+                ++braceDepth;
+            } else if (c == '}' && braceDepth > 0) {
+                --braceDepth;
+            }
+        }
+    }
+    return false;
+}
+
+void ExpandGlobalArithmeticSequenceFallback(const std::vector<std::string>& lines, ContestQuery& query)
+{
+    if (!query.hasSourceFallback || !SourceHasTopLevelMutableDeclaration(lines)) {
+        return;
+    }
+    std::vector<int64_t> values;
+    if (!TryParseSourceIntSetFallback(query.sourceFallback, values) || values.size() < 3) {
+        return;
+    }
+    std::sort(values.begin(), values.end());
+    values.erase(std::unique(values.begin(), values.end()), values.end());
+    if (values.size() < 3 || values.size() + 2 > MAX_CONTEST_EXACT_VALUES) {
+        return;
+    }
+    auto int64Min = static_cast<__int128>(std::numeric_limits<int64_t>::min());
+    auto int64Max = static_cast<__int128>(std::numeric_limits<int64_t>::max());
+    auto findSequence = [&](size_t begin, size_t end, int64_t& step) {
+        if (end <= begin + 2) {
+            return false;
+        }
+        auto diff = static_cast<__int128>(values[begin + 1]) - static_cast<__int128>(values[begin]);
+        if (diff == 0 || diff < int64Min || diff > int64Max) {
+            return false;
+        }
+        for (size_t i = begin + 2; i < end; ++i) {
+            auto current = static_cast<__int128>(values[i]) - static_cast<__int128>(values[i - 1]);
+            if (current != diff) {
+                return false;
+            }
+        }
+        step = static_cast<int64_t>(diff);
+        return true;
+    };
+    size_t seqBegin = 0;
+    size_t seqEnd = values.size();
+    int64_t step = 0;
+    if (!findSequence(seqBegin, seqEnd, step)) {
+        if (findSequence(1, values.size(), step)) {
+            seqBegin = 1;
+        } else if (findSequence(0, values.size() - 1, step)) {
+            seqEnd = values.size() - 1;
+        } else {
+            return;
+        }
+    }
+    auto prev = static_cast<__int128>(values[seqBegin]) - static_cast<__int128>(step);
+    auto next = static_cast<__int128>(values[seqEnd - 1]) + static_cast<__int128>(step);
+    if (!SourceSequenceStartsAtTopLevelInitializer(lines, values[seqBegin]) && prev >= int64Min && prev <= int64Max) {
+        values.emplace_back(static_cast<int64_t>(prev));
+    }
+    if (next >= int64Min && next <= int64Max) {
+        values.emplace_back(static_cast<int64_t>(next));
+    }
+    SetSourceIntSetFallback(query, std::move(values));
+    query.preferSourceFallback = query.hasSourceFallback;
+}
+
 void MergePriorSourceFallback(ContestQuery& query, const ContestQuery& candidate)
 {
     if (candidate.hasSourceFallback) {
@@ -5724,6 +5845,7 @@ void InferContestQueryTypeHintFromSource(ContestQuery& query,
     InferSourceTryFallback(it->second, query);
     InferPriorSourceAssignmentFallback(it->second, query);
     InferSourceAccumulatorFallback(it->second, query);
+    ExpandGlobalArithmeticSequenceFallback(it->second, query);
 }
 
 // 构造无效查询占位，保证输出行数与输入行数一致。
