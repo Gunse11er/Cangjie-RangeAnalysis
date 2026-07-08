@@ -1302,6 +1302,7 @@ void InferSourceGlobalConstantFallback(const std::vector<std::string>& lines, Co
     if (!TryCollectSourceConstantIntWrites(lines, query.variableName, values)) {
         return;
     }
+    DropCoveredSourceZeroInitializer(lines, 1, static_cast<unsigned>(lines.size()), query.variableName, values);
     SetSourceIntSetFallback(query, std::move(values));
 }
 
@@ -5568,35 +5569,8 @@ bool TryParseSourceIntSetFallback(const std::string& text, std::vector<int64_t>&
     return !values.empty();
 }
 
-bool SourceHasTopLevelMutableDeclaration(const std::vector<std::string>& lines)
-{
-    int braceDepth = 0;
-    for (const auto& rawLine : lines) {
-        auto line = Trim(StripLineComment(rawLine));
-        if (braceDepth == 0) {
-            auto pos = SkipSourceDeclarationModifiers(line);
-            if (line.compare(pos, 3, "var") == 0 &&
-                (pos + 3 == line.size() || !IsIdentifierChar(line[pos + 3]))) {
-                std::string name;
-                ContestQueryTypeHint typeHint{ContestQueryTypeHint::UNKNOWN};
-                std::string expr;
-                if (ParseSourceDeclaration(line, name, typeHint, expr)) {
-                    return true;
-                }
-            }
-        }
-        for (auto c : line) {
-            if (c == '{') {
-                ++braceDepth;
-            } else if (c == '}' && braceDepth > 0) {
-                --braceDepth;
-            }
-        }
-    }
-    return false;
-}
-
-bool SourceSequenceStartsAtTopLevelInitializer(const std::vector<std::string>& lines, int64_t firstValue)
+std::optional<int64_t> GetSourceTopLevelIntegerInitializer(
+    const std::vector<std::string>& lines, const std::string& variableName)
 {
     std::vector<SourceScope> scopes(1);
     int braceDepth = 0;
@@ -5610,13 +5584,11 @@ bool SourceSequenceStartsAtTopLevelInitializer(const std::vector<std::string>& l
                 ContestQueryTypeHint typeHint{ContestQueryTypeHint::UNKNOWN};
                 std::string expr;
                 SourceExactValue exact;
-                if (ParseSourceDeclaration(line, name, typeHint, expr) &&
+                if (ParseSourceDeclaration(line, name, typeHint, expr) && name == variableName &&
                     TryEvalSourceExactValue(expr, scopes, typeHint, exact) &&
                     IsSourceIntegerTypeHint(exact.typeHint)) {
                     scopes.front()[name] = exact;
-                    if (exact.intValue == firstValue) {
-                        return true;
-                    }
+                    return exact.intValue;
                 }
             }
         }
@@ -5628,12 +5600,12 @@ bool SourceSequenceStartsAtTopLevelInitializer(const std::vector<std::string>& l
             }
         }
     }
-    return false;
+    return std::nullopt;
 }
 
 void ExpandGlobalArithmeticSequenceFallback(const std::vector<std::string>& lines, ContestQuery& query)
 {
-    if (!query.hasSourceFallback || !SourceHasTopLevelMutableDeclaration(lines)) {
+    if (!query.hasSourceFallback || !SourceHasTopLevelVariableDeclaration(lines, query.variableName)) {
         return;
     }
     std::vector<int64_t> values;
@@ -5678,11 +5650,36 @@ void ExpandGlobalArithmeticSequenceFallback(const std::vector<std::string>& line
     }
     auto prev = static_cast<__int128>(values[seqBegin]) - static_cast<__int128>(step);
     auto next = static_cast<__int128>(values[seqEnd - 1]) + static_cast<__int128>(step);
-    if (!SourceSequenceStartsAtTopLevelInitializer(lines, values[seqBegin]) && prev >= int64Min && prev <= int64Max) {
-        values.emplace_back(static_cast<int64_t>(prev));
+    const auto topLevelInitializer = GetSourceTopLevelIntegerInitializer(lines, query.variableName);
+    const bool sequenceStartsAtInitializer = topLevelInitializer.has_value() &&
+        values[seqBegin] == topLevelInitializer.value();
+    const bool queryLineMutatesVariable = query.line > 0 && query.line <= lines.size() &&
+        SourceLineAssignsVariableName(lines[query.line - 1], query.variableName);
+    bool shouldAppendNext = !queryLineMutatesVariable;
+    if (shouldAppendNext) {
+        size_t dynamicSequenceLength = seqEnd - seqBegin;
+        if (sequenceStartsAtInitializer && dynamicSequenceLength > 0) {
+            --dynamicSequenceLength;
+        }
+        if (auto loop = FindInnermostSourceLoop(lines, query.line); loop.has_value()) {
+            if (auto tripCount = ParseSourceTripCount(lines, loop.value());
+                tripCount.has_value() && tripCount.value() > 0 &&
+                dynamicSequenceLength >= static_cast<size_t>(tripCount.value())) {
+                shouldAppendNext = false;
+            }
+        }
     }
-    if (next >= int64Min && next <= int64Max) {
+    if (!sequenceStartsAtInitializer && prev >= int64Min && prev <= int64Max) {
+        auto prevValue = static_cast<int64_t>(prev);
+        if (!topLevelInitializer.has_value() || topLevelInitializer.value() != prevValue) {
+            values.emplace_back(prevValue);
+        }
+    }
+    if (shouldAppendNext && next >= int64Min && next <= int64Max) {
         values.emplace_back(static_cast<int64_t>(next));
+    }
+    if (!queryLineMutatesVariable && topLevelInitializer.has_value() && values.size() > 1) {
+        values.erase(std::remove(values.begin(), values.end(), topLevelInitializer.value()), values.end());
     }
     SetSourceIntSetFallback(query, std::move(values));
     query.preferSourceFallback = query.hasSourceFallback;
