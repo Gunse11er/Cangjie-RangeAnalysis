@@ -1423,6 +1423,52 @@ std::optional<std::string> ParseSourceCasePayloadVariable(const std::string& cas
     return variable;
 }
 
+std::optional<std::string> ParseSourceCaseConstructorName(const std::string& casePrefix)
+{
+    auto prefix = Trim(casePrefix);
+    auto casePos = prefix.find("case");
+    if (casePos == std::string::npos) {
+        return std::nullopt;
+    }
+    auto body = Trim(prefix.substr(casePos + 4));
+    if (body.empty()) {
+        return std::nullopt;
+    }
+    if (body[0] == '_') {
+        return std::string("_");
+    }
+    size_t end = 0;
+    while (end < body.size() && !std::isspace(static_cast<unsigned char>(body[end])) &&
+        body[end] != '(' && body[end] != '=' && body[end] != '{' && body[end] != ',') {
+        ++end;
+    }
+    auto ctor = Trim(body.substr(0, end));
+    auto dot = ctor.find_last_of('.');
+    if (dot != std::string::npos) {
+        ctor = ctor.substr(dot + 1);
+    }
+    if (ctor.empty() || !std::all_of(ctor.begin(), ctor.end(), IsIdentifierChar)) {
+        return std::nullopt;
+    }
+    return ctor;
+}
+
+bool SourceMatchArmMatchesKnownEnum(const std::string& casePrefix,
+    const std::optional<SourceEnumPayloadValue>& enumPayload, bool hasSpecificMatch)
+{
+    if (!enumPayload.has_value()) {
+        return true;
+    }
+    auto ctor = ParseSourceCaseConstructorName(casePrefix);
+    if (!ctor.has_value()) {
+        return true;
+    }
+    if (ctor.value() == "_") {
+        return !hasSpecificMatch;
+    }
+    return ctor.value() == enumPayload->constructor;
+}
+
 std::vector<SourceScope> BuildSourceMatchArmScopes(
     const std::string& casePrefix, const std::optional<SourceEnumPayloadValue>& enumPayload)
 {
@@ -1496,6 +1542,20 @@ void CollectSourceMatchArmIntValues(const std::vector<std::string>& lines, unsig
     std::vector<int64_t>& values, bool collectBareValues = true)
 {
     std::vector<SourceScope> emptyScopes(1);
+    bool hasSpecificMatch = false;
+    if (enumPayload.has_value()) {
+        for (unsigned lineNo = begin; lineNo <= end && lineNo <= lines.size(); ++lineNo) {
+            auto line = StripLineComment(lines[lineNo - 1]);
+            size_t pos = 0;
+            while ((pos = line.find("=>", pos)) != std::string::npos) {
+                auto ctor = ParseSourceCaseConstructorName(line.substr(0, pos));
+                if (ctor.has_value() && ctor.value() == enumPayload->constructor) {
+                    hasSpecificMatch = true;
+                }
+                pos += 2;
+            }
+        }
+    }
     for (unsigned lineNo = begin; lineNo <= end && lineNo <= lines.size(); ++lineNo) {
         auto line = StripLineComment(lines[lineNo - 1]);
         std::string assigned;
@@ -1507,7 +1567,12 @@ void CollectSourceMatchArmIntValues(const std::vector<std::string>& lines, unsig
         }
         size_t pos = 0;
         while ((pos = line.find("=>", pos)) != std::string::npos) {
-            auto armScopes = BuildSourceMatchArmScopes(line.substr(0, pos), enumPayload);
+            auto casePrefix = line.substr(0, pos);
+            if (!SourceMatchArmMatchesKnownEnum(casePrefix, enumPayload, hasSpecificMatch)) {
+                pos += 2;
+                continue;
+            }
+            auto armScopes = BuildSourceMatchArmScopes(casePrefix, enumPayload);
             auto expr = TrimSourceMatchArmExpr(line.substr(pos + 2));
             std::string inlineAssigned;
             std::string inlineAssignedExpr;
@@ -4290,6 +4355,32 @@ std::optional<size_t> FindSourceVectorBlockEnd(const std::vector<std::string>& l
     return std::nullopt;
 }
 
+std::optional<std::pair<size_t, size_t>> FindSourceElseBlock(
+    const std::vector<std::string>& lines, size_t ifBlockEnd)
+{
+    auto hasElse = [](const std::string& raw) {
+        auto line = Trim(StripLineComment(raw));
+        auto pos = line.find("else");
+        return pos != std::string::npos &&
+            (pos == 0 || !IsIdentifierChar(line[pos - 1])) &&
+            (pos + 4 >= line.size() || !IsIdentifierChar(line[pos + 4]));
+    };
+    std::optional<size_t> elseStart;
+    if (ifBlockEnd < lines.size() && hasElse(lines[ifBlockEnd])) {
+        elseStart = ifBlockEnd;
+    } else if (ifBlockEnd + 1 < lines.size() && hasElse(lines[ifBlockEnd + 1])) {
+        elseStart = ifBlockEnd + 1;
+    }
+    if (!elseStart.has_value()) {
+        return std::nullopt;
+    }
+    auto elseEnd = FindSourceVectorBlockEnd(lines, elseStart.value());
+    if (!elseEnd.has_value() || elseEnd.value() < elseStart.value()) {
+        return std::nullopt;
+    }
+    return std::make_pair(elseStart.value(), elseEnd.value());
+}
+
 std::optional<SourceExactValue> EvalSourceExactForSimulation(const std::string& expr,
     std::vector<SourceScope>& scopes, const std::unordered_map<std::string, SourceFunctionSummary>& summaries,
     ContestQueryTypeHint preferredHint, size_t depth)
@@ -4512,6 +4603,7 @@ SourceSimulationResult ExecuteSourceSummaryBlock(const std::vector<std::string>&
                 result.failed = true;
                 return result;
             }
+            auto elseBlock = FindSourceElseBlock(lines, blockEnd.value());
             if (conditionValue.value()) {
                 scopes.emplace_back();
                 auto inner = ExecuteSourceSummaryBlock(
@@ -4529,8 +4621,25 @@ SourceSimulationResult ExecuteSourceSummaryBlock(const std::vector<std::string>&
                     result.returnValue = inner.returnValue;
                     return result;
                 }
+            } else if (elseBlock.has_value() && elseBlock->second > elseBlock->first) {
+                scopes.emplace_back();
+                auto inner = ExecuteSourceSummaryBlock(lines, elseBlock->first + 1, elseBlock->second - 1,
+                    scopes, summaries, depth + 1, budget, baseSourceLine, target);
+                if (scopes.size() > 1) {
+                    scopes.pop_back();
+                }
+                result.observedValues.insert(
+                    result.observedValues.end(), inner.observedValues.begin(), inner.observedValues.end());
+                if (inner.failed) {
+                    result.failed = true;
+                    return result;
+                }
+                if (inner.returnValue.has_value()) {
+                    result.returnValue = inner.returnValue;
+                    return result;
+                }
             }
-            index = blockEnd.value();
+            index = elseBlock.has_value() ? elseBlock->second : blockEnd.value();
             continue;
         }
         if (auto direct = simulateDirectCall(trimmed); direct.has_value()) {
@@ -5163,8 +5272,7 @@ bool SourceSummaryPrefixUnsupportedForLocalSimulation(const SourceFunctionSummar
         }
         if (SourceLineStartsWithKeyword(trimmed, "match") || SourceLineStartsWithKeyword(trimmed, "try") ||
             SourceLineStartsWithKeyword(trimmed, "catch") || SourceLineStartsWithKeyword(trimmed, "finally") ||
-            trimmed.find("else") != std::string::npos || trimmed.find(" spawn") != std::string::npos ||
-            trimmed.rfind("spawn", 0) == 0 ||
+            trimmed.find(" spawn") != std::string::npos || trimmed.rfind("spawn", 0) == 0 ||
             trimmed == "break" || trimmed == "break;" || trimmed == "continue" || trimmed == "continue;") {
             return true;
         }
