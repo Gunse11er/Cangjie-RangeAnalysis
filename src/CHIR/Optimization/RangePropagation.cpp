@@ -5655,18 +5655,25 @@ void ExpandGlobalArithmeticSequenceFallback(const std::vector<std::string>& line
         values[seqBegin] == topLevelInitializer.value();
     const bool queryLineMutatesVariable = query.line > 0 && query.line <= lines.size() &&
         SourceLineAssignsVariableName(lines[query.line - 1], query.variableName);
-    bool shouldAppendNext = !queryLineMutatesVariable;
+    auto loop = FindInnermostSourceLoop(lines, query.line);
+    std::optional<int64_t> tripCount;
+    bool queryBeforeLoopUpdate = false;
+    if (loop.has_value()) {
+        tripCount = ParseSourceTripCount(lines, loop.value());
+        if (auto updateLine = FindSourceLoopVariableUpdateLine(lines, loop.value(), query.variableName);
+            updateLine.has_value() && query.line < updateLine.value()) {
+            queryBeforeLoopUpdate = true;
+        }
+    }
+    bool shouldAppendNext = !queryLineMutatesVariable && !queryBeforeLoopUpdate;
     if (shouldAppendNext) {
         size_t dynamicSequenceLength = seqEnd - seqBegin;
         if (sequenceStartsAtInitializer && dynamicSequenceLength > 0) {
             --dynamicSequenceLength;
         }
-        if (auto loop = FindInnermostSourceLoop(lines, query.line); loop.has_value()) {
-            if (auto tripCount = ParseSourceTripCount(lines, loop.value());
-                tripCount.has_value() && tripCount.value() > 0 &&
-                dynamicSequenceLength >= static_cast<size_t>(tripCount.value())) {
-                shouldAppendNext = false;
-            }
+        if (tripCount.has_value() && tripCount.value() > 0 &&
+            dynamicSequenceLength >= static_cast<size_t>(tripCount.value())) {
+            shouldAppendNext = false;
         }
     }
     if (!sequenceStartsAtInitializer && prev >= int64Min && prev <= int64Max) {
@@ -5678,7 +5685,7 @@ void ExpandGlobalArithmeticSequenceFallback(const std::vector<std::string>& line
     if (shouldAppendNext && next >= int64Min && next <= int64Max) {
         values.emplace_back(static_cast<int64_t>(next));
     }
-    if (!queryLineMutatesVariable && topLevelInitializer.has_value() && values.size() > 1) {
+    if (!queryLineMutatesVariable && !queryBeforeLoopUpdate && topLevelInitializer.has_value() && values.size() > 1) {
         values.erase(std::remove(values.begin(), values.end(), topLevelInitializer.value()), values.end());
     }
     SetSourceIntSetFallback(query, std::move(values));
