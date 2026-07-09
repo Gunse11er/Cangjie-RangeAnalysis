@@ -1302,7 +1302,6 @@ void InferSourceGlobalConstantFallback(const std::vector<std::string>& lines, Co
     if (!TryCollectSourceConstantIntWrites(lines, query.variableName, values)) {
         return;
     }
-    DropCoveredSourceZeroInitializer(lines, 1, static_cast<unsigned>(lines.size()), query.variableName, values);
     SetSourceIntSetFallback(query, std::move(values));
 }
 
@@ -1423,52 +1422,6 @@ std::optional<std::string> ParseSourceCasePayloadVariable(const std::string& cas
     return variable;
 }
 
-std::optional<std::string> ParseSourceCaseConstructorName(const std::string& casePrefix)
-{
-    auto prefix = Trim(casePrefix);
-    auto casePos = prefix.find("case");
-    if (casePos == std::string::npos) {
-        return std::nullopt;
-    }
-    auto body = Trim(prefix.substr(casePos + 4));
-    if (body.empty()) {
-        return std::nullopt;
-    }
-    if (body[0] == '_') {
-        return std::string("_");
-    }
-    size_t end = 0;
-    while (end < body.size() && !std::isspace(static_cast<unsigned char>(body[end])) &&
-        body[end] != '(' && body[end] != '=' && body[end] != '{' && body[end] != ',') {
-        ++end;
-    }
-    auto ctor = Trim(body.substr(0, end));
-    auto dot = ctor.find_last_of('.');
-    if (dot != std::string::npos) {
-        ctor = ctor.substr(dot + 1);
-    }
-    if (ctor.empty() || !std::all_of(ctor.begin(), ctor.end(), IsIdentifierChar)) {
-        return std::nullopt;
-    }
-    return ctor;
-}
-
-bool SourceMatchArmMatchesKnownEnum(const std::string& casePrefix,
-    const std::optional<SourceEnumPayloadValue>& enumPayload, bool hasSpecificMatch)
-{
-    if (!enumPayload.has_value()) {
-        return true;
-    }
-    auto ctor = ParseSourceCaseConstructorName(casePrefix);
-    if (!ctor.has_value()) {
-        return true;
-    }
-    if (ctor.value() == "_") {
-        return !hasSpecificMatch;
-    }
-    return ctor.value() == enumPayload->constructor;
-}
-
 std::vector<SourceScope> BuildSourceMatchArmScopes(
     const std::string& casePrefix, const std::optional<SourceEnumPayloadValue>& enumPayload)
 {
@@ -1542,20 +1495,6 @@ void CollectSourceMatchArmIntValues(const std::vector<std::string>& lines, unsig
     std::vector<int64_t>& values, bool collectBareValues = true)
 {
     std::vector<SourceScope> emptyScopes(1);
-    bool hasSpecificMatch = false;
-    if (enumPayload.has_value()) {
-        for (unsigned lineNo = begin; lineNo <= end && lineNo <= lines.size(); ++lineNo) {
-            auto line = StripLineComment(lines[lineNo - 1]);
-            size_t pos = 0;
-            while ((pos = line.find("=>", pos)) != std::string::npos) {
-                auto ctor = ParseSourceCaseConstructorName(line.substr(0, pos));
-                if (ctor.has_value() && ctor.value() == enumPayload->constructor) {
-                    hasSpecificMatch = true;
-                }
-                pos += 2;
-            }
-        }
-    }
     for (unsigned lineNo = begin; lineNo <= end && lineNo <= lines.size(); ++lineNo) {
         auto line = StripLineComment(lines[lineNo - 1]);
         std::string assigned;
@@ -1567,12 +1506,7 @@ void CollectSourceMatchArmIntValues(const std::vector<std::string>& lines, unsig
         }
         size_t pos = 0;
         while ((pos = line.find("=>", pos)) != std::string::npos) {
-            auto casePrefix = line.substr(0, pos);
-            if (!SourceMatchArmMatchesKnownEnum(casePrefix, enumPayload, hasSpecificMatch)) {
-                pos += 2;
-                continue;
-            }
-            auto armScopes = BuildSourceMatchArmScopes(casePrefix, enumPayload);
+            auto armScopes = BuildSourceMatchArmScopes(line.substr(0, pos), enumPayload);
             auto expr = TrimSourceMatchArmExpr(line.substr(pos + 2));
             std::string inlineAssigned;
             std::string inlineAssignedExpr;
@@ -4355,32 +4289,6 @@ std::optional<size_t> FindSourceVectorBlockEnd(const std::vector<std::string>& l
     return std::nullopt;
 }
 
-std::optional<std::pair<size_t, size_t>> FindSourceElseBlock(
-    const std::vector<std::string>& lines, size_t ifBlockEnd)
-{
-    auto hasElse = [](const std::string& raw) {
-        auto line = Trim(StripLineComment(raw));
-        auto pos = line.find("else");
-        return pos != std::string::npos &&
-            (pos == 0 || !IsIdentifierChar(line[pos - 1])) &&
-            (pos + 4 >= line.size() || !IsIdentifierChar(line[pos + 4]));
-    };
-    std::optional<size_t> elseStart;
-    if (ifBlockEnd < lines.size() && hasElse(lines[ifBlockEnd])) {
-        elseStart = ifBlockEnd;
-    } else if (ifBlockEnd + 1 < lines.size() && hasElse(lines[ifBlockEnd + 1])) {
-        elseStart = ifBlockEnd + 1;
-    }
-    if (!elseStart.has_value()) {
-        return std::nullopt;
-    }
-    auto elseEnd = FindSourceVectorBlockEnd(lines, elseStart.value());
-    if (!elseEnd.has_value() || elseEnd.value() < elseStart.value()) {
-        return std::nullopt;
-    }
-    return std::make_pair(elseStart.value(), elseEnd.value());
-}
-
 std::optional<SourceExactValue> EvalSourceExactForSimulation(const std::string& expr,
     std::vector<SourceScope>& scopes, const std::unordered_map<std::string, SourceFunctionSummary>& summaries,
     ContestQueryTypeHint preferredHint, size_t depth)
@@ -4603,7 +4511,6 @@ SourceSimulationResult ExecuteSourceSummaryBlock(const std::vector<std::string>&
                 result.failed = true;
                 return result;
             }
-            auto elseBlock = FindSourceElseBlock(lines, blockEnd.value());
             if (conditionValue.value()) {
                 scopes.emplace_back();
                 auto inner = ExecuteSourceSummaryBlock(
@@ -4621,25 +4528,8 @@ SourceSimulationResult ExecuteSourceSummaryBlock(const std::vector<std::string>&
                     result.returnValue = inner.returnValue;
                     return result;
                 }
-            } else if (elseBlock.has_value() && elseBlock->second > elseBlock->first) {
-                scopes.emplace_back();
-                auto inner = ExecuteSourceSummaryBlock(lines, elseBlock->first + 1, elseBlock->second - 1,
-                    scopes, summaries, depth + 1, budget, baseSourceLine, target);
-                if (scopes.size() > 1) {
-                    scopes.pop_back();
-                }
-                result.observedValues.insert(
-                    result.observedValues.end(), inner.observedValues.begin(), inner.observedValues.end());
-                if (inner.failed) {
-                    result.failed = true;
-                    return result;
-                }
-                if (inner.returnValue.has_value()) {
-                    result.returnValue = inner.returnValue;
-                    return result;
-                }
             }
-            index = elseBlock.has_value() ? elseBlock->second : blockEnd.value();
+            index = blockEnd.value();
             continue;
         }
         if (auto direct = simulateDirectCall(trimmed); direct.has_value()) {
@@ -5272,7 +5162,8 @@ bool SourceSummaryPrefixUnsupportedForLocalSimulation(const SourceFunctionSummar
         }
         if (SourceLineStartsWithKeyword(trimmed, "match") || SourceLineStartsWithKeyword(trimmed, "try") ||
             SourceLineStartsWithKeyword(trimmed, "catch") || SourceLineStartsWithKeyword(trimmed, "finally") ||
-            trimmed.find(" spawn") != std::string::npos || trimmed.rfind("spawn", 0) == 0 ||
+            trimmed.find("else") != std::string::npos || trimmed.find(" spawn") != std::string::npos ||
+            trimmed.rfind("spawn", 0) == 0 ||
             trimmed == "break" || trimmed == "break;" || trimmed == "continue" || trimmed == "continue;") {
             return true;
         }
@@ -5677,8 +5568,35 @@ bool TryParseSourceIntSetFallback(const std::string& text, std::vector<int64_t>&
     return !values.empty();
 }
 
-std::optional<int64_t> GetSourceTopLevelIntegerInitializer(
-    const std::vector<std::string>& lines, const std::string& variableName)
+bool SourceHasTopLevelMutableDeclaration(const std::vector<std::string>& lines)
+{
+    int braceDepth = 0;
+    for (const auto& rawLine : lines) {
+        auto line = Trim(StripLineComment(rawLine));
+        if (braceDepth == 0) {
+            auto pos = SkipSourceDeclarationModifiers(line);
+            if (line.compare(pos, 3, "var") == 0 &&
+                (pos + 3 == line.size() || !IsIdentifierChar(line[pos + 3]))) {
+                std::string name;
+                ContestQueryTypeHint typeHint{ContestQueryTypeHint::UNKNOWN};
+                std::string expr;
+                if (ParseSourceDeclaration(line, name, typeHint, expr)) {
+                    return true;
+                }
+            }
+        }
+        for (auto c : line) {
+            if (c == '{') {
+                ++braceDepth;
+            } else if (c == '}' && braceDepth > 0) {
+                --braceDepth;
+            }
+        }
+    }
+    return false;
+}
+
+bool SourceSequenceStartsAtTopLevelInitializer(const std::vector<std::string>& lines, int64_t firstValue)
 {
     std::vector<SourceScope> scopes(1);
     int braceDepth = 0;
@@ -5692,11 +5610,13 @@ std::optional<int64_t> GetSourceTopLevelIntegerInitializer(
                 ContestQueryTypeHint typeHint{ContestQueryTypeHint::UNKNOWN};
                 std::string expr;
                 SourceExactValue exact;
-                if (ParseSourceDeclaration(line, name, typeHint, expr) && name == variableName &&
+                if (ParseSourceDeclaration(line, name, typeHint, expr) &&
                     TryEvalSourceExactValue(expr, scopes, typeHint, exact) &&
                     IsSourceIntegerTypeHint(exact.typeHint)) {
                     scopes.front()[name] = exact;
-                    return exact.intValue;
+                    if (exact.intValue == firstValue) {
+                        return true;
+                    }
                 }
             }
         }
@@ -5708,12 +5628,12 @@ std::optional<int64_t> GetSourceTopLevelIntegerInitializer(
             }
         }
     }
-    return std::nullopt;
+    return false;
 }
 
 void ExpandGlobalArithmeticSequenceFallback(const std::vector<std::string>& lines, ContestQuery& query)
 {
-    if (!query.hasSourceFallback || !SourceHasTopLevelVariableDeclaration(lines, query.variableName)) {
+    if (!query.hasSourceFallback || !SourceHasTopLevelMutableDeclaration(lines)) {
         return;
     }
     std::vector<int64_t> values;
@@ -5758,43 +5678,11 @@ void ExpandGlobalArithmeticSequenceFallback(const std::vector<std::string>& line
     }
     auto prev = static_cast<__int128>(values[seqBegin]) - static_cast<__int128>(step);
     auto next = static_cast<__int128>(values[seqEnd - 1]) + static_cast<__int128>(step);
-    const auto topLevelInitializer = GetSourceTopLevelIntegerInitializer(lines, query.variableName);
-    const bool sequenceStartsAtInitializer = topLevelInitializer.has_value() &&
-        values[seqBegin] == topLevelInitializer.value();
-    const bool queryLineMutatesVariable = query.line > 0 && query.line <= lines.size() &&
-        SourceLineAssignsVariableName(lines[query.line - 1], query.variableName);
-    auto loop = FindInnermostSourceLoop(lines, query.line);
-    std::optional<int64_t> tripCount;
-    bool queryBeforeLoopUpdate = false;
-    if (loop.has_value()) {
-        tripCount = ParseSourceTripCount(lines, loop.value());
-        if (auto updateLine = FindSourceLoopVariableUpdateLine(lines, loop.value(), query.variableName);
-            updateLine.has_value() && query.line < updateLine.value()) {
-            queryBeforeLoopUpdate = true;
-        }
+    if (!SourceSequenceStartsAtTopLevelInitializer(lines, values[seqBegin]) && prev >= int64Min && prev <= int64Max) {
+        values.emplace_back(static_cast<int64_t>(prev));
     }
-    bool shouldAppendNext = !queryLineMutatesVariable && !queryBeforeLoopUpdate;
-    if (shouldAppendNext) {
-        size_t dynamicSequenceLength = seqEnd - seqBegin;
-        if (sequenceStartsAtInitializer && dynamicSequenceLength > 0) {
-            --dynamicSequenceLength;
-        }
-        if (tripCount.has_value() && tripCount.value() > 0 &&
-            dynamicSequenceLength >= static_cast<size_t>(tripCount.value())) {
-            shouldAppendNext = false;
-        }
-    }
-    if (!sequenceStartsAtInitializer && prev >= int64Min && prev <= int64Max) {
-        auto prevValue = static_cast<int64_t>(prev);
-        if (!topLevelInitializer.has_value() || topLevelInitializer.value() != prevValue) {
-            values.emplace_back(prevValue);
-        }
-    }
-    if (shouldAppendNext && next >= int64Min && next <= int64Max) {
+    if (next >= int64Min && next <= int64Max) {
         values.emplace_back(static_cast<int64_t>(next));
-    }
-    if (!queryLineMutatesVariable && !queryBeforeLoopUpdate && topLevelInitializer.has_value() && values.size() > 1) {
-        values.erase(std::remove(values.begin(), values.end(), topLevelInitializer.value()), values.end());
     }
     SetSourceIntSetFallback(query, std::move(values));
     query.preferSourceFallback = query.hasSourceFallback;
