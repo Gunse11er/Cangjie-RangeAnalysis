@@ -5146,6 +5146,92 @@ void CollectSourceFunctionContextValuesFromExpr(const std::string& expr, const s
     }
 }
 
+void CollectSourceFunctionContextValuesInRange(const std::vector<std::string>& lines, unsigned begin, unsigned end,
+    std::vector<SourceScope>& scopes, const std::unordered_map<std::string, SourceFunctionSummary>& summaries,
+    const ContestQuery& query, std::vector<int64_t>& values, size_t depth = 0)
+{
+    if (depth > 4 || begin == 0 || begin > lines.size()) {
+        return;
+    }
+    end = std::min<unsigned>(end, static_cast<unsigned>(lines.size()));
+    for (unsigned lineNo = begin; lineNo <= end && values.size() <= MAX_CONTEST_EXACT_VALUES; ++lineNo) {
+        auto raw = lines[lineNo - 1];
+        auto trimmed = Trim(StripLineComment(raw));
+        if (trimmed.empty()) {
+            continue;
+        }
+        if (trimmed.find("func ") != std::string::npos) {
+            if (auto blockEnd = FindSourceBraceBlockEnd(lines, lineNo);
+                blockEnd.has_value() && blockEnd.value() >= lineNo) {
+                lineNo = blockEnd.value();
+                continue;
+            }
+        }
+        if (SourceLineStartsWithKeyword(trimmed, "for")) {
+            auto forRange = ParseSourceForInRangeHeaderWithScopes(trimmed, scopes);
+            auto blockEnd = FindSourceBraceBlockEnd(lines, lineNo);
+            if (forRange.has_value() && blockEnd.has_value() && blockEnd.value() > lineNo) {
+                auto bounds = GetSourceForRangeBounds(forRange.value());
+                if (bounds.has_value()) {
+                    size_t guard = 0;
+                    for (int64_t iter = bounds->first; iter <= bounds->second; ++iter) {
+                        if (++guard > MAX_CONTEST_EXACT_VALUES || values.size() > MAX_CONTEST_EXACT_VALUES) {
+                            break;
+                        }
+                        auto iterScopes = scopes;
+                        iterScopes.emplace_back();
+                        SourceExactValue exact;
+                        exact.typeHint = ContestQueryTypeHint::INT64;
+                        exact.intValue = iter;
+                        iterScopes.back()[forRange->variable] = exact;
+                        CollectSourceFunctionContextValuesInRange(lines, lineNo + 1, blockEnd.value() - 1,
+                            iterScopes, summaries, query, values, depth + 1);
+                        if (iter == bounds->second) {
+                            break;
+                        }
+                    }
+                    lineNo = blockEnd.value();
+                    continue;
+                }
+            }
+        }
+
+        std::string name;
+        ContestQueryTypeHint typeHint{ContestQueryTypeHint::UNKNOWN};
+        std::string expr;
+        if (ParseSourceDeclaration(raw, name, typeHint, expr)) {
+            CollectSourceFunctionContextValuesFromExpr(expr, scopes, summaries, query, values);
+            if (auto exact = EvalSourceExactForSimulation(expr, scopes, summaries, typeHint, 0); exact.has_value()) {
+                if (scopes.empty()) {
+                    scopes.emplace_back();
+                }
+                scopes.back()[name] = exact.value();
+            }
+        } else if (ParseSourceAssignment(raw, name, expr)) {
+            CollectSourceFunctionContextValuesFromExpr(expr, scopes, summaries, query, values);
+            auto old = LookupSourceValue(scopes, name);
+            auto hint = old == nullptr ? ContestQueryTypeHint::UNKNOWN : old->typeHint;
+            if (auto exact = EvalSourceExactForSimulation(expr, scopes, summaries, hint, 0); exact.has_value()) {
+                SetSourceValueInNearestScope(scopes, name, exact.value());
+            } else {
+                EraseSourceValueFromScopes(scopes, name);
+            }
+        } else if (auto ret = ExtractSourceReturnExpr(trimmed); ret.has_value()) {
+            CollectSourceFunctionContextValuesFromExpr(ret.value(), scopes, summaries, query, values);
+        } else if (trimmed.find('(') != std::string::npos) {
+            CollectSourceFunctionContextValuesFromExpr(trimmed, scopes, summaries, query, values);
+        }
+
+        for (auto c : raw) {
+            if (c == '{') {
+                scopes.emplace_back();
+            } else if (c == '}' && scopes.size() > 1) {
+                scopes.pop_back();
+            }
+        }
+    }
+}
+
 bool SourceSummaryPrefixUnsupportedForLocalSimulation(const SourceFunctionSummary& summary, unsigned queryLine)
 {
     if (summary.startLine == 0 || queryLine <= summary.startLine) {
@@ -5298,54 +5384,8 @@ void InferSourceFunctionContextQueryFallback(const std::vector<std::string>& lin
 
     std::vector<int64_t> values;
     auto scopes = BuildSourceGlobalScopes(lines);
-    for (unsigned lineNo = 1; lineNo <= lines.size(); ++lineNo) {
-        auto raw = lines[lineNo - 1];
-        auto trimmed = Trim(StripLineComment(raw));
-        if (trimmed.find("func ") != std::string::npos) {
-            if (auto end = FindSourceBraceBlockEnd(lines, lineNo); end.has_value() && end.value() >= lineNo) {
-                lineNo = end.value();
-                continue;
-            }
-        }
-
-        std::string name;
-        ContestQueryTypeHint typeHint{ContestQueryTypeHint::UNKNOWN};
-        std::string expr;
-        if (ParseSourceDeclaration(raw, name, typeHint, expr)) {
-            CollectSourceFunctionContextValuesFromExpr(expr, scopes, summaries, query, values);
-            if (values.size() > MAX_CONTEST_EXACT_VALUES) {
-                return;
-            }
-            if (auto exact = EvalSourceExactForSimulation(expr, scopes, summaries, typeHint, 0); exact.has_value()) {
-                scopes.back()[name] = exact.value();
-            }
-        } else if (ParseSourceAssignment(raw, name, expr)) {
-            CollectSourceFunctionContextValuesFromExpr(expr, scopes, summaries, query, values);
-            if (values.size() > MAX_CONTEST_EXACT_VALUES) {
-                return;
-            }
-            auto old = LookupSourceValue(scopes, name);
-            auto hint = old == nullptr ? ContestQueryTypeHint::UNKNOWN : old->typeHint;
-            if (auto exact = EvalSourceExactForSimulation(expr, scopes, summaries, hint, 0); exact.has_value()) {
-                SetSourceValueInNearestScope(scopes, name, exact.value());
-            } else {
-                EraseSourceValueFromScopes(scopes, name);
-            }
-        } else if (auto ret = ExtractSourceReturnExpr(trimmed); ret.has_value()) {
-            CollectSourceFunctionContextValuesFromExpr(ret.value(), scopes, summaries, query, values);
-            if (values.size() > MAX_CONTEST_EXACT_VALUES) {
-                return;
-            }
-        }
-
-        for (auto c : raw) {
-            if (c == '{') {
-                scopes.emplace_back();
-            } else if (c == '}' && scopes.size() > 1) {
-                scopes.pop_back();
-            }
-        }
-    }
+    CollectSourceFunctionContextValuesInRange(
+        lines, 1, static_cast<unsigned>(lines.size()), scopes, summaries, query, values);
     auto normalized = NormalizeSourceIntSet(std::move(values));
     if (normalized.has_value()) {
         SetSourceIntSetFallback(query, std::move(normalized.value()));
