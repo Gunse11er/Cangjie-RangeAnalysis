@@ -4370,6 +4370,44 @@ SourceSimulationResult ExecuteSourceSummaryBlock(const std::vector<std::string>&
         }
         return callResult;
     };
+    std::function<void(const std::string&, size_t)> collectNestedCallObservations =
+        [&](const std::string& expr, size_t nestedDepth) {
+            if (target == nullptr || nestedDepth > 8) {
+                return;
+            }
+            auto normalized = StripSourceEnclosingParens(NormalizeSourceTrailingClosureCall(expr));
+            if (!normalized.empty() && normalized.back() == ';') {
+                normalized = Trim(normalized.substr(0, normalized.size() - 1));
+            }
+            const std::vector<std::vector<std::string>> precedenceGroups{
+                {"|"}, {"^"}, {"&"}, {"<<", ">>"}, {"+", "-"}, {"*", "/", "%"}, {"**"}};
+            for (const auto& group : precedenceGroups) {
+                for (const auto& token : group) {
+                    auto pos = FindSourceBinaryToken(normalized, token);
+                    if (!pos.has_value()) {
+                        continue;
+                    }
+                    collectNestedCallObservations(normalized.substr(0, pos.value()), nestedDepth + 1);
+                    collectNestedCallObservations(
+                        normalized.substr(pos.value() + token.size()), nestedDepth + 1);
+                    return;
+                }
+            }
+            auto open = FindSourceTrailingCallOpen(normalized);
+            if (!open.has_value()) {
+                return;
+            }
+            auto args = SplitSourceTopLevelCommaList(
+                normalized.substr(open.value() + 1, normalized.size() - open.value() - 2));
+            for (const auto& arg : args) {
+                collectNestedCallObservations(arg, nestedDepth + 1);
+            }
+            auto direct = simulateDirectCall(normalized);
+            if (direct.has_value() && !direct->failed) {
+                result.observedValues.insert(
+                    result.observedValues.end(), direct->observedValues.begin(), direct->observedValues.end());
+            }
+        };
     auto observeTargetWrite = [&](unsigned currentLine, const std::string& name,
                                   const std::optional<SourceExactValue>& exact) {
         if (target == nullptr || target->sourceLine != currentLine || name != target->variableName ||
@@ -4542,6 +4580,7 @@ SourceSimulationResult ExecuteSourceSummaryBlock(const std::vector<std::string>&
             continue;
         }
         if (auto ret = ExtractSourceReturnExpr(trimmed); ret.has_value() && !ret->empty()) {
+            collectNestedCallObservations(ret.value(), 0);
             if (auto direct = simulateDirectCall(ret.value()); direct.has_value()) {
                 result.observedValues.insert(
                     result.observedValues.end(), direct->observedValues.begin(), direct->observedValues.end());
@@ -4566,6 +4605,7 @@ SourceSimulationResult ExecuteSourceSummaryBlock(const std::vector<std::string>&
         std::string expr;
         if (ParseSourceDeclaration(trimmed, name, typeHint, expr)) {
             std::optional<SourceExactValue> exact;
+            collectNestedCallObservations(expr, 0);
             if (auto direct = simulateDirectCall(expr); direct.has_value()) {
                 result.observedValues.insert(
                     result.observedValues.end(), direct->observedValues.begin(), direct->observedValues.end());
@@ -4595,6 +4635,7 @@ SourceSimulationResult ExecuteSourceSummaryBlock(const std::vector<std::string>&
             auto old = LookupSourceValue(scopes, name);
             auto hint = old == nullptr ? ContestQueryTypeHint::UNKNOWN : old->typeHint;
             std::optional<SourceExactValue> exact;
+            collectNestedCallObservations(expr, 0);
             if (auto direct = simulateDirectCall(expr); direct.has_value()) {
                 result.observedValues.insert(
                     result.observedValues.end(), direct->observedValues.begin(), direct->observedValues.end());
@@ -5146,6 +5187,97 @@ void CollectSourceFunctionContextValuesFromExpr(const std::string& expr, const s
     }
 }
 
+std::optional<std::pair<std::string, std::vector<int64_t>>> GetSourceLoopBodyIterationBinding(
+    const std::vector<std::string>& lines, const SourceLoopExtent& loop, const std::vector<SourceScope>& scopes)
+{
+    if (loop.start == 0 || loop.start > lines.size()) {
+        return std::nullopt;
+    }
+    if (auto forRange = ParseSourceForInRangeHeaderWithScopes(lines[loop.start - 1], scopes); forRange.has_value()) {
+        auto bounds = GetSourceForRangeBounds(forRange.value());
+        if (!bounds.has_value()) {
+            return std::nullopt;
+        }
+        std::vector<int64_t> values;
+        for (int64_t value = bounds->first;; ++value) {
+            values.emplace_back(value);
+            if (values.size() > MAX_CONTEST_EXACT_VALUES) {
+                return std::nullopt;
+            }
+            if (value == bounds->second) {
+                break;
+            }
+        }
+        auto normalized = NormalizeSourceIntSet(std::move(values));
+        if (!normalized.has_value()) {
+            return std::nullopt;
+        }
+        return std::make_pair(forRange->variable, std::move(normalized.value()));
+    }
+
+    auto condition = ParseSourceWhileCondition(lines[loop.start - 1]);
+    if (!condition.has_value()) {
+        return std::nullopt;
+    }
+    auto trimmed = StripSourceEnclosingParens(condition.value());
+    const std::vector<std::pair<std::string, RelationalOperation>> relations{
+        {">=", RelationalOperation::GE}, {"<=", RelationalOperation::LE},
+        {">", RelationalOperation::GT}, {"<", RelationalOperation::LT}};
+    std::string induction;
+    for (const auto& relationInfo : relations) {
+        auto pos = FindSourceBinaryToken(trimmed, relationInfo.first);
+        if (!pos.has_value()) {
+            continue;
+        }
+        auto lhs = StripSourceEnclosingParens(trimmed.substr(0, pos.value()));
+        auto rhs = StripSourceEnclosingParens(trimmed.substr(pos.value() + relationInfo.first.size()));
+        for (const auto& candidate : {lhs, rhs}) {
+            if (!IsSourceIdentifierName(candidate)) {
+                continue;
+            }
+            auto step = FindSourceLoopVariableStep(lines, loop, candidate);
+            if (!step.has_value() || step.value() == 0) {
+                continue;
+            }
+            if (auto values = InferSourceWhileInductionValues(lines, loop, candidate, 0);
+                values.has_value() && !values->empty()) {
+                induction = candidate;
+                break;
+            }
+        }
+        if (!induction.empty()) {
+            break;
+        }
+    }
+    if (induction.empty()) {
+        return std::nullopt;
+    }
+    auto allValues = InferSourceWhileInductionValues(lines, loop, induction, 0);
+    if (!allValues.has_value()) {
+        return std::nullopt;
+    }
+    std::vector<int64_t> bodyValues;
+    for (auto value : allValues.value()) {
+        auto iterScopes = scopes;
+        if (iterScopes.empty()) {
+            iterScopes.emplace_back();
+        }
+        SourceExactValue exact;
+        exact.typeHint = ContestQueryTypeHint::INT64;
+        exact.intValue = value;
+        SetSourceValueInNearestScope(iterScopes, induction, exact);
+        auto active = EvalSourceBoolExpr(condition.value(), iterScopes);
+        if (active.has_value() && active.value()) {
+            bodyValues.emplace_back(value);
+        }
+    }
+    auto normalized = NormalizeSourceIntSet(std::move(bodyValues));
+    if (!normalized.has_value()) {
+        return std::nullopt;
+    }
+    return std::make_pair(induction, std::move(normalized.value()));
+}
+
 void CollectSourceFunctionContextValuesInRange(const std::vector<std::string>& lines, unsigned begin, unsigned end,
     std::vector<SourceScope>& scopes, const std::unordered_map<std::string, SourceFunctionSummary>& summaries,
     const ContestQuery& query, std::vector<int64_t>& values, size_t depth = 0)
@@ -5189,6 +5321,30 @@ void CollectSourceFunctionContextValuesInRange(const std::vector<std::string>& l
                         if (iter == bounds->second) {
                             break;
                         }
+                    }
+                    lineNo = blockEnd.value();
+                    continue;
+                }
+            }
+        }
+        if (SourceLineStartsWithKeyword(trimmed, "while")) {
+            auto blockEnd = FindSourceBraceBlockEnd(lines, lineNo);
+            if (blockEnd.has_value() && blockEnd.value() > lineNo) {
+                SourceLoopExtent loop{lineNo, blockEnd.value()};
+                auto binding = GetSourceLoopBodyIterationBinding(lines, loop, scopes);
+                if (binding.has_value()) {
+                    for (auto iter : binding->second) {
+                        if (values.size() > MAX_CONTEST_EXACT_VALUES) {
+                            break;
+                        }
+                        auto iterScopes = scopes;
+                        iterScopes.emplace_back();
+                        SourceExactValue exact;
+                        exact.typeHint = ContestQueryTypeHint::INT64;
+                        exact.intValue = iter;
+                        iterScopes.back()[binding->first] = exact;
+                        CollectSourceFunctionContextValuesInRange(lines, lineNo + 1, blockEnd.value() - 1,
+                            iterScopes, summaries, query, values, depth + 1);
                     }
                     lineNo = blockEnd.value();
                     continue;
@@ -5422,7 +5578,9 @@ void InferSourceFunctionCallFallback(const std::vector<std::string>& lines, Cont
     auto forRange = loop.has_value() ? ParseSourceForInRangeHeader(lines[loop->start - 1]) : std::optional<SourceForRangeInfo>{};
     auto iterations = loop.has_value() ? GetSourceForRangeIterationValues(lines, loop.value()) : std::optional<std::vector<int64_t>>{};
     bool usedFunctionSimulation = false;
+    bool triedLoopEnumeration = false;
     if (forRange.has_value() && iterations.has_value() && SourceExprContainsIdentifier(expr, forRange->variable)) {
+        triedLoopEnumeration = true;
         for (auto iterValue : iterations.value()) {
             auto scopes = baseScopes;
             SourceExactValue exact;
@@ -5434,9 +5592,31 @@ void InferSourceFunctionCallFallback(const std::vector<std::string>& lines, Cont
                 values.insert(values.end(), current->begin(), current->end());
             }
         }
-    } else if (auto current = EvalSourceIntExprSetWithFunctions(
-        expr, baseScopes, summaries, 0, &usedFunctionSimulation); current.has_value()) {
-        values.insert(values.end(), current->begin(), current->end());
+    } else if (loop.has_value()) {
+        auto binding = GetSourceLoopBodyIterationBinding(lines, loop.value(), baseScopes);
+        if (binding.has_value() && SourceExprContainsIdentifier(expr, binding->first)) {
+            triedLoopEnumeration = true;
+            for (auto iterValue : binding->second) {
+                auto scopes = baseScopes;
+                if (scopes.empty()) {
+                    scopes.emplace_back();
+                }
+                SourceExactValue exact;
+                exact.typeHint = ContestQueryTypeHint::INT64;
+                exact.intValue = iterValue;
+                SetSourceValueInNearestScope(scopes, binding->first, exact);
+                auto current = EvalSourceIntExprSetWithFunctions(expr, scopes, summaries, 0, &usedFunctionSimulation);
+                if (current.has_value()) {
+                    values.insert(values.end(), current->begin(), current->end());
+                }
+            }
+        }
+    }
+    if (!triedLoopEnumeration) {
+        if (auto current = EvalSourceIntExprSetWithFunctions(
+            expr, baseScopes, summaries, 0, &usedFunctionSimulation); current.has_value()) {
+            values.insert(values.end(), current->begin(), current->end());
+        }
     }
     if (!values.empty()) {
         SetSourceIntSetFallback(query, std::move(values));
