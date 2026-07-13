@@ -1443,13 +1443,48 @@ std::vector<SourceScope> BuildSourceMatchArmScopes(
 std::string TrimSourceMatchArmExpr(std::string expr)
 {
     expr = Trim(StripLineComment(expr));
-    auto comma = expr.find(',');
-    auto brace = expr.find('}');
-    auto semi = expr.find(';');
-    auto nextCase = expr.find(" case ");
-    auto end = std::min({comma == std::string::npos ? expr.size() : comma,
-        brace == std::string::npos ? expr.size() : brace, semi == std::string::npos ? expr.size() : semi,
-        nextCase == std::string::npos ? expr.size() : nextCase});
+    size_t end = expr.size();
+    int parenDepth = 0;
+    int braceDepth = 0;
+    int bracketDepth = 0;
+    for (size_t pos = 0; pos < expr.size(); ++pos) {
+        auto ch = expr[pos];
+        if (ch == '(') {
+            ++parenDepth;
+            continue;
+        }
+        if (ch == '[') {
+            ++bracketDepth;
+            continue;
+        }
+        if (ch == '{') {
+            ++braceDepth;
+            continue;
+        }
+        if (ch == ')') {
+            parenDepth = std::max(0, parenDepth - 1);
+            continue;
+        }
+        if (ch == ']') {
+            bracketDepth = std::max(0, bracketDepth - 1);
+            continue;
+        }
+        if (ch == '}') {
+            if (parenDepth == 0 && bracketDepth == 0 && braceDepth == 0) {
+                end = pos;
+                break;
+            }
+            braceDepth = std::max(0, braceDepth - 1);
+            continue;
+        }
+        if (parenDepth != 0 || braceDepth != 0 || bracketDepth != 0) {
+            continue;
+        }
+        if (ch == ',' || ch == ';' || expr.compare(pos, 6, " case ") == 0) {
+            end = pos;
+            break;
+        }
+    }
     expr = Trim(expr.substr(0, end));
     if (expr.rfind("return ", 0) == 0) {
         expr = Trim(expr.substr(7));
@@ -2365,11 +2400,11 @@ std::optional<size_t> FindSourceBinaryToken(const std::string& expr, const std::
     if (token == "**") {
         int depth = 0;
         for (size_t pos = 0; pos < expr.size(); ++pos) {
-            if (expr[pos] == '(') {
+            if (expr[pos] == '(' || expr[pos] == '{' || expr[pos] == '[') {
                 ++depth;
                 continue;
             }
-            if (expr[pos] == ')') {
+            if (expr[pos] == ')' || expr[pos] == '}' || expr[pos] == ']') {
                 --depth;
                 continue;
             }
@@ -2382,11 +2417,11 @@ std::optional<size_t> FindSourceBinaryToken(const std::string& expr, const std::
     int depth = 0;
     for (size_t i = expr.size(); i > 0; --i) {
         auto pos = i - 1;
-        if (expr[pos] == ')') {
+        if (expr[pos] == ')' || expr[pos] == '}' || expr[pos] == ']') {
             ++depth;
             continue;
         }
-        if (expr[pos] == '(') {
+        if (expr[pos] == '(' || expr[pos] == '{' || expr[pos] == '[') {
             --depth;
             continue;
         }
@@ -4044,14 +4079,14 @@ std::unordered_map<std::string, SourceFunctionSummary> BuildSourceFunctionSummar
         }
         auto afterName = SkipSourceGenericParameterList(line, nameEnd);
         auto open = line.find('(', afterName);
-        auto close = line.find(')', open == std::string::npos ? 0 : open);
-        if (open == std::string::npos || close == std::string::npos || close <= open) {
+        auto close = open == std::string::npos ? std::optional<size_t>{} : FindMatchingSourceParen(line, open);
+        if (open == std::string::npos || !close.has_value() || close.value() <= open) {
             continue;
         }
         SourceFunctionSummary summary;
         summary.startLine = lineNo;
-        summary.params = ParseSourceParamNames(line.substr(open + 1, close - open - 1));
-        auto arrow = line.find("=>", close);
+        summary.params = ParseSourceParamNames(line.substr(open + 1, close.value() - open - 1));
+        auto arrow = line.find("=>", close.value());
         if (arrow != std::string::npos) {
             auto ret = TrimSourceMatchArmExpr(line.substr(arrow + 2));
             if (!ret.empty()) {
@@ -4148,23 +4183,30 @@ std::optional<size_t> FindSourceTrailingCallOpen(const std::string& expr)
     if (expr.empty() || expr.back() != ')') {
         return std::nullopt;
     }
-    std::vector<size_t> stack;
+    std::vector<std::pair<char, size_t>> stack;
     std::optional<size_t> trailingOpen;
     for (size_t pos = 0; pos < expr.size(); ++pos) {
-        if (expr[pos] == '(') {
-            if (stack.empty()) {
+        auto ch = expr[pos];
+        if (ch == '(' || ch == '{' || ch == '[') {
+            if (ch == '(' && stack.empty()) {
                 trailingOpen = pos;
             }
-            stack.emplace_back(pos);
-        } else if (expr[pos] == ')') {
-            if (stack.empty()) {
-                return std::nullopt;
-            }
-            auto open = stack.back();
-            stack.pop_back();
-            if (pos == expr.size() - 1 && stack.empty()) {
-                return open;
-            }
+            stack.emplace_back(ch, pos);
+            continue;
+        }
+        if (ch != ')' && ch != '}' && ch != ']') {
+            continue;
+        }
+        if (stack.empty()) {
+            return std::nullopt;
+        }
+        auto [openCh, openPos] = stack.back();
+        if ((ch == ')' && openCh != '(') || (ch == '}' && openCh != '{') || (ch == ']' && openCh != '[')) {
+            return std::nullopt;
+        }
+        stack.pop_back();
+        if (ch == ')' && pos == expr.size() - 1 && stack.empty()) {
+            return openPos;
         }
     }
     return trailingOpen;
@@ -4358,7 +4400,7 @@ SourceSimulationResult ExecuteSourceSummaryBlock(const std::vector<std::string>&
     std::vector<SourceScope>& scopes, const std::unordered_map<std::string, SourceFunctionSummary>& summaries,
     size_t depth, size_t& budget, unsigned baseSourceLine, const SourceSimulationTarget* target = nullptr)
 {
-    if (depth > 8) {
+    if (depth > 16) {
         return SourceSimulationResult{true, std::nullopt};
     }
     if (lines.empty() || begin > end || begin >= lines.size()) {
@@ -4377,7 +4419,7 @@ SourceSimulationResult ExecuteSourceSummaryBlock(const std::vector<std::string>&
         }
         auto callee = StripSourceGenericSuffix(normalized.substr(0, open.value()));
         auto summaryIt = summaries.find(callee);
-        if (summaryIt == summaries.end() || summaryIt->second.bodyLines.empty()) {
+        if (summaryIt == summaries.end()) {
             return std::nullopt;
         }
         auto args = SplitSourceTopLevelCommaList(
@@ -4385,20 +4427,41 @@ SourceSimulationResult ExecuteSourceSummaryBlock(const std::vector<std::string>&
         if (args.size() != summaryIt->second.params.size()) {
             return std::nullopt;
         }
-        std::vector<SourceScope> calleeScopes(1);
-        if (!scopes.empty()) {
-            calleeScopes.front() = scopes.front();
+        std::vector<SourceScope> calleeScopes = scopes;
+        if (calleeScopes.empty()) {
+            calleeScopes.emplace_back();
         }
         calleeScopes.emplace_back();
+        auto localSummaries = summaries;
         for (size_t i = 0; i < args.size(); ++i) {
-            auto exact = EvalSourceExactForSimulation(args[i], scopes, summaries, ContestQueryTypeHint::INT64, depth + 1);
+            if (auto lambda = ParseSourceLambdaSummary(args[i]); lambda.has_value()) {
+                localSummaries[summaryIt->second.params[i]] = std::move(lambda.value());
+                continue;
+            }
+            auto argCallee = StripSourceGenericSuffix(args[i]);
+            if (auto calleeIt = localSummaries.find(argCallee); calleeIt != localSummaries.end()) {
+                localSummaries[summaryIt->second.params[i]] = calleeIt->second;
+                continue;
+            }
+            auto exact = EvalSourceExactForSimulation(args[i], scopes, localSummaries, ContestQueryTypeHint::INT64, depth + 1);
             if (!exact.has_value() || !IsSourceIntegerTypeHint(exact->typeHint)) {
                 return std::nullopt;
             }
             calleeScopes.back()[summaryIt->second.params[i]] = exact.value();
         }
+        if (summaryIt->second.bodyLines.empty()) {
+            SourceSimulationResult lambdaResult;
+            for (const auto& ret : summaryIt->second.returnExprs) {
+                auto values = EvalSourceIntExprSetWithFunctions(ret, calleeScopes, localSummaries, depth + 1);
+                if (values.has_value() && values->size() == 1) {
+                    lambdaResult.returnValue = values->front();
+                    return lambdaResult;
+                }
+            }
+            return std::nullopt;
+        }
         auto callResult = ExecuteSourceSummaryBlock(summaryIt->second.bodyLines, 0, summaryIt->second.bodyLines.size() - 1,
-            calleeScopes, summaries, depth + 1, budget, summaryIt->second.startLine + 1, target);
+            calleeScopes, localSummaries, depth + 1, budget, summaryIt->second.startLine + 1, target);
         if (!callResult.failed && !scopes.empty() && !calleeScopes.empty()) {
             scopes.front() = calleeScopes.front();
         }
@@ -4406,7 +4469,7 @@ SourceSimulationResult ExecuteSourceSummaryBlock(const std::vector<std::string>&
     };
     std::function<void(const std::string&, size_t)> collectNestedCallObservations =
         [&](const std::string& expr, size_t nestedDepth) {
-            if (target == nullptr || nestedDepth > 8) {
+            if (target == nullptr || nestedDepth > 16) {
                 return;
             }
             auto normalized = StripSourceEnclosingParens(NormalizeSourceTrailingClosureCall(expr));
@@ -4782,7 +4845,7 @@ std::optional<std::vector<int64_t>> EvalSourceIntExprSetWithFunctions(const std:
     const std::vector<SourceScope>& scopes, const std::unordered_map<std::string, SourceFunctionSummary>& summaries,
     size_t depth, bool* usedFunctionSimulation)
 {
-    if (depth > 8) {
+    if (depth > 16) {
         return std::nullopt;
     }
     if (auto value = EvalSourceIntExpr(expr, scopes); value.has_value()) {
@@ -4824,13 +4887,22 @@ std::optional<std::vector<int64_t>> EvalSourceIntExprSetWithFunctions(const std:
     if (!open.has_value()) {
         return std::nullopt;
     }
-    auto callee = StripSourceGenericSuffix(trimmed.substr(0, open.value()));
-    auto it = summaries.find(callee);
-    if (it == summaries.end()) {
-        return std::nullopt;
+    auto calleeExpr = Trim(trimmed.substr(0, open.value()));
+    SourceFunctionSummary inlineLambdaSummary;
+    const SourceFunctionSummary* summary = nullptr;
+    if (auto lambda = ParseSourceLambdaSummary(calleeExpr); lambda.has_value()) {
+        inlineLambdaSummary = std::move(lambda.value());
+        summary = &inlineLambdaSummary;
+    } else {
+        auto callee = StripSourceGenericSuffix(calleeExpr);
+        auto it = summaries.find(callee);
+        if (it == summaries.end()) {
+            return std::nullopt;
+        }
+        summary = &it->second;
     }
     auto args = SplitSourceTopLevelCommaList(trimmed.substr(open.value() + 1, trimmed.size() - open.value() - 2));
-    if (args.size() != it->second.params.size()) {
+    if (args.size() != summary->params.size()) {
         return std::nullopt;
     }
     std::vector<std::vector<int64_t>> argValues(args.size());
@@ -4838,13 +4910,13 @@ std::optional<std::vector<int64_t>> EvalSourceIntExprSetWithFunctions(const std:
     auto localSummaries = summaries;
     for (size_t i = 0; i < args.size(); ++i) {
         if (auto lambda = ParseSourceLambdaSummary(args[i]); lambda.has_value()) {
-            localSummaries[it->second.params[i]] = std::move(lambda.value());
+            localSummaries[summary->params[i]] = std::move(lambda.value());
             isLambdaArg[i] = true;
             continue;
         }
         auto argCallee = StripSourceGenericSuffix(args[i]);
         if (auto summaryIt = localSummaries.find(argCallee); summaryIt != localSummaries.end()) {
-            localSummaries[it->second.params[i]] = summaryIt->second;
+            localSummaries[summary->params[i]] = summaryIt->second;
             isLambdaArg[i] = true;
             continue;
         }
@@ -4864,9 +4936,9 @@ std::optional<std::vector<int64_t>> EvalSourceIntExprSetWithFunctions(const std:
     }
     std::vector<size_t> indices(valueArgIndices.size(), 0);
     while (true) {
-        std::vector<SourceScope> calleeScopes(1);
-        if (!scopes.empty()) {
-            calleeScopes.front() = scopes.front();
+        std::vector<SourceScope> calleeScopes = scopes;
+        if (calleeScopes.empty()) {
+            calleeScopes.emplace_back();
         }
         calleeScopes.emplace_back();
         for (size_t indexPos = 0; indexPos < valueArgIndices.size(); ++indexPos) {
@@ -4874,9 +4946,9 @@ std::optional<std::vector<int64_t>> EvalSourceIntExprSetWithFunctions(const std:
             SourceExactValue exact;
             exact.typeHint = ContestQueryTypeHint::INT64;
             exact.intValue = argValues[argIndex][indices[indexPos]];
-            calleeScopes.back()[it->second.params[argIndex]] = exact;
+            calleeScopes.back()[summary->params[argIndex]] = exact;
         }
-        if (auto simulated = SimulateSourceFunctionSummary(it->second, calleeScopes, localSummaries, depth + 1);
+        if (auto simulated = SimulateSourceFunctionSummary(*summary, calleeScopes, localSummaries, depth + 1);
             simulated.has_value()) {
             if (usedFunctionSimulation != nullptr) {
                 *usedFunctionSimulation = true;
@@ -4886,7 +4958,7 @@ std::optional<std::vector<int64_t>> EvalSourceIntExprSetWithFunctions(const std:
                 return std::nullopt;
             }
         } else {
-        for (const auto& ret : it->second.returnExprs) {
+        for (const auto& ret : summary->returnExprs) {
             auto values = EvalSourceIntExprSetWithFunctions(ret, calleeScopes, localSummaries, depth + 1,
                 usedFunctionSimulation);
             if (!values.has_value()) {
