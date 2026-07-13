@@ -4289,6 +4289,40 @@ std::optional<size_t> FindSourceVectorBlockEnd(const std::vector<std::string>& l
     return std::nullopt;
 }
 
+std::optional<std::pair<size_t, size_t>> FindSourceVectorElseBlock(
+    const std::vector<std::string>& lines, size_t trueBlockEnd)
+{
+    if (trueBlockEnd >= lines.size()) {
+        return std::nullopt;
+    }
+    auto lineHasElse = [](const std::string& line) {
+        auto trimmed = Trim(StripLineComment(line));
+        auto pos = trimmed.find("else");
+        if (pos == std::string::npos) {
+            return false;
+        }
+        auto before = pos == 0 ? '\0' : trimmed[pos - 1];
+        auto afterPos = pos + 4;
+        auto after = afterPos >= trimmed.size() ? '\0' : trimmed[afterPos];
+        return !IsIdentifierChar(before) && !IsIdentifierChar(after);
+    };
+    size_t elseHeader = trueBlockEnd;
+    if (!lineHasElse(lines[elseHeader])) {
+        elseHeader = trueBlockEnd + 1;
+        while (elseHeader < lines.size() && Trim(StripLineComment(lines[elseHeader])).empty()) {
+            ++elseHeader;
+        }
+        if (elseHeader >= lines.size() || !lineHasElse(lines[elseHeader])) {
+            return std::nullopt;
+        }
+    }
+    auto elseEnd = FindSourceVectorBlockEnd(lines, elseHeader);
+    if (!elseEnd.has_value() || elseEnd.value() < elseHeader) {
+        return std::nullopt;
+    }
+    return std::make_pair(elseHeader, elseEnd.value());
+}
+
 std::optional<SourceExactValue> EvalSourceExactForSimulation(const std::string& expr,
     std::vector<SourceScope>& scopes, const std::unordered_map<std::string, SourceFunctionSummary>& summaries,
     ContestQueryTypeHint preferredHint, size_t depth)
@@ -4566,6 +4600,29 @@ SourceSimulationResult ExecuteSourceSummaryBlock(const std::vector<std::string>&
                     result.returnValue = inner.returnValue;
                     return result;
                 }
+                if (auto elseBlock = FindSourceVectorElseBlock(lines, blockEnd.value()); elseBlock.has_value()) {
+                    index = elseBlock->second;
+                    continue;
+                }
+            } else if (auto elseBlock = FindSourceVectorElseBlock(lines, blockEnd.value()); elseBlock.has_value()) {
+                scopes.emplace_back();
+                auto inner = ExecuteSourceSummaryBlock(lines, elseBlock->first + 1, elseBlock->second - 1,
+                    scopes, summaries, depth + 1, budget, baseSourceLine, target);
+                if (scopes.size() > 1) {
+                    scopes.pop_back();
+                }
+                result.observedValues.insert(
+                    result.observedValues.end(), inner.observedValues.begin(), inner.observedValues.end());
+                if (inner.failed) {
+                    result.failed = true;
+                    return result;
+                }
+                if (inner.returnValue.has_value()) {
+                    result.returnValue = inner.returnValue;
+                    return result;
+                }
+                index = elseBlock->second;
+                continue;
             }
             index = blockEnd.value();
             continue;
@@ -5278,6 +5335,36 @@ std::optional<std::pair<std::string, std::vector<int64_t>>> GetSourceLoopBodyIte
     return std::make_pair(induction, std::move(normalized.value()));
 }
 
+std::optional<std::vector<SourceScope>> BuildSourceScopesForLoopIterationBeforeLine(
+    const std::vector<std::string>& lines, const SourceLoopExtent& loop,
+    const std::unordered_map<std::string, SourceFunctionSummary>& summaries, const std::string& induction,
+    int64_t iterationValue, unsigned beforeLine)
+{
+    if (loop.start == 0 || loop.end == 0 || loop.start > lines.size() ||
+        beforeLine <= loop.start || beforeLine > loop.end) {
+        return std::nullopt;
+    }
+    auto scopes = BuildSourceScopesBeforeLine(lines, loop.start);
+    if (scopes.empty()) {
+        scopes.emplace_back();
+    }
+    scopes.emplace_back();
+    SourceExactValue exact;
+    exact.typeHint = ContestQueryTypeHint::INT64;
+    exact.intValue = iterationValue;
+    SetSourceValueInNearestScope(scopes, induction, exact);
+
+    if (beforeLine > loop.start + 1) {
+        size_t budget = 20000;
+        auto result = ExecuteSourceSummaryBlock(
+            lines, loop.start, static_cast<size_t>(beforeLine - 2), scopes, summaries, 0, budget, 1);
+        if (result.failed || result.returnValue.has_value()) {
+            return std::nullopt;
+        }
+    }
+    return scopes;
+}
+
 void CollectSourceFunctionContextValuesInRange(const std::vector<std::string>& lines, unsigned begin, unsigned end,
     std::vector<SourceScope>& scopes, const std::unordered_map<std::string, SourceFunctionSummary>& summaries,
     const ContestQuery& query, std::vector<int64_t>& values, size_t depth = 0)
@@ -5347,6 +5434,39 @@ void CollectSourceFunctionContextValuesInRange(const std::vector<std::string>& l
                             iterScopes, summaries, query, values, depth + 1);
                     }
                     lineNo = blockEnd.value();
+                    continue;
+                }
+            }
+        }
+        if (SourceLineStartsWithKeyword(trimmed, "if")) {
+            auto condition = ParseSourceControlCondition(trimmed, "if");
+            auto blockEnd = FindSourceBraceBlockEnd(lines, lineNo);
+            if (condition.has_value() && blockEnd.has_value() && blockEnd.value() > lineNo) {
+                auto conditionValue = EvalSourceBoolExpr(condition.value(), scopes);
+                auto executeBranch = [&](unsigned beginLine, unsigned endLine) {
+                    auto branchScopes = scopes;
+                    branchScopes.emplace_back();
+                    CollectSourceFunctionContextValuesInRange(
+                        lines, beginLine, endLine, branchScopes, summaries, query, values, depth + 1);
+                    if (branchScopes.size() > 1) {
+                        branchScopes.pop_back();
+                    }
+                    scopes = std::move(branchScopes);
+                };
+                auto elseBlock = FindSourceVectorElseBlock(lines, blockEnd.value() - 1);
+                if (conditionValue.has_value() && conditionValue.value()) {
+                    executeBranch(lineNo + 1, blockEnd.value() - 1);
+                    lineNo = elseBlock.has_value() ? static_cast<unsigned>(elseBlock->second + 1) : blockEnd.value();
+                    continue;
+                }
+                if (conditionValue.has_value() && !conditionValue.value()) {
+                    if (elseBlock.has_value()) {
+                        executeBranch(static_cast<unsigned>(elseBlock->first + 2),
+                            static_cast<unsigned>(elseBlock->second));
+                        lineNo = static_cast<unsigned>(elseBlock->second + 1);
+                    } else {
+                        lineNo = blockEnd.value();
+                    }
                     continue;
                 }
             }
@@ -5594,21 +5714,22 @@ void InferSourceFunctionCallFallback(const std::vector<std::string>& lines, Cont
         }
     } else if (loop.has_value()) {
         auto binding = GetSourceLoopBodyIterationBinding(lines, loop.value(), baseScopes);
-        if (binding.has_value() && SourceExprContainsIdentifier(expr, binding->first)) {
+        if (binding.has_value()) {
             triedLoopEnumeration = true;
             for (auto iterValue : binding->second) {
-                auto scopes = baseScopes;
-                if (scopes.empty()) {
-                    scopes.emplace_back();
+                auto scopes = BuildSourceScopesForLoopIterationBeforeLine(
+                    lines, loop.value(), summaries, binding->first, iterValue, query.line);
+                if (!scopes.has_value()) {
+                    continue;
                 }
-                SourceExactValue exact;
-                exact.typeHint = ContestQueryTypeHint::INT64;
-                exact.intValue = iterValue;
-                SetSourceValueInNearestScope(scopes, binding->first, exact);
-                auto current = EvalSourceIntExprSetWithFunctions(expr, scopes, summaries, 0, &usedFunctionSimulation);
+                auto current = EvalSourceIntExprSetWithFunctions(
+                    expr, scopes.value(), summaries, 0, &usedFunctionSimulation);
                 if (current.has_value()) {
                     values.insert(values.end(), current->begin(), current->end());
                 }
+            }
+            if (values.empty() && !SourceExprContainsIdentifier(expr, binding->first)) {
+                triedLoopEnumeration = false;
             }
         }
     }
