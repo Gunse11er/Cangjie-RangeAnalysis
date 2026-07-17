@@ -1839,14 +1839,24 @@ std::optional<std::vector<int64_t>> InferSourceDeltaExactValues(const std::vecto
     return deltas;
 }
 
+enum class SourceAccumulatorObservation {
+    AT_QUERY_LINE,
+    AFTER_LOOP,
+};
+
 std::optional<std::vector<int64_t>> InferSourceAccumulatorExactValues(const std::vector<std::string>& lines,
-    const SourceLoopExtent& loop, const std::string& accumulator, int64_t init, unsigned queryLine)
+    const SourceLoopExtent& loop, const std::string& accumulator, int64_t init, unsigned queryLine,
+    SourceAccumulatorObservation observation = SourceAccumulatorObservation::AT_QUERY_LINE)
 {
     std::string assigned;
     std::string expr;
     std::optional<std::vector<int64_t>> deltas;
+    std::optional<unsigned> updateLine;
     if (queryLine <= lines.size() && ParseSourceAssignment(lines[queryLine - 1], assigned, expr) && assigned == accumulator) {
         deltas = InferSourceDeltaExactValues(lines, loop, accumulator, expr);
+        if (deltas.has_value()) {
+            updateLine = queryLine;
+        }
     }
     if (!deltas.has_value()) {
         for (unsigned lineNo = loop.start + 1; lineNo < loop.end && lineNo <= lines.size(); ++lineNo) {
@@ -1855,26 +1865,36 @@ std::optional<std::vector<int64_t>> InferSourceAccumulatorExactValues(const std:
             }
             deltas = InferSourceDeltaExactValues(lines, loop, accumulator, expr);
             if (deltas.has_value()) {
+                updateLine = lineNo;
                 break;
             }
         }
     }
-    if (!deltas.has_value() || deltas->empty()) {
+    if (!deltas.has_value() || deltas->empty() || !updateLine.has_value()) {
         return std::nullopt;
     }
     std::vector<int64_t> values;
     int64_t current = init;
+    const bool observeAfterUpdate = observation == SourceAccumulatorObservation::AT_QUERY_LINE &&
+        queryLine > updateLine.value();
     for (auto delta : deltas.value()) {
-        values.emplace_back(current);
+        if (observation == SourceAccumulatorObservation::AT_QUERY_LINE && !observeAfterUpdate) {
+            values.emplace_back(current);
+        }
         int64_t next = 0;
         if (__builtin_add_overflow(current, delta, &next)) {
             return std::nullopt;
         }
         current = next;
-        values.emplace_back(current);
+        if (observation == SourceAccumulatorObservation::AT_QUERY_LINE && observeAfterUpdate) {
+            values.emplace_back(current);
+        }
         if (values.size() > MAX_CONTEST_EXACT_VALUES) {
             return std::nullopt;
         }
+    }
+    if (observation == SourceAccumulatorObservation::AFTER_LOOP) {
+        values.emplace_back(current);
     }
     return values;
 }
@@ -3663,29 +3683,6 @@ std::optional<std::vector<int64_t>> InferSourceLoopExitValuesForVariable(
     return InferSourceLinearLoopExitValues(lines, loop, variableName);
 }
 
-std::optional<std::vector<int64_t>> InferSourceLoopAllValuesForVariable(
-    const std::vector<std::string>& lines, const SourceLoopExtent& loop, const std::string& variableName)
-{
-    if (auto info = BuildSourcePairLoopInfo(lines, loop); info.has_value()) {
-        if (auto values = EnumerateSourcePairLoopValues(info.value()); values.has_value()) {
-            std::vector<int64_t> selected;
-            if (variableName == info->comparison.lhs) {
-                selected = values->lhsBodyValues;
-                selected.insert(selected.end(), values->lhsPostBodyValues.begin(), values->lhsPostBodyValues.end());
-                selected.insert(selected.end(), values->lhsExitValues.begin(), values->lhsExitValues.end());
-                return NormalizeSmallSourceValues(std::move(selected));
-            }
-            if (variableName == info->comparison.rhs) {
-                selected = values->rhsBodyValues;
-                selected.insert(selected.end(), values->rhsPostBodyValues.begin(), values->rhsPostBodyValues.end());
-                selected.insert(selected.end(), values->rhsExitValues.begin(), values->rhsExitValues.end());
-                return NormalizeSmallSourceValues(std::move(selected));
-            }
-        }
-    }
-    return InferSourceWhileInductionValues(lines, loop, variableName, 0);
-}
-
 std::optional<std::string> InferSourcePriorLoopAccumulatorOutput(
     const std::vector<std::string>& lines, const SourceLoopExtent& loop, const std::string& variableName)
 {
@@ -3702,7 +3699,8 @@ std::optional<std::string> InferSourcePriorLoopAccumulatorOutput(
         if (!ParseSourceAssignment(lines[lineNo - 1], assigned, expr) || assigned != variableName) {
             continue;
         }
-        if (auto exactValues = InferSourceAccumulatorExactValues(lines, loop, variableName, init.value(), lineNo);
+        if (auto exactValues = InferSourceAccumulatorExactValues(lines, loop, variableName, init.value(), lineNo,
+                SourceAccumulatorObservation::AFTER_LOOP);
             exactValues.has_value() && !exactValues->empty() && exactValues->size() <= MAX_CONTEST_EXACT_VALUES) {
             auto normalized = NormalizeSourceIntSet(std::move(exactValues.value()));
             if (normalized.has_value()) {
@@ -3785,7 +3783,7 @@ void InferSourcePriorLoopValueFallback(const std::vector<std::string>& lines, Co
             SourceHasAssignmentInRange(lines, loop.end + 1, query.line - 1, query.variableName)) {
             continue;
         }
-        auto values = InferSourceLoopAllValuesForVariable(lines, loop, query.variableName);
+        auto values = InferSourceLoopExitValuesForVariable(lines, loop, query.variableName);
         if (!values.has_value() || values->empty()) {
             if (auto accumulatorOutput = InferSourcePriorLoopAccumulatorOutput(lines, loop, query.variableName);
                 accumulatorOutput.has_value()) {
@@ -3848,7 +3846,7 @@ void InferSourcePairLoopFallback(const std::vector<std::string>& lines, ContestQ
         } else if (queryInsideBody) {
             auto updateLine = FindSourceLoopVariableUpdateLine(
                 lines, loop, targetSide.value() ? info->comparison.lhs : info->comparison.rhs);
-            if (updateLine.has_value() && updateLine.value() <= query.line) {
+            if (updateLine.has_value() && updateLine.value() < query.line) {
                 selected = targetSide.value() ? values->lhsPostBodyValues : values->rhsPostBodyValues;
             } else {
                 selected = targetSide.value() ? values->lhsBodyValues : values->rhsBodyValues;
@@ -4505,8 +4503,8 @@ SourceSimulationResult ExecuteSourceSummaryBlock(const std::vector<std::string>&
                     result.observedValues.end(), direct->observedValues.begin(), direct->observedValues.end());
             }
         };
-    auto observeTargetWrite = [&](unsigned currentLine, const std::string& name,
-                                  const std::optional<SourceExactValue>& exact) {
+    auto observeTargetDeclaration = [&](unsigned currentLine, const std::string& name,
+                                        const std::optional<SourceExactValue>& exact) {
         if (target == nullptr || target->sourceLine != currentLine || name != target->variableName ||
             !exact.has_value() || !IsSourceIntegerTypeHint(exact->typeHint)) {
             return;
@@ -4584,10 +4582,6 @@ SourceSimulationResult ExecuteSourceSummaryBlock(const std::vector<std::string>&
                 if (iterValue == bounds->second) {
                     break;
                 }
-            }
-            if (target != nullptr && target->sourceLine == baseSourceLine + static_cast<unsigned>(index) &&
-                target->variableName == forRange->variable && bounds->second != std::numeric_limits<int64_t>::max()) {
-                result.observedValues.emplace_back(bounds->second + 1);
             }
             index = blockEnd.value();
             continue;
@@ -4748,7 +4742,7 @@ SourceSimulationResult ExecuteSourceSummaryBlock(const std::vector<std::string>&
                 }
                 scopes.back()[name] = exact.value();
             }
-            observeTargetWrite(baseSourceLine + static_cast<unsigned>(index), name, exact);
+            observeTargetDeclaration(baseSourceLine + static_cast<unsigned>(index), name, exact);
             continue;
         }
         if (ParseSourceAssignment(trimmed, name, expr)) {
@@ -4777,7 +4771,6 @@ SourceSimulationResult ExecuteSourceSummaryBlock(const std::vector<std::string>&
             } else {
                 EraseSourceValueFromScopes(scopes, name);
             }
-            observeTargetWrite(baseSourceLine + static_cast<unsigned>(index), name, exact);
             continue;
         }
         std::string op;
@@ -4794,7 +4787,6 @@ SourceSimulationResult ExecuteSourceSummaryBlock(const std::vector<std::string>&
             } else {
                 EraseSourceValueFromScopes(scopes, name);
             }
-            observeTargetWrite(baseSourceLine + static_cast<unsigned>(index), name, exact);
             continue;
         }
     }
