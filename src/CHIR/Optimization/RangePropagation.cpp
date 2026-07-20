@@ -285,7 +285,6 @@ struct ContestAggregate {
     Type* type{nullptr};
     unsigned firstDebugLine{std::numeric_limits<unsigned>::max()};
     std::optional<std::vector<SInt>> exactValues;
-    std::optional<BoolDomain> boolValues;
 };
 
 using ContestAggregateMap = std::unordered_map<std::string, ContestAggregate>;
@@ -6636,7 +6635,6 @@ void RememberContestAggregateFirstLine(
     aggregate.type = aggregate.type == nullptr ? type : aggregate.type;
     if (aggregate.firstDebugLine == std::numeric_limits<unsigned>::max()) {
         aggregate.exactValues.reset();
-        aggregate.boolValues.reset();
     }
     aggregate.firstDebugLine = std::min(aggregate.firstDebugLine, location.GetBeginPos().line);
 }
@@ -6649,24 +6647,11 @@ void RecordContestAggregateValue(ContestAggregateMap& aggregates, const ValueNam
         return;
     }
     auto range = GetContestRangeForValue(state, value);
-    if (range == nullptr) {
+    if (range == nullptr || range->GetRangeKind() != ValueRange::RangeKind::SINT) {
         return;
     }
-    const std::vector<SInt>* exactValues = nullptr;
-    const BoolDomain* boolValues = nullptr;
-    if (range->GetRangeKind() == ValueRange::RangeKind::SINT) {
-        const auto& sintRange = StaticCast<const SIntRange&>(*range);
-        if (!sintRange.GetExactValues().has_value()) {
-            return;
-        }
-        exactValues = &*sintRange.GetExactValues();
-    } else if (range->GetRangeKind() == ValueRange::RangeKind::BOOL) {
-        const auto& boolRange = StaticCast<const BoolRange&>(*range).GetVal();
-        if (boolRange.IsBottom()) {
-            return;
-        }
-        boolValues = &boolRange;
-    } else {
+    const auto& sintRange = StaticCast<const SIntRange&>(*range);
+    if (!sintRange.GetExactValues().has_value()) {
         return;
     }
     auto type = GetQueryValueType(value);
@@ -6677,13 +6662,7 @@ void RecordContestAggregateValue(ContestAggregateMap& aggregates, const ValueNam
             location.GetBeginPos().line == aggregate.firstDebugLine) {
             continue;
         }
-        if (exactValues != nullptr) {
-            aggregate.exactValues = MergeContestExactValues(aggregate.exactValues, *exactValues);
-        } else if (boolValues != nullptr) {
-            aggregate.boolValues = aggregate.boolValues.has_value()
-                ? std::optional<BoolDomain>{BoolDomain::Union(*aggregate.boolValues, *boolValues)}
-                : std::optional<BoolDomain>{*boolValues};
-        }
+        aggregate.exactValues = MergeContestExactValues(aggregate.exactValues, *sintRange.GetExactValues());
     }
 }
 
@@ -6722,32 +6701,19 @@ void ApplyContestAggregates(std::vector<ContestQuery>& queries, const ContestAgg
 {
     for (auto& query : queries) {
         auto it = aggregates.find(MakeContestAggregateKey(query.fileKey, query.line, query.variableName));
-        if (it == aggregates.end()) {
-            continue;
-        }
-        auto hasIntegerValues = it->second.exactValues.has_value() && it->second.exactValues->size() > 1;
-        auto hasBoolValues = it->second.boolValues.has_value() && !it->second.boolValues->IsBottom() &&
-            !it->second.boolValues->IsSingleValue();
-        if (!hasIntegerValues && !hasBoolValues) {
+        if (it == aggregates.end() || !it->second.exactValues.has_value() || it->second.exactValues->size() <= 1) {
             continue;
         }
         if (query.resolved && query.line != it->second.firstDebugLine) {
             continue;
         }
         auto type = query.type == nullptr ? it->second.type : query.type;
-        if (type == nullptr || (!type->IsInteger() && !type->IsBoolean())) {
+        if (type == nullptr || !type->IsInteger()) {
             continue;
         }
         query.type = type;
         query.typeHint = GetQueryTypeHint(type);
-        if (type->IsBoolean() && hasBoolValues) {
-            auto range = BoolRange{*it->second.boolValues};
-            query.result = FormatContestRange(&range, type);
-        } else if (type->IsInteger() && hasIntegerValues) {
-            query.result = FormatExactSIntValues(*it->second.exactValues, *type);
-        } else {
-            continue;
-        }
+        query.result = FormatExactSIntValues(*it->second.exactValues, *type);
         query.resolved = true;
     }
 }
@@ -6945,8 +6911,9 @@ void ResolveQueryAtDebug(std::vector<ContestQuery>& queries, ValueNameMap& value
     auto fileKey = GetLocationFileKey(debug.GetDebugLocation(), contestRoot);
     RememberContestAggregateFirstLine(
         aggregates, debug.GetDebugLocation(), fileKey, debug.GetSrcCodeIdentifier(), GetQueryValueType(debug.GetValue()));
-    // Debug for a mutable source variable names its Ref allocation. Resolve that Ref through the
-    // current memory state; a later same-line Store can replace this result when it becomes precise.
+    if (debug.GetValue()->GetType()->IsRef()) {
+        return;
+    }
     auto type = GetQueryValueType(debug.GetValue());
     auto range = GetContestRangeForValue(state, debug.GetValue());
     for (auto& query : queries) {
@@ -7015,6 +6982,9 @@ void CollectContextCandidateAtDebug(const std::vector<ContestQuery>& queries, Co
     ValueNameMap& valueNames, const Debug& debug, const RangeDomain& state, const std::filesystem::path& contestRoot)
 {
     RememberValueName(valueNames, debug, contestRoot);
+    if (debug.GetValue()->GetType()->IsRef()) {
+        return;
+    }
     auto type = GetQueryValueType(debug.GetValue());
     auto range = GetContestRangeForValue(state, debug.GetValue());
     for (size_t index = 0; index < queries.size(); ++index) {
