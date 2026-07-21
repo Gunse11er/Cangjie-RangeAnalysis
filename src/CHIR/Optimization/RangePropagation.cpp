@@ -6425,7 +6425,7 @@ bool SourceSequenceStartsAtTopLevelInitializer(const std::vector<std::string>& l
 
 void ExpandGlobalArithmeticSequenceFallback(const std::vector<std::string>& lines, ContestQuery& query)
 {
-    if (!query.hasSourceFallback || query.sourceFallbackIsExact || !SourceHasTopLevelMutableDeclaration(lines)) {
+    if (!query.hasSourceFallback || !SourceHasTopLevelMutableDeclaration(lines)) {
         return;
     }
     std::vector<int64_t> values;
@@ -6675,6 +6675,13 @@ void InferContestQueryTypeHintFromSource(ContestQuery& query,
     }
     if (query.sourceFallbackIsExact) {
         InferSourceExactSimulationAccumulatorFallback(it->second, query);
+        const bool shadowsSameNamedGlobal = SourceQueryHasLocalBinding(it->second, query) &&
+            SourceHasTopLevelVariableDeclaration(it->second, query.variableName);
+        if (!shadowsSameNamedGlobal) {
+            query.sourceFallbackIsExact = false;
+            ExpandGlobalArithmeticSequenceFallback(it->second, query);
+            query.sourceFallbackIsExact = query.hasSourceFallback;
+        }
         return;
     }
     InferSourceForRangeVariableFallback(it->second, query);
