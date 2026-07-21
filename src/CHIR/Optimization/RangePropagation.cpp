@@ -3677,29 +3677,6 @@ std::optional<std::vector<int64_t>> InferSourceLoopExitValuesForVariable(
     return InferSourceLinearLoopExitValues(lines, loop, variableName);
 }
 
-std::optional<std::vector<int64_t>> InferSourceLoopAllValuesForVariable(
-    const std::vector<std::string>& lines, const SourceLoopExtent& loop, const std::string& variableName)
-{
-    if (auto info = BuildSourcePairLoopInfo(lines, loop); info.has_value()) {
-        if (auto values = EnumerateSourcePairLoopValues(info.value()); values.has_value()) {
-            std::vector<int64_t> selected;
-            if (variableName == info->comparison.lhs) {
-                selected = values->lhsBodyValues;
-                selected.insert(selected.end(), values->lhsPostBodyValues.begin(), values->lhsPostBodyValues.end());
-                selected.insert(selected.end(), values->lhsExitValues.begin(), values->lhsExitValues.end());
-                return NormalizeSmallSourceValues(std::move(selected));
-            }
-            if (variableName == info->comparison.rhs) {
-                selected = values->rhsBodyValues;
-                selected.insert(selected.end(), values->rhsPostBodyValues.begin(), values->rhsPostBodyValues.end());
-                selected.insert(selected.end(), values->rhsExitValues.begin(), values->rhsExitValues.end());
-                return NormalizeSmallSourceValues(std::move(selected));
-            }
-        }
-    }
-    return InferSourceWhileInductionValues(lines, loop, variableName, 0);
-}
-
 void InferSourceLinearLoopPointFallback(const std::vector<std::string>& lines, ContestQuery& query)
 {
     if (!query.valid || query.line == 0 || query.line > lines.size() ||
