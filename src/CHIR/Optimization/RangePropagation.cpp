@@ -6308,9 +6308,39 @@ bool SourceHasTopLevelMutableDeclaration(const std::vector<std::string>& lines)
     return false;
 }
 
+bool SourceQueryHasLocalBinding(const std::vector<std::string>& lines, const ContestQuery& query)
+{
+    auto summaries = BuildSourceFunctionSummaries(lines);
+    for (const auto& [functionName, summary] : summaries) {
+        (void)functionName;
+        if (summary.startLine == 0 || summary.endLine == 0 ||
+            !(summary.startLine < query.line && query.line < summary.endLine)) {
+            continue;
+        }
+        if (std::find(summary.params.begin(), summary.params.end(), query.variableName) != summary.params.end()) {
+            return true;
+        }
+        for (unsigned lineNo = summary.startLine + 1;
+             lineNo <= query.line && lineNo <= lines.size(); ++lineNo) {
+            std::string name;
+            ContestQueryTypeHint typeHint{ContestQueryTypeHint::UNKNOWN};
+            std::string expr;
+            if (ParseSourceDeclaration(lines[lineNo - 1], name, typeHint, expr) &&
+                name == query.variableName) {
+                return true;
+            }
+        }
+        return false;
+    }
+    return false;
+}
+
 bool MergeSourceTopLevelMutableInitializerFallback(
     const std::vector<std::string>& lines, ContestQuery& query)
 {
+    if (SourceQueryHasLocalBinding(lines, query)) {
+        return false;
+    }
     std::vector<SourceScope> scopes(1);
     int braceDepth = 0;
     for (size_t index = 0; index < lines.size(); ++index) {
@@ -6327,8 +6357,7 @@ bool MergeSourceTopLevelMutableInitializerFallback(
                 if (ParseSourceDeclaration(line, name, typeHint, expr) &&
                     TryEvalSourceExactValue(expr, scopes, typeHint, exact)) {
                     scopes.front()[name] = exact;
-                    if (index + 1 == query.line && name == query.variableName &&
-                        IsSourceIntegerTypeHint(exact.typeHint)) {
+                    if (name == query.variableName && IsSourceIntegerTypeHint(exact.typeHint)) {
                         if (auto history = SimulateSourceGlobalVariableHistory(lines, name); history.has_value()) {
                             SetSourceIntSetFallback(query, std::move(history.value()));
                             query.preferSourceFallback = query.hasSourceFallback;
@@ -6641,6 +6670,9 @@ void InferContestQueryTypeHintFromSource(ContestQuery& query,
     InferContestQuerySourceFallback(it->second, query);
     InferSourceLocalSimulationFallback(it->second, query);
     InferSourceEntrySimulationFallback(it->second, query);
+    if (MergeSourceTopLevelMutableInitializerFallback(it->second, query)) {
+        return;
+    }
     if (query.sourceFallbackIsExact) {
         InferSourceExactSimulationAccumulatorFallback(it->second, query);
         return;
@@ -6659,9 +6691,6 @@ void InferContestQueryTypeHintFromSource(ContestQuery& query,
     InferSourceTryFallback(it->second, query);
     InferPriorSourceAssignmentFallback(it->second, query);
     InferSourceAccumulatorFallback(it->second, query);
-    if (MergeSourceTopLevelMutableInitializerFallback(it->second, query)) {
-        return;
-    }
     ExpandGlobalArithmeticSequenceFallback(it->second, query);
 }
 
