@@ -4511,6 +4511,7 @@ std::optional<SourceExactValue> EvalSourceExactForSimulation(const std::string& 
 struct SourceSimulationTarget {
     unsigned sourceLine{0};
     std::string variableName;
+    bool observeAllWrites{false};
 };
 
 enum class SourceLoopControl {
@@ -4640,8 +4641,8 @@ SourceSimulationResult ExecuteSourceSummaryBlock(const std::vector<std::string>&
         };
     auto observeTargetWrite = [&](unsigned currentLine, const std::string& name,
                                   const std::optional<SourceExactValue>& exact) {
-        if (target == nullptr || target->sourceLine != currentLine || name != target->variableName ||
-            !exact.has_value()) {
+        if (target == nullptr || name != target->variableName || !exact.has_value() ||
+            (!target->observeAllWrites && target->sourceLine != currentLine)) {
             return;
         }
         if (IsSourceIntegerTypeHint(exact->typeHint)) {
@@ -5047,6 +5048,32 @@ std::optional<std::vector<bool>> SimulateSourceFunctionSummaryBoolAtLine(const S
     std::sort(values.begin(), values.end());
     values.erase(std::unique(values.begin(), values.end()), values.end());
     return values;
+}
+
+std::optional<std::vector<int64_t>> SimulateSourceGlobalVariableHistory(
+    const std::vector<std::string>& lines, const std::string& variableName)
+{
+    auto summaries = BuildSourceFunctionSummaries(lines);
+    auto mainIt = summaries.find("main");
+    if (mainIt == summaries.end() || !mainIt->second.params.empty() || mainIt->second.bodyLines.empty()) {
+        return std::nullopt;
+    }
+    auto scopes = BuildSourceGlobalScopes(lines);
+    auto initial = LookupSourceValue(scopes, variableName);
+    if (initial == nullptr || !IsSourceIntegerTypeHint(initial->typeHint)) {
+        return std::nullopt;
+    }
+    std::vector<int64_t> values{initial->intValue};
+    scopes.emplace_back();
+    SourceSimulationTarget target{0, variableName, true};
+    size_t budget = 20000;
+    auto result = ExecuteSourceSummaryBlock(mainIt->second.bodyLines, 0, mainIt->second.bodyLines.size() - 1,
+        scopes, summaries, 0, budget, mainIt->second.startLine + 1, &target);
+    if (result.failed) {
+        return std::nullopt;
+    }
+    values.insert(values.end(), result.observedValues.begin(), result.observedValues.end());
+    return NormalizeSourceIntSet(std::move(values));
 }
 
 std::optional<std::vector<int64_t>> EvalSourceIntExprSetWithFunctions(const std::string& expr,
@@ -6281,6 +6308,57 @@ bool SourceHasTopLevelMutableDeclaration(const std::vector<std::string>& lines)
     return false;
 }
 
+bool MergeSourceTopLevelMutableInitializerFallback(
+    const std::vector<std::string>& lines, ContestQuery& query)
+{
+    std::vector<SourceScope> scopes(1);
+    int braceDepth = 0;
+    for (size_t index = 0; index < lines.size(); ++index) {
+        const auto& rawLine = lines[index];
+        auto line = Trim(StripLineComment(rawLine));
+        if (braceDepth == 0) {
+            auto pos = SkipSourceDeclarationModifiers(line);
+            if (line.compare(pos, 3, "var") == 0 &&
+                (pos + 3 == line.size() || !IsIdentifierChar(line[pos + 3]))) {
+                std::string name;
+                ContestQueryTypeHint typeHint{ContestQueryTypeHint::UNKNOWN};
+                std::string expr;
+                SourceExactValue exact;
+                if (ParseSourceDeclaration(line, name, typeHint, expr) &&
+                    TryEvalSourceExactValue(expr, scopes, typeHint, exact)) {
+                    scopes.front()[name] = exact;
+                    if (index + 1 == query.line && name == query.variableName &&
+                        IsSourceIntegerTypeHint(exact.typeHint)) {
+                        if (auto history = SimulateSourceGlobalVariableHistory(lines, name); history.has_value()) {
+                            SetSourceIntSetFallback(query, std::move(history.value()));
+                            query.preferSourceFallback = query.hasSourceFallback;
+                            query.sourceFallbackIsExact = query.hasSourceFallback;
+                            return query.hasSourceFallback;
+                        }
+                        std::vector<int64_t> values{exact.intValue};
+                        std::vector<int64_t> existing;
+                        if (query.hasSourceFallback &&
+                            TryParseSourceIntSetFallback(query.sourceFallback, existing)) {
+                            values.insert(values.end(), existing.begin(), existing.end());
+                        }
+                        SetSourceIntSetFallback(query, std::move(values));
+                        query.preferSourceFallback = query.hasSourceFallback;
+                        return query.hasSourceFallback;
+                    }
+                }
+            }
+        }
+        for (auto c : line) {
+            if (c == '{') {
+                ++braceDepth;
+            } else if (c == '}' && braceDepth > 0) {
+                --braceDepth;
+            }
+        }
+    }
+    return false;
+}
+
 bool SourceSequenceStartsAtTopLevelInitializer(const std::vector<std::string>& lines, int64_t firstValue)
 {
     std::vector<SourceScope> scopes(1);
@@ -6581,6 +6659,9 @@ void InferContestQueryTypeHintFromSource(ContestQuery& query,
     InferSourceTryFallback(it->second, query);
     InferPriorSourceAssignmentFallback(it->second, query);
     InferSourceAccumulatorFallback(it->second, query);
+    if (MergeSourceTopLevelMutableInitializerFallback(it->second, query)) {
+        return;
+    }
     ExpandGlobalArithmeticSequenceFallback(it->second, query);
 }
 
