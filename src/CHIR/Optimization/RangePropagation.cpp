@@ -4190,6 +4190,42 @@ std::unordered_map<std::string, SourceFunctionSummary> BuildSourceFunctionSummar
     return summaries;
 }
 
+struct SourceModuleSummaryContext {
+    std::unordered_map<std::string, SourceFunctionSummary> summaries;
+    std::unordered_map<std::string, unsigned> lineBases;
+};
+
+SourceModuleSummaryContext BuildSourceModuleSummaryContext(
+    const std::unordered_map<std::string, std::vector<std::string>>& sourceCache)
+{
+    SourceModuleSummaryContext context;
+    std::vector<std::string> sourceKeys;
+    sourceKeys.reserve(sourceCache.size());
+    for (const auto& [sourceKey, lines] : sourceCache) {
+        (void)lines;
+        sourceKeys.emplace_back(sourceKey);
+    }
+    std::sort(sourceKeys.begin(), sourceKeys.end());
+
+    uint64_t nextBase = 0;
+    for (const auto& sourceKey : sourceKeys) {
+        auto sourceIt = sourceCache.find(sourceKey);
+        if (sourceIt == sourceCache.end() || nextBase > std::numeric_limits<unsigned>::max()) {
+            continue;
+        }
+        auto lineBase = static_cast<unsigned>(nextBase);
+        context.lineBases.emplace(sourceKey, lineBase);
+        auto summaries = BuildSourceFunctionSummaries(sourceIt->second);
+        for (auto& [name, summary] : summaries) {
+            summary.startLine += lineBase;
+            summary.endLine += lineBase;
+            AddSourceFunctionSummary(context.summaries, name, std::move(summary));
+        }
+        nextBase += static_cast<uint64_t>(sourceIt->second.size()) + 1;
+    }
+    return context;
+}
+
 std::optional<std::vector<int64_t>> NormalizeSourceIntSet(std::vector<int64_t> values)
 {
     std::sort(values.begin(), values.end());
@@ -5770,18 +5806,22 @@ void InferSourceEntrySimulationFallback(const std::vector<std::string>& lines, C
     query.sourceFallbackMayBeLoopNarrow = query.hasSourceFallback;
 }
 
-void InferSourceFunctionContextQueryFallback(const std::vector<std::string>& lines, ContestQuery& query)
+void InferSourceFunctionContextQueryFallback(const std::vector<std::string>& lines, ContestQuery& query,
+    const std::string& sourceKey,
+    const std::unordered_map<std::string, std::vector<std::string>>* moduleSources = nullptr,
+    const SourceModuleSummaryContext* moduleContext = nullptr)
 {
     if (!query.valid || query.line == 0 || query.line > lines.size() || query.typeHint == ContestQueryTypeHint::BOOL) {
         return;
     }
-    auto summaries = BuildSourceFunctionSummaries(lines);
-    if (summaries.empty()) {
+    auto localSummaries = BuildSourceFunctionSummaries(lines);
+    const auto& summaries = moduleContext == nullptr ? localSummaries : moduleContext->summaries;
+    if (localSummaries.empty() || summaries.empty()) {
         return;
     }
 
     const SourceFunctionSummary* targetSummary = nullptr;
-    for (const auto& [name, summary] : summaries) {
+    for (const auto& [name, summary] : localSummaries) {
         if (summary.startLine != 0 && summary.endLine != 0 &&
             summary.startLine < query.line && query.line < summary.endLine) {
             targetSummary = &summary;
@@ -5793,9 +5833,28 @@ void InferSourceFunctionContextQueryFallback(const std::vector<std::string>& lin
     }
 
     std::vector<int64_t> values;
-    auto scopes = BuildSourceGlobalScopes(lines);
-    CollectSourceFunctionContextValuesInRange(
-        lines, 1, static_cast<unsigned>(lines.size()), scopes, summaries, query, values);
+    ContestQuery adjustedQuery = query;
+    if (moduleSources != nullptr && moduleContext != nullptr) {
+        auto baseIt = moduleContext->lineBases.find(sourceKey);
+        if (baseIt == moduleContext->lineBases.end() ||
+            query.line > std::numeric_limits<unsigned>::max() - baseIt->second) {
+            return;
+        }
+        adjustedQuery.line += baseIt->second;
+        for (const auto& [moduleSourceKey, moduleLines] : *moduleSources) {
+            (void)moduleSourceKey;
+            auto scopes = BuildSourceGlobalScopes(moduleLines);
+            CollectSourceFunctionContextValuesInRange(moduleLines, 1, static_cast<unsigned>(moduleLines.size()),
+                scopes, summaries, adjustedQuery, values);
+            if (values.size() > MAX_CONTEST_EXACT_VALUES) {
+                break;
+            }
+        }
+    } else {
+        auto scopes = BuildSourceGlobalScopes(lines);
+        CollectSourceFunctionContextValuesInRange(
+            lines, 1, static_cast<unsigned>(lines.size()), scopes, summaries, adjustedQuery, values);
+    }
     auto normalized = NormalizeSourceIntSet(std::move(values));
     if (normalized.has_value()) {
         SetSourceIntSetFallback(query, std::move(normalized.value()));
@@ -5803,7 +5862,8 @@ void InferSourceFunctionContextQueryFallback(const std::vector<std::string>& lin
     }
 }
 
-void InferSourceFunctionCallFallback(const std::vector<std::string>& lines, ContestQuery& query)
+void InferSourceFunctionCallFallback(const std::vector<std::string>& lines, ContestQuery& query,
+    const std::unordered_map<std::string, SourceFunctionSummary>* moduleSummaries = nullptr)
 {
     if (!query.valid || query.line == 0 || query.line > lines.size() || query.typeHint == ContestQueryTypeHint::BOOL) {
         return;
@@ -5822,7 +5882,8 @@ void InferSourceFunctionCallFallback(const std::vector<std::string>& lines, Cont
     if (!matched || expr.find('(') == std::string::npos) {
         return;
     }
-    auto summaries = BuildSourceFunctionSummaries(lines);
+    auto localSummaries = BuildSourceFunctionSummaries(lines);
+    const auto& summaries = moduleSummaries == nullptr ? localSummaries : *moduleSummaries;
     if (summaries.empty()) {
         return;
     }
@@ -6280,7 +6341,8 @@ void InferContestQuerySourceFallback(const std::vector<std::string>& lines, Cont
 
 // 读取查询所在源码行，在 CHIR Debug 缺失时保留 Bool/整数 fallback 所需类型。
 void InferContestQueryTypeHintFromSource(ContestQuery& query,
-    std::unordered_map<std::string, std::vector<std::string>>& sourceCache, const std::filesystem::path& contestRoot)
+    std::unordered_map<std::string, std::vector<std::string>>& sourceCache, const std::filesystem::path& contestRoot,
+    const SourceModuleSummaryContext* moduleContext = nullptr)
 {
     if (!query.valid || query.fileName.empty() || query.line == 0) {
         return;
@@ -6313,8 +6375,10 @@ void InferContestQueryTypeHintFromSource(ContestQuery& query,
     InferSourceLinearLoopPointFallback(it->second, query);
     InferSourceMatchFallback(it->second, query);
     InferSourceGlobalConstantFallback(it->second, query);
-    InferSourceFunctionCallFallback(it->second, query);
-    InferSourceFunctionContextQueryFallback(it->second, query);
+    InferSourceFunctionCallFallback(
+        it->second, query, moduleContext == nullptr ? nullptr : &moduleContext->summaries);
+    InferSourceFunctionContextQueryFallback(
+        it->second, query, sourceKey, moduleContext == nullptr ? nullptr : &sourceCache, moduleContext);
     InferSourceLocalSimulationFallback(it->second, query);
     InferSourceEntrySimulationFallback(it->second, query);
     InferSourcePriorLoopValueFallback(it->second, query);
@@ -6365,6 +6429,34 @@ ContestQuery ParseContestQueryLine(const std::string& line, const std::filesyste
 }
 
 // 当 input.txt 存在时读取全部竞赛查询。
+void LoadContestModuleSources(std::unordered_map<std::string, std::vector<std::string>>& sourceCache,
+    const std::filesystem::path& contestRoot)
+{
+    std::error_code error;
+    std::filesystem::recursive_directory_iterator it(
+        contestRoot, std::filesystem::directory_options::skip_permission_denied, error);
+    const std::filesystem::recursive_directory_iterator end;
+    while (!error && it != end) {
+        const auto& entry = *it;
+        if (entry.is_directory(error)) {
+            auto name = entry.path().filename().string();
+            if (name == ".git" || name == "build" || name == "output" || name == "target") {
+                it.disable_recursion_pending();
+            }
+        } else if (entry.is_regular_file(error) && entry.path().extension() == ".cj") {
+            auto sourceKey = entry.path().lexically_normal().string();
+            std::vector<std::string> lines;
+            std::ifstream source(sourceKey);
+            std::string sourceLine;
+            while (std::getline(source, sourceLine)) {
+                lines.emplace_back(sourceLine);
+            }
+            sourceCache.emplace(std::move(sourceKey), std::move(lines));
+        }
+        it.increment(error);
+    }
+}
+
 std::optional<std::vector<ContestQuery>> LoadContestQueries(const ContestInputContext& inputContext)
 {
     std::ifstream input(inputContext.inputPath.string());
@@ -6373,10 +6465,16 @@ std::optional<std::vector<ContestQuery>> LoadContestQueries(const ContestInputCo
     }
     std::vector<ContestQuery> queries;
     std::unordered_map<std::string, std::vector<std::string>> sourceCache;
+    LoadContestModuleSources(sourceCache, inputContext.rootPath);
+    std::optional<SourceModuleSummaryContext> moduleContext;
+    if (sourceCache.size() > 1) {
+        moduleContext = BuildSourceModuleSummaryContext(sourceCache);
+    }
     std::string line;
     while (std::getline(input, line)) {
         auto query = ParseContestQueryLine(line, inputContext.rootPath);
-        InferContestQueryTypeHintFromSource(query, sourceCache, inputContext.rootPath);
+        InferContestQueryTypeHintFromSource(
+            query, sourceCache, inputContext.rootPath, moduleContext.has_value() ? &moduleContext.value() : nullptr);
         queries.emplace_back(std::move(query));
     }
     return queries;
