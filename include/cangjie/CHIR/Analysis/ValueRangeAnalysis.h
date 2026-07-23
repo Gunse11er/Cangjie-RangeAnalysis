@@ -148,7 +148,14 @@ public:
 
     static void VisitContextSensitiveResults(const ContextResultVisitor& visitor);
 
+    static bool VisitReachableContextSensitiveResults(
+        const Function* rootFunction, Results<RangeDomain>& root, const ContextResultVisitor& visitor);
+
     static void ClearContextSensitiveResults();
+
+    static std::unique_ptr<ValueRange> GetBoundedLoopObservedRange(const Expression* expression);
+
+    static void ClearBoundedLoopObservedRanges();
 
     /**
      * @brief get bool domain of CHIR value from state.
@@ -174,13 +181,25 @@ public:
      */
     bool CheckInQueueTimes(const Block* block, RangeDomain& curState) override;
 
+    unsigned GetNarrowingIterationLimit() const override;
+
+    bool NarrowState(RangeDomain& state, const RangeDomain& candidate) override;
+
 private:
+    friend RangeDomain GetTerminatorStateForSuccessor(
+        Analysis<RangeDomain>& analysis, const RangeDomain& state,
+        const Terminator* terminator, const Block* successor);
+
     struct ContextAbstractValue;
     struct ContextualSummary;
+    struct LambdaContextualSummary;
     using ContextArguments = std::vector<ContextAbstractValue>;
+    using ContextGlobalValues = std::vector<std::pair<GlobalVar*, ContextAbstractValue>>;
+    using ContextLocationValues = std::vector<std::pair<Value*, ContextAbstractValue>>;
+    using BoundedLoopExitCache = std::unordered_map<std::string, ContextLocationValues>;
 
     RangeAnalysis(const Function* func, CHIRBuilder& builder, bool isDebug, DiagnosticEngine* diag,
-        ContextArguments contextArguments);
+        ContextArguments contextArguments, ContextGlobalValues contextGlobalArguments);
 
     template <class Domain,
         typename = typename std::enable_if<std::is_same_v<Domain, SIntDomain> || std::is_same_v<Domain, BoolDomain>>>
@@ -209,25 +228,61 @@ private:
 
     void HandleApplyExpr(RangeDomain& state, const Apply* apply, Value* refObj) override;
 
+    void HandleVarStateCapturedByLambda(RangeDomain& state, const Lambda* lambda) override;
+
     std::optional<Block*> HandleApplyWithExceptionTerminator(
         RangeDomain& state, const ApplyWithException* apply, Value* refObj) override;
 
-    void HandleContextSensitiveCall(
-        RangeDomain& state, Value* calleeValue, const std::vector<Value*>& args, Value* result);
+    std::optional<Block*> HandleInvokeWithExceptionTerminator(
+        RangeDomain& state, const InvokeWithException* invoke, Value* refObj) override;
+
+    void HandleContextSensitiveCall(RangeDomain& state, const Expression* callExpression,
+        Value* calleeValue, const std::vector<Value*>& args, Value* result);
+
+    void HavocCallEffects(RangeDomain& state, const std::vector<Value*>& args, Value* result,
+        const Lambda* lambda = nullptr);
+
+    bool HandleLambdaContextSensitiveCall(
+        RangeDomain& state, const Lambda* lambda, const std::vector<Value*>& args, Value* result);
+
+    bool AnalyzeLambdaWithContext(const Lambda* lambda, const std::vector<Value*>& args,
+        const RangeDomain& callerState, LambdaContextualSummary& summary);
+
+    std::string BuildLambdaContextKey(
+        const RangeDomain& state, const Lambda* lambda, const std::vector<Value*>& args);
+
+    void ApplyLambdaContextSummary(RangeDomain& state, const LambdaContextualSummary& summary,
+        const std::vector<Value*>& args, Value* result) const;
 
     std::optional<ContextAbstractValue> AnalyzeCalleeWithContext(
         const Function* callee, const ContextArguments& arguments,
-        std::vector<std::optional<ContextAbstractValue>>& refArgValues);
+        std::vector<std::optional<ContextAbstractValue>>& refArgValues, ContextGlobalValues& globalValues);
 
     std::optional<ContextAbstractValue> SummarizeReturnValue(const Function* callee, Results<RangeDomain>& results);
 
     std::vector<std::optional<ContextAbstractValue>> SummarizeRefParamValues(
         const Function* callee, Results<RangeDomain>& results);
 
-    ContextAbstractValue CaptureContextValue(const RangeDomain& state, Value* value, bool preserveIntervals) const;
+    ContextGlobalValues SummarizeGlobalValues(
+        const ContextGlobalValues& globals, Results<RangeDomain>& results);
 
-    ContextAbstractValue CaptureContextValue(
-        const RangeDomain& state, Value* value, Type* type, bool preserveIntervals) const;
+    static std::string BuildContextKey(
+        const Function* callee, const ContextArguments& arguments, const ContextGlobalValues& globalValues);
+
+    static std::optional<std::string> BuildContextKeyForCall(
+        const RangeDomain& state, Value* calleeValue, const std::vector<Value*>& args,
+        bool requireSingleton = false);
+
+    static ContextAbstractValue CaptureContextValue(
+        const RangeDomain& state, Value* value, bool preserveIntervals);
+
+    static ContextAbstractValue CaptureContextValue(
+        const RangeDomain& state, Value* value, Type* type, bool preserveIntervals);
+
+    static ContextAbstractValue JoinContextValues(
+        const ContextAbstractValue& lhs, const ContextAbstractValue& rhs);
+
+    ClassType* ResolveExactClassForValue(Value* value) const;
 
     void ApplyContextValue(RangeDomain& state, Value* dest, const ContextAbstractValue& value) const;
 
@@ -241,6 +296,12 @@ private:
 
     static std::unordered_map<const Function*, size_t>& GetContextCounts();
 
+    static std::unordered_map<const Function*, size_t>& GetBoundedLoopContextCounts();
+
+    static std::mutex& GetBoundedLoopExitCacheMutex();
+
+    static std::unordered_map<const RangeAnalysis*, BoundedLoopExitCache>& GetBoundedLoopExitCaches();
+
     // ======================= Transfer functions for terminators ======================= //
 
     std::optional<Block*> HandleTerminatorEffect(RangeDomain& state, const Terminator* terminator) override;
@@ -248,6 +309,9 @@ private:
     std::optional<Block*> HandleBranchTerminator(const RangeDomain& state, const Branch* branch) const;
 
     std::optional<Block*> HandleMultiBranchTerminator(const RangeDomain& state, const MultiBranch* multi) const;
+
+    std::optional<RangeDomain> TryEvaluateBoundedScalarLoopExit(
+        const RangeDomain& state, const Branch* branch, const Block* successor);
 
     enum class ExceptionKind : uint8_t { SUCCESS, FAIL, NA };
 
@@ -283,11 +347,17 @@ private:
 
     ContextArguments contextArguments;
 
+    ContextGlobalValues contextGlobalArguments;
+
+    bool isContextAnalysis{false};
+
+    std::unordered_map<std::string, std::unique_ptr<LambdaContextualSummary>> lambdaContextSummaries;
+
     std::unordered_map<const Block*, uint32_t> inqueueTimes;
 };
 
     // 构造 RangeAnalysis 在某条终结符后继边上传播的状态。
 RangeDomain GetTerminatorStateForSuccessor(
-    const Analysis<RangeDomain>& analysis, const RangeDomain& state, const Terminator* terminator, const Block* successor);
+    Analysis<RangeDomain>& analysis, const RangeDomain& state, const Terminator* terminator, const Block* successor);
 } // namespace Cangjie::CHIR
 #endif

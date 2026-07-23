@@ -19,7 +19,7 @@ namespace Cangjie::CHIR {
 
 template <typename Domain>
 Domain GetTerminatorStateForSuccessor(
-    const Analysis<Domain>& analysis, const Domain& state, const Terminator* terminator, const Block* successor)
+    Analysis<Domain>& analysis, const Domain& state, const Terminator* terminator, const Block* successor)
 {
     (void)analysis;
     (void)terminator;
@@ -172,6 +172,7 @@ public:
      */
     void IterateSingleUnitToFixpoint(Block* entryBlock, std::unordered_map<Block*, Domain>* entryStates)
     {
+        const auto entrySeed = entryStates->at(entryBlock);
         std::deque<Block*> worklist = TopologicalSort(entryBlock);
         std::unordered_set<Block*> worklistSet(worklist.begin(), worklist.end());
 #ifdef AnalysisDevDebug
@@ -257,9 +258,69 @@ public:
                 }
             }
         }
+        IterateSingleUnitToNarrowingFixpoint(entryBlock, entryStates, entrySeed);
     }
 
 private:
+    void IterateSingleUnitToNarrowingFixpoint(
+        Block* entryBlock, std::unordered_map<Block*, Domain>* entryStates, const Domain& entrySeed)
+    {
+        const auto iterationLimit = analysis->GetNarrowingIterationLimit();
+        if (iterationLimit == 0) {
+            return;
+        }
+        const auto blockOrder = TopologicalSort(entryBlock);
+        for (unsigned iteration = 0; iteration < iterationLimit; ++iteration) {
+            std::unordered_map<Block*, Domain> candidates;
+            for (const auto& [block, state] : *entryStates) {
+                (void)state;
+                candidates.emplace(block, analysis->Bottom());
+            }
+            candidates.at(entryBlock) = entrySeed;
+
+            for (auto block : blockOrder) {
+                auto state = entryStates->at(block);
+                if (state.IsBottom()) {
+                    continue;
+                }
+                auto expressions = block->GetExpressions();
+                if (expressions.empty()) {
+                    continue;
+                }
+                auto terminator = StaticCast<Terminator*>(expressions.back());
+                expressions.pop_back();
+                for (auto expression : expressions) {
+                    if (expression->GetExprKind() == ExprKind::LAMBDA) {
+                        analysis->PreHandleLambdaExpression(state, StaticCast<const Lambda*>(expression));
+                    } else {
+                        if (auto lambda = IsApplyToLambda(expression); lambda) {
+                            analysis->HandleVarStateCapturedByLambda(state, lambda);
+                        }
+                        analysis->PropagateExpressionEffect(state, expression);
+                    }
+                }
+                if (auto lambda = IsApplyToLambda(terminator); lambda) {
+                    analysis->HandleVarStateCapturedByLambda(state, lambda);
+                }
+                auto targetSuccessor = analysis->PropagateTerminatorEffect(state, terminator);
+                auto successors = targetSuccessor.has_value() ? std::vector<Block*>{targetSuccessor.value()}
+                                                               : block->GetSuccessors();
+                for (auto successor : successors) {
+                    auto edgeState = GetTerminatorStateForSuccessor(*analysis, state, terminator, successor);
+                    candidates.at(successor).Join(edgeState);
+                }
+            }
+
+            bool changed = false;
+            for (auto& [block, state] : *entryStates) {
+                changed |= analysis->NarrowState(state, candidates.at(block));
+            }
+            if (!changed) {
+                break;
+            }
+        }
+    }
+
     /**
      * @brief check whether exceed block limit to ensure whether do opt in this function.
      * @return flag whether exceed block limit.

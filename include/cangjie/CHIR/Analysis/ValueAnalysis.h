@@ -471,6 +471,28 @@ public:
         this->kind = ReachableKind::UNREACHABLE;
     }
 
+    /**
+     * Narrow values present in both states using an analysis-specific operation.
+     * Reference topology is intentionally left unchanged; referenced objects are
+     * still visited through their entries in the program state.
+     */
+    template <typename NarrowOperation>
+    bool NarrowValuesWith(const State<ValueDomain, ValueStatePool>& candidate, NarrowOperation&& narrow)
+    {
+        if (this->IsBottom() || candidate.IsBottom()) {
+            return false;
+        }
+        bool changed = false;
+        for (auto it = programState.Begin(); it != programState.End(); ++it) {
+            auto candidateIt = candidate.programState.Find(it->first);
+            if (candidateIt == candidate.programState.End()) {
+                continue;
+            }
+            changed |= narrow(it->first, it->second, candidateIt->second);
+        }
+        return changed;
+    }
+
 private:
     Ref* CreateNewRef(const Expression* expr = nullptr, bool createTwoLevelRef = false)
     {
@@ -1500,9 +1522,12 @@ private:
             childrenTypes.emplace_back(false);
         } else if (rootTy->GetTypeKind() == Type::TypeKind::TYPE_CLASS) {
             auto classTy = StaticCast<ClassType*>(rootTy);
-            auto classDef = classTy->GetClassDef();
-            if (classDef->GetSrcCodeIdentifier().find("$BOX_RNat5Array") == 0) {
-                childrenTypes.emplace_back(classDef->GetInstanceVar(0).type->IsRef());
+            constexpr size_t MAX_TRACKED_CLASS_FIELDS = 64;
+            auto memberTypes = classTy->GetInstantiatedMemberTys(builder);
+            auto trackedFields = std::min(memberTypes.size(), MAX_TRACKED_CLASS_FIELDS);
+            childrenTypes.reserve(trackedFields);
+            for (size_t i = 0; i < trackedFields; ++i) {
+                childrenTypes.emplace_back(memberTypes[i]->IsRef());
             }
         }
 
@@ -1679,6 +1704,11 @@ private:
     std::vector<std::unique_ptr<AbstractObject>> absObjPool;
 
 protected:
+    void ResetObjectChildrenToTop(State<ValueDomain, ValueStatePool>& state, Value* root, Type* rootTy) const
+    {
+        SetObjChildrenStateToTop(state, root, rootTy, builder);
+    }
+
     CHIRBuilder& builder;
 }; // namespace Cangjie::CHIR
 

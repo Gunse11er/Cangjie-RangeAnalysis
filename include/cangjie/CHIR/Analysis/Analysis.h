@@ -158,6 +158,20 @@ public:
         return false;
     }
 
+    /// Number of bounded post-fixpoint narrowing rounds requested by this analysis.
+    virtual unsigned GetNarrowingIterationLimit() const
+    {
+        return 0;
+    }
+
+    /// Intersect an existing block-entry state with a freshly recomputed candidate.
+    virtual bool NarrowState(Domain& state, const Domain& candidate)
+    {
+        (void)state;
+        (void)candidate;
+        return false;
+    }
+
     /// get analysis name
     static std::string GetAnalysisName()
     {
