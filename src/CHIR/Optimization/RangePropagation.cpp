@@ -108,6 +108,7 @@ enum class ContestResultOrigin {
     NONE,
     CHIR_ANALYSIS,
     CONTEXT_SUMMARY,
+    SOURCE_FALLBACK,
 };
 struct ContestQuery {
     std::string fileName;
@@ -2037,11 +2038,12 @@ bool IsLoopBranchConditionExpr(const Expression& expr)
 }
 
 // 按查询顺序写入 output.txt，未解析项使用 fallback。
-std::string GetContestQueryOutput(const ContestQuery& query)
+std::string GetContestQueryOutput(ContestQuery& query)
 {
-    if (query.resolved) {
-        return query.result.empty() ? FormatFallback(query) : query.result;
+    if (query.resolved && !query.result.empty()) {
+        return query.result;
     }
+    query.resultOrigin = ContestResultOrigin::SOURCE_FALLBACK;
     return FormatFallback(query);
 }
 
@@ -2052,6 +2054,8 @@ const char* ContestResultOriginName(ContestResultOrigin origin)
             return "CHIRAnalysis";
         case ContestResultOrigin::CONTEXT_SUMMARY:
             return "ContextSummary";
+        case ContestResultOrigin::SOURCE_FALLBACK:
+            return "SourceFallback";
         case ContestResultOrigin::NONE:
             return "None";
     }
@@ -2117,11 +2121,9 @@ void WriteContestOutput(std::vector<ContestQuery>& queries, const ContestInputCo
         auto& query = queries[index];
         auto current = GetContestQueryOutput(query);
         if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
-            auto origin = query.resolved ? query.resultOrigin : ContestResultOrigin::NONE;
             std::cerr << "[RangeAnalysisOutput] " << query.fileName << ':' << query.line << ':'
-                      << query.variableName << " origin=" << ContestResultOriginName(origin)
+                      << query.variableName << " origin=" << ContestResultOriginName(query.resultOrigin)
                       << " value=" << current << " resolved=" << query.resolved
-                      << " rawOrigin=" << ContestResultOriginName(query.resultOrigin)
                       << " raw=" << query.result << '\n';
         }
         output << current << '\n';
