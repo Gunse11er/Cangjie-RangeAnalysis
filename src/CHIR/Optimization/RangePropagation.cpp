@@ -1231,6 +1231,12 @@ Expression* GetLocalDefiningExpression(Value* value)
     return StaticCast<LocalVar*>(value)->GetExpr();
 }
 
+std::unique_ptr<ValueRange> GetBoundedLoopObservedRangeForValue(Value* value)
+{
+    auto expression = GetLocalDefiningExpression(value);
+    return expression == nullptr ? nullptr : RangeAnalysis::GetBoundedLoopObservedRange(expression);
+}
+
 bool IsLoadFromLocation(Value* value, Value* location)
 {
     auto expression = GetLocalDefiningExpression(value);
@@ -1426,7 +1432,8 @@ void ResolveQueryAtDebug(std::vector<ContestQuery>& queries, ValueNameMap& value
     RememberContestAggregateBinding(aggregates, debug, fileKey, GetQueryValueType(debug.GetValue()));
     if (!debug.GetValue()->GetType()->IsRef()) {
         auto type = GetQueryValueType(debug.GetValue());
-        auto range = GetContestRangeForValue(state, debug.GetValue());
+        auto observed = GetBoundedLoopObservedRangeForValue(debug.GetValue());
+        auto range = observed != nullptr ? observed.get() : GetContestRangeForValue(state, debug.GetValue());
         for (auto& query : queries) {
             if (!query.valid || query.variableName != debug.GetSrcCodeIdentifier()) {
                 continue;

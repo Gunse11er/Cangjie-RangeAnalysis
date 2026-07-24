@@ -2889,6 +2889,8 @@ std::optional<SIntRange> TryComputeCountedAccumulatorUpdateRange(
 std::optional<SIntRange> TryComputeSimpleInductionLoadExitRange(const RangeDomain& state, const Load* load);
 std::optional<SIntRange> TryComputeCountedAccumulatorLoadExitRange(const RangeDomain& state, const Load* load);
 std::optional<SIntRange> TryComputeCountedAccumulatorBodyLoadRange(const RangeDomain& state, const Load* load);
+std::optional<SIntRange> TryComputeLockstepDifferenceRange(
+    const RangeDomain& state, const BinaryExpression* binaryExpr);
 namespace {
 std::optional<SIntRange> TryComputeSimpleLoopLoadRange(const RangeDomain& state, Value* value);
 std::optional<SIntRange> TryComputePairLoopLoadRange(const RangeDomain& state, const Load* load);
@@ -3343,13 +3345,19 @@ void RangeAnalysis::HandleBinaryExpr(RangeDomain& state, const BinaryExpression*
         if (!IsBasicBinaryExpr(*binaryExpr) && !IsBitwiseBinaryExpr(kind) && !IsShiftBinaryExpr(kind)) {
             return state.SetToBound(binaryExpr->GetResult(), true);
         }
-        if (auto countedAccumulatorRange = TryComputeCountedAccumulatorUpdateRange(state, binaryExpr);
-            countedAccumulatorRange.has_value()) {
-            return state.Update(dest, std::make_unique<SIntRange>(std::move(countedAccumulatorRange.value())));
-        }
-        if (auto inductionRange = TryComputeSimpleInductionUpdateRange(binaryExpr);
-            inductionRange.has_value() && inductionRange->IsNonTrivial()) {
-            return state.Update(dest, std::make_unique<SIntRange>(std::move(inductionRange.value())));
+        if (boundedLoopEvaluationOwner != this) {
+            if (auto lockstepRange = TryComputeLockstepDifferenceRange(state, binaryExpr);
+                lockstepRange.has_value()) {
+                return state.Update(dest, std::make_unique<SIntRange>(std::move(lockstepRange.value())));
+            }
+            if (auto countedAccumulatorRange = TryComputeCountedAccumulatorUpdateRange(state, binaryExpr);
+                countedAccumulatorRange.has_value()) {
+                return state.Update(dest, std::make_unique<SIntRange>(std::move(countedAccumulatorRange.value())));
+            }
+            if (auto inductionRange = TryComputeSimpleInductionUpdateRange(binaryExpr);
+                inductionRange.has_value() && inductionRange->IsNonTrivial()) {
+                return state.Update(dest, std::make_unique<SIntRange>(std::move(inductionRange.value())));
+            }
         }
         const auto& lRange = GetSIntDomainFromState(state, lhs);
         const auto& rRange = GetSIntDomainFromState(state, rhs);
@@ -8124,6 +8132,111 @@ std::optional<CountedAccumulatorLoopContext> FindCountedAccumulatorLoopContext(
     return std::nullopt;
 }
 
+const Load* GetRootIntegerLoad(Value* value)
+{
+    constexpr size_t MAX_TRANSPARENT_CAST_DEPTH = 4;
+    for (size_t depth = 0; value != nullptr && depth <= MAX_TRANSPARENT_CAST_DEPTH; ++depth) {
+        auto expression = GetDefiningExpr(value);
+        if (expression == nullptr) {
+            return nullptr;
+        }
+        if (expression->GetExprKind() == ExprKind::LOAD) {
+            return StaticCast<const Load*>(expression);
+        }
+        if (expression->GetExprKind() != ExprKind::TYPECAST) {
+            return nullptr;
+        }
+        auto cast = StaticCast<const TypeCast*>(expression);
+        auto source = cast->GetSourceValue();
+        if (source == nullptr || !source->GetType()->IsInteger() || !value->GetType()->IsInteger() ||
+            source->GetType()->IsUnsignedInteger() != value->GetType()->IsUnsignedInteger() ||
+            ToWidth(*source->GetType()) != ToWidth(*value->GetType())) {
+            return nullptr;
+        }
+        value = source;
+    }
+    return nullptr;
+}
+
+bool HasStoreToEitherLocationBeforeExpression(
+    const Expression* target, Value* lhsLocation, Value* rhsLocation)
+{
+    if (target == nullptr || target->GetParentBlock() == nullptr) {
+        return true;
+    }
+    for (auto expression : target->GetParentBlock()->GetExpressions()) {
+        if (expression == target) {
+            return false;
+        }
+        if (expression->GetExprKind() != ExprKind::STORE) {
+            continue;
+        }
+        auto location = StaticCast<const Store*>(expression)->GetLocation();
+        if (location == lhsLocation || location == rhsLocation) {
+            return true;
+        }
+    }
+    return true;
+}
+
+std::optional<SIntRange> TryComputeLockstepDifferenceRangeImpl(
+    const RangeDomain& state, const BinaryExpression* binaryExpr)
+{
+    if (binaryExpr == nullptr || binaryExpr->GetExprKind() != ExprKind::SUB ||
+        binaryExpr->GetResult() == nullptr || !binaryExpr->GetResult()->GetType()->IsInteger() ||
+        binaryExpr->GetResult()->GetType()->IsUnsignedInteger()) {
+        return std::nullopt;
+    }
+    auto lhsLoad = GetRootIntegerLoad(binaryExpr->GetLHSOperand());
+    auto rhsLoad = GetRootIntegerLoad(binaryExpr->GetRHSOperand());
+    if (lhsLoad == nullptr || rhsLoad == nullptr ||
+        lhsLoad->GetParentBlock() != binaryExpr->GetParentBlock() ||
+        rhsLoad->GetParentBlock() != binaryExpr->GetParentBlock()) {
+        return std::nullopt;
+    }
+    auto lhsLocation = lhsLoad->GetLocation();
+    auto rhsLocation = rhsLoad->GetLocation();
+    if (lhsLocation == nullptr || rhsLocation == nullptr || lhsLocation == rhsLocation ||
+        HasStoreToEitherLocationBeforeExpression(binaryExpr, lhsLocation, rhsLocation)) {
+        return std::nullopt;
+    }
+
+    auto context = FindCountedAccumulatorLoopContext(state, binaryExpr->GetParentBlock());
+    if (!context.has_value()) {
+        return std::nullopt;
+    }
+    auto bodySuccessor = context->branch->GetTrueBlock() == context->exitSuccessor
+        ? context->branch->GetFalseBlock()
+        : context->branch->GetTrueBlock();
+    if (binaryExpr->GetParentBlock() != bodySuccessor) {
+        return std::nullopt;
+    }
+
+    Value* candidateLocation = nullptr;
+    bool candidateOnLhs = false;
+    if (rhsLocation == context->induction.location) {
+        candidateLocation = lhsLocation;
+        candidateOnLhs = true;
+    } else if (lhsLocation == context->induction.location) {
+        candidateLocation = rhsLocation;
+    } else {
+        return std::nullopt;
+    }
+    auto proof = ProveLockstepInductionRelation(context->induction.header,
+        context->induction.location, candidateLocation, context->loopBlocks);
+    if (!proof.has_value()) {
+        return std::nullopt;
+    }
+    auto difference = candidateOnLhs
+        ? std::optional<int64_t>{proof->offset}
+        : NegateSignedStep(proof->offset);
+    if (!difference.has_value() ||
+        !FitsSignedWidth(difference.value(), ToWidth(*binaryExpr->GetResult()->GetType()))) {
+        return std::nullopt;
+    }
+    return BuildSignedExactRange(binaryExpr->GetResult()->GetType(), {difference.value()});
+}
+
 std::optional<SIntRange> BuildSignedValuesRange(Type* type, std::vector<int64_t> values)
 {
     if (type == nullptr || values.empty()) {
@@ -8261,6 +8374,16 @@ std::optional<SIntRange> TryComputeCountedAccumulatorUpdateRangeImpl(
         location = GetLoadLocation(binaryExpr->GetRHSOperand());
     }
     if (location == nullptr) {
+        return std::nullopt;
+    }
+    auto resultUsers = binaryExpr->GetResult()->GetUsers();
+    const bool isStoredBack = std::any_of(resultUsers.begin(),
+        resultUsers.end(), [binaryExpr, location](auto user) {
+            return user->GetExprKind() == ExprKind::STORE &&
+                StaticCast<const Store*>(user)->GetLocation() == location &&
+                StaticCast<const Store*>(user)->GetValue() == binaryExpr->GetResult();
+        });
+    if (!isStoredBack) {
         return std::nullopt;
     }
     auto rootType = GetIntegerRefRootType(location);
@@ -9461,6 +9584,12 @@ std::optional<SIntRange> TryComputeCountedAccumulatorUpdateRange(
     const RangeDomain& state, const BinaryExpression* binaryExpr)
 {
     return TryComputeCountedAccumulatorUpdateRangeImpl(state, binaryExpr);
+}
+
+std::optional<SIntRange> TryComputeLockstepDifferenceRange(
+    const RangeDomain& state, const BinaryExpression* binaryExpr)
+{
+    return TryComputeLockstepDifferenceRangeImpl(state, binaryExpr);
 }
 
 std::optional<SIntRange> TryComputeSimpleInductionLoadExitRange(const RangeDomain& state, const Load* load)
