@@ -4971,6 +4971,10 @@ bool IsLoopBodySuccessor(const Branch* branch, const Block* successor)
 
 bool IsBackedgePredecessor(const Block* header, const Block* pred)
 {
+    if (header != nullptr && pred == header) {
+        const auto successors = header->GetSuccessors();
+        return std::find(successors.begin(), successors.end(), header) != successors.end();
+    }
     auto terminator = header == nullptr ? nullptr : header->GetTerminator();
     if (terminator != nullptr && terminator->GetExprKind() == ExprKind::BRANCH) {
         auto branch = StaticCast<const Branch*>(terminator);
@@ -5564,9 +5568,48 @@ bool IsLoopExitSuccessor(const Branch* branch, const Block* successor)
 }
 
 // 在识别出简单归纳模式时将循环退出状态收窄为精确值。
+bool HasOnlyGuardControlledLoopExit(const Branch* branch, const Block* exitSuccessor)
+{
+    if (branch == nullptr || exitSuccessor == nullptr || !IsLoopExitSuccessor(branch, exitSuccessor)) {
+        return false;
+    }
+    auto header = branch->GetParentBlock();
+    auto loopSuccessor =
+        branch->GetTrueBlock() == exitSuccessor ? branch->GetFalseBlock() : branch->GetTrueBlock();
+    if (header == nullptr || loopSuccessor == nullptr) {
+        return false;
+    }
+
+    constexpr size_t MAX_PROOF_BLOCKS = 4096;
+    std::vector<const Block*> worklist{loopSuccessor};
+    std::unordered_set<const Block*> visited;
+    while (!worklist.empty()) {
+        auto block = worklist.back();
+        worklist.pop_back();
+        if (block == nullptr || block == header || !visited.emplace(block).second) {
+            continue;
+        }
+        if (visited.size() > MAX_PROOF_BLOCKS) {
+            return false;
+        }
+        for (auto successor : block->GetSuccessors()) {
+            if (successor == header) {
+                continue;
+            }
+            std::unordered_set<const Block*> reachesHeader;
+            if (!CanReachBlock(successor, header, reachesHeader)) {
+                return false;
+            }
+            worklist.emplace_back(successor);
+        }
+    }
+    return true;
+}
+
 bool TryNarrowSimpleInductionExit(RangeDomain& state, const Branch* branch, const Block* successor)
 {
-    if (!IsLoopExitSuccessor(branch, successor)) {
+    if (!IsLoopExitSuccessor(branch, successor) ||
+        !HasOnlyGuardControlledLoopExit(branch, successor)) {
         return true;
     }
     auto condition = GetSimpleInductionCondition(branch->GetCondition());
@@ -5609,7 +5652,8 @@ bool TryNarrowSimpleInductionExit(RangeDomain& state, const Branch* branch, cons
 
 bool CanComputeSimpleInductionExitFromState(const RangeDomain& state, const Branch* branch, const Block* successor)
 {
-    if (!IsLoopExitSuccessor(branch, successor)) {
+    if (!IsLoopExitSuccessor(branch, successor) ||
+        !HasOnlyGuardControlledLoopExit(branch, successor)) {
         return false;
     }
     auto condition = GetSimpleInductionCondition(branch->GetCondition());
@@ -8841,7 +8885,8 @@ std::optional<SIntRange> TryComputeSimpleInductionLoadExitRangeImpl(const RangeD
             if (terminator != nullptr && terminator->GetExprKind() == ExprKind::BRANCH) {
                 auto branch = StaticCast<const Branch*>(terminator);
                 for (auto successor : {branch->GetTrueBlock(), branch->GetFalseBlock()}) {
-                    if (!IsLoopExitSuccessor(branch, successor)) {
+                    if (!IsLoopExitSuccessor(branch, successor) ||
+                        !HasOnlyGuardControlledLoopExit(branch, successor)) {
                         continue;
                     }
                     std::unordered_set<const Block*> reachLoad;
