@@ -51,6 +51,49 @@ constexpr size_t MAX_LAMBDA_CONTEXTS_PER_ANALYSIS = 32;
 constexpr size_t MAX_EXACT_INT_SET_SIZE = 64;
 constexpr size_t MAX_BOUNDED_LOOP_OBSERVATIONS = 4096;
 constexpr size_t MAX_RECORDED_CALL_CONTEXTS = 4096;
+constexpr size_t MAX_CONTEXT_OBJECT_IDENTITIES = MAX_TOTAL_CONTEXT_SUMMARIES * 256;
+
+std::unordered_map<const Value*, size_t> contextObjectIdentities;
+std::mutex contextObjectIdentitiesMtx;
+
+size_t GetContextObjectIdentity(const Value* object)
+{
+    if (object == nullptr) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(contextObjectIdentitiesMtx);
+    auto found = contextObjectIdentities.find(object);
+    return found == contextObjectIdentities.end()
+        ? reinterpret_cast<size_t>(object)
+        : found->second;
+}
+
+bool SetContextObjectIdentity(const Value* object, size_t identity)
+{
+    if (object == nullptr || identity == 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(contextObjectIdentitiesMtx);
+    auto found = contextObjectIdentities.find(object);
+    if (found != contextObjectIdentities.end()) {
+        if (found->second != identity) {
+            found->second = 0;
+            return false;
+        }
+        return true;
+    }
+    if (contextObjectIdentities.size() >= MAX_CONTEXT_OBJECT_IDENTITIES) {
+        return false;
+    }
+    contextObjectIdentities.emplace(object, identity);
+    return true;
+}
+
+void ClearContextObjectIdentities()
+{
+    std::lock_guard<std::mutex> lock(contextObjectIdentitiesMtx);
+    contextObjectIdentities.clear();
+}
 
 using BoundedLoopObservationMap = std::unordered_map<const Expression*, std::unique_ptr<ValueRange>>;
 BoundedLoopObservationMap boundedLoopObservations;
@@ -380,7 +423,25 @@ Type* GetRefRootBaseType(Type* type)
     return StaticCast<RefType*>(type)->GetRootBaseType();
 }
 
-bool IsSupportedLambdaContextType(Type* type)
+bool IsSupportedContextRootType(Type* type)
+{
+    return type != nullptr && (type->IsBoolean() || type->IsInteger() || type->IsClass() ||
+        type->IsStruct() || type->IsTuple());
+}
+
+bool IsSupportedLambdaArgumentType(Type* type)
+{
+    if (type == nullptr) {
+        return false;
+    }
+    if (type->IsBoolean() || type->IsInteger()) {
+        return true;
+    }
+    auto baseType = GetRefRootBaseType(type);
+    return IsSupportedContextRootType(baseType);
+}
+
+bool IsSupportedLambdaResultType(Type* type)
 {
     if (type == nullptr) {
         return false;
@@ -395,15 +456,15 @@ bool IsSupportedLambdaContextType(Type* type)
 bool CanAnalyzeLambdaContext(const Lambda* lambda)
 {
     if (lambda == nullptr || lambda->GetBody() == nullptr || lambda->GetReturnValue() == nullptr ||
-        !IsSupportedLambdaContextType(lambda->GetReturnValue()->GetType())) {
+        !IsSupportedLambdaResultType(lambda->GetReturnValue()->GetType())) {
         return false;
     }
     const auto params = lambda->GetParams();
     const auto captures = lambda->GetCapturedVariables();
     return std::all_of(params.begin(), params.end(), [](Value* param) {
-        return param != nullptr && IsSupportedLambdaContextType(param->GetType());
+        return param != nullptr && IsSupportedLambdaArgumentType(param->GetType());
     }) && std::all_of(captures.begin(), captures.end(), [](Value* captured) {
-        return captured != nullptr && IsSupportedLambdaContextType(captured->GetType());
+        return captured != nullptr && IsSupportedLambdaArgumentType(captured->GetType());
     });
 }
 
@@ -450,6 +511,8 @@ struct RangeAnalysis::ContextAbstractValue {
     std::optional<std::vector<SInt>> exactSIntValues;
     ClassType* classValue{nullptr};
     std::vector<ContextAbstractValue> objectFields;
+    size_t aliasGroup{0};
+    size_t objectIdentity{0};
 
     ContextAbstractValue() = default;
 
@@ -467,14 +530,15 @@ struct RangeAnalysis::ContextAbstractValue {
     {
     }
 
-    ContextAbstractValue(ClassType* value, std::vector<ContextAbstractValue> fields)
-        : kind(Kind::OBJECT), classValue(value), objectFields(std::move(fields))
+    ContextAbstractValue(ClassType* value, std::vector<ContextAbstractValue> fields, size_t identity)
+        : kind(Kind::OBJECT), classValue(value), objectFields(std::move(fields)), objectIdentity(identity)
     {
     }
 
     ContextAbstractValue(const ContextAbstractValue& other)
         : kind(other.kind), boolValue(other.boolValue), exactSIntValues(other.exactSIntValues),
-          classValue(other.classValue), objectFields(other.objectFields)
+          classValue(other.classValue), objectFields(other.objectFields), aliasGroup(other.aliasGroup),
+          objectIdentity(other.objectIdentity)
     {
         if (other.sintValue) {
             sintValue = std::make_unique<SIntDomain>(*other.sintValue);
@@ -494,6 +558,8 @@ struct RangeAnalysis::ContextAbstractValue {
         exactSIntValues = other.exactSIntValues;
         classValue = other.classValue;
         objectFields = other.objectFields;
+        aliasGroup = other.aliasGroup;
+        objectIdentity = other.objectIdentity;
         return *this;
     }
 
@@ -524,6 +590,9 @@ struct RangeAnalysis::ContextAbstractValue {
     std::string ToKeyString(Type* type) const
     {
         std::stringstream ss;
+        if (aliasGroup != 0) {
+            ss << "alias:" << aliasGroup << ':';
+        }
         if (IsTop()) {
             ss << "top:" << (type == nullptr ? "<null>" : type->ToString());
             return ss.str();
@@ -551,7 +620,7 @@ struct RangeAnalysis::ContextAbstractValue {
             return ss.str();
         }
         if (kind == Kind::OBJECT) {
-            ss << "object:" << static_cast<const void*>(classValue) << '{';
+            ss << "object:" << static_cast<const void*>(classValue) << ":id:" << objectIdentity << '{';
             for (size_t i = 0; i < objectFields.size(); ++i) {
                 if (i != 0) {
                     ss << ',';
@@ -767,6 +836,7 @@ void RangeAnalysis::ClearContextSensitiveResults()
         std::lock_guard<std::mutex> lock(GetBoundedLoopExitCacheMutex());
         GetBoundedLoopExitCaches().clear();
     }
+    ClearContextObjectIdentities();
 }
 
 RangeAnalysis::ContextAbstractValue RangeAnalysis::CaptureContextValue(
@@ -782,18 +852,71 @@ RangeAnalysis::ContextAbstractValue RangeAnalysis::CaptureContextValue(
         type = StaticCast<RefType*>(type)->GetRootBaseType();
         auto object = state.CheckAbstractObjectRefBy(value);
         if (type != nullptr && (type->IsClass() || type->IsStruct() || type->IsTuple())) {
-            constexpr size_t MAX_CONTEXT_OBJECT_FIELDS = 64;
+            auto aggregate = CaptureContextValue(state, object, type, preserveIntervals);
+            if (aggregate.kind == ContextAbstractValue::Kind::OBJECT) {
+                aggregate.classValue = exactClass;
+            }
+            return aggregate;
+        }
+        auto scalar = CaptureContextValue(state, object, type, preserveIntervals);
+        return scalar.IsTop() && exactClass != nullptr ? ContextAbstractValue{exactClass} : scalar;
+    }
+    if (exactClass != nullptr) {
+        return ContextAbstractValue{exactClass};
+    }
+    return CaptureContextValue(state, value, type, preserveIntervals);
+}
+
+RangeAnalysis::ContextAbstractValue RangeAnalysis::CaptureContextValue(
+    const RangeDomain& state, Value* value, Type* type, bool preserveIntervals)
+{
+    if (value == nullptr || type == nullptr) {
+        return ContextAbstractValue{};
+    }
+    if (type->IsClass() || type->IsStruct() || type->IsTuple()) {
+        constexpr size_t MAX_CONTEXT_OBJECT_DEPTH = 4;
+        constexpr size_t MAX_CONTEXT_OBJECT_NODES = 128;
+        constexpr size_t MAX_CONTEXT_OBJECT_FIELDS = 64;
+        size_t remainingNodes = MAX_CONTEXT_OBJECT_NODES;
+        std::unordered_set<Value*> visitedObjects;
+        std::function<ContextAbstractValue(Value*, size_t)> captureObject =
+            [&](Value* object, size_t depth) -> ContextAbstractValue {
+            if (object == nullptr || depth >= MAX_CONTEXT_OBJECT_DEPTH || remainingNodes == 0 ||
+                !visitedObjects.emplace(object).second) {
+                return ContextAbstractValue{};
+            }
+            auto objectIdentity = GetContextObjectIdentity(object);
+            if (objectIdentity == 0) {
+                return ContextAbstractValue{};
+            }
             std::vector<ContextAbstractValue> fields;
             auto children = const_cast<RangeDomain&>(state).GetChildren(object);
             auto trackedFields = std::min(children.size(), MAX_CONTEXT_OBJECT_FIELDS);
             fields.reserve(trackedFields);
             for (size_t i = 0; i < trackedFields; ++i) {
-                auto domain = state.CheckAbstractValueWithTopBottom(children[i]);
-                if (domain == nullptr || domain->IsTop() || domain->CheckAbsVal() == nullptr) {
+                if (remainingNodes == 0) {
                     fields.emplace_back();
                     continue;
                 }
+                --remainingNodes;
+                auto child = children[i];
+                auto domain = state.CheckAbstractValueWithTopBottom(child);
+                if (domain == nullptr || domain->IsTop()) {
+                    fields.emplace_back();
+                    continue;
+                }
+                if (domain->GetKind() == RangeValueDomain::ValueKind::REF) {
+                    fields.emplace_back(captureObject(state.CheckAbstractObjectRefBy(child), depth + 1));
+                    continue;
+                }
                 auto absVal = domain->CheckAbsVal();
+                if (absVal == nullptr) {
+                    auto nestedChildren = const_cast<RangeDomain&>(state).GetChildren(child);
+                    fields.emplace_back(nestedChildren.empty()
+                            ? ContextAbstractValue{}
+                            : captureObject(child, depth + 1));
+                    continue;
+                }
                 if (absVal->GetRangeKind() == ValueRange::RangeKind::BOOL) {
                     auto boolDomain = StaticCast<const BoolRange*>(absVal)->GetVal();
                     fields.emplace_back(boolDomain.IsNonTrivial() &&
@@ -814,22 +937,9 @@ RangeAnalysis::ContextAbstractValue RangeAnalysis::CaptureContextValue(
                 }
                 fields.emplace_back();
             }
-            return ContextAbstractValue{exactClass, std::move(fields)};
-        }
-        auto scalar = CaptureContextValue(state, object, type, preserveIntervals);
-        return scalar.IsTop() && exactClass != nullptr ? ContextAbstractValue{exactClass} : scalar;
-    }
-    if (exactClass != nullptr) {
-        return ContextAbstractValue{exactClass};
-    }
-    return CaptureContextValue(state, value, type, preserveIntervals);
-}
-
-RangeAnalysis::ContextAbstractValue RangeAnalysis::CaptureContextValue(
-    const RangeDomain& state, Value* value, Type* type, bool preserveIntervals)
-{
-    if (value == nullptr || type == nullptr) {
-        return ContextAbstractValue{};
+            return ContextAbstractValue{nullptr, std::move(fields), objectIdentity};
+        };
+        return captureObject(value, 0);
     }
     auto domain = state.CheckAbstractValueWithTopBottom(value);
     if (domain == nullptr || domain->IsTop()) {
@@ -883,6 +993,7 @@ RangeAnalysis::ContextAbstractValue RangeAnalysis::JoinContextValues(
         return lhs.classValue == rhs.classValue ? ContextAbstractValue{lhs.classValue} : ContextAbstractValue{};
     }
     if (lhs.kind == ContextAbstractValue::Kind::OBJECT &&
+        lhs.objectIdentity != 0 && lhs.objectIdentity == rhs.objectIdentity &&
         lhs.objectFields.size() == rhs.objectFields.size()) {
         std::vector<ContextAbstractValue> fields;
         fields.reserve(lhs.objectFields.size());
@@ -890,7 +1001,7 @@ RangeAnalysis::ContextAbstractValue RangeAnalysis::JoinContextValues(
             fields.emplace_back(JoinContextValues(lhs.objectFields[i], rhs.objectFields[i]));
         }
         auto exactClass = lhs.classValue == rhs.classValue ? lhs.classValue : nullptr;
-        return ContextAbstractValue{exactClass, std::move(fields)};
+        return ContextAbstractValue{exactClass, std::move(fields), lhs.objectIdentity};
     }
     return ContextAbstractValue{};
 }
@@ -999,6 +1110,28 @@ void RangeAnalysis::ApplyContextValue(RangeDomain& state, Value* dest, Type* typ
     if (dest == nullptr || value.IsTop()) {
         return;
     }
+    if (type != nullptr && type->IsRef()) {
+        auto baseType = StaticCast<RefType*>(type)->GetRootBaseType();
+        auto object = state.CheckAbstractObjectRefBy(dest);
+        if (baseType == nullptr) {
+            return;
+        }
+        if (value.kind == ContextAbstractValue::Kind::OBJECT && value.objectIdentity != 0 &&
+            (object == nullptr || GetContextObjectIdentity(object) != value.objectIdentity)) {
+            object = state.GetReferencedObjAndSetToTop(dest);
+        }
+        if (object == nullptr) {
+            object = state.GetReferencedObjAndSetToTop(dest);
+        }
+        if (value.kind == ContextAbstractValue::Kind::OBJECT &&
+            !SetContextObjectIdentity(object, value.objectIdentity)) {
+            state.Update(object, /* isTop = */ true);
+            state.ForgetChildren(object);
+            return;
+        }
+        ApplyContextValue(state, object, baseType, value);
+        return;
+    }
     if ((type == nullptr || type->IsBoolean()) && value.kind == ContextAbstractValue::Kind::BOOL &&
         value.boolValue.has_value()) {
         state.Update(dest, std::make_unique<BoolRange>(*value.boolValue));
@@ -1010,11 +1143,36 @@ void RangeAnalysis::ApplyContextValue(RangeDomain& state, Value* dest, Type* typ
     }
     if (type != nullptr && value.kind == ContextAbstractValue::Kind::OBJECT &&
         (type->IsClass() || type->IsStruct() || type->IsTuple())) {
+        if (!SetContextObjectIdentity(dest, value.objectIdentity)) {
+            state.Update(dest, /* isTop = */ true);
+            state.ForgetChildren(dest);
+            return;
+        }
+        std::vector<Type*> memberTypes;
+        if (type->IsClass() || type->IsStruct()) {
+            memberTypes = StaticCast<CustomType*>(type)->GetInstantiatedMemberTys(builder);
+        } else {
+            memberTypes = StaticCast<TupleType*>(type)->GetElementTypes();
+        }
+        auto oldChildren = state.GetChildren(dest);
+        std::vector<AbstractObject*> referencedObjects(oldChildren.size(), nullptr);
+        for (size_t i = 0; i < oldChildren.size() && i < memberTypes.size(); ++i) {
+            if (memberTypes[i] != nullptr && memberTypes[i]->IsRef()) {
+                referencedObjects[i] = state.CheckAbstractObjectRefBy(oldChildren[i]);
+            }
+        }
         ResetObjectChildrenToTop(state, dest, type);
         auto children = state.GetChildren(dest);
         auto count = std::min(children.size(), value.objectFields.size());
         for (size_t i = 0; i < count; ++i) {
-            ApplyContextValue(state, children[i], nullptr, value.objectFields[i]);
+            auto memberType = i < memberTypes.size() ? memberTypes[i] : nullptr;
+            if (memberType != nullptr && memberType->IsRef() && i < referencedObjects.size() &&
+                referencedObjects[i] != nullptr &&
+                value.objectFields[i].kind == ContextAbstractValue::Kind::OBJECT &&
+                GetContextObjectIdentity(referencedObjects[i]) == value.objectFields[i].objectIdentity) {
+                state.SetRefToObject(children[i], referencedObjects[i]);
+            }
+            ApplyContextValue(state, children[i], memberType, value.objectFields[i]);
         }
     }
 }
@@ -1131,6 +1289,27 @@ void RangeAnalysis::HandleContextSensitiveCall(RangeDomain& state, const Express
         }
         contextArgs.emplace_back(std::move(contextValue));
     }
+    std::unordered_map<AbstractObject*, size_t> firstRefArgument;
+    size_t nextAliasGroup = 1;
+    for (size_t i = 0; i < args.size(); ++i) {
+        auto arg = args[i];
+        if (arg == nullptr || arg->GetType() == nullptr || !arg->GetType()->IsRef()) {
+            continue;
+        }
+        auto object = state.CheckAbstractObjectRefBy(arg);
+        if (object == nullptr) {
+            continue;
+        }
+        auto [found, inserted] = firstRefArgument.emplace(object, i);
+        if (inserted) {
+            continue;
+        }
+        auto& firstValue = contextArgs[found->second];
+        if (firstValue.aliasGroup == 0) {
+            firstValue.aliasGroup = nextAliasGroup++;
+        }
+        contextArgs[i].aliasGroup = firstValue.aliasGroup;
+    }
 
     auto trackedGlobals = CollectTrackedMutableGlobals(callee, builder.GetCurPackage());
     if (!trackedGlobals.complete) {
@@ -1141,9 +1320,8 @@ void RangeAnalysis::HandleContextSensitiveCall(RangeDomain& state, const Express
     for (auto global : trackedGlobals) {
         auto baseType = GetTrackedMutableGlobalBaseType(global);
         CJC_ASSERT(baseType != nullptr);
-        auto object = EnsureMutableGlobalValueInitialized(state, global);
-        contextGlobals.emplace_back(
-            global, CaptureContextValue(state, object, baseType, /* preserveIntervals = */ true));
+        EnsureMutableGlobalValueInitialized(state, global);
+        contextGlobals.emplace_back(global, CaptureContextValue(state, global, /* preserveIntervals = */ true));
     }
     auto childContext = BuildContextKey(callee, contextArgs, contextGlobals);
     auto parentContext = isContextAnalysis
@@ -1183,7 +1361,7 @@ void RangeAnalysis::HandleContextSensitiveCall(RangeDomain& state, const Express
             state.Update(object, /* isTop = */ true);
             continue;
         }
-        ApplyContextValue(state, object, baseType, summaryIt->second);
+        ApplyContextValue(state, global, summaryIt->second);
     }
     if (summary.has_value()) {
         ApplyContextValue(state, result, summary.value());
@@ -1236,17 +1414,10 @@ std::string RangeAnalysis::BuildLambdaContextKey(
 void RangeAnalysis::ApplyLambdaContextSummary(RangeDomain& state, const LambdaContextualSummary& summary,
     const std::vector<Value*>& args, Value* result) const
 {
-    if (result != nullptr) {
-        if (summary.returnValue.has_value() && !summary.returnValue->IsTop()) {
-            ApplyContextValue(state, result, summary.returnValue.value());
-        } else {
-            state.SetToTopOrTopRef(result, result->GetType()->IsRef());
-        }
-    }
     for (size_t i = 0; i < args.size(); ++i) {
         auto arg = args[i];
         auto baseType = arg == nullptr ? nullptr : GetRefRootBaseType(arg->GetType());
-        if (baseType == nullptr || (!baseType->IsBoolean() && !baseType->IsInteger())) {
+        if (!IsSupportedContextRootType(baseType)) {
             continue;
         }
         auto object = state.CheckAbstractObjectRefBy(arg);
@@ -1266,7 +1437,7 @@ void RangeAnalysis::ApplyLambdaContextSummary(RangeDomain& state, const LambdaCo
             }
             continue;
         }
-        ApplyContextValue(state, object, baseType, value);
+        ApplyContextValue(state, captured, value);
     }
     for (const auto& [global, value] : summary.globalValues) {
         auto baseType = GetTrackedMutableGlobalBaseType(global);
@@ -1275,7 +1446,14 @@ void RangeAnalysis::ApplyLambdaContextSummary(RangeDomain& state, const LambdaCo
             state.Update(object, /* isTop = */ true);
             continue;
         }
-        ApplyContextValue(state, object, baseType, value);
+        ApplyContextValue(state, global, value);
+    }
+    if (result != nullptr) {
+        if (summary.returnValue.has_value() && !summary.returnValue->IsTop()) {
+            ApplyContextValue(state, result, summary.returnValue.value());
+        } else {
+            state.SetToTopOrTopRef(result, result->GetType()->IsRef());
+        }
     }
 }
 
@@ -1325,6 +1503,7 @@ bool RangeAnalysis::AnalyzeLambdaWithContext(const Lambda* lambda, const std::ve
 
     auto lambdaState = callerState;
     auto params = lambda->GetParams();
+    std::vector<AbstractObject*> parameterObjects(params.size(), nullptr);
     for (size_t i = 0; i < params.size(); ++i) {
         auto param = params[i];
         auto argument = args[i];
@@ -1334,10 +1513,11 @@ bool RangeAnalysis::AnalyzeLambdaWithContext(const Lambda* lambda, const std::ve
         if (param->GetType()->IsRef()) {
             auto object = lambdaState.CheckAbstractObjectRefBy(argument);
             if (object == nullptr) {
-                lambdaState.GetReferencedObjAndSetToTop(param);
+                object = lambdaState.GetReferencedObjAndSetToTop(param);
             } else {
                 lambdaState.SetRefToObject(param, object);
             }
+            parameterObjects[i] = object;
             continue;
         }
         if (lambdaState.CheckAbstractValueWithTopBottom(argument) == nullptr) {
@@ -1429,16 +1609,15 @@ bool RangeAnalysis::AnalyzeLambdaWithContext(const Lambda* lambda, const std::ve
     summary.refArgValues.resize(params.size());
     for (size_t i = 0; i < params.size(); ++i) {
         auto baseType = GetRefRootBaseType(params[i]->GetType());
-        if (baseType == nullptr || (!baseType->IsBoolean() && !baseType->IsInteger())) {
+        if (!IsSupportedContextRootType(baseType)) {
             continue;
         }
-        auto object = joinedExitState->CheckAbstractObjectRefBy(params[i]);
         summary.refArgValues[i] = CaptureContextValue(
-            joinedExitState.value(), object, baseType, /* preserveIntervals = */ true);
+            joinedExitState.value(), parameterObjects[i], baseType, /* preserveIntervals = */ true);
     }
     for (auto captured : lambda->GetCapturedVariables()) {
         auto baseType = captured == nullptr ? nullptr : GetRefRootBaseType(captured->GetType());
-        if (baseType == nullptr || (!baseType->IsBoolean() && !baseType->IsInteger())) {
+        if (!IsSupportedContextRootType(baseType)) {
             continue;
         }
         auto object = joinedExitState->CheckAbstractObjectRefBy(captured);
@@ -1695,9 +1874,7 @@ RangeAnalysis::ContextGlobalValues RangeAnalysis::SummarizeGlobalValues(
                     continue;
                 }
                 auto global = globals[i].first;
-                auto baseType = GetTrackedMutableGlobalBaseType(global);
-                auto object = state.CheckAbstractObjectRefBy(global);
-                auto value = CaptureContextValue(state, object, baseType, /* preserveIntervals = */ true);
+                auto value = CaptureContextValue(state, global, /* preserveIntervals = */ true);
                 if (value.IsTop()) {
                     becameTop[i] = true;
                     joinedValues[i].second = ContextAbstractValue{};
@@ -1869,20 +2046,95 @@ RangeAnalysis::~RangeAnalysis()
     }
 }
 
+void RangeAnalysis::SeedMutableGlobalInitializers(RangeDomain& state)
+{
+    auto package = builder.GetCurPackage();
+    if (isContextAnalysis || func == nullptr || func->IsGVInit() || package == nullptr) {
+        return;
+    }
+
+    size_t analyzedInitializers = 0;
+    for (auto global : package->GetGlobalVars()) {
+        auto baseType = GetTrackedMutableGlobalBaseType(global);
+        if (baseType == nullptr) {
+            continue;
+        }
+        auto targetObject = EnsureMutableGlobalValueInitialized(state, global);
+        auto init = global->GetInitFunc();
+        if (init == nullptr || init->GetBody() == nullptr) {
+            continue;
+        }
+        if (analyzedInitializers >= MAX_CONTEXT_GLOBALS) {
+            state.Update(targetObject, /* isTop = */ true);
+            continue;
+        }
+        ++analyzedInitializers;
+
+        auto trackedGlobals = CollectTrackedMutableGlobals(init, package);
+        if (!trackedGlobals.complete) {
+            state.Update(targetObject, /* isTop = */ true);
+            continue;
+        }
+        if (std::find(trackedGlobals.begin(), trackedGlobals.end(), global) == trackedGlobals.end()) {
+            if (trackedGlobals.values.size() >= MAX_CONTEXT_GLOBALS) {
+                state.Update(targetObject, /* isTop = */ true);
+                continue;
+            }
+            trackedGlobals.values.emplace_back(global);
+            std::sort(trackedGlobals.values.begin(), trackedGlobals.values.end());
+        }
+
+        ContextGlobalValues inputGlobals;
+        inputGlobals.reserve(trackedGlobals.size());
+        for (auto trackedGlobal : trackedGlobals) {
+            EnsureMutableGlobalValueInitialized(state, trackedGlobal);
+            inputGlobals.emplace_back(
+                trackedGlobal, CaptureContextValue(state, trackedGlobal, /* preserveIntervals = */ true));
+        }
+
+        std::vector<std::optional<ContextAbstractValue>> refArgValues;
+        auto summarizedGlobals = inputGlobals;
+        (void)AnalyzeCalleeWithContext(init, {}, refArgValues, summarizedGlobals);
+        for (const auto& [summarizedGlobal, value] : summarizedGlobals) {
+            auto summarizedType = GetTrackedMutableGlobalBaseType(summarizedGlobal);
+            auto object = EnsureMutableGlobalValueInitialized(state, summarizedGlobal);
+            if (summarizedType == nullptr || value.IsTop()) {
+                state.Update(object, /* isTop = */ true);
+                continue;
+            }
+            ApplyContextValue(state, summarizedGlobal, value);
+        }
+    }
+}
+
 void RangeAnalysis::InitializeFuncEntryState(RangeDomain& state)
 {
     ValueAnalysis<RangeValueDomain>::InitializeFuncEntryState(state);
     for (auto global : CollectTrackedMutableGlobals(func, builder.GetCurPackage())) {
         EnsureMutableGlobalValueInitialized(state, global);
     }
+    SeedMutableGlobalInitializers(state);
     auto params = func->GetParams();
     auto limit = std::min(params.size(), contextArguments.size());
+    std::unordered_map<size_t, AbstractObject*> aliasedParameterObjects;
     for (size_t i = 0; i < limit; ++i) {
         auto param = params[i];
         auto type = param->GetType();
         if (type != nullptr && type->IsRef()) {
             auto baseType = GetRefRootBaseType(type);
             auto object = state.CheckAbstractObjectRefBy(param);
+            auto aliasGroup = contextArguments[i].aliasGroup;
+            if (aliasGroup != 0) {
+                auto found = aliasedParameterObjects.find(aliasGroup);
+                if (found == aliasedParameterObjects.end()) {
+                    if (object != nullptr) {
+                        aliasedParameterObjects.emplace(aliasGroup, object);
+                    }
+                } else {
+                    state.SetRefToObject(param, found->second);
+                    object = found->second;
+                }
+            }
             if (object != nullptr && baseType != nullptr && (baseType->IsBoolean() || baseType->IsInteger() ||
                 baseType->IsClass() || baseType->IsStruct() || baseType->IsTuple())) {
                 ApplyContextValue(state, object, baseType, contextArguments[i]);
@@ -1898,7 +2150,7 @@ void RangeAnalysis::InitializeFuncEntryState(RangeDomain& state)
             state.Update(object, /* isTop = */ true);
             continue;
         }
-        ApplyContextValue(state, object, baseType, value);
+        ApplyContextValue(state, global, value);
     }
 }
 
@@ -2904,8 +3156,11 @@ Type* GetTrackedMutableGlobalBaseType(Value* location)
     if (global->TestAttr(Attribute::READONLY) || global->GetType() == nullptr || !global->GetType()->IsRef()) {
         return nullptr;
     }
-    auto baseType = StaticCast<RefType*>(global->GetType())->GetBaseType();
-    return baseType->IsBoolean() || baseType->IsInteger() ? baseType : nullptr;
+    auto baseType = GetRefRootBaseType(global->GetType());
+    return baseType != nullptr && (baseType->IsBoolean() || baseType->IsInteger() || baseType->IsClass() ||
+        baseType->IsStruct() || baseType->IsTuple())
+        ? baseType
+        : nullptr;
 }
 
 AbstractObject* EnsureMutableGlobalValueInitialized(RangeDomain& state, GlobalVar* global)
@@ -3052,12 +3307,11 @@ void RangeAnalysis::HandleNormalExpressionEffect(RangeDomain& state, const Expre
                 auto baseType = GetTrackedMutableGlobalBaseType(global);
                 if (global != nullptr && baseType != nullptr) {
                     auto object = EnsureMutableGlobalValueInitialized(state, global);
-                    auto value = CaptureContextValue(
-                        state, store->GetValue(), baseType, /* preserveIntervals = */ true);
+                    auto value = CaptureContextValue(state, store->GetValue(), /* preserveIntervals = */ true);
                     if (value.IsTop()) {
                         state.Update(object, /* isTop = */ true);
                     } else {
-                        ApplyContextValue(state, object, baseType, value);
+                        ApplyContextValue(state, global, value);
                     }
                 }
                 return;
@@ -3068,9 +3322,12 @@ void RangeAnalysis::HandleNormalExpressionEffect(RangeDomain& state, const Expre
                 auto baseType = GetTrackedMutableGlobalBaseType(global);
                 if (global != nullptr && baseType != nullptr) {
                     auto object = EnsureMutableGlobalValueInitialized(state, global);
-                    auto value = CaptureContextValue(state, object, baseType, /* preserveIntervals = */ true);
+                    auto value = CaptureContextValue(state, global, /* preserveIntervals = */ true);
                     if (value.IsTop()) {
-                        state.SetToTopOrTopRef(load->GetResult(), /* isRef = */ false);
+                        state.SetToTopOrTopRef(load->GetResult(), load->GetResult()->GetType()->IsRef());
+                    } else if (load->GetResult()->GetType()->IsRef() &&
+                        (baseType->IsClass() || baseType->IsStruct() || baseType->IsTuple())) {
+                        state.SetRefToObject(load->GetResult(), object);
                     } else {
                         ApplyContextValue(state, load->GetResult(), baseType, value);
                     }
@@ -3845,16 +4102,16 @@ void ForgetReferenceArgument(RangeDomain& state, Value* arg)
     }
 
     auto baseType = GetRefRootBaseType(arg->GetType());
-    if (baseType == nullptr || (!baseType->IsBoolean() && !baseType->IsInteger())) {
-        state.ClearState();
-        return;
-    }
     auto object = state.CheckAbstractObjectRefBy(arg);
     if (object == nullptr || object->IsTopObjInstance()) {
         state.ClearState();
         return;
     }
-    state.Update(object, /* isTop = */ true);
+    if (baseType == nullptr) {
+        state.ClearState();
+        return;
+    }
+    state.ForgetValueAndChildren(arg);
 }
 
 std::optional<StructArrayLiteralInfo> LookupStructArrayLiteralInfo(Value* arrayValue)
@@ -4272,6 +4529,22 @@ Function* ResolveExactInvokeTarget(const Invoke* invoke, ClassType* exactClass, 
     }
     auto target = methods[offset].GetVirtualMethod();
     return target != nullptr && target->IsFuncWithBody() && !target->IsPureAbstract() ? target : nullptr;
+}
+
+void RangeAnalysis::PreHandleFieldExpr(RangeDomain& state, const Field* field)
+{
+    if (field != nullptr && field->GetBase() != nullptr && field->GetPath().size() == 1) {
+        auto object = state.CheckAbstractObjectRefBy(field->GetBase());
+        if (object != nullptr) {
+            auto children = state.GetChildren(object);
+            auto index = static_cast<size_t>(field->GetPath().front());
+            if (index < children.size()) {
+                state.Propagate(children[index], field->GetResult());
+                return;
+            }
+        }
+    }
+    ValueAnalysis<RangeValueDomain>::PreHandleFieldExpr(state, field);
 }
 
 void RangeAnalysis::HandleOthersExpr(RangeDomain& state, const Expression* expression)
@@ -4827,12 +5100,19 @@ bool HasLowerBoundRelation(RelationalOperation rel)
 // 从定义常量中读取有符号整数值。
 std::optional<int64_t> GetSignedConstantFromDefiningConstant(Value* value)
 {
-    if (value == nullptr || !value->GetType()->IsInteger() || value->GetType()->IsUnsignedInteger()) {
+    if (value == nullptr || !value->GetType()->IsInteger()) {
         return std::nullopt;
     }
     auto constant = GetSingleIntFromDefiningConstant(value);
     if (!constant.has_value()) {
         return std::nullopt;
+    }
+    if (value->GetType()->IsUnsignedInteger()) {
+        auto unsignedValue = constant->UVal();
+        if (unsignedValue > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+            return std::nullopt;
+        }
+        return static_cast<int64_t>(unsignedValue);
     }
     return constant->SVal();
 }
@@ -5092,6 +5372,19 @@ bool FitsSignedWidth(__int128 value, IntWidth width)
 {
     auto [min, max] = SignedLimits(width);
     return value >= static_cast<__int128>(min) && value <= static_cast<__int128>(max);
+}
+
+bool FitsModeledIntegerWidth(__int128 value, Type* type)
+{
+    if (type == nullptr || !type->IsInteger()) {
+        return false;
+    }
+    if (!type->IsUnsignedInteger()) {
+        return FitsSignedWidth(value, ToWidth(*type));
+    }
+    auto bits = static_cast<unsigned>(ToWidth(*type));
+    auto max = (static_cast<__int128>(1) << bits) - 1;
+    return value >= 0 && value <= max;
 }
 
 // 计算正数归纳变量推导中使用的向上整除。
@@ -5821,18 +6114,30 @@ std::optional<int64_t> FindIncomingSignedStoreConstantBeforeLoop(
 
 std::optional<int64_t> GetSingleSignedValueFromState(const RangeDomain& state, Value* value)
 {
-    if (value == nullptr || !value->GetType()->IsInteger() || value->GetType()->IsUnsignedInteger()) {
+    if (value == nullptr || !value->GetType()->IsInteger()) {
         return std::nullopt;
     }
     if (auto range = GetSIntRangeFromState(state, value);
         range != nullptr && range->GetExactValues().has_value() && range->GetExactValues()->size() == 1) {
-        return range->GetExactValues()->front().SVal();
+        auto exact = range->GetExactValues()->front();
+        if (value->GetType()->IsUnsignedInteger()) {
+            return exact.UVal() <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max())
+                ? std::optional<int64_t>{static_cast<int64_t>(exact.UVal())}
+                : std::nullopt;
+        }
+        return exact.SVal();
     }
     const auto& domain = RangeAnalysis::GetSIntDomainFromState(state, value);
     if (!domain.IsSingleValue()) {
         return std::nullopt;
     }
-    return domain.NumericBound().GetSingleElement().SVal();
+    auto exact = domain.NumericBound().GetSingleElement();
+    if (value->GetType()->IsUnsignedInteger()) {
+        return exact.UVal() <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max())
+            ? std::optional<int64_t>{static_cast<int64_t>(exact.UVal())}
+            : std::nullopt;
+    }
+    return exact.SVal();
 }
 
 LocalStoreLookupResult FindLatestSignedStoreValueAvoidingBlocks(const RangeDomain& state, const Block* block,
@@ -5899,8 +6204,9 @@ std::optional<VariableBoundInductionExit> TryBuildVariableBoundInductionCandidat
     auto location = GetLoadLocation(inductionValue);
     auto loadExpr = GetDefiningExpr(inductionValue);
     if (location == nullptr || loadExpr == nullptr || loadExpr->GetParentBlock() == nullptr ||
-        !inductionValue->GetType()->IsInteger() || inductionValue->GetType()->IsUnsignedInteger() ||
-        boundValue == nullptr || !boundValue->GetType()->IsInteger() || boundValue->GetType()->IsUnsignedInteger()) {
+        !inductionValue->GetType()->IsInteger() || boundValue == nullptr ||
+        !boundValue->GetType()->IsInteger() ||
+        inductionValue->GetType()->IsUnsignedInteger() != boundValue->GetType()->IsUnsignedInteger()) {
         return std::nullopt;
     }
     auto header = loadExpr->GetParentBlock();
@@ -6170,7 +6476,7 @@ std::vector<CountedAccumulatorUpdate> CollectLinearCountedAccumulatorUpdates(
                 continue;
             }
             auto rootType = GetIntegerRefRootType(location);
-            if (rootType == nullptr || rootType->IsUnsignedInteger()) {
+            if (rootType == nullptr) {
                 continue;
             }
             if (!IsProvenSingleExecutionPerLoopIteration(
@@ -6213,15 +6519,27 @@ std::vector<CountedAccumulatorUpdate> CollectLinearCountedAccumulatorUpdates(
 
 std::optional<std::vector<int64_t>> EnumerateSmallSignedValues(const SIntDomain& domain)
 {
-    if (domain.IsUnsigned() || domain.IsTop() || domain.IsBottom() || !domain.SymbolicBounds().Empty()) {
+    if (domain.IsTop() || domain.IsBottom() || !domain.SymbolicBounds().Empty()) {
         return std::nullopt;
     }
     const auto& numeric = domain.NumericBound();
     if (numeric.IsFullSet() || numeric.IsEmptySet() || numeric.IsWrappedSet() || numeric.IsSignWrappedSet()) {
         return std::nullopt;
     }
-    auto min = numeric.SMinValue().SVal();
-    auto max = numeric.SMaxValue().SVal();
+    int64_t min = 0;
+    int64_t max = 0;
+    if (domain.IsUnsigned()) {
+        auto unsignedMin = numeric.UMinValue().UVal();
+        auto unsignedMax = numeric.UMaxValue().UVal();
+        if (unsignedMax > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+            return std::nullopt;
+        }
+        min = static_cast<int64_t>(unsignedMin);
+        max = static_cast<int64_t>(unsignedMax);
+    } else {
+        min = numeric.SMinValue().SVal();
+        max = numeric.SMaxValue().SVal();
+    }
     if (max < min) {
         return std::nullopt;
     }
@@ -6247,7 +6565,7 @@ std::optional<std::vector<int64_t>> GetSmallSignedValuesFromState(
         return std::nullopt;
     }
     auto type = explicitType != nullptr ? explicitType : value->GetType();
-    if (type == nullptr || !type->IsInteger() || type->IsUnsignedInteger()) {
+    if (type == nullptr || !type->IsInteger()) {
         return std::nullopt;
     }
     if (auto range = GetSIntRangeFromState(state, value, type);
@@ -6255,7 +6573,14 @@ std::optional<std::vector<int64_t>> GetSmallSignedValuesFromState(
         std::vector<int64_t> values;
         values.reserve(range->GetExactValues()->size());
         for (const auto& exactValue : *range->GetExactValues()) {
-            values.emplace_back(exactValue.SVal());
+            if (type->IsUnsignedInteger()) {
+                if (exactValue.UVal() > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+                    return std::nullopt;
+                }
+                values.emplace_back(static_cast<int64_t>(exactValue.UVal()));
+            } else {
+                values.emplace_back(exactValue.SVal());
+            }
         }
         return values;
     }
@@ -6296,7 +6621,7 @@ std::vector<AffineAccumulatorUpdate> CollectAffineCountedAccumulatorUpdates(
                 continue;
             }
             auto rootType = GetIntegerRefRootType(location);
-            if (rootType == nullptr || rootType->IsUnsignedInteger()) {
+            if (rootType == nullptr) {
                 continue;
             }
             if (!IsProvenSingleExecutionPerLoopIteration(
@@ -6861,17 +7186,18 @@ std::optional<AccumulatorDeltaInterval> GetAccumulatorDeltaIntervalFromLocation(
 
 std::optional<SIntRange> BuildSignedIntervalRange(Type* type, SignedInterval interval)
 {
-    if (type == nullptr || !type->IsInteger() || type->IsUnsignedInteger()) {
+    if (type == nullptr || !type->IsInteger()) {
         return std::nullopt;
     }
     auto width = ToWidth(*type);
-    if (!FitsSignedWidth(interval.min, width) || !FitsSignedWidth(interval.max, width)) {
+    if (!FitsModeledIntegerWidth(interval.min, type) || !FitsModeledIntegerWidth(interval.max, type)) {
         return std::nullopt;
     }
     auto lowerValue = SInt{width, static_cast<uint64_t>(interval.min)};
     auto upperValue = SInt{width, static_cast<uint64_t>(interval.max)};
-    auto domain = SIntDomain::Intersects(SIntDomain::FromNumeric(RelationalOperation::GE, lowerValue, false),
-        SIntDomain::FromNumeric(RelationalOperation::LE, upperValue, false));
+    auto isUnsigned = type->IsUnsignedInteger();
+    auto domain = SIntDomain::Intersects(SIntDomain::FromNumeric(RelationalOperation::GE, lowerValue, isUnsigned),
+        SIntDomain::FromNumeric(RelationalOperation::LE, upperValue, isUnsigned));
     auto count = static_cast<__int128>(interval.max) - static_cast<__int128>(interval.min) + 1;
     if (count > 0 && count <= static_cast<__int128>(MAX_EXACT_INT_SET_SIZE)) {
         std::vector<SInt> exact;
@@ -6979,7 +7305,7 @@ std::optional<SInt> ComputeCountedAccumulatorValue(
     auto tripCount = static_cast<__int128>(values->size());
     auto value = static_cast<__int128>(update.init) + tripCount * static_cast<__int128>(update.step);
     auto width = ToWidth(*update.type);
-    if (!FitsSignedWidth(value, width)) {
+    if (!FitsModeledIntegerWidth(value, update.type)) {
         return std::nullopt;
     }
     return SInt{width, static_cast<uint64_t>(static_cast<int64_t>(value))};
@@ -7070,14 +7396,14 @@ struct PairLoopValues {
 
 std::optional<SIntRange> BuildSignedExactRange(Type* type, const std::vector<int64_t>& values)
 {
-    if (type == nullptr || !type->IsInteger() || type->IsUnsignedInteger() || values.empty()) {
+    if (type == nullptr || !type->IsInteger() || values.empty()) {
         return std::nullopt;
     }
     auto width = ToWidth(*type);
     std::vector<SInt> exact;
     exact.reserve(values.size());
     for (auto value : values) {
-        if (!FitsSignedWidth(value, width)) {
+        if (!FitsModeledIntegerWidth(value, type)) {
             return std::nullopt;
         }
         exact.emplace_back(width, static_cast<uint64_t>(value));
@@ -7086,7 +7412,7 @@ std::optional<SIntRange> BuildSignedExactRange(Type* type, const std::vector<int
     if (!exactValues.has_value()) {
         return std::nullopt;
     }
-    auto domain = DomainFromExactIntValues(*exactValues, false);
+    auto domain = DomainFromExactIntValues(*exactValues, type->IsUnsignedInteger());
     return SIntRange{std::move(domain), std::move(exactValues)};
 }
 
@@ -8274,7 +8600,7 @@ std::optional<int64_t> ComputeAffineAccumulatorValue(
     auto value = static_cast<__int128>(update.init) +
         static_cast<__int128>(update.inductionCoefficient) * inductionSum +
         static_cast<__int128>(update.constant) * iteration;
-    if (!FitsSignedWidth(value, ToWidth(*update.type))) {
+    if (!FitsModeledIntegerWidth(value, update.type)) {
         return std::nullopt;
     }
     return static_cast<int64_t>(value);
@@ -8349,7 +8675,7 @@ std::optional<SIntRange> BuildCountedAccumulatorIterationRange(
         for (__int128 iteration = 1; iteration <= tripCount; ++iteration) {
             auto value = static_cast<__int128>(update.init) + iteration * static_cast<__int128>(update.step);
             auto width = ToWidth(*update.type);
-            if (!FitsSignedWidth(value, width)) {
+            if (!FitsModeledIntegerWidth(value, update.type)) {
                 return std::nullopt;
             }
             values.emplace_back(SInt{width, static_cast<uint64_t>(static_cast<int64_t>(value))});
@@ -8387,7 +8713,7 @@ std::optional<SIntRange> TryComputeCountedAccumulatorUpdateRangeImpl(
         return std::nullopt;
     }
     auto rootType = GetIntegerRefRootType(location);
-    if (rootType == nullptr || rootType->IsUnsignedInteger()) {
+    if (rootType == nullptr) {
         return std::nullopt;
     }
     auto step = GetUpdateStepFromLocation(binaryExpr->GetResult(), location);
@@ -8426,7 +8752,7 @@ std::optional<SIntRange> TryComputeCountedAccumulatorBodyLoadRangeImpl(const Ran
 {
     auto location = load->GetLocation();
     auto rootType = GetIntegerRefRootType(location);
-    if (rootType == nullptr || rootType->IsUnsignedInteger()) {
+    if (rootType == nullptr) {
         return std::nullopt;
     }
     auto context = FindCountedAccumulatorLoopContext(state, load->GetParentBlock());
@@ -8567,7 +8893,7 @@ std::optional<SIntRange> TryComputeCountedAccumulatorLoadExitRangeImpl(const Ran
 {
     auto location = load->GetLocation();
     auto rootType = GetIntegerRefRootType(location);
-    if (rootType == nullptr || rootType->IsUnsignedInteger()) {
+    if (rootType == nullptr) {
         return std::nullopt;
     }
     constexpr size_t MAX_EXIT_SEARCH_BLOCKS = 32;
@@ -8623,7 +8949,7 @@ bool TryNarrowVariableBoundAccumulatorExit(RangeDomain& state, const Branch* bra
     }
     auto storageType = GetIntegerRefRootType(induction->location);
     auto boundValues = GetSmallSignedValuesFromState(state, induction->boundValue);
-    if (storageType != nullptr && !storageType->IsUnsignedInteger() && boundValues.has_value()) {
+    if (storageType != nullptr && boundValues.has_value()) {
         std::vector<int64_t> exitValues;
         exitValues.reserve(boundValues->size());
         bool allExitsProven = true;

@@ -224,6 +224,8 @@ private:
 
     std::optional<SIntDomain> TryComputeSimpleInductionUpdateRange(const BinaryExpression* binaryExpr) const;
 
+    void PreHandleFieldExpr(RangeDomain& state, const Field* field) override;
+
     void HandleOthersExpr(RangeDomain& state, const Expression* expression);
 
     void HandleApplyExpr(RangeDomain& state, const Apply* apply, Value* refObj) override;
@@ -287,6 +289,8 @@ private:
     void ApplyContextValue(RangeDomain& state, Value* dest, const ContextAbstractValue& value) const;
 
     void ApplyContextValue(RangeDomain& state, Value* dest, Type* type, const ContextAbstractValue& value) const;
+
+    void SeedMutableGlobalInitializers(RangeDomain& state);
 
     static std::mutex& GetContextSummaryMutex();
 

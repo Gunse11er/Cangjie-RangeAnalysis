@@ -108,7 +108,7 @@ enum class ContestResultOrigin {
     NONE,
     CHIR_ANALYSIS,
     CONTEXT_SUMMARY,
-    SOURCE_FALLBACK,
+    UNRESOLVED_CHIR_TOP,
 };
 struct ContestQuery {
     std::string fileName;
@@ -128,6 +128,8 @@ struct ContestQuery {
     bool hasDirectPointLoadResult{false};
     bool hasUnknownPointObservation{false};
     bool hasBoundedLifetimeResult{false};
+    bool hasDeclarationStoreResult{false};
+    bool hasReadModifyWriteResult{false};
 };
 
 struct ValueNameInfo {
@@ -411,7 +413,7 @@ std::string FormatFullIntegerRange(const Type& type)
 }
 
 // 按源码类型提示格式化未解析查询的 sound fallback。
-std::string FormatFallback(ContestQueryTypeHint typeHint)
+std::string FormatTopRange(ContestQueryTypeHint typeHint)
 {
     switch (typeHint) {
         case ContestQueryTypeHint::BOOL:
@@ -439,7 +441,7 @@ std::string FormatFallback(ContestQueryTypeHint typeHint)
 }
 
 // 为未解析或不精确查询生成 sound fallback 输出。
-std::string FormatFallback(Type* type)
+std::string FormatTopRange(Type* type)
 {
     if (type && type->IsBoolean()) {
         return "false, true";
@@ -451,19 +453,19 @@ std::string FormatFallback(Type* type)
 }
 
 // 优先使用 CHIR Type*，缺失时使用源码类型提示生成 fallback。
-std::string FormatFallback(const ContestQuery& query)
+std::string FormatTopRange(const ContestQuery& query)
 {
     if (query.type != nullptr) {
-        return FormatFallback(query.type);
+        return FormatTopRange(query.type);
     }
-    return FormatFallback(query.typeHint);
+    return FormatTopRange(query.typeHint);
 }
 
 // 将抽象值域转换为竞赛要求的输出格式。
 std::string FormatContestRange(const ValueRange* range, Type* type)
 {
     if (!type || !range) {
-        return FormatFallback(type);
+        return FormatTopRange(type);
     }
     if (range->GetRangeKind() == ValueRange::RangeKind::BOOL) {
         const auto& boolRange = StaticCast<const BoolRange&>(*range).GetVal();
@@ -488,9 +490,9 @@ std::string FormatContestRange(const ValueRange* range, Type* type)
         if (IsContestPrintableIntegerInterval(numeric, *type)) {
             return FormatContestIntegerInterval(numeric, *type);
         }
-        return FormatFallback(type);
+        return FormatTopRange(type);
     }
-    return FormatFallback(type);
+    return FormatTopRange(type);
 }
 
 // 读取普通 SSA 值或 ref 背后 var 对象的竞赛可见值域。
@@ -537,6 +539,18 @@ bool AreContestRangesEquivalent(const ValueRange& lhs, const ValueRange& rhs)
     const auto& rhsInt = StaticCast<const SIntRange&>(rhs);
     return lhsInt.GetVal().IsSame(rhsInt.GetVal()) &&
         lhsInt.GetExactValues() == rhsInt.GetExactValues();
+}
+
+bool IsContestRangeSubset(const ValueRange& candidate, const ValueRange& superset)
+{
+    if (candidate.GetRangeKind() != superset.GetRangeKind()) {
+        return false;
+    }
+    auto joined = superset.Clone();
+    if (auto updated = joined->Join(candidate); updated.has_value()) {
+        joined = std::move(updated.value());
+    }
+    return AreContestRangesEquivalent(*joined, superset);
 }
 
 bool IsContestTopRange(const ValueRange* range, Type* type)
@@ -960,6 +974,64 @@ void BindGlobalQueries(const Ptr<const Package>& package, std::vector<ContestQue
                     break;
                 }
             }
+        }
+        if (ambiguous || matchedGlobal == nullptr) {
+            continue;
+        }
+        query.boundGlobal = matchedGlobal;
+        query.type = GetQueryValueType(matchedGlobal);
+        query.typeHint = GetQueryTypeHint(query.type);
+    }
+}
+
+bool HasPotentialLocalBindingBeforeQuery(const Ptr<const Package>& package, const ContestQuery& query,
+    const std::filesystem::path& contestRoot)
+{
+    for (auto func : package->GetGlobalFuncsWithBody()) {
+        if (func == nullptr || func->GetBody() == nullptr) {
+            continue;
+        }
+        for (auto block : func->GetBody()->GetAllBlocks()) {
+            for (auto expression : block->GetExpressions()) {
+                if (expression->GetExprKind() != ExprKind::DEBUGEXPR) {
+                    continue;
+                }
+                auto debug = StaticCast<const Debug*>(expression);
+                auto value = debug->GetValue();
+                if (value == nullptr || IsGlobalVarInCurrentPackage(value) ||
+                    debug->GetSrcCodeIdentifier() != query.variableName ||
+                    debug->GetDebugLocation().GetBeginPos().line > query.line ||
+                    !IsSameQueryFile(query, debug->GetDebugLocation(), contestRoot)) {
+                    continue;
+                }
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void BindUnambiguousGlobalQueries(const Ptr<const Package>& package, std::vector<ContestQuery>& queries,
+    const std::filesystem::path& contestRoot)
+{
+    for (auto& query : queries) {
+        if (!query.valid || query.boundGlobal != nullptr ||
+            HasPotentialLocalBindingBeforeQuery(package, query, contestRoot)) {
+            continue;
+        }
+        GlobalVar* matchedGlobal = nullptr;
+        bool ambiguous = false;
+        for (auto global : package->GetGlobalVars()) {
+            if (!IsGlobalVarInCurrentPackage(global) ||
+                query.variableName != global->GetSrcCodeIdentifier() ||
+                !IsSameQueryFile(query, global->GetDebugLocation(), contestRoot)) {
+                continue;
+            }
+            if (matchedGlobal != nullptr && matchedGlobal != global) {
+                ambiguous = true;
+                break;
+            }
+            matchedGlobal = global;
         }
         if (ambiguous || matchedGlobal == nullptr) {
             continue;
@@ -1641,14 +1713,13 @@ void SeedBoundGlobalInitializers(
     }
 }
 
-bool IsQueryDeclarationBindingLoad(
-    const ContestQuery& query, const ValueNameMap& valueNames, const Load& load)
+bool IsQueryDeclarationBinding(const ContestQuery& query, const ValueNameMap& valueNames,
+    Value* location, const DebugLocation& useLocation)
 {
-    auto names = valueNames.find(load.GetLocation());
+    auto names = valueNames.find(location);
     if (names == valueNames.end()) {
         return false;
     }
-    const auto& useLocation = load.GetDebugLocation();
     if (useLocation.GetBeginPos().line < query.line) {
         return false;
     }
@@ -1659,6 +1730,13 @@ bool IsQueryDeclarationBindingLoad(
         return sameFile && info.name == query.variableName && info.line == query.line &&
             IsScopePrefix(info.scopeInfo, useScope);
     });
+}
+
+bool IsQueryDeclarationBindingLoad(
+    const ContestQuery& query, const ValueNameMap& valueNames, const Load& load)
+{
+    return IsQueryDeclarationBinding(
+        query, valueNames, load.GetLocation(), load.GetDebugLocation());
 }
 
 bool IsSafeForwardQueryLoad(const ContestQuery& query, const ValueNameMap& valueNames, const Load& load,
@@ -1700,7 +1778,7 @@ void ResolveQueryAtLoadResult(std::vector<ContestQuery>& queries, const ValueNam
         auto type = GetQueryValueType(load->GetResult());
         auto observed = RangeAnalysis::GetBoundedLoopObservedRange(&expr);
         auto range = observed != nullptr ? observed.get() : GetContestRangeForValue(state, load->GetResult());
-        if (lifetimeObservation && query.hasBoundedLifetimeResult && observed == nullptr) {
+        if (lifetimeObservation && query.hasDeclarationStoreResult) {
             continue;
         }
         auto result = FormatContestRange(range, type);
@@ -1861,6 +1939,15 @@ void ResolveQueryAtStoreValue(std::vector<ContestQuery>& queries, const ValueNam
         query.hasBoundedLifetimeResult = query.hasBoundedLifetimeResult || observed != nullptr;
         auto range = observed != nullptr ? observed.get() : GetContestRangeForValue(state, store->GetValue());
         auto readModifyWrite = GetReadModifyWriteObservation(state, *store);
+        query.hasReadModifyWriteResult = query.hasReadModifyWriteResult ||
+            (readModifyWrite.found && readModifyWrite.complete && readModifyWrite.range != nullptr);
+        // A plain assignment executes after the query point and must not
+        // overwrite a value already observed before that source line. Keep
+        // read-modify-write observations, because they intentionally describe
+        // both the value read at the point and the value written back.
+        if (query.hasBeforePointResult && !readModifyWrite.found) {
+            continue;
+        }
         std::unique_ptr<ValueRange> combined;
         if (readModifyWrite.found && readModifyWrite.complete && readModifyWrite.range != nullptr) {
             combined = readModifyWrite.range->Clone();
@@ -1891,6 +1978,8 @@ void ResolveQueryAtStoreValue(std::vector<ContestQuery>& queries, const ValueNam
             continue;
         }
         SetContestQueryResult(query, type, range, ContestResultOrigin::CHIR_ANALYSIS);
+        query.hasDeclarationStoreResult = !readModifyWrite.found &&
+            IsQueryDeclarationBinding(query, valueNames, location, store->GetDebugLocation());
     }
 }
 
@@ -2050,8 +2139,8 @@ std::string GetContestQueryOutput(ContestQuery& query)
     if (query.resolved && !query.result.empty()) {
         return query.result;
     }
-    query.resultOrigin = ContestResultOrigin::SOURCE_FALLBACK;
-    return FormatFallback(query);
+    query.resultOrigin = ContestResultOrigin::UNRESOLVED_CHIR_TOP;
+    return FormatTopRange(query);
 }
 
 const char* ContestResultOriginName(ContestResultOrigin origin)
@@ -2061,8 +2150,8 @@ const char* ContestResultOriginName(ContestResultOrigin origin)
             return "CHIRAnalysis";
         case ContestResultOrigin::CONTEXT_SUMMARY:
             return "ContextSummary";
-        case ContestResultOrigin::SOURCE_FALLBACK:
-            return "SourceFallback";
+        case ContestResultOrigin::UNRESOLVED_CHIR_TOP:
+            return "UnresolvedCHIRTop";
         case ContestResultOrigin::NONE:
             return "None";
     }
@@ -2084,14 +2173,25 @@ void ApplyContestContextCandidates(std::vector<ContestQuery>& queries, const Con
                       << " global=" << candidate.fromGlobalAccess
                       << " root=" << query.result << '\n';
         }
-        if (candidate.hasUnknownObservation) {
-            query.hasUnknownPointObservation = true;
-        }
         const bool hasCompleteRootResult = query.resolved &&
             query.resultOrigin != ContestResultOrigin::NONE && query.resultRange != nullptr &&
             !query.hasUnknownPointObservation;
+        const bool hasCompleteContextCandidate = !candidate.fromGlobalAccess &&
+            !candidate.incompleteGlobalLifetime && !candidate.hasUnknownObservation &&
+            !candidate.auxiliaryOnly && candidate.range != nullptr &&
+            !query.hasReadModifyWriteResult;
         if (hasCompleteRootResult && !candidate.fromGlobalAccess) {
+            auto type = query.type == nullptr ? candidate.type : query.type;
+            if (hasCompleteContextCandidate && AreContestTypesCompatible(type, candidate.type) &&
+                query.resultRange->GetRangeKind() == candidate.range->GetRangeKind() &&
+                IsContestRangeSubset(*candidate.range, *query.resultRange)) {
+                SetContestQueryResult(
+                    query, type, candidate.range.get(), ContestResultOrigin::CONTEXT_SUMMARY);
+            }
             continue;
+        }
+        if (candidate.hasUnknownObservation) {
+            query.hasUnknownPointObservation = true;
         }
         auto type = query.type == nullptr ? candidate.type : query.type;
         auto joined = candidate.incompleteGlobalLifetime || candidate.hasUnknownObservation
@@ -2258,6 +2358,7 @@ void RangePropagation::EmitContestOutput(const Ptr<const Package>& package, Rang
     }
     auto contestRoot = inputContext.value().rootPath;
     BindGlobalQueries(package, queries.value(), contestRoot);
+    BindUnambiguousGlobalQueries(package, queries.value(), contestRoot);
     ValueNameMap valueNames;
     ContestAggregateMap aggregates;
     ContestContextCandidateMap contextCandidates;
@@ -2357,7 +2458,7 @@ void RangePropagation::EmitContestOutput(const Ptr<const Package>& package, Rang
                 SetContestQueryResult(
                     query, query.type, nullptr, ContestResultOrigin::CONTEXT_SUMMARY);
             } else {
-                query.result = FormatFallback(query);
+                query.result = FormatTopRange(query);
                 query.resultRange.reset();
                 query.resolved = true;
                 query.resultOrigin = ContestResultOrigin::CONTEXT_SUMMARY;
