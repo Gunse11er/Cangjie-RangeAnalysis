@@ -160,6 +160,9 @@ struct ContestContextCandidate {
     Type* type{nullptr};
     std::unique_ptr<ValueRange> range;
     bool fromGlobalAccess{false};
+    bool requiresInitializerObservation{false};
+    bool sawInitializerObservation{false};
+    bool sawExitObservation{false};
     bool incompleteGlobalLifetime{false};
     bool hasUnknownObservation{false};
     bool auxiliaryOnly{false};
@@ -971,6 +974,26 @@ void ApplyContestAggregates(
                       << " old=" << query.result << '\n';
         }
         auto aggregateRange = combined.complete ? combined.range.get() : nullptr;
+        if (query.boundGlobal != nullptr && query.resolved &&
+            query.resultRange != nullptr) {
+            if (aggregateRange == nullptr ||
+                !AreContestTypesCompatible(type, query.type) ||
+                query.resultRange->GetRangeKind() !=
+                    aggregateRange->GetRangeKind()) {
+                // The abstract-memory/context result already represents the
+                // global lifetime. An incomplete loop-only observation cannot
+                // safely replace it.
+                continue;
+            }
+            auto joined = query.resultRange->Clone();
+            if (auto updated = joined->Join(*aggregateRange);
+                updated.has_value()) {
+                joined = std::move(updated.value());
+            }
+            SetContestQueryResult(
+                query, type, joined.get(), query.resultOrigin);
+            continue;
+        }
         if (query.resolved && query.resultOrigin == ContestResultOrigin::CONTEXT_SUMMARY &&
             !(combined.complete && combined.hasContextObservation &&
                 aggregateRange != nullptr)) {
@@ -1216,16 +1239,21 @@ std::unordered_set<const Function*> CollectContestRelevantFunctions(
             worklist.emplace_back(func, 0);
         }
     }
+    const bool hasValidQuery = std::any_of(queries.begin(), queries.end(), [](const auto& query) {
+        return query.valid;
+    });
     const bool hasBoundGlobalQuery = std::any_of(queries.begin(), queries.end(), [](const auto& query) {
         return query.valid && query.boundGlobal != nullptr;
     });
-    if (hasBoundGlobalQuery) {
+    if (hasValidQuery) {
         for (auto func : package->GetGlobalFuncsWithBody()) {
             if (func != nullptr && func->GetBody() != nullptr && func->GetFuncKind() == FuncKind::MAIN_ENTRY &&
                 relevantFunctions.emplace(func).second) {
                 worklist.emplace_back(func, 0);
             }
         }
+    }
+    if (hasBoundGlobalQuery) {
         auto packageInit = package->GetPackageInitFunc();
         if (packageInit != nullptr && packageInit->GetBody() != nullptr &&
             relevantFunctions.emplace(packageInit).second) {
@@ -1757,10 +1785,23 @@ void CollectContextCandidateAtGlobalAccess(const std::vector<ContestQuery>& quer
             if (expression.GetExprKind() != ExprKind::STORE) {
                 continue;
             }
+            if (expression.GetTopLevelFunc() == global->GetInitFunc()) {
+                candidate.sawInitializerObservation = true;
+            }
             auto storedValue = StaticCast<const Store*>(&expression)->GetValue();
             auto observed = RangeAnalysis::GetBoundedLoopObservedRange(&expression);
             auto type = GetQueryValueType(global);
             auto range = observed != nullptr ? observed.get() : GetContestRangeForValue(state, storedValue);
+            if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
+                auto topLevelFunc = expression.GetTopLevelFunc();
+                std::cerr << "[RangeAnalysisGlobalLifetime] kind=store query="
+                          << query.variableName << '@' << query.line
+                          << " line=" << expression.GetDebugLocation().GetBeginPos().line
+                          << " initializer=" << (topLevelFunc == global->GetInitFunc())
+                          << " func=" << (topLevelFunc == nullptr ? "<null>" : topLevelFunc->GetIdentifier())
+                          << " range=" << FormatContestRange(range, type)
+                          << " bounded=" << (observed != nullptr) << '\n';
+            }
             if (range == nullptr) {
                 candidate.incompleteGlobalLifetime = true;
             }
@@ -1784,20 +1825,73 @@ void SeedBoundGlobalInitializers(
         }
         auto& candidate = candidates[index];
         candidate.fromGlobalAccess = true;
+        candidate.requiresInitializerObservation = true;
         auto initializer = global->GetInitializer();
         if (initializer == nullptr || initializer->IsNullLiteral()) {
-            candidate.incompleteGlobalLifetime = true;
-            MergeContestContextCandidate(candidates, index, GetQueryValueType(global), nullptr, true);
             continue;
         }
         auto initialValue = HandleNonNullLiteralValue<RangeValueDomain>(initializer);
         auto range = initialValue.CheckAbsVal();
         if (range == nullptr) {
-            candidate.incompleteGlobalLifetime = true;
-            MergeContestContextCandidate(candidates, index, GetQueryValueType(global), nullptr, true);
             continue;
         }
+        candidate.sawInitializerObservation = true;
         MergeContestContextCandidate(candidates, index, GetQueryValueType(global), range);
+    }
+}
+
+void CollectContextCandidateAtGlobalExit(const std::vector<ContestQuery>& queries,
+    ContestContextCandidateMap& candidates, const Terminator& terminator,
+    const RangeDomain& state)
+{
+    if (terminator.GetExprKind() != ExprKind::EXIT || state.IsBottom()) {
+        return;
+    }
+    for (size_t index = 0; index < queries.size(); ++index) {
+        const auto& query = queries[index];
+        auto global = query.boundGlobal;
+        if (!query.valid || !query.isGlobalDeclarationQuery || global == nullptr) {
+            continue;
+        }
+        auto& candidate = candidates[index];
+        candidate.fromGlobalAccess = true;
+        candidate.sawExitObservation = true;
+        auto type = GetQueryValueType(global);
+        auto range = GetContestRangeForValue(state, global);
+        if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
+            auto topLevelFunc = terminator.GetTopLevelFunc();
+            std::cerr << "[RangeAnalysisGlobalLifetime] kind=exit query="
+                      << query.variableName << '@' << query.line
+                      << " func=" << (topLevelFunc == nullptr ? "<null>" : topLevelFunc->GetIdentifier())
+                      << " range=" << FormatContestRange(range, type) << '\n';
+        }
+        if (range == nullptr) {
+            candidate.incompleteGlobalLifetime = true;
+        }
+        MergeContestContextCandidate(
+            candidates, index, type, range, range == nullptr);
+    }
+}
+
+void FinalizeBoundGlobalCandidateCompleteness(const std::vector<ContestQuery>& queries,
+    ContestContextCandidateMap& candidates, bool requireExitObservation)
+{
+    for (size_t index = 0; index < queries.size(); ++index) {
+        const auto& query = queries[index];
+        if (!query.valid || !query.isGlobalDeclarationQuery ||
+            query.boundGlobal == nullptr) {
+            continue;
+        }
+        auto found = candidates.find(index);
+        if (found == candidates.end()) {
+            continue;
+        }
+        auto& candidate = found->second;
+        if ((candidate.requiresInitializerObservation &&
+                !candidate.sawInitializerObservation) ||
+            (requireExitObservation && !candidate.sawExitObservation)) {
+            candidate.incompleteGlobalLifetime = true;
+        }
     }
 }
 
@@ -2258,7 +2352,8 @@ const char* ContestResultOriginName(ContestResultOrigin origin)
     return "None";
 }
 
-void ApplyContestContextCandidates(std::vector<ContestQuery>& queries, const ContestContextCandidateMap& candidates)
+void ApplyContestContextCandidates(std::vector<ContestQuery>& queries,
+    const ContestContextCandidateMap& candidates, bool contextClosureComplete)
 {
     for (const auto& [index, candidate] : candidates) {
         if (index >= queries.size() || candidate.type == nullptr) {
@@ -2271,6 +2366,8 @@ void ApplyContestContextCandidates(std::vector<ContestQuery>& queries, const Con
                       << " unknown=" << candidate.hasUnknownObservation
                       << " auxiliaryOnly=" << candidate.auxiliaryOnly
                       << " incomplete=" << candidate.incompleteGlobalLifetime
+                      << " initializerSeen=" << candidate.sawInitializerObservation
+                      << " exitSeen=" << candidate.sawExitObservation
                       << " global=" << candidate.fromGlobalAccess
                       << " rootUnknown=" << query.hasUnknownPointObservation
                       << " rootRmw=" << query.hasReadModifyWriteResult
@@ -2279,11 +2376,19 @@ void ApplyContestContextCandidates(std::vector<ContestQuery>& queries, const Con
         }
         const bool hasCompleteRootResult = query.resolved &&
             query.resultOrigin != ContestResultOrigin::NONE && query.resultRange != nullptr &&
-            !query.hasUnknownPointObservation;
+            !query.hasUnknownPointObservation &&
+            !IsContestTopRange(query.resultRange.get(), query.type);
         const bool hasCompleteContextCandidate = !candidate.fromGlobalAccess &&
             !candidate.incompleteGlobalLifetime && !candidate.hasUnknownObservation &&
             !candidate.auxiliaryOnly && candidate.range != nullptr &&
             !query.hasReadModifyWriteResult;
+        if (!contextClosureComplete && !candidate.fromGlobalAccess) {
+            // A partial call closure is useful for diagnostics but is not an
+            // exhaustive set of executions. Keep the root CHIR result, which
+            // is a safe over-approximation, instead of narrowing it with a
+            // subset of observed contexts.
+            continue;
+        }
         if (hasCompleteRootResult && !candidate.fromGlobalAccess) {
             auto type = query.type == nullptr ? candidate.type : query.type;
             if (!query.hasBoundedPointResult && hasCompleteContextCandidate &&
@@ -2519,16 +2624,36 @@ void RangePropagation::EmitContestOutput(const Ptr<const Package>& package, Rang
         CollectContextCandidateAtExpressionOperands(
             queries.value(), contextCandidates, contextValueNames, *expr, state, contestRoot);
     };
-    const auto contextActionOnTerminator = [&queries, &contextCandidates, &contextValueNames, &contestRoot](
-                                               const RangeDomain& state, Terminator* terminator, std::optional<Block*>) {
+    const auto collectContextTerminator =
+        [&queries, &contextCandidates, &contextValueNames, &contestRoot](
+            const RangeDomain& state, Terminator* terminator, bool collectLifetimeExit) {
         if (terminator == nullptr) {
             return;
+        }
+        if (collectLifetimeExit) {
+            CollectContextCandidateAtGlobalExit(
+                queries.value(), contextCandidates, *terminator, state);
         }
         CollectContextCandidateAtExpressionOperands(
             queries.value(), contextCandidates, contextValueNames, *terminator, state, contestRoot);
     };
+    const auto contextActionOnTerminator =
+        [&collectContextTerminator](
+            const RangeDomain& state, Terminator* terminator, std::optional<Block*>) {
+            collectContextTerminator(state, terminator, /* collectLifetimeExit = */ false);
+        };
     bool contextClosureComplete = true;
     auto collectContextCandidates = [&](const Function* rootFunction, Results<RangeDomain>& root) {
+        const bool collectLifetimeExit = rootFunction != nullptr &&
+            rootFunction->GetFuncKind() == FuncKind::MAIN_ENTRY;
+        const auto contextRootActionOnTerminator =
+            [&collectContextTerminator, collectLifetimeExit](
+                const RangeDomain& state, Terminator* terminator, std::optional<Block*>) {
+                collectContextTerminator(state, terminator, collectLifetimeExit);
+            };
+        root.VisitWith(
+            contextActionBeforeVisitExpr, contextActionAfterVisitExpr,
+            contextRootActionOnTerminator);
         contextClosureComplete = RangeAnalysis::VisitReachableContextSensitiveResults(rootFunction, root,
             [&](const Function*, const std::string&, Results<RangeDomain>& result) {
                 result.VisitWith(
@@ -2541,6 +2666,11 @@ void RangePropagation::EmitContestOutput(const Ptr<const Package>& package, Rang
     };
     auto relevantFunctions = CollectContestRelevantFunctions(package, queries.value(), contestRoot);
     auto reverseCallGraph = BuildReverseContestCallGraph(package);
+    const bool hasMainContextRoot = std::any_of(
+        relevantFunctions.begin(), relevantFunctions.end(), [](const auto* function) {
+            return function != nullptr && function->GetFuncKind() == FuncKind::MAIN_ENTRY;
+        });
+    auto packageInit = package->GetPackageInitFunc();
 
     RangeAnalysis::ClearContextSensitiveResults();
     for (auto func : package->GetGlobalFuncsWithBody()) {
@@ -2548,7 +2678,10 @@ void RangePropagation::EmitContestOutput(const Ptr<const Package>& package, Rang
             continue;
         }
         auto callers = reverseCallGraph.find(func);
-        const bool isContextRoot = callers == reverseCallGraph.end() || callers->second.empty();
+        const bool hasDirectCaller =
+            callers != reverseCallGraph.end() && !callers->second.empty();
+        const bool isContextRoot = func->GetFuncKind() == FuncKind::MAIN_ENTRY ||
+            func == packageInit || (!hasMainContextRoot && !hasDirectCaller);
         auto result = rangeAnalysisWrapper.RunOnFunc(func, /* isDebug = */ false, diag);
         if (result != nullptr) {
             resolveQueries(*result);
@@ -2561,29 +2694,20 @@ void RangePropagation::EmitContestOutput(const Ptr<const Package>& package, Rang
                 collectContextCandidates(func, *cachedResult);
             }
         }
-        RangeAnalysis::ClearContextSensitiveResults();
     }
 
-    ApplyContestContextCandidates(queries.value(), contextCandidates);
+    FinalizeBoundGlobalCandidateCompleteness(
+        queries.value(), contextCandidates, hasMainContextRoot);
+    ApplyContestContextCandidates(
+        queries.value(), contextCandidates, contextClosureComplete);
     ApplyContestAggregates(
         queries.value(), aggregates, contextLoopObservations);
-    if (!contextClosureComplete) {
-        for (auto& query : queries.value()) {
-            if (!query.valid) {
-                continue;
-            }
-            if (query.type != nullptr) {
-                SetContestQueryResult(
-                    query, query.type, nullptr, ContestResultOrigin::CONTEXT_SUMMARY);
-            } else {
-                query.result = FormatTopRange(query);
-                query.resultRange.reset();
-                query.resolved = true;
-                query.resultOrigin = ContestResultOrigin::CONTEXT_SUMMARY;
-            }
-        }
+    if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
+        std::cerr << "[RangeAnalysisContextClosure] complete="
+                  << contextClosureComplete << '\n';
     }
     WriteContestOutput(queries.value(), inputContext.value());
+    RangeAnalysis::ClearContextSensitiveResults();
     RangeAnalysis::ClearBoundedLoopObservedRanges();
 }
 

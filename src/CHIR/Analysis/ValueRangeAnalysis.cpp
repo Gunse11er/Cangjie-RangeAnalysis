@@ -50,10 +50,28 @@ constexpr size_t MAX_TOTAL_CONTEXT_SUMMARIES = 512;
 constexpr size_t MAX_CONTEXT_GLOBALS = 64;
 constexpr size_t MAX_CONTEXT_CALL_CLOSURE_FUNCTIONS = 128;
 constexpr size_t MAX_LAMBDA_CONTEXTS_PER_ANALYSIS = 32;
+constexpr size_t MAX_CONTEXT_ANALYSIS_DEPTH = 16;
+constexpr size_t MAX_FAILED_CONTEXT_KEYS = MAX_TOTAL_CONTEXT_SUMMARIES;
 constexpr size_t MAX_EXACT_INT_SET_SIZE = 64;
 constexpr size_t MAX_BOUNDED_LOOP_OBSERVATIONS = 4096;
 constexpr size_t MAX_RECORDED_CALL_CONTEXTS = 4096;
 constexpr size_t MAX_CONTEXT_OBJECT_IDENTITIES = MAX_TOTAL_CONTEXT_SUMMARIES * 256;
+
+enum class ContextSummaryState : uint8_t {
+    UNSEEN,
+    COMPUTING,
+    READY,
+    FAILED
+};
+
+std::unordered_set<std::string> failedContextKeys;
+size_t contextSummaryAnalysisCount{0};
+size_t contextSummaryCacheHitCount{0};
+size_t contextSummaryRecursiveHitCount{0};
+size_t contextSummaryBudgetRejectCount{0};
+size_t contextSummaryFailedCount{0};
+size_t contextSummaryPeakDepth{0};
+thread_local size_t contextSummaryAnalysisDepth{0};
 
 std::unordered_map<const Value*, size_t> contextObjectIdentities;
 std::mutex contextObjectIdentitiesMtx;
@@ -671,7 +689,7 @@ struct RangeAnalysis::ContextAbstractValue {
 };
 
 struct RangeAnalysis::ContextualSummary {
-    bool ready{false};
+    ContextSummaryState state{ContextSummaryState::UNSEEN};
     size_t precision{0};
     std::optional<ContextAbstractValue> returnValue;
     std::vector<std::optional<ContextAbstractValue>> refArgValues;
@@ -768,7 +786,8 @@ void RangeAnalysis::VisitContextSensitiveResults(const ContextResultVisitor& vis
         auto& summaryCache = GetContextSummaryCache();
         for (const auto& key : GetContextSummaryOrder()) {
             auto it = summaryCache.find(key);
-            if (it == summaryCache.end() || !it->second.ready || it->second.result == nullptr) {
+            if (it == summaryCache.end() || it->second.state != ContextSummaryState::READY ||
+                it->second.result == nullptr) {
                 continue;
             }
             results.emplace_back(it->second.callee, key, it->second.result.get());
@@ -830,6 +849,11 @@ bool RangeAnalysis::VisitReachableContextSensitiveResults(
             } else if (expression->GetExprKind() == ExprKind::APPLY_WITH_EXCEPTION) {
                 auto apply = StaticCast<ApplyWithException*>(expression);
                 context = BuildContextKeyForCall(state, apply->GetCallee(), apply->GetArgs());
+            } else if (expression->GetExprKind() == ExprKind::INVOKE ||
+                expression->GetExprKind() == ExprKind::INVOKE_WITH_EXCEPTION) {
+                // A virtual call without recorded finite targets has an open target set.
+                // Its known targets cannot be treated as a complete calling context closure.
+                complete = false;
             }
             if (context.has_value()) {
                 enqueue(context.value());
@@ -854,7 +878,9 @@ bool RangeAnalysis::VisitReachableContextSensitiveResults(
         {
             std::lock_guard<std::mutex> lock(GetContextSummaryMutex());
             auto found = GetContextSummaryCache().find(key);
-            if (found != GetContextSummaryCache().end() && found->second.ready && found->second.result != nullptr) {
+            if (found != GetContextSummaryCache().end() &&
+                found->second.state == ContextSummaryState::READY &&
+                found->second.result != nullptr) {
                 callee = found->second.callee;
                 result = found->second.result.get();
             }
@@ -873,11 +899,39 @@ void RangeAnalysis::ClearContextSensitiveResults()
 {
     {
         std::lock_guard<std::mutex> lock(GetContextSummaryMutex());
-        GetContextSummaryCache().clear();
+        auto& summaryCache = GetContextSummaryCache();
+        if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr &&
+            (!summaryCache.empty() || !failedContextKeys.empty())) {
+            const auto countState = [&summaryCache](ContextSummaryState state) {
+                return static_cast<size_t>(std::count_if(
+                    summaryCache.begin(), summaryCache.end(),
+                    [state](const auto& entry) { return entry.second.state == state; }));
+            };
+            std::cerr << "[RangeAnalysisContextStats] summaries=" << summaryCache.size()
+                      << " ready=" << countState(ContextSummaryState::READY)
+                      << " computing=" << countState(ContextSummaryState::COMPUTING)
+                      << " failed=" << countState(ContextSummaryState::FAILED)
+                      << " failed-keys=" << failedContextKeys.size()
+                      << " analyses=" << contextSummaryAnalysisCount
+                      << " cache-hits=" << contextSummaryCacheHitCount
+                      << " recursive-hits=" << contextSummaryRecursiveHitCount
+                      << " budget-rejects=" << contextSummaryBudgetRejectCount
+                      << " analysis-failures=" << contextSummaryFailedCount
+                      << " peak-depth=" << contextSummaryPeakDepth << '\n';
+        }
+        summaryCache.clear();
         GetContextSummaryOrder().clear();
         GetContextCounts().clear();
         GetBoundedLoopContextCounts().clear();
+        failedContextKeys.clear();
+        contextSummaryAnalysisCount = 0;
+        contextSummaryCacheHitCount = 0;
+        contextSummaryRecursiveHitCount = 0;
+        contextSummaryBudgetRejectCount = 0;
+        contextSummaryFailedCount = 0;
+        contextSummaryPeakDepth = 0;
     }
+    contextSummaryAnalysisDepth = 0;
     ClearBoundedLoopCallContexts();
     {
         std::lock_guard<std::mutex> lock(GetBoundedLoopExitCacheMutex());
@@ -2303,26 +2357,45 @@ std::optional<RangeAnalysis::ContextAbstractValue> RangeAnalysis::AnalyzeCalleeW
     std::vector<std::optional<ContextAbstractValue>>& refArgValues, ContextGlobalValues& globalValues)
 {
     auto key = BuildContextKey(callee, arguments, globalValues);
+    const auto setUnknownOutputs = [&refArgValues, &globalValues]() {
+        refArgValues.clear();
+        for (auto& entry : globalValues) {
+            entry.second = ContextAbstractValue{};
+        }
+    };
     {
         std::lock_guard<std::mutex> lock(GetContextSummaryMutex());
         auto& summaryCache = GetContextSummaryCache();
+        if (failedContextKeys.find(key) != failedContextKeys.end()) {
+            ++contextSummaryCacheHitCount;
+            setUnknownOutputs();
+            return std::nullopt;
+        }
         if (auto it = summaryCache.find(key); it != summaryCache.end()) {
-            if (it->second.ready) {
+            ++contextSummaryCacheHitCount;
+            if (it->second.state == ContextSummaryState::READY) {
                 refArgValues = it->second.refArgValues;
                 globalValues = it->second.globalValues;
             } else {
-                refArgValues.clear();
-                for (auto& entry : globalValues) {
-                    entry.second = ContextAbstractValue{};
+                if (it->second.state == ContextSummaryState::COMPUTING) {
+                    ++contextSummaryRecursiveHitCount;
                 }
+                setUnknownOutputs();
             }
-            return it->second.ready ? it->second.returnValue : std::nullopt;
+            return it->second.state == ContextSummaryState::READY
+                ? it->second.returnValue
+                : std::nullopt;
         }
-        if (GetContextSummaryOrder().size() >= MAX_TOTAL_CONTEXT_SUMMARIES) {
-            refArgValues.clear();
-            for (auto& entry : globalValues) {
-                entry.second = ContextAbstractValue{};
+        const auto rejectContext = [&key]() {
+            ++contextSummaryBudgetRejectCount;
+            if (failedContextKeys.size() < MAX_FAILED_CONTEXT_KEYS) {
+                failedContextKeys.emplace(key);
             }
+        };
+        if (contextSummaryAnalysisDepth >= MAX_CONTEXT_ANALYSIS_DEPTH ||
+            GetContextSummaryOrder().size() >= MAX_TOTAL_CONTEXT_SUMMARIES) {
+            rejectContext();
+            setUnknownOutputs();
             return std::nullopt;
         }
         auto& count = GetContextCounts()[callee];
@@ -2330,18 +2403,14 @@ std::optional<RangeAnalysis::ContextAbstractValue> RangeAnalysis::AnalyzeCalleeW
             ? MAX_BOUNDED_LOOP_CONTEXT_PER_FUNCTION
             : (globalValues.empty() ? MAX_CONTEXT_PER_FUNCTION : MAX_GLOBAL_CONTEXT_PER_FUNCTION);
         if (count >= contextLimit) {
-            refArgValues.clear();
-            for (auto& entry : globalValues) {
-                entry.second = ContextAbstractValue{};
-            }
+            rejectContext();
+            setUnknownOutputs();
             return std::nullopt;
         }
         if (boundedLoopEvaluationOwner != nullptr &&
             GetBoundedLoopContextCounts()[callee] >= MAX_BOUNDED_LOOP_CONTEXT_PER_FUNCTION) {
-            refArgValues.clear();
-            for (auto& entry : globalValues) {
-                entry.second = ContextAbstractValue{};
-            }
+            rejectContext();
+            setUnknownOutputs();
             return std::nullopt;
         }
         ++count;
@@ -2350,13 +2419,30 @@ std::optional<RangeAnalysis::ContextAbstractValue> RangeAnalysis::AnalyzeCalleeW
         }
         ContextualSummary pending;
         pending.callee = callee;
+        pending.state = ContextSummaryState::COMPUTING;
         pending.precision = static_cast<size_t>(std::count_if(
             arguments.begin(), arguments.end(), [](const auto& argument) { return !argument.IsTop(); }));
         pending.precision += static_cast<size_t>(std::count_if(globalValues.begin(), globalValues.end(),
             [](const auto& entry) { return !entry.second.IsTop(); }));
         summaryCache.emplace(key, std::move(pending));
         GetContextSummaryOrder().emplace_back(key);
+        ++contextSummaryAnalysisCount;
+        if (contextSummaryAnalysisDepth + 1 > contextSummaryPeakDepth) {
+            contextSummaryPeakDepth = contextSummaryAnalysisDepth + 1;
+        }
     }
+
+    struct ContextDepthGuard {
+        ContextDepthGuard()
+        {
+            ++contextSummaryAnalysisDepth;
+        }
+
+        ~ContextDepthGuard()
+        {
+            --contextSummaryAnalysisDepth;
+        }
+    } depthGuard;
 
     std::optional<ContextAbstractValue> returnValue;
     std::vector<std::optional<ContextAbstractValue>> summarizedRefArgs;
@@ -2370,14 +2456,24 @@ std::optional<RangeAnalysis::ContextAbstractValue> RangeAnalysis::AnalyzeCalleeW
         summarizedRefArgs = SummarizeRefParamValues(callee, *results);
         summarizedGlobals = SummarizeGlobalValues(globalValues, *results);
     }
+    const bool analysisFailed = results == nullptr;
     {
         std::lock_guard<std::mutex> lock(GetContextSummaryMutex());
         auto& cached = GetContextSummaryCache()[key];
-        cached.ready = true;
-        cached.returnValue = returnValue;
-        cached.refArgValues = summarizedRefArgs;
-        cached.globalValues = summarizedGlobals;
-        cached.result = std::move(results);
+        if (analysisFailed) {
+            cached.state = ContextSummaryState::FAILED;
+            ++contextSummaryFailedCount;
+        } else {
+            cached.state = ContextSummaryState::READY;
+            cached.returnValue = returnValue;
+            cached.refArgValues = summarizedRefArgs;
+            cached.globalValues = summarizedGlobals;
+            cached.result = std::move(results);
+        }
+    }
+    if (analysisFailed) {
+        setUnknownOutputs();
+        return std::nullopt;
     }
     refArgValues = std::move(summarizedRefArgs);
     globalValues = std::move(summarizedGlobals);
