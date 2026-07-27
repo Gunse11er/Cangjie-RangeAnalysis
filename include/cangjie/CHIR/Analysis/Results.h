@@ -71,6 +71,11 @@ public:
 
     const Function* func;
 
+    Analysis<Domain>* GetAnalysis() const
+    {
+        return analysis.get();
+    }
+
 private:
 // Add only cangjie native backend for cjmp
 #ifdef CANGJIE_CODEGEN_CJNATIVE_BACKEND

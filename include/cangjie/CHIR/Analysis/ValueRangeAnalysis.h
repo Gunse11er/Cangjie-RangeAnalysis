@@ -14,6 +14,7 @@
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "cangjie/CHIR/Analysis/BoolDomain.h"
@@ -157,6 +158,8 @@ public:
 
     static void ClearBoundedLoopObservedRanges();
 
+    std::unique_ptr<ValueRange> GetLocalBoundedLoopObservedRange(const Expression* expression) const;
+
     /**
      * @brief get bool domain of CHIR value from state.
      * @param state state to get domain.
@@ -241,6 +244,22 @@ private:
     void HandleContextSensitiveCall(RangeDomain& state, const Expression* callExpression,
         Value* calleeValue, const std::vector<Value*>& args, Value* result);
 
+    bool TryHandlePureSpawnFutureResult(RangeDomain& state, const Apply* apply);
+
+    bool TryHandlePureSpawnFutureResult(RangeDomain& state, const ApplyWithException* apply);
+
+    const Lambda* ResolvePureSpawnLambdaForApply(const Apply* apply) const;
+
+    const Lambda* ResolvePureSpawnLambdaForApply(const ApplyWithException* apply) const;
+
+    bool IsUniqueSpawnValueProjection(
+        Value* future, Value* callee, Type* resultType, Type* parentType) const;
+
+    bool ApplyPureSpawnLambdaResult(
+        RangeDomain& state, const Lambda* lambda, Value* result, const Expression* callExpression);
+
+    bool IsPureSpawnLambda(const Lambda* lambda) const;
+
     void HavocCallEffects(RangeDomain& state, const std::vector<Value*>& args, Value* result,
         const Lambda* lambda = nullptr);
 
@@ -286,6 +305,20 @@ private:
 
     ClassType* ResolveExactClassForValue(Value* value) const;
 
+    const Lambda* ResolveContextLambdaForValue(Value* value) const;
+
+    std::optional<std::vector<ClassType*>> ResolveFiniteClassSetForValue(Value* value) const;
+
+    bool HandleFiniteInvokeTargets(
+        RangeDomain& state, const Expression* callExpression, const Invoke* invoke);
+
+    bool HandleFiniteInvokeTargets(
+        RangeDomain& state, const Expression* callExpression, const InvokeWithException* invoke);
+
+    bool MergeFiniteDispatchTargets(RangeDomain& state, const Expression* callExpression,
+        const std::vector<Value*>& args, Value* result, const std::vector<Function*>& targets,
+        size_t classCount);
+
     void ApplyContextValue(RangeDomain& state, Value* dest, const ContextAbstractValue& value) const;
 
     void ApplyContextValue(RangeDomain& state, Value* dest, Type* type, const ContextAbstractValue& value) const;
@@ -305,6 +338,12 @@ private:
     static std::mutex& GetBoundedLoopExitCacheMutex();
 
     static std::unordered_map<const RangeAnalysis*, BoundedLoopExitCache>& GetBoundedLoopExitCaches();
+
+    void RecordTerminatorEdgeState(
+        const Terminator* terminator, const Block* successor, const RangeDomain& state);
+
+    const RangeDomain* GetRecordedTerminatorEdgeState(
+        const Terminator* terminator, const Block* successor) const;
 
     // ======================= Transfer functions for terminators ======================= //
 
@@ -331,6 +370,15 @@ private:
     {
         auto from = cast->GetSourceTy();
         auto to = cast->GetTargetTy();
+        if (from->IsRef() && to->IsRef()) {
+            auto object = state.CheckAbstractObjectRefBy(cast->GetSourceValue());
+            if (object == nullptr || object->IsTopObjInstance()) {
+                state.SetToTopOrTopRef(cast->GetResult(), /* isRef = */ true);
+            } else {
+                state.SetRefToObject(cast->GetResult(), object, cast);
+            }
+            return ExceptionKind::NA;
+        }
         if (!from->IsInteger() || !to->IsInteger()) {
             state.SetToTopOrTopRef(cast->GetResult(), cast->GetResult()->GetType()->IsRef());
             return ExceptionKind::NA;
@@ -356,6 +404,12 @@ private:
     bool isContextAnalysis{false};
 
     std::unordered_map<std::string, std::unique_ptr<LambdaContextualSummary>> lambdaContextSummaries;
+
+    std::unordered_map<const Terminator*, std::unordered_map<const Block*, RangeDomain>> terminatorEdgeStates;
+
+    std::unordered_map<const Expression*, std::unique_ptr<ValueRange>> localBoundedLoopObservations;
+
+    std::unordered_set<const Expression*> incompleteLocalBoundedLoopObservations;
 
     std::unordered_map<const Block*, uint32_t> inqueueTimes;
 };

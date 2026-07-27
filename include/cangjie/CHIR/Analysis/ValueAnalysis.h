@@ -466,6 +466,28 @@ public:
         }
     }
 
+    /**
+     * Set every tracked memory object to Top while preserving immutable CHIR
+     * SSA values. An unknown reference may alias any tracked object, but a
+     * call cannot mutate scalar values that have already been computed.
+     */
+    void ClearObjectState()
+    {
+        if (absObjPool == nullptr) {
+            ClearState();
+            return;
+        }
+        for (const auto& object : *absObjPool) {
+            if (object == nullptr) {
+                continue;
+            }
+            auto it = programState.Find(object.get());
+            if (it != programState.End() && it->second.GetKind() == ValueDomain::ValueKind::VAL) {
+                it->second = true;
+            }
+        }
+    }
+
     void SetUnreachable()
     {
         this->kind = ReachableKind::UNREACHABLE;

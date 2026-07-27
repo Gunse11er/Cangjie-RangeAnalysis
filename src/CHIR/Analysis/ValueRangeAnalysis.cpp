@@ -29,6 +29,8 @@ using LoopRangeSnapshots = std::unordered_map<const Block*, LoopRangeSnapshot>;
 std::unordered_map<const RangeAnalysis*, LoopRangeSnapshots> loopRangeSnapshots;
 std::mutex loopRangeSnapshotsMtx;
 thread_local const RangeAnalysis* boundedLoopEvaluationOwner{nullptr};
+using BoundedAggregateStoreMap = std::unordered_map<Value*, Value*>;
+thread_local BoundedAggregateStoreMap* boundedAggregateStores{nullptr};
 struct RecordedCallContexts {
     std::unordered_set<std::string> keys;
     bool complete{true};
@@ -501,15 +503,20 @@ TrackedMutableGlobals CollectTrackedMutableGlobals(const Lambda* lambda, const P
 }
 
 ClassType* ResolveExactAllocatedClass(Value* value, std::unordered_set<Value*>& visited, unsigned depth = 0);
+Function* ResolveExactInvokeTarget(const Invoke* invoke, ClassType* exactClass, CHIRBuilder& builder);
+Function* ResolveExactInvokeTarget(
+    const InvokeWithException* invoke, ClassType* exactClass, CHIRBuilder& builder);
 
 struct RangeAnalysis::ContextAbstractValue {
-    enum class Kind : uint8_t { TOP, BOOL, SINT, CLASS, OBJECT };
+    enum class Kind : uint8_t { TOP, BOOL, SINT, CLASS, OBJECT, LAMBDA };
 
     Kind kind{Kind::TOP};
     std::optional<BoolDomain> boolValue;
     std::unique_ptr<SIntDomain> sintValue;
     std::optional<std::vector<SInt>> exactSIntValues;
     ClassType* classValue{nullptr};
+    const Lambda* lambdaValue{nullptr};
+    std::vector<ContextAbstractValue> lambdaCapturedValues;
     std::vector<ContextAbstractValue> objectFields;
     size_t aliasGroup{0};
     size_t objectIdentity{0};
@@ -530,6 +537,15 @@ struct RangeAnalysis::ContextAbstractValue {
     {
     }
 
+    explicit ContextAbstractValue(const Lambda* value) : kind(Kind::LAMBDA), lambdaValue(value)
+    {
+    }
+
+    ContextAbstractValue(const Lambda* value, std::vector<ContextAbstractValue> captures)
+        : kind(Kind::LAMBDA), lambdaValue(value), lambdaCapturedValues(std::move(captures))
+    {
+    }
+
     ContextAbstractValue(ClassType* value, std::vector<ContextAbstractValue> fields, size_t identity)
         : kind(Kind::OBJECT), classValue(value), objectFields(std::move(fields)), objectIdentity(identity)
     {
@@ -537,8 +553,9 @@ struct RangeAnalysis::ContextAbstractValue {
 
     ContextAbstractValue(const ContextAbstractValue& other)
         : kind(other.kind), boolValue(other.boolValue), exactSIntValues(other.exactSIntValues),
-          classValue(other.classValue), objectFields(other.objectFields), aliasGroup(other.aliasGroup),
-          objectIdentity(other.objectIdentity)
+          classValue(other.classValue), lambdaValue(other.lambdaValue),
+          lambdaCapturedValues(other.lambdaCapturedValues), objectFields(other.objectFields),
+          aliasGroup(other.aliasGroup), objectIdentity(other.objectIdentity)
     {
         if (other.sintValue) {
             sintValue = std::make_unique<SIntDomain>(*other.sintValue);
@@ -557,6 +574,8 @@ struct RangeAnalysis::ContextAbstractValue {
         sintValue = other.sintValue ? std::make_unique<SIntDomain>(*other.sintValue) : nullptr;
         exactSIntValues = other.exactSIntValues;
         classValue = other.classValue;
+        lambdaValue = other.lambdaValue;
+        lambdaCapturedValues = other.lambdaCapturedValues;
         objectFields = other.objectFields;
         aliasGroup = other.aliasGroup;
         objectIdentity = other.objectIdentity;
@@ -580,6 +599,11 @@ struct RangeAnalysis::ContextAbstractValue {
         }
         if (kind == Kind::CLASS) {
             return classValue != nullptr;
+        }
+        if (kind == Kind::LAMBDA) {
+            return lambdaValue != nullptr &&
+                std::all_of(lambdaCapturedValues.begin(), lambdaCapturedValues.end(),
+                    [](const auto& captured) { return captured.IsSingleValue(); });
         }
         return kind == Kind::OBJECT &&
             std::all_of(objectFields.begin(), objectFields.end(), [](const auto& field) {
@@ -617,6 +641,17 @@ struct RangeAnalysis::ContextAbstractValue {
         }
         if (kind == Kind::CLASS && classValue != nullptr) {
             ss << "class:" << static_cast<const void*>(classValue);
+            return ss.str();
+        }
+        if (kind == Kind::LAMBDA && lambdaValue != nullptr) {
+            ss << "lambda:" << static_cast<const void*>(lambdaValue) << '{';
+            for (size_t i = 0; i < lambdaCapturedValues.size(); ++i) {
+                if (i != 0) {
+                    ss << ',';
+                }
+                ss << lambdaCapturedValues[i].ToKeyString(nullptr);
+            }
+            ss << '}';
             return ss.str();
         }
         if (kind == Kind::OBJECT) {
@@ -704,6 +739,18 @@ std::unique_ptr<ValueRange> RangeAnalysis::GetBoundedLoopObservedRange(const Exp
     }
     auto found = boundedLoopObservations.find(expression);
     return found == boundedLoopObservations.end() ? nullptr : found->second->Clone();
+}
+
+std::unique_ptr<ValueRange> RangeAnalysis::GetLocalBoundedLoopObservedRange(
+    const Expression* expression) const
+{
+    if (expression == nullptr ||
+        incompleteLocalBoundedLoopObservations.find(expression) !=
+            incompleteLocalBoundedLoopObservations.end()) {
+        return nullptr;
+    }
+    auto found = localBoundedLoopObservations.find(expression);
+    return found == localBoundedLoopObservations.end() ? nullptr : found->second->Clone();
 }
 
 void RangeAnalysis::ClearBoundedLoopObservedRanges()
@@ -844,6 +891,60 @@ RangeAnalysis::ContextAbstractValue RangeAnalysis::CaptureContextValue(
 {
     if (value == nullptr) {
         return ContextAbstractValue{};
+    }
+    if (value->IsLocalVar()) {
+        auto expression = StaticCast<LocalVar*>(value)->GetExpr();
+        if (expression != nullptr && expression->GetExprKind() == ExprKind::LAMBDA) {
+            auto lambda = StaticCast<const Lambda*>(expression);
+            if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
+                std::cerr << "[RangeAnalysisLambdaContext] captures="
+                          << lambda->GetCapturedVariables().size();
+                for (auto captured : lambda->GetCapturedVariables()) {
+                    std::cerr << " type="
+                              << (captured == nullptr || captured->GetType() == nullptr
+                                      ? "<null>"
+                                      : captured->GetType()->ToString())
+                              << " readonly="
+                              << (captured != nullptr && captured->TestAttr(Attribute::READONLY));
+                }
+                std::cerr << '\n';
+            }
+            constexpr size_t MAX_CONTEXT_LAMBDA_CAPTURES = 16;
+            auto capturedVariables = lambda->GetCapturedVariables();
+            if (capturedVariables.size() > MAX_CONTEXT_LAMBDA_CAPTURES) {
+                return ContextAbstractValue{};
+            }
+            std::vector<ContextAbstractValue> capturedValues;
+            capturedValues.reserve(capturedVariables.size());
+            for (auto captured : capturedVariables) {
+                auto capturedType = captured == nullptr ? nullptr : captured->GetType();
+                if (capturedType == nullptr || capturedType->IsRef() ||
+                    (!capturedType->IsBoolean() && !capturedType->IsInteger())) {
+                    return ContextAbstractValue{};
+                }
+                auto capturedValue = CaptureContextValue(
+                    state, captured, /* preserveIntervals = */ true);
+                if (capturedValue.IsTop()) {
+                    return ContextAbstractValue{};
+                }
+                capturedValues.emplace_back(std::move(capturedValue));
+            }
+            return ContextAbstractValue{lambda, std::move(capturedValues)};
+        }
+        if (expression != nullptr && expression->GetExprKind() == ExprKind::CONSTANT) {
+            auto literal = StaticCast<Constant*>(expression)->GetValue();
+            if (literal != nullptr && !literal->IsNullLiteral()) {
+                auto literalDomain = HandleNonNullLiteralValue<RangeValueDomain>(literal);
+                auto literalRange = literalDomain.CheckAbsVal();
+                if (literalRange != nullptr && literalRange->GetRangeKind() == ValueRange::RangeKind::BOOL) {
+                    return ContextAbstractValue{StaticCast<const BoolRange*>(literalRange)->GetVal()};
+                }
+                if (literalRange != nullptr && literalRange->GetRangeKind() == ValueRange::RangeKind::SINT) {
+                    const auto* sintRange = StaticCast<const SIntRange*>(literalRange);
+                    return ContextAbstractValue{sintRange->GetVal(), sintRange->GetExactValues()};
+                }
+            }
+        }
     }
     std::unordered_set<Value*> visited;
     auto exactClass = ResolveExactAllocatedClass(value, visited);
@@ -992,6 +1093,19 @@ RangeAnalysis::ContextAbstractValue RangeAnalysis::JoinContextValues(
     if (lhs.kind == ContextAbstractValue::Kind::CLASS) {
         return lhs.classValue == rhs.classValue ? ContextAbstractValue{lhs.classValue} : ContextAbstractValue{};
     }
+    if (lhs.kind == ContextAbstractValue::Kind::LAMBDA) {
+        if (lhs.lambdaValue != rhs.lambdaValue ||
+            lhs.lambdaCapturedValues.size() != rhs.lambdaCapturedValues.size()) {
+            return ContextAbstractValue{};
+        }
+        std::vector<ContextAbstractValue> captures;
+        captures.reserve(lhs.lambdaCapturedValues.size());
+        for (size_t i = 0; i < lhs.lambdaCapturedValues.size(); ++i) {
+            captures.emplace_back(
+                JoinContextValues(lhs.lambdaCapturedValues[i], rhs.lambdaCapturedValues[i]));
+        }
+        return ContextAbstractValue{lhs.lambdaValue, std::move(captures)};
+    }
     if (lhs.kind == ContextAbstractValue::Kind::OBJECT &&
         lhs.objectIdentity != 0 && lhs.objectIdentity == rhs.objectIdentity &&
         lhs.objectFields.size() == rhs.objectFields.size()) {
@@ -1048,6 +1162,12 @@ ClassType* RangeAnalysis::ResolveExactClassForValue(Value* value) const
                     ? StaticCast<ClassType*>(allocatedType)
                     : nullptr;
             }
+            case ExprKind::ALLOCATE_WITH_EXCEPTION: {
+                auto allocatedType = StaticCast<AllocateWithException*>(expression)->GetType();
+                return allocatedType != nullptr && allocatedType->IsClass()
+                    ? StaticCast<ClassType*>(allocatedType)
+                    : nullptr;
+            }
             case ExprKind::TYPECAST:
                 return resolve(StaticCast<TypeCast*>(expression)->GetSourceValue(), depth + 1);
             case ExprKind::LOAD:
@@ -1057,6 +1177,217 @@ ClassType* RangeAnalysis::ResolveExactClassForValue(Value* value) const
         }
     };
     return resolve(value, 0);
+}
+
+const Lambda* RangeAnalysis::ResolveContextLambdaForValue(Value* value) const
+{
+    constexpr unsigned MAX_LAMBDA_DEF_DEPTH = 8;
+    std::unordered_set<Value*> visited;
+    std::function<const Lambda*(Value*, unsigned)> resolve =
+        [&](Value* current, unsigned depth) -> const Lambda* {
+        if (current == nullptr || depth >= MAX_LAMBDA_DEF_DEPTH ||
+            !visited.emplace(current).second) {
+            return nullptr;
+        }
+        if (current->IsParameter()) {
+            auto parameter = StaticCast<Parameter*>(current);
+            if (!isContextAnalysis || parameter->GetOwnerFunc() != func) {
+                return nullptr;
+            }
+            const auto& params = func->GetParams();
+            auto found = std::find(params.begin(), params.end(), parameter);
+            if (found == params.end()) {
+                return nullptr;
+            }
+            auto index = static_cast<size_t>(std::distance(params.begin(), found));
+            if (index >= contextArguments.size()) {
+                return nullptr;
+            }
+            const auto& contextValue = contextArguments[index];
+            return contextValue.kind == ContextAbstractValue::Kind::LAMBDA
+                ? contextValue.lambdaValue
+                : nullptr;
+        }
+        if (!current->IsLocalVar()) {
+            return nullptr;
+        }
+        auto expression = StaticCast<LocalVar*>(current)->GetExpr();
+        if (expression == nullptr) {
+            return nullptr;
+        }
+        if (expression->GetExprKind() == ExprKind::LAMBDA) {
+            return StaticCast<const Lambda*>(expression);
+        }
+        if (expression->GetExprKind() == ExprKind::TYPECAST) {
+            return resolve(StaticCast<TypeCast*>(expression)->GetSourceValue(), depth + 1);
+        }
+        return nullptr;
+    };
+    return resolve(value, 0);
+}
+
+std::optional<std::vector<ClassType*>> RangeAnalysis::ResolveFiniteClassSetForValue(Value* value) const
+{
+    constexpr unsigned MAX_CLASS_DEF_DEPTH = 16;
+    constexpr size_t MAX_CLASS_TARGETS = 16;
+    std::unordered_set<Value*> active;
+    std::function<std::optional<std::vector<ClassType*>>(Value*, unsigned)> resolve =
+        [&](Value* current, unsigned depth) -> std::optional<std::vector<ClassType*>> {
+        if (current == nullptr || depth >= MAX_CLASS_DEF_DEPTH || !active.emplace(current).second) {
+            return std::nullopt;
+        }
+        const auto eraseActive = [&active, current]() { active.erase(current); };
+        if (auto exactClass = ResolveExactClassForValue(current); exactClass != nullptr) {
+            eraseActive();
+            return std::vector<ClassType*>{exactClass};
+        }
+        if (!current->IsLocalVar()) {
+            eraseActive();
+            return std::nullopt;
+        }
+        auto expression = StaticCast<LocalVar*>(current)->GetExpr();
+        if (expression == nullptr) {
+            eraseActive();
+            return std::nullopt;
+        }
+        if (expression->GetExprKind() == ExprKind::TYPECAST) {
+            auto result = resolve(StaticCast<TypeCast*>(expression)->GetSourceValue(), depth + 1);
+            eraseActive();
+            return result;
+        }
+        if (expression->GetExprKind() != ExprKind::LOAD) {
+            eraseActive();
+            return std::nullopt;
+        }
+
+        auto location = StaticCast<Load*>(expression)->GetLocation();
+        if (location == nullptr || location->IsGlobal() || location->TestAttr(Attribute::STATIC)) {
+            eraseActive();
+            return std::nullopt;
+        }
+        std::vector<ClassType*> classes;
+        bool sawStore = false;
+        for (auto user : location->GetUsers()) {
+            if (user->GetExprKind() == ExprKind::DEBUGEXPR) {
+                continue;
+            }
+            if (user->GetExprKind() == ExprKind::LOAD &&
+                StaticCast<const Load*>(user)->GetLocation() == location) {
+                continue;
+            }
+            if (user->GetExprKind() != ExprKind::STORE ||
+                StaticCast<const Store*>(user)->GetLocation() != location) {
+                eraseActive();
+                return std::nullopt;
+            }
+            sawStore = true;
+            auto storedClasses = resolve(StaticCast<const Store*>(user)->GetValue(), depth + 1);
+            if (!storedClasses.has_value()) {
+                eraseActive();
+                return std::nullopt;
+            }
+            for (auto storedClass : *storedClasses) {
+                if (std::find(classes.begin(), classes.end(), storedClass) != classes.end()) {
+                    continue;
+                }
+                if (classes.size() >= MAX_CLASS_TARGETS) {
+                    eraseActive();
+                    return std::nullopt;
+                }
+                classes.emplace_back(storedClass);
+            }
+        }
+        eraseActive();
+        return sawStore && !classes.empty()
+            ? std::optional<std::vector<ClassType*>>{std::move(classes)}
+            : std::nullopt;
+    };
+    return resolve(value, 0);
+}
+
+bool RangeAnalysis::HandleFiniteInvokeTargets(
+    RangeDomain& state, const Expression* callExpression, const Invoke* invoke)
+{
+    auto classes = ResolveFiniteClassSetForValue(invoke == nullptr ? nullptr : invoke->GetObject());
+    if (!classes.has_value() || classes->empty()) {
+        return false;
+    }
+    std::vector<Function*> targets;
+    targets.reserve(classes->size());
+    for (auto exactClass : *classes) {
+        auto target = ResolveExactInvokeTarget(invoke, exactClass, builder);
+        if (target == nullptr) {
+            return false;
+        }
+        if (std::find(targets.begin(), targets.end(), target) == targets.end()) {
+            targets.emplace_back(target);
+        }
+    }
+    if (targets.empty()) {
+        return false;
+    }
+
+    return MergeFiniteDispatchTargets(
+        state, callExpression, invoke->GetArgs(), invoke->GetResult(), targets, classes->size());
+}
+
+bool RangeAnalysis::HandleFiniteInvokeTargets(
+    RangeDomain& state, const Expression* callExpression, const InvokeWithException* invoke)
+{
+    auto classes = ResolveFiniteClassSetForValue(invoke == nullptr ? nullptr : invoke->GetObject());
+    if (!classes.has_value() || classes->empty()) {
+        return false;
+    }
+    std::vector<Function*> targets;
+    targets.reserve(classes->size());
+    for (auto exactClass : *classes) {
+        auto target = ResolveExactInvokeTarget(invoke, exactClass, builder);
+        if (target == nullptr) {
+            return false;
+        }
+        if (std::find(targets.begin(), targets.end(), target) == targets.end()) {
+            targets.emplace_back(target);
+        }
+    }
+    if (targets.empty()) {
+        return false;
+    }
+
+    return MergeFiniteDispatchTargets(
+        state, callExpression, invoke->GetArgs(), invoke->GetResult(), targets, classes->size());
+}
+
+bool RangeAnalysis::MergeFiniteDispatchTargets(RangeDomain& state, const Expression* callExpression,
+    const std::vector<Value*>& args, Value* result, const std::vector<Function*>& targets, size_t classCount)
+{
+    auto inputState = state;
+    bool hasMergedState = false;
+    RangeDomain mergedState = state;
+    for (auto target : targets) {
+        auto targetState = inputState;
+        HandleContextSensitiveCall(targetState, callExpression, target, args, result);
+        if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
+            auto resultRange = result == nullptr ? nullptr : targetState.CheckAbstractValue(result);
+            std::cerr << "[RangeAnalysisInvokeTargetSummary] target=" << target->GetIdentifier()
+                      << " value=" << (resultRange == nullptr ? "Top" : resultRange->ToString()) << '\n';
+        }
+        if (!hasMergedState) {
+            mergedState = targetState;
+            hasMergedState = true;
+        } else {
+            mergedState.Join(targetState);
+        }
+    }
+    state = mergedState;
+    if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
+        auto resultRange = result == nullptr ? nullptr : state.CheckAbstractValue(result);
+        const auto& location = callExpression->GetDebugLocation();
+        std::cerr << "[RangeAnalysisInvokeTargets] result=finite classes=" << classCount
+                  << " targets=" << targets.size()
+                  << " value=" << (resultRange == nullptr ? "Top" : resultRange->ToString())
+                  << " line=" << location.GetBeginPos().line << '\n';
+    }
+    return true;
 }
 
 std::optional<std::string> RangeAnalysis::BuildContextKeyForCall(
@@ -1225,10 +1556,292 @@ void RangeAnalysis::HavocCallEffects(
 void RangeAnalysis::HandleApplyExpr(RangeDomain& state, const Apply* apply, Value* refObj)
 {
     (void)refObj;
+    if (TryHandlePureSpawnFutureResult(state, apply)) {
+        return;
+    }
     HandleContextSensitiveCall(state, apply, apply->GetCallee(), apply->GetArgs(), apply->GetResult());
     (void)TryRecordStructArrayLiteralConstructor(apply);
     (void)TryHandleStructArrayLiteralMutation(state, apply);
     (void)TryHandleArrayLiteralIndexApply(state, apply);
+}
+
+bool RangeAnalysis::IsPureSpawnLambda(const Lambda* lambda) const
+{
+    if (lambda == nullptr || lambda->GetBody() == nullptr || !lambda->GetParams().empty() ||
+        !lambda->GetCapturedVariables().empty()) {
+        return false;
+    }
+    auto globals = CollectTrackedMutableGlobals(lambda, builder.GetCurPackage());
+    if (!globals.complete || !globals.values.empty()) {
+        return false;
+    }
+    for (auto block : lambda->GetBody()->GetBlocks()) {
+        for (auto expression : block->GetExpressions()) {
+            switch (expression->GetExprMajorKind()) {
+                case ExprMajorKind::UNARY_EXPR:
+                case ExprMajorKind::BINARY_EXPR:
+                    continue;
+                case ExprMajorKind::MEMORY_EXPR: {
+                    switch (expression->GetExprKind()) {
+                        case ExprKind::ALLOCATE:
+                            continue;
+                        case ExprKind::LOAD: {
+                            auto location = StaticCast<const Load*>(expression)->GetLocation();
+                            if (location != nullptr && !location->IsGlobal() &&
+                                !location->TestAttr(Attribute::STATIC)) {
+                                continue;
+                            }
+                            return false;
+                        }
+                        case ExprKind::STORE: {
+                            auto location = StaticCast<const Store*>(expression)->GetLocation();
+                            if (location != nullptr && !location->IsGlobal() &&
+                                !location->TestAttr(Attribute::STATIC)) {
+                                continue;
+                            }
+                            return false;
+                        }
+                        default:
+                            return false;
+                    }
+                }
+                case ExprMajorKind::STRUCTURED_CTRL_FLOW_EXPR:
+                    return false;
+                case ExprMajorKind::OTHERS:
+                    switch (expression->GetExprKind()) {
+                        case ExprKind::CONSTANT:
+                        case ExprKind::DEBUGEXPR:
+                        case ExprKind::TUPLE:
+                        case ExprKind::TYPECAST:
+                        case ExprKind::INSTANCEOF:
+                            continue;
+                        default:
+                            return false;
+                    }
+                case ExprMajorKind::TERMINATOR:
+                    switch (expression->GetExprKind()) {
+                        case ExprKind::GOTO:
+                        case ExprKind::BRANCH:
+                        case ExprKind::MULTIBRANCH:
+                        case ExprKind::EXIT:
+                            continue;
+                        default:
+                            return false;
+                    }
+                default:
+                    return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool RangeAnalysis::IsUniqueSpawnValueProjection(
+    Value* future, Value* calleeValue, Type* resultType, Type* parentType) const
+{
+    auto parentClass = parentType == nullptr ? nullptr : DynamicCast<ClassType*>(parentType->StripAllRefs());
+    auto futureClass = future == nullptr ? nullptr : DynamicCast<ClassType*>(future->GetType()->StripAllRefs());
+    auto callee = DynamicCast<Function*>(calleeValue);
+    if (parentClass == nullptr || futureClass == nullptr || callee == nullptr || resultType == nullptr ||
+        parentClass->GetClassDef() != futureClass->GetClassDef()) {
+        return false;
+    }
+    auto genericParams = parentClass->GetClassDef()->GetGenericTypeParams();
+    auto genericArgs = parentClass->GetGenericArgs();
+    if (genericParams.size() != genericArgs.size()) {
+        return false;
+    }
+    std::vector<Function*> valueProjectionMethods;
+    for (auto method : parentClass->GetClassDef()->GetMethods()) {
+        if (method == nullptr || method->TestAttr(Attribute::STATIC) || method->GetParams().size() != 1) {
+            continue;
+        }
+        for (size_t i = 0; i < genericParams.size(); ++i) {
+            if (method->GetReturnType() == genericParams[i] && genericArgs[i] == resultType) {
+                valueProjectionMethods.emplace_back(method);
+                break;
+            }
+        }
+    }
+    return valueProjectionMethods.size() == 1 && valueProjectionMethods.front() == callee;
+}
+
+const Lambda* RangeAnalysis::ResolvePureSpawnLambdaForApply(const Apply* apply) const
+{
+    if (apply == nullptr || apply->GetResult() == nullptr || apply->GetArgs().size() != 1 ||
+        (!apply->GetResult()->GetType()->IsInteger() && !apply->GetResult()->GetType()->IsBoolean())) {
+        return nullptr;
+    }
+    auto future = apply->GetArgs().front();
+    auto block = apply->GetParentBlock();
+    if (future == nullptr || block == nullptr) {
+        return nullptr;
+    }
+    const auto& expressions = block->GetExpressions();
+    auto applyPosition = std::find(expressions.begin(), expressions.end(), apply);
+    if (applyPosition == expressions.end()) {
+        return nullptr;
+    }
+
+    const Spawn* spawn = nullptr;
+    for (auto user : future->GetUsers()) {
+        if (user->GetExprKind() != ExprKind::SPAWN) {
+            continue;
+        }
+        auto candidate = StaticCast<const Spawn*>(user);
+        if (candidate->IsExecuteClosure() || candidate->GetFuture() != future ||
+            candidate->GetParentBlock() != block) {
+            continue;
+        }
+        auto position = std::find(expressions.begin(), expressions.end(), candidate);
+        if (position == expressions.end() || position >= applyPosition || spawn != nullptr) {
+            return nullptr;
+        }
+        spawn = candidate;
+    }
+    if (spawn == nullptr) {
+        return nullptr;
+    }
+    auto spawnPosition = std::find(expressions.begin(), expressions.end(), spawn);
+
+    const Lambda* lambda = nullptr;
+    for (auto user : future->GetUsers()) {
+        if (user == apply || user->GetExprKind() != ExprKind::APPLY || user->GetParentBlock() != block) {
+            continue;
+        }
+        auto initializer = StaticCast<const Apply*>(user);
+        auto args = initializer->GetArgs();
+        if (args.empty() || args.front() != future) {
+            continue;
+        }
+        auto position = std::find(expressions.begin(), expressions.end(), initializer);
+        if (position == expressions.end() || position >= spawnPosition) {
+            continue;
+        }
+        const Lambda* candidateLambda = nullptr;
+        for (size_t i = 1; i < args.size(); ++i) {
+            auto candidate = ResolveContextLambdaForValue(args[i]);
+            if (candidate == nullptr) {
+                continue;
+            }
+            if (candidateLambda != nullptr) {
+                return nullptr;
+            }
+            candidateLambda = candidate;
+        }
+        if (candidateLambda == nullptr || (lambda != nullptr && lambda != candidateLambda)) {
+            return nullptr;
+        }
+        lambda = candidateLambda;
+    }
+    if (!IsPureSpawnLambda(lambda) || lambda->GetReturnType() != apply->GetResult()->GetType()) {
+        return nullptr;
+    }
+
+    return IsUniqueSpawnValueProjection(future, apply->GetCallee(), apply->GetResult()->GetType(),
+        apply->GetInstParentCustomTyOfCallee(builder))
+        ? lambda
+        : nullptr;
+}
+
+const Lambda* RangeAnalysis::ResolvePureSpawnLambdaForApply(const ApplyWithException* apply) const
+{
+    if (apply == nullptr || apply->GetResult() == nullptr || apply->GetArgs().size() != 1 ||
+        (!apply->GetResult()->GetType()->IsInteger() && !apply->GetResult()->GetType()->IsBoolean())) {
+        return nullptr;
+    }
+    auto future = apply->GetArgs().front();
+    if (future == nullptr || apply->GetParentBlock() == nullptr) {
+        return nullptr;
+    }
+
+    const SpawnWithException* spawn = nullptr;
+    for (auto user : future->GetUsers()) {
+        if (user->GetExprKind() != ExprKind::SPAWN_WITH_EXCEPTION) {
+            continue;
+        }
+        auto candidate = StaticCast<const SpawnWithException*>(user);
+        if (candidate->IsExecuteClosure() || candidate->GetFuture() != future ||
+            candidate->GetSuccessBlock() != apply->GetParentBlock() || spawn != nullptr) {
+            return nullptr;
+        }
+        spawn = candidate;
+    }
+    if (spawn == nullptr || spawn->GetParentBlock() == nullptr) {
+        return nullptr;
+    }
+
+    const Lambda* lambda = nullptr;
+    for (auto user : future->GetUsers()) {
+        if (user == apply || user->GetExprKind() != ExprKind::APPLY_WITH_EXCEPTION) {
+            continue;
+        }
+        auto initializer = StaticCast<const ApplyWithException*>(user);
+        if (initializer->GetSuccessBlock() != spawn->GetParentBlock()) {
+            continue;
+        }
+        auto args = initializer->GetArgs();
+        if (args.empty() || args.front() != future) {
+            continue;
+        }
+        const Lambda* candidateLambda = nullptr;
+        for (size_t i = 1; i < args.size(); ++i) {
+            auto candidate = ResolveContextLambdaForValue(args[i]);
+            if (candidate == nullptr) {
+                continue;
+            }
+            if (candidateLambda != nullptr) {
+                return nullptr;
+            }
+            candidateLambda = candidate;
+        }
+        if (candidateLambda == nullptr || (lambda != nullptr && lambda != candidateLambda)) {
+            return nullptr;
+        }
+        lambda = candidateLambda;
+    }
+    if (!IsPureSpawnLambda(lambda) || lambda->GetReturnType() != apply->GetResult()->GetType()) {
+        return nullptr;
+    }
+    return IsUniqueSpawnValueProjection(future, apply->GetCallee(), apply->GetResult()->GetType(),
+        apply->GetInstParentCustomTyOfCallee(builder))
+        ? lambda
+        : nullptr;
+}
+
+bool RangeAnalysis::ApplyPureSpawnLambdaResult(
+    RangeDomain& state, const Lambda* lambda, Value* resultValue, const Expression* callExpression)
+{
+    if (lambda == nullptr || resultValue == nullptr || callExpression == nullptr) {
+        return false;
+    }
+    auto candidateState = state;
+    if (!HandleLambdaContextSensitiveCall(candidateState, lambda, {}, resultValue)) {
+        return false;
+    }
+    auto result = candidateState.CheckAbstractValue(resultValue);
+    if (result == nullptr) {
+        return false;
+    }
+    state = std::move(candidateState);
+    if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
+        const auto& location = callExpression->GetDebugLocation();
+        std::cerr << "[RangeAnalysisSpawnFuture] result=" << result->ToString()
+                  << " line=" << location.GetBeginPos().line << '\n';
+    }
+    return true;
+}
+
+bool RangeAnalysis::TryHandlePureSpawnFutureResult(RangeDomain& state, const Apply* apply)
+{
+    auto lambda = ResolvePureSpawnLambdaForApply(apply);
+    return ApplyPureSpawnLambdaResult(state, lambda, apply == nullptr ? nullptr : apply->GetResult(), apply);
+}
+
+bool RangeAnalysis::TryHandlePureSpawnFutureResult(RangeDomain& state, const ApplyWithException* apply)
+{
+    auto lambda = ResolvePureSpawnLambdaForApply(apply);
+    return ApplyPureSpawnLambdaResult(state, lambda, apply == nullptr ? nullptr : apply->GetResult(), apply);
 }
 
 void RangeAnalysis::HandleVarStateCapturedByLambda(RangeDomain& state, const Lambda* lambda)
@@ -1243,7 +1856,9 @@ std::optional<Block*> RangeAnalysis::HandleApplyWithExceptionTerminator(
     RangeDomain& state, const ApplyWithException* apply, Value* refObj)
 {
     (void)refObj;
-    HandleContextSensitiveCall(state, apply, apply->GetCallee(), apply->GetArgs(), apply->GetResult());
+    if (!TryHandlePureSpawnFutureResult(state, apply)) {
+        HandleContextSensitiveCall(state, apply, apply->GetCallee(), apply->GetArgs(), apply->GetResult());
+    }
     return std::nullopt;
 }
 
@@ -1251,14 +1866,20 @@ std::optional<Block*> RangeAnalysis::HandleInvokeWithExceptionTerminator(
     RangeDomain& state, const InvokeWithException* invoke, Value* refObj)
 {
     (void)refObj;
-    HavocCallEffects(state, invoke->GetArgs(), invoke->GetResult());
+    if (!HandleFiniteInvokeTargets(state, invoke, invoke)) {
+        HavocCallEffects(state, invoke->GetArgs(), invoke->GetResult());
+    }
     return std::nullopt;
 }
 
 void RangeAnalysis::HandleContextSensitiveCall(RangeDomain& state, const Expression* callExpression,
     Value* calleeValue, const std::vector<Value*>& args, Value* result)
 {
-    if (auto lambda = IsApplyToLambda(callExpression); lambda != nullptr) {
+    auto lambda = IsApplyToLambda(callExpression);
+    if (lambda == nullptr) {
+        lambda = ResolveContextLambdaForValue(calleeValue);
+    }
+    if (lambda != nullptr) {
         if (HandleLambdaContextSensitiveCall(state, lambda, args, result)) {
             return;
         }
@@ -1267,12 +1888,12 @@ void RangeAnalysis::HandleContextSensitiveCall(RangeDomain& state, const Express
         }
     }
     if (calleeValue == nullptr || !calleeValue->IsFuncWithBody()) {
-        HavocCallEffects(state, args, result, IsApplyToLambda(callExpression));
+        HavocCallEffects(state, args, result, lambda);
         return;
     }
     auto callee = DynamicCast<Function*>(calleeValue);
     if (callee == nullptr || callee->GetBody() == nullptr || callee->GetParams().size() != args.size()) {
-        HavocCallEffects(state, args, result, IsApplyToLambda(callExpression));
+        HavocCallEffects(state, args, result, lambda);
         return;
     }
 
@@ -1313,7 +1934,7 @@ void RangeAnalysis::HandleContextSensitiveCall(RangeDomain& state, const Express
 
     auto trackedGlobals = CollectTrackedMutableGlobals(callee, builder.GetCurPackage());
     if (!trackedGlobals.complete) {
-        HavocCallEffects(state, args, result, IsApplyToLambda(callExpression));
+        HavocCallEffects(state, args, result, lambda);
         return;
     }
     ContextGlobalValues contextGlobals;
@@ -1336,6 +1957,24 @@ void RangeAnalysis::HandleContextSensitiveCall(RangeDomain& state, const Express
     std::vector<std::optional<ContextAbstractValue>> refArgValues;
     ContextGlobalValues summarizedGlobals = contextGlobals;
     auto summary = AnalyzeCalleeWithContext(callee, contextArgs, refArgValues, summarizedGlobals);
+    if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
+        for (size_t i = 0; i < args.size(); ++i) {
+            auto arg = args[i];
+            if (arg == nullptr || arg->GetType() == nullptr || !arg->GetType()->IsRef()) {
+                continue;
+            }
+            std::cerr << "[RangeAnalysisCallRefSummary] callee=" << callee->GetIdentifier()
+                      << " arg=" << i
+                      << " input=" << contextArgs[i].ToKeyString(arg->GetType())
+                      << " output=";
+            if (i >= refArgValues.size() || !refArgValues[i].has_value()) {
+                std::cerr << "Top";
+            } else {
+                std::cerr << refArgValues[i]->ToKeyString(arg->GetType());
+            }
+            std::cerr << '\n';
+        }
+    }
     for (size_t i = 0; i < args.size(); ++i) {
         auto arg = args[i];
         if (arg == nullptr || arg->GetType() == nullptr || !arg->GetType()->IsRef()) {
@@ -2046,6 +2685,32 @@ RangeAnalysis::~RangeAnalysis()
     }
 }
 
+void RangeAnalysis::RecordTerminatorEdgeState(
+    const Terminator* terminator, const Block* successor, const RangeDomain& state)
+{
+    if (terminator == nullptr || successor == nullptr) {
+        return;
+    }
+    auto& successorStates = terminatorEdgeStates[terminator];
+    auto found = successorStates.find(successor);
+    if (found == successorStates.end()) {
+        successorStates.emplace(successor, state);
+    } else {
+        found->second = state;
+    }
+}
+
+const RangeDomain* RangeAnalysis::GetRecordedTerminatorEdgeState(
+    const Terminator* terminator, const Block* successor) const
+{
+    auto terminatorIt = terminatorEdgeStates.find(terminator);
+    if (terminatorIt == terminatorEdgeStates.end()) {
+        return nullptr;
+    }
+    auto successorIt = terminatorIt->second.find(successor);
+    return successorIt == terminatorIt->second.end() ? nullptr : &successorIt->second;
+}
+
 void RangeAnalysis::SeedMutableGlobalInitializers(RangeDomain& state)
 {
     auto package = builder.GetCurPackage();
@@ -2120,6 +2785,17 @@ void RangeAnalysis::InitializeFuncEntryState(RangeDomain& state)
     for (size_t i = 0; i < limit; ++i) {
         auto param = params[i];
         auto type = param->GetType();
+        if (contextArguments[i].kind == ContextAbstractValue::Kind::LAMBDA &&
+            contextArguments[i].lambdaValue != nullptr) {
+            auto capturedVariables = contextArguments[i].lambdaValue->GetCapturedVariables();
+            if (capturedVariables.size() == contextArguments[i].lambdaCapturedValues.size()) {
+                for (size_t captureIndex = 0; captureIndex < capturedVariables.size(); ++captureIndex) {
+                    ApplyContextValue(state, capturedVariables[captureIndex],
+                        contextArguments[i].lambdaCapturedValues[captureIndex]);
+                }
+            }
+            continue;
+        }
         if (type != nullptr && type->IsRef()) {
             auto baseType = GetRefRootBaseType(type);
             auto object = state.CheckAbstractObjectRefBy(param);
@@ -3989,6 +4665,256 @@ bool TryHandleFieldFromAggregateLiteral(RangeDomain& state, const Field* field)
     return CopyKnownScalarRange(state, field->GetResult(), element);
 }
 
+bool HasOnlyDirectEnumLoadStoreUsers(Value* location)
+{
+    if (location == nullptr || location->IsGlobal() || location->TestAttr(Attribute::STATIC)) {
+        return false;
+    }
+    for (auto user : location->GetUsers()) {
+        if (user->GetExprKind() == ExprKind::DEBUGEXPR) {
+            continue;
+        }
+        if (user->GetExprKind() == ExprKind::LOAD && StaticCast<const Load*>(user)->GetLocation() == location) {
+            continue;
+        }
+        if (user->GetExprKind() == ExprKind::STORE && StaticCast<const Store*>(user)->GetLocation() == location) {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+std::optional<uint64_t> GetSingleEnumTagRangeValue(const RangeDomain& state, Value* value)
+{
+    auto range = state.CheckAbstractValue(value);
+    if (range == nullptr) {
+        return std::nullopt;
+    }
+    if (range->GetRangeKind() == ValueRange::RangeKind::BOOL) {
+        const auto& domain = StaticCast<const BoolRange*>(range)->GetVal();
+        return domain.IsSingleValue() ? std::optional<uint64_t>{domain.IsTrue() ? 1U : 0U} : std::nullopt;
+    }
+    if (range->GetRangeKind() != ValueRange::RangeKind::SINT) {
+        return std::nullopt;
+    }
+    const auto& domain = StaticCast<const SIntRange*>(range)->GetVal();
+    if (!domain.IsSingleValue()) {
+        return std::nullopt;
+    }
+    return domain.NumericBound().GetSingleElement().UVal();
+}
+
+std::optional<uint64_t> GetEnumConstructorIndex(Value* enumTuple)
+{
+    auto expression = GetDefiningExprForWidening(enumTuple);
+    if (expression == nullptr || expression->GetExprKind() != ExprKind::TUPLE ||
+        enumTuple->GetType() == nullptr || !enumTuple->GetType()->IsEnum()) {
+        return std::nullopt;
+    }
+    auto elements = StaticCast<const Tuple*>(expression)->GetElementValues();
+    if (elements.empty()) {
+        return std::nullopt;
+    }
+    auto indexExpression = GetDefiningExprForWidening(elements.front());
+    if (indexExpression == nullptr || indexExpression->GetExprKind() != ExprKind::CONSTANT) {
+        return std::nullopt;
+    }
+    auto literal = StaticCast<const Constant*>(indexExpression)->GetValue();
+    if (literal == nullptr) {
+        return std::nullopt;
+    }
+    if (literal->IsBoolLiteral()) {
+        return StaticCast<BoolLiteral*>(literal)->GetVal() ? 1U : 0U;
+    }
+    if (!literal->IsIntLiteral()) {
+        return std::nullopt;
+    }
+    auto domain = SIntDomain::From(*literal);
+    return domain.IsSingleValue()
+        ? std::optional<uint64_t>{domain.NumericBound().GetSingleElement().UVal()}
+        : std::nullopt;
+}
+
+std::optional<uint64_t> GetKnownEnumConstructorIndex(RangeDomain& state, Value* source)
+{
+    std::optional<uint64_t> result;
+    const auto mergeIndex = [&result](std::optional<uint64_t> index) {
+        if (!index.has_value()) {
+            return true;
+        }
+        if (result.has_value() && result.value() != index.value()) {
+            return false;
+        }
+        result = index;
+        return true;
+    };
+
+    auto children = state.GetChildren(source);
+    if (!children.empty() && !mergeIndex(GetSingleEnumTagRangeValue(state, children.front()))) {
+        return std::nullopt;
+    }
+    for (auto user : source->GetUsers()) {
+        if (user->GetExprKind() != ExprKind::FIELD) {
+            continue;
+        }
+        auto field = StaticCast<const Field*>(user);
+        auto path = field->GetPath();
+        if (path.size() == 1 && path.front() == 0 &&
+            !mergeIndex(GetSingleEnumTagRangeValue(state, field->GetResult()))) {
+            return std::nullopt;
+        }
+    }
+    return result;
+}
+
+std::unique_ptr<ValueRange> GetKnownScalarAggregateRange(RangeDomain& state, Value* value)
+{
+    if (value == nullptr || value->GetType() == nullptr ||
+        (!value->GetType()->IsInteger() && !value->GetType()->IsBoolean())) {
+        return nullptr;
+    }
+    if (auto range = state.CheckAbstractValue(value); range != nullptr) {
+        return range->Clone();
+    }
+    auto expression = GetDefiningExprForWidening(value);
+    if (expression == nullptr || expression->GetExprKind() != ExprKind::CONSTANT) {
+        return nullptr;
+    }
+    auto literal = StaticCast<const Constant*>(expression)->GetValue();
+    if (literal == nullptr || literal->IsNullLiteral()) {
+        return nullptr;
+    }
+    auto domain = HandleNonNullLiteralValue<RangeValueDomain>(literal);
+    auto range = domain.CheckAbsVal();
+    return range == nullptr ? nullptr : range->Clone();
+}
+
+bool TryHandleEnumTupleTypeCast(RangeDomain& state, const TypeCast* cast)
+{
+    auto source = cast == nullptr ? nullptr : cast->GetSourceValue();
+    auto targetType = cast == nullptr ? nullptr : cast->GetTargetTy();
+    if (source == nullptr || source->GetType() == nullptr || !source->GetType()->IsEnum() ||
+        targetType == nullptr || !targetType->IsTuple()) {
+        return false;
+    }
+    const auto traceReject = [cast](const char* reason) {
+        if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") == nullptr) {
+            return;
+        }
+        const auto& location = cast->GetDebugLocation();
+        std::cerr << "[RangeAnalysisEnumCast] result=reject reason=" << reason
+                  << " line=" << location.GetBeginPos().line << '\n';
+    };
+    auto constructorIndex = GetKnownEnumConstructorIndex(state, source);
+    if (!constructorIndex.has_value()) {
+        traceReject("unknown-tag");
+        return false;
+    }
+
+    std::vector<Value*> possibleTuples;
+    auto sourceExpression = GetDefiningExprForWidening(source);
+    if (sourceExpression != nullptr && sourceExpression->GetExprKind() == ExprKind::TUPLE) {
+        possibleTuples.emplace_back(source);
+    } else if (sourceExpression != nullptr && sourceExpression->GetExprKind() == ExprKind::LOAD) {
+        auto location = StaticCast<const Load*>(sourceExpression)->GetLocation();
+        if (!HasOnlyDirectEnumLoadStoreUsers(location)) {
+            traceReject("aliased-location");
+            return false;
+        }
+        bool usedConcreteStore = false;
+        if (boundedAggregateStores != nullptr) {
+            auto concreteStore = boundedAggregateStores->find(location);
+            if (concreteStore != boundedAggregateStores->end()) {
+                possibleTuples.emplace_back(concreteStore->second);
+                usedConcreteStore = true;
+            }
+        }
+        if (!usedConcreteStore) {
+            for (auto user : location->GetUsers()) {
+                if (user->GetExprKind() != ExprKind::STORE) {
+                    continue;
+                }
+                auto storedValue = StaticCast<const Store*>(user)->GetValue();
+                if (!GetEnumConstructorIndex(storedValue).has_value()) {
+                    traceReject("unknown-stored-constructor");
+                    return false;
+                }
+                possibleTuples.emplace_back(storedValue);
+            }
+        }
+    } else {
+        traceReject("unsupported-source");
+        return false;
+    }
+
+    auto elementTypes = StaticCast<TupleType*>(targetType)->GetElementTypes();
+    if (elementTypes.empty()) {
+        traceReject("empty-target");
+        return false;
+    }
+    std::vector<std::unique_ptr<ValueRange>> fieldRanges(elementTypes.size());
+    bool foundMatchingConstructor = false;
+    for (auto tupleValue : possibleTuples) {
+        auto index = GetEnumConstructorIndex(tupleValue);
+        if (!index.has_value() || index.value() != constructorIndex.value()) {
+            continue;
+        }
+        auto tupleExpression = StaticCast<const Tuple*>(GetDefiningExprForWidening(tupleValue));
+        auto elements = tupleExpression->GetElementValues();
+        if (elements.size() < elementTypes.size()) {
+            traceReject("short-constructor");
+            return false;
+        }
+        foundMatchingConstructor = true;
+        for (size_t fieldIndex = 0; fieldIndex < elementTypes.size(); ++fieldIndex) {
+            auto type = elementTypes[fieldIndex];
+            if (type == nullptr || (!type->IsInteger() && !type->IsBoolean())) {
+                continue;
+            }
+            auto incoming = GetKnownScalarAggregateRange(state, elements[fieldIndex]);
+            if (incoming == nullptr) {
+                traceReject("unknown-field");
+                return false;
+            }
+            if (fieldRanges[fieldIndex] == nullptr) {
+                fieldRanges[fieldIndex] = std::move(incoming);
+            } else if (fieldRanges[fieldIndex]->GetRangeKind() != incoming->GetRangeKind()) {
+                traceReject("field-kind-mismatch");
+                return false;
+            } else if (auto joined = fieldRanges[fieldIndex]->Join(*incoming); joined.has_value()) {
+                fieldRanges[fieldIndex] = std::move(joined.value());
+            }
+        }
+    }
+    if (!foundMatchingConstructor) {
+        traceReject("no-matching-constructor");
+        return false;
+    }
+
+    auto dest = cast->GetResult();
+    state.SetToBound(dest, /* isTop = */ true);
+    state.EnsureChildren(dest, elementTypes.size(), [&state, &elementTypes](AbstractObject* child, size_t index) {
+        state.SetToTopOrTopRef(child, elementTypes[index]->IsRef());
+    });
+    auto children = state.GetChildren(dest);
+    if (children.size() != elementTypes.size()) {
+        traceReject("child-layout");
+        return false;
+    }
+    for (size_t fieldIndex = 0; fieldIndex < fieldRanges.size(); ++fieldIndex) {
+        if (fieldRanges[fieldIndex] != nullptr) {
+            state.Update(children[fieldIndex], std::move(fieldRanges[fieldIndex]));
+        }
+    }
+    if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
+        const auto& location = cast->GetDebugLocation();
+        std::cerr << "[RangeAnalysisEnumCast] result=success tag=" << constructorIndex.value()
+                  << " line=" << location.GetBeginPos().line << '\n';
+    }
+    return true;
+}
+
 std::optional<size_t> GetSingleNonNegativeIndex(const RangeDomain& state, Value* value)
 {
     auto range = GetSIntRangeFromState(state, value);
@@ -4104,11 +5030,11 @@ void ForgetReferenceArgument(RangeDomain& state, Value* arg)
     auto baseType = GetRefRootBaseType(arg->GetType());
     auto object = state.CheckAbstractObjectRefBy(arg);
     if (object == nullptr || object->IsTopObjInstance()) {
-        state.ClearState();
+        state.ClearObjectState();
         return;
     }
     if (baseType == nullptr) {
-        state.ClearState();
+        state.ClearObjectState();
         return;
     }
     state.ForgetValueAndChildren(arg);
@@ -4512,7 +5438,8 @@ ClassType* ResolveExactAllocatedClass(Value* value, std::unordered_set<Value*>& 
     }
 }
 
-Function* ResolveExactInvokeTarget(const Invoke* invoke, ClassType* exactClass, CHIRBuilder& builder)
+template <typename TInvoke>
+Function* ResolveExactInvokeTargetImpl(const TInvoke* invoke, ClassType* exactClass, CHIRBuilder& builder)
 {
     if (invoke == nullptr || exactClass == nullptr) {
         return nullptr;
@@ -4529,6 +5456,17 @@ Function* ResolveExactInvokeTarget(const Invoke* invoke, ClassType* exactClass, 
     }
     auto target = methods[offset].GetVirtualMethod();
     return target != nullptr && target->IsFuncWithBody() && !target->IsPureAbstract() ? target : nullptr;
+}
+
+Function* ResolveExactInvokeTarget(const Invoke* invoke, ClassType* exactClass, CHIRBuilder& builder)
+{
+    return ResolveExactInvokeTargetImpl(invoke, exactClass, builder);
+}
+
+Function* ResolveExactInvokeTarget(
+    const InvokeWithException* invoke, ClassType* exactClass, CHIRBuilder& builder)
+{
+    return ResolveExactInvokeTargetImpl(invoke, exactClass, builder);
 }
 
 void RangeAnalysis::PreHandleFieldExpr(RangeDomain& state, const Field* field)
@@ -4551,7 +5489,10 @@ void RangeAnalysis::HandleOthersExpr(RangeDomain& state, const Expression* expre
 {
     switch (expression->GetExprKind()) {
         case ExprKind::TYPECAST: {
-            HandleTypeCast(state, StaticCast<const TypeCast*>(expression));
+            auto cast = StaticCast<const TypeCast*>(expression);
+            if (!TryHandleEnumTupleTypeCast(state, cast)) {
+                HandleTypeCast(state, cast);
+            }
             break;
         }
         case ExprKind::FIELD:
@@ -4584,10 +5525,7 @@ void RangeAnalysis::HandleOthersExpr(RangeDomain& state, const Expression* expre
         }
         case ExprKind::INVOKE: {
             auto invoke = StaticCast<const Invoke*>(expression);
-            auto target = ResolveExactInvokeTarget(invoke, ResolveExactClassForValue(invoke->GetObject()), builder);
-            if (target != nullptr) {
-                HandleContextSensitiveCall(state, expression, target, invoke->GetArgs(), invoke->GetResult());
-            } else {
+            if (!HandleFiniteInvokeTargets(state, expression, invoke)) {
                 HavocCallEffects(state, invoke->GetArgs(), invoke->GetResult());
             }
             return;
@@ -6348,13 +7286,16 @@ Type* GetIntegerRefRootType(Value* location)
     return rootType != nullptr && rootType->IsInteger() ? rootType : nullptr;
 }
 
-Type* GetBoundedScalarRefRootType(Value* location)
+Type* GetBoundedLoopRefRootType(Value* location)
 {
     if (location == nullptr || !location->GetType()->IsRef()) {
         return nullptr;
     }
     auto rootType = StaticCast<RefType*>(location->GetType())->GetRootBaseType();
-    return rootType != nullptr && (rootType->IsInteger() || rootType->IsBoolean()) ? rootType : nullptr;
+    return rootType != nullptr &&
+        (rootType->IsInteger() || rootType->IsBoolean() || rootType->IsEnum() || rootType->IsTuple())
+        ? rootType
+        : nullptr;
 }
 
 enum class StoreLookupKind : uint8_t { NOT_FOUND, FOUND, UNKNOWN };
@@ -7438,6 +8379,25 @@ struct PairLoopValues {
     std::vector<int64_t> rhsExitValues;
 };
 
+std::optional<SIntRange> BuildIntegerExactRange(Type* type, std::vector<SInt> values)
+{
+    if (type == nullptr || !type->IsInteger() || values.empty()) {
+        return std::nullopt;
+    }
+    auto width = ToWidth(*type);
+    if (std::any_of(values.begin(), values.end(), [width](const SInt& value) {
+        return value.Width() != width;
+    })) {
+        return std::nullopt;
+    }
+    auto exactValues = NormalizeExactIntSet(std::move(values));
+    if (!exactValues.has_value()) {
+        return std::nullopt;
+    }
+    auto domain = DomainFromExactIntValues(*exactValues, type->IsUnsignedInteger());
+    return SIntRange{std::move(domain), std::move(exactValues)};
+}
+
 std::optional<SIntRange> BuildSignedExactRange(Type* type, const std::vector<int64_t>& values)
 {
     if (type == nullptr || !type->IsInteger() || values.empty()) {
@@ -7661,7 +8621,8 @@ SmallStoreLookupResult FindLatestSmallSignedStoreValuesAvoidingBlocks(const Rang
 std::optional<std::vector<int64_t>> FindIncomingSmallSignedStoreValues(
     const RangeDomain& state, const Block* header, Value* location, Value* fallbackValue, Type* type,
     const std::unordered_set<const Block*>& loopBlocks,
-    const std::optional<std::vector<int64_t>>& entryValues)
+    const std::optional<std::vector<int64_t>>& entryValues,
+    const std::function<const RangeDomain*(const Block*)>& incomingEdgeState = {})
 {
     std::vector<int64_t> values;
     bool sawIncoming = false;
@@ -7670,6 +8631,16 @@ std::optional<std::vector<int64_t>> FindIncomingSmallSignedStoreValues(
             continue;
         }
         sawIncoming = true;
+        if (incomingEdgeState) {
+            auto edgeState = incomingEdgeState(pred);
+            auto edgeValues = edgeState == nullptr
+                ? std::nullopt
+                : ValuesFromSmallSignedValueSet(*edgeState, fallbackValue, type);
+            if (edgeValues.has_value()) {
+                values.insert(values.end(), edgeValues->begin(), edgeValues->end());
+                continue;
+            }
+        }
         std::unordered_set<const Block*> visited;
         auto lookup = FindLatestSmallSignedStoreValuesAvoidingBlocks(
             state, pred, location, type, loopBlocks, visited, 0);
@@ -7699,6 +8670,146 @@ std::optional<std::vector<int64_t>> FindIncomingSmallSignedStoreValues(
         return std::nullopt;
     }
     return values;
+}
+
+struct IntegerStoreLookupResult {
+    SmallStoreLookupKind kind{SmallStoreLookupKind::NOT_FOUND};
+    std::vector<SInt> values;
+};
+
+IntegerStoreLookupResult MergeIntegerStoreLookup(
+    IntegerStoreLookupResult lhs, IntegerStoreLookupResult rhs)
+{
+    if (lhs.kind == SmallStoreLookupKind::UNKNOWN || rhs.kind == SmallStoreLookupKind::UNKNOWN) {
+        return {SmallStoreLookupKind::UNKNOWN, {}};
+    }
+    if (lhs.kind == SmallStoreLookupKind::NOT_FOUND) {
+        return rhs;
+    }
+    if (rhs.kind == SmallStoreLookupKind::NOT_FOUND) {
+        return lhs;
+    }
+    lhs.values.insert(lhs.values.end(), rhs.values.begin(), rhs.values.end());
+    auto normalized = NormalizeExactIntSet(std::move(lhs.values));
+    if (!normalized.has_value()) {
+        return {SmallStoreLookupKind::UNKNOWN, {}};
+    }
+    return {SmallStoreLookupKind::FOUND, std::move(normalized.value())};
+}
+
+std::optional<std::vector<SInt>> GetSmallIntegerValuesFromState(
+    const RangeDomain& state, Value* value, Type* type)
+{
+    if (type == nullptr || !type->IsInteger()) {
+        return std::nullopt;
+    }
+    auto values = GetExactValuesOrSmallRange(
+        GetSIntRangeFromState(state, value, type), type->IsUnsignedInteger());
+    if (!values.has_value() ||
+        std::any_of(values->begin(), values->end(), [type](const SInt& item) {
+            return item.Width() != ToWidth(*type);
+        })) {
+        return std::nullopt;
+    }
+    return values;
+}
+
+IntegerStoreLookupResult FindLatestSmallIntegerStoreValuesAvoidingBlocks(
+    const RangeDomain& state, const Block* block, Value* location, Type* type,
+    const std::unordered_set<const Block*>& blocked, std::unordered_set<const Block*>& visited, size_t depth)
+{
+    constexpr size_t MAX_BACKWARD_INTEGER_STORE_LOOKUP_DEPTH = 32;
+    if (block == nullptr || depth > MAX_BACKWARD_INTEGER_STORE_LOOKUP_DEPTH) {
+        return {SmallStoreLookupKind::UNKNOWN, {}};
+    }
+    if (blocked.find(block) != blocked.end() || !visited.emplace(block).second) {
+        return {SmallStoreLookupKind::NOT_FOUND, {}};
+    }
+    auto expressions = block->GetExpressions();
+    for (auto it = expressions.rbegin(); it != expressions.rend(); ++it) {
+        if (location->IsGlobalVarWithInitializer() && IsFunctionCallExpression(*it)) {
+            return {SmallStoreLookupKind::UNKNOWN, {}};
+        }
+        if ((*it)->GetExprKind() != ExprKind::STORE) {
+            continue;
+        }
+        auto store = StaticCast<const Store*>(*it);
+        if (store->GetLocation() != location) {
+            continue;
+        }
+        auto values = GetSmallIntegerValuesFromState(state, store->GetValue(), type);
+        return values.has_value()
+            ? IntegerStoreLookupResult{SmallStoreLookupKind::FOUND, std::move(values.value())}
+            : IntegerStoreLookupResult{SmallStoreLookupKind::UNKNOWN, {}};
+    }
+
+    IntegerStoreLookupResult result;
+    for (auto predecessor : block->GetPredecessors()) {
+        result = MergeIntegerStoreLookup(result,
+            FindLatestSmallIntegerStoreValuesAvoidingBlocks(
+                state, predecessor, location, type, blocked, visited, depth + 1));
+        if (result.kind == SmallStoreLookupKind::UNKNOWN) {
+            return result;
+        }
+    }
+    return result;
+}
+
+std::optional<std::vector<SInt>> FindIncomingSmallIntegerStoreValues(
+    const RangeDomain& state, const Block* entry, Value* location, Value* fallbackValue, Type* type,
+    const std::unordered_set<const Block*>& loopBlocks,
+    const std::optional<std::vector<SInt>>& entryValues,
+    const std::function<const RangeDomain*(const Block*)>& incomingEdgeState = {})
+{
+    IntegerStoreLookupResult result;
+    bool sawIncoming = false;
+    for (auto predecessor : entry->GetPredecessors()) {
+        if (loopBlocks.find(predecessor) != loopBlocks.end()) {
+            continue;
+        }
+        sawIncoming = true;
+        if (incomingEdgeState) {
+            auto edgeState = incomingEdgeState(predecessor);
+            auto edgeValues = edgeState == nullptr
+                ? std::nullopt
+                : GetSmallIntegerValuesFromState(*edgeState, fallbackValue, type);
+            if (edgeValues.has_value()) {
+                result = MergeIntegerStoreLookup(
+                    std::move(result), {SmallStoreLookupKind::FOUND, std::move(edgeValues.value())});
+                if (result.kind == SmallStoreLookupKind::UNKNOWN) {
+                    return std::nullopt;
+                }
+                continue;
+            }
+        }
+        std::unordered_set<const Block*> visited;
+        auto lookup = FindLatestSmallIntegerStoreValuesAvoidingBlocks(
+            state, predecessor, location, type, loopBlocks, visited, 0);
+        if (lookup.kind == SmallStoreLookupKind::UNKNOWN) {
+            return std::nullopt;
+        }
+        if (lookup.kind == SmallStoreLookupKind::NOT_FOUND) {
+            auto fallback = entryValues.has_value()
+                ? entryValues
+                : GetSmallIntegerValuesFromState(state, fallbackValue, type);
+            if (!fallback.has_value()) {
+                return std::nullopt;
+            }
+            lookup = {SmallStoreLookupKind::FOUND, std::move(fallback.value())};
+        }
+        result = MergeIntegerStoreLookup(std::move(result), std::move(lookup));
+        if (result.kind == SmallStoreLookupKind::UNKNOWN) {
+            return std::nullopt;
+        }
+    }
+    if (!sawIncoming) {
+        return entryValues.has_value()
+            ? entryValues
+            : GetSmallIntegerValuesFromState(state, fallbackValue, type);
+    }
+    return result.kind == SmallStoreLookupKind::FOUND
+        ? std::optional<std::vector<SInt>>{std::move(result.values)}
+        : std::nullopt;
 }
 
 StoreLookupResult FindLatestBoolStoreValueAvoidingBlocks(const RangeDomain& state, const Block* block,
@@ -7744,7 +8855,8 @@ StoreLookupResult FindLatestBoolStoreValueAvoidingBlocks(const RangeDomain& stat
 
 std::optional<bool> FindIncomingBoolStoreValue(const RangeDomain& state, const Block* entry,
     Value* location, Value* fallbackValue, const std::unordered_set<const Block*>& loopBlocks,
-    std::optional<bool> entryValue)
+    std::optional<bool> entryValue,
+    const std::function<const RangeDomain*(const Block*)>& incomingEdgeState = {})
 {
     StoreLookupResult result{StoreLookupKind::NOT_FOUND, 0};
     bool sawIncoming = false;
@@ -7753,6 +8865,20 @@ std::optional<bool> FindIncomingBoolStoreValue(const RangeDomain& state, const B
             continue;
         }
         sawIncoming = true;
+        if (incomingEdgeState) {
+            auto edgeState = incomingEdgeState(predecessor);
+            if (edgeState != nullptr) {
+                auto rootType = location->GetType()->IsRef()
+                    ? StaticCast<RefType*>(location->GetType())->GetRootBaseType()
+                    : location->GetType();
+                auto edgeValue = GetBoolDomainFromStateWithType(*edgeState, fallbackValue, rootType);
+                if (edgeValue.IsSingleValue()) {
+                    result = MergeStoreLookup(result,
+                        {StoreLookupKind::FOUND, edgeValue.IsTrue() ? 1 : 0});
+                    continue;
+                }
+            }
+        }
         std::unordered_set<const Block*> visited;
         result = MergeStoreLookup(result, FindLatestBoolStoreValueAvoidingBlocks(
             state, predecessor, location, loopBlocks, visited, 0));
@@ -9420,28 +10546,59 @@ bool IsLoopBranch(const Branch* branch)
     return CanReachBlock(branch->GetFalseBlock(), parent, visited);
 }
 
-bool IsBoundedScalarCallSupported(const Apply* apply)
+bool IsBoundedScalarCallTargetSupported(
+    Value* result, const std::vector<Value*>& arguments, const Function* callee, size_t firstScalarArgument)
 {
-    if (apply == nullptr || apply->GetResult() == nullptr) {
+    if (result == nullptr || callee == nullptr) {
         return false;
     }
-    auto resultType = apply->GetResult()->GetType();
-    auto callee = DynamicCast<Function*>(apply->GetCallee());
+    auto resultType = result->GetType();
     if (resultType == nullptr || (!resultType->IsUnit() && !resultType->IsInteger() && !resultType->IsBoolean()) ||
-        callee == nullptr ||
-        callee->GetBody() == nullptr || callee->GetParams().size() != apply->GetArgs().size()) {
+        callee->GetBody() == nullptr || callee->GetParams().size() != arguments.size() ||
+        firstScalarArgument > arguments.size()) {
         return false;
     }
     auto trackedGlobals = CollectTrackedMutableGlobals(callee);
     if (!trackedGlobals.complete ||
         !std::all_of(trackedGlobals.begin(), trackedGlobals.end(), [](GlobalVar* global) {
             auto type = GetTrackedMutableGlobalBaseType(global);
-            return type != nullptr && (type->IsBoolean() || (type->IsInteger() && !type->IsUnsignedInteger()));
+            return type != nullptr && (type->IsBoolean() || type->IsInteger());
         })) {
         return false;
     }
+    return std::all_of(arguments.begin() + static_cast<std::ptrdiff_t>(firstScalarArgument),
+        arguments.end(), [](const Value* argument) {
+        auto type = argument == nullptr ? nullptr : argument->GetType();
+        return type != nullptr && !type->IsRef() && (type->IsInteger() || type->IsBoolean());
+    });
+}
+
+bool IsBoundedScalarCallSupported(const Apply* apply)
+{
+    if (apply == nullptr) {
+        return false;
+    }
     auto arguments = apply->GetArgs();
-    return std::all_of(arguments.begin(), arguments.end(), [](const Value* argument) {
+    return IsBoundedScalarCallTargetSupported(
+        apply->GetResult(), arguments, DynamicCast<Function*>(apply->GetCallee()), 0);
+}
+
+bool IsBoundedScalarInvokeShapeSupported(const Invoke* invoke)
+{
+    if (invoke == nullptr || invoke->GetObject() == nullptr) {
+        return false;
+    }
+    auto arguments = invoke->GetArgs();
+    if (arguments.empty() || arguments.front() != invoke->GetObject()) {
+        return false;
+    }
+    auto result = invoke->GetResult();
+    auto resultType = result == nullptr ? nullptr : result->GetType();
+    if (resultType == nullptr ||
+        (!resultType->IsUnit() && !resultType->IsInteger() && !resultType->IsBoolean())) {
+        return false;
+    }
+    return std::all_of(arguments.begin() + 1, arguments.end(), [](const Value* argument) {
         auto type = argument == nullptr ? nullptr : argument->GetType();
         return type != nullptr && !type->IsRef() && (type->IsInteger() || type->IsBoolean());
     });
@@ -9452,6 +10609,20 @@ bool IsLoopLocalScalarLocation(Value* location, const std::unordered_set<const B
     auto definingExpression = GetDefiningExpr(location);
     return definingExpression != nullptr && definingExpression->GetExprKind() == ExprKind::ALLOCATE &&
         loopBlocks.find(definingExpression->GetParentBlock()) != loopBlocks.end();
+}
+
+bool IsBoundedFlatAggregateType(const Type* type)
+{
+    return type != nullptr && (type->IsEnum() || type->IsTuple());
+}
+
+bool HasOnlyBoundedAggregateElements(const Expression* expression)
+{
+    auto operands = expression->GetOperands();
+    return std::all_of(operands.begin(), operands.end(), [](const Value* operand) {
+        auto type = operand == nullptr ? nullptr : operand->GetType();
+        return type != nullptr && !type->IsRef() && (type->IsInteger() || type->IsBoolean());
+    });
 }
 
 bool IsBoundedScalarLoopExpressionSupported(const Expression* expression)
@@ -9473,24 +10644,40 @@ bool IsBoundedScalarLoopExpressionSupported(const Expression* expression)
         }
         case ExprKind::LOAD: {
             auto load = StaticCast<const Load*>(expression);
-            auto rootType = GetBoundedScalarRefRootType(load->GetLocation());
-            return rootType != nullptr && (!rootType->IsInteger() || !rootType->IsUnsignedInteger());
+            auto rootType = GetBoundedLoopRefRootType(load->GetLocation());
+            return rootType != nullptr && (rootType->IsBoolean() ||
+                rootType->IsInteger() || IsBoundedFlatAggregateType(rootType));
         }
         case ExprKind::STORE: {
             auto store = StaticCast<const Store*>(expression);
-            auto rootType = GetBoundedScalarRefRootType(store->GetLocation());
-            return rootType != nullptr && (!rootType->IsInteger() || !rootType->IsUnsignedInteger());
+            auto rootType = GetBoundedLoopRefRootType(store->GetLocation());
+            return rootType != nullptr && (rootType->IsBoolean() ||
+                rootType->IsInteger() || IsBoundedFlatAggregateType(rootType));
         }
         case ExprKind::TYPECAST: {
             auto cast = StaticCast<const TypeCast*>(expression);
-            return cast->GetSourceTy()->IsInteger() && cast->GetTargetTy()->IsInteger();
+            return (cast->GetSourceTy()->IsInteger() && cast->GetTargetTy()->IsInteger()) ||
+                (cast->GetSourceTy()->IsEnum() && cast->GetTargetTy()->IsTuple());
         }
         case ExprKind::ALLOCATE: {
-            auto rootType = GetBoundedScalarRefRootType(expression->GetResult());
-            return rootType != nullptr && (rootType->IsInteger() || rootType->IsBoolean());
+            auto rootType = GetBoundedLoopRefRootType(expression->GetResult());
+            return rootType != nullptr &&
+                (rootType->IsInteger() || rootType->IsBoolean() || IsBoundedFlatAggregateType(rootType));
+        }
+        case ExprKind::TUPLE:
+            return IsBoundedFlatAggregateType(expression->GetResult()->GetType()) &&
+                HasOnlyBoundedAggregateElements(expression);
+        case ExprKind::FIELD: {
+            auto field = StaticCast<const Field*>(expression);
+            auto resultType = field->GetResult()->GetType();
+            auto baseType = field->GetBase()->GetType();
+            return resultType != nullptr && (resultType->IsInteger() || resultType->IsBoolean()) &&
+                IsBoundedFlatAggregateType(baseType);
         }
         case ExprKind::APPLY:
             return IsBoundedScalarCallSupported(StaticCast<const Apply*>(expression));
+        case ExprKind::INVOKE:
+            return IsBoundedScalarInvokeShapeSupported(StaticCast<const Invoke*>(expression));
         default:
             return false;
     }
@@ -9504,6 +10691,14 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
     constexpr size_t MAX_BOUNDED_LOOP_LOCATIONS = 64;
     constexpr size_t MAX_BOUNDED_LOOP_STEPS = 16384;
     constexpr size_t MAX_BOUNDED_LOOP_CACHE_ENTRIES = 64;
+    const auto traceReject = [branch](const char* reason) {
+        if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") == nullptr) {
+            return;
+        }
+        const auto& location = branch->GetDebugLocation();
+        std::cerr << "[RangeAnalysisBoundedReject] reason=" << reason
+                  << " loop-line=" << location.GetBeginPos().line << '\n';
+    };
     if (boundedLoopEvaluationOwner != nullptr && boundedLoopEvaluationOwner != this) {
         return std::nullopt;
     }
@@ -9527,10 +10722,13 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
     auto analysisContext = isContextAnalysis
         ? BuildContextKey(func, contextArguments, contextGlobalArguments)
         : BuildRootAnalysisContextKey(func);
+    std::vector<const Expression*> loopExpressions;
     std::vector<const Expression*> loopCallExpressions;
     for (auto block : loopBlocks) {
         for (auto expression : block->GetNonTerminatorExpressions()) {
-            if (expression->GetExprKind() == ExprKind::APPLY) {
+            loopExpressions.emplace_back(expression);
+            if (expression->GetExprKind() == ExprKind::APPLY ||
+                expression->GetExprKind() == ExprKind::INVOKE) {
                 loopCallExpressions.emplace_back(expression);
             }
         }
@@ -9538,13 +10736,18 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
     struct BoundedContextAttempt {
         ~BoundedContextAttempt()
         {
-            if (succeeded || callExpressions.empty()) {
+            if (succeeded) {
                 return;
             }
-            if (parentRecorder != nullptr) {
-                MarkBoundedLoopCallContextsIncomplete(*parentRecorder, callExpressions);
-            } else {
-                MarkBoundedLoopCallContextsIncomplete(parentContext, callExpressions);
+            if (incompleteObservations != nullptr) {
+                incompleteObservations->insert(loopExpressions.begin(), loopExpressions.end());
+            }
+            if (!callExpressions.empty()) {
+                if (parentRecorder != nullptr) {
+                    MarkBoundedLoopCallContextsIncomplete(*parentRecorder, callExpressions);
+                } else {
+                    MarkBoundedLoopCallContextsIncomplete(parentContext, callExpressions);
+                }
             }
         }
 
@@ -9554,10 +10757,14 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
         }
 
         const std::string& parentContext;
+        const std::vector<const Expression*>& loopExpressions;
         const std::vector<const Expression*>& callExpressions;
         BoundedLoopCallContextMap* parentRecorder;
+        std::unordered_set<const Expression*>* incompleteObservations;
         bool succeeded{false};
-    } boundedContextAttempt{analysisContext, loopCallExpressions, parentCallContextRecorder};
+    } boundedContextAttempt{analysisContext, loopExpressions, loopCallExpressions,
+        parentCallContextRecorder,
+        isContextAnalysis ? &incompleteLocalBoundedLoopObservations : nullptr};
     const Block* loopEntry = nullptr;
     for (auto block : loopBlocks) {
         bool hasOutsidePredecessor = false;
@@ -9582,20 +10789,67 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
     std::vector<Value*> mutatedLocations;
     std::vector<Value*> readLocations;
     std::vector<Value*> externalValues;
+    std::vector<Value*> callReceiverValues;
     std::unordered_set<Value*> seenMutatedLocations;
     std::unordered_set<Value*> seenReadLocations;
     std::unordered_set<Value*> seenExternalValues;
+    std::unordered_set<Value*> seenCallReceiverValues;
     for (auto block : loopBlocks) {
         for (auto expression : block->GetNonTerminatorExpressions()) {
             if (!IsBoundedScalarLoopExpressionSupported(expression)) {
+                if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
+                    const auto& location = expression->GetDebugLocation();
+                    std::cerr << "[RangeAnalysisBoundedReject] reason=unsupported-expression kind="
+                              << static_cast<int>(expression->GetExprKind())
+                              << " line=" << location.GetBeginPos().line << '\n';
+                }
                 return std::nullopt;
             }
+            std::vector<Function*> callTargets;
+            size_t firstScalarArgument = 0;
             if (expression->GetExprKind() == ExprKind::APPLY) {
                 auto apply = StaticCast<const Apply*>(expression);
                 auto callee = DynamicCast<Function*>(apply->GetCallee());
-                if (callee == nullptr) {
+                if (!IsBoundedScalarCallTargetSupported(
+                    apply->GetResult(), apply->GetArgs(), callee, firstScalarArgument)) {
                     return std::nullopt;
                 }
+                callTargets.emplace_back(callee);
+            } else if (expression->GetExprKind() == ExprKind::INVOKE) {
+                auto invoke = StaticCast<const Invoke*>(expression);
+                auto receiver = invoke->GetObject();
+                auto receiverRootType =
+                    receiver == nullptr ? nullptr : GetRefRootBaseType(receiver->GetType());
+                if (receiverRootType == nullptr || !IsSupportedContextRootType(receiverRootType)) {
+                    traceReject("unsupported-invoke-receiver");
+                    return std::nullopt;
+                }
+                if (seenCallReceiverValues.emplace(receiver).second) {
+                    callReceiverValues.emplace_back(receiver);
+                }
+                auto classes = ResolveFiniteClassSetForValue(invoke->GetObject());
+                if (!classes.has_value() || classes->empty()) {
+                    traceReject("unresolved-invoke-classes");
+                    return std::nullopt;
+                }
+                firstScalarArgument = 1;
+                for (auto exactClass : *classes) {
+                    auto target = ResolveExactInvokeTarget(invoke, exactClass, builder);
+                    if (!IsBoundedScalarCallTargetSupported(
+                        invoke->GetResult(), invoke->GetArgs(), target, firstScalarArgument)) {
+                        traceReject("unsupported-invoke-target");
+                        return std::nullopt;
+                    }
+                    if (std::find(callTargets.begin(), callTargets.end(), target) == callTargets.end()) {
+                        callTargets.emplace_back(target);
+                    }
+                }
+                if (callTargets.empty()) {
+                    traceReject("empty-invoke-targets");
+                    return std::nullopt;
+                }
+            }
+            for (auto callee : callTargets) {
                 auto trackedGlobals = CollectTrackedMutableGlobals(callee);
                 if (!trackedGlobals.complete) {
                     return std::nullopt;
@@ -9672,6 +10926,7 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
         }
     }
     if (mutatedLocations.empty()) {
+        traceReject("no-mutated-locations");
         return std::nullopt;
     }
     std::vector<Value*> loopCarriedLocations;
@@ -9685,8 +10940,51 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
     BoundedLoopObservationMap observedRanges;
     BoundedLoopCallContextMap observedCallContexts;
     std::unordered_set<const Expression*> invalidObservedExpressions;
+    auto incomingEdgeState = [this, loopEntry](const Block* predecessor) {
+        return predecessor == nullptr
+            ? nullptr
+            : GetRecordedTerminatorEdgeState(predecessor->GetTerminator(), loopEntry);
+    };
+    for (auto receiver : callReceiverValues) {
+        std::optional<ContextAbstractValue> incomingReceiver;
+        for (auto predecessor : loopEntry->GetPredecessors()) {
+            if (loopBlocks.find(predecessor) != loopBlocks.end()) {
+                continue;
+            }
+            auto edgeState = incomingEdgeState(predecessor);
+            if (edgeState == nullptr || edgeState->IsBottom()) {
+                continue;
+            }
+            auto candidate =
+                CaptureContextValue(*edgeState, receiver, /* preserveIntervals = */ true);
+            if (candidate.IsTop()) {
+                traceReject("top-invoke-receiver-entry");
+                return std::nullopt;
+            }
+            if (!incomingReceiver.has_value()) {
+                incomingReceiver = std::move(candidate);
+                continue;
+            }
+            auto joined = JoinContextValues(incomingReceiver.value(), candidate);
+            if (joined.IsTop()) {
+                traceReject("unknown-invoke-receiver-entry");
+                return std::nullopt;
+            }
+            incomingReceiver = std::move(joined);
+        }
+        if (!incomingReceiver.has_value()) {
+            auto candidate =
+                CaptureContextValue(state, receiver, /* preserveIntervals = */ true);
+            if (candidate.IsTop()) {
+                traceReject("missing-invoke-receiver-entry");
+                return std::nullopt;
+            }
+            incomingReceiver = std::move(candidate);
+        }
+        ApplyContextValue(loopState, receiver, receiver->GetType(), incomingReceiver.value());
+    }
     auto observeExpression = [&](const Expression* expression) {
-        if (isContextAnalysis || expression == nullptr) {
+        if (expression == nullptr) {
             return;
         }
         Value* observedValue = expression->GetResult();
@@ -9717,14 +11015,14 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
         }
     };
     for (auto location : loopCarriedLocations) {
-        auto rootType = GetBoundedScalarRefRootType(location);
+        auto rootType = GetBoundedLoopRefRootType(location);
         auto object = loopState.CheckAbstractObjectRefBy(location);
-        if (rootType == nullptr || object == nullptr ||
-            (rootType->IsInteger() && rootType->IsUnsignedInteger())) {
+        if (rootType == nullptr || object == nullptr || IsBoundedFlatAggregateType(rootType)) {
+            traceReject("unsupported-loop-carried-location");
             return std::nullopt;
         }
         std::optional<bool> entryBoolValue;
-        std::optional<std::vector<int64_t>> entrySignedValues;
+        std::optional<std::vector<SInt>> entryIntegerValues;
         if (auto global = DynamicCast<GlobalVar*>(location); global != nullptr) {
             bool foundContextGlobal = false;
             if (isContextAnalysis) {
@@ -9738,8 +11036,8 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
                         entryBoolValue = value.boolValue->IsTrue();
                     } else if (rootType->IsInteger() && value.kind == ContextAbstractValue::Kind::SINT &&
                         value.sintValue != nullptr && value.sintValue->IsSingleValue()) {
-                        entrySignedValues = std::vector<int64_t>{
-                            value.sintValue->NumericBound().GetSingleElement().SVal()};
+                        entryIntegerValues = std::vector<SInt>{
+                            value.sintValue->NumericBound().GetSingleElement()};
                     }
                     break;
                 }
@@ -9751,51 +11049,114 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
                 } else if (initializer != nullptr && rootType->IsInteger() && initializer->IsIntLiteral()) {
                     auto initialDomain = SIntDomain::From(*initializer);
                     if (initialDomain.IsSingleValue()) {
-                        entrySignedValues = std::vector<int64_t>{
-                            initialDomain.NumericBound().GetSingleElement().SVal()};
+                        entryIntegerValues = std::vector<SInt>{
+                            initialDomain.NumericBound().GetSingleElement()};
                     }
                 }
             }
         }
         if (rootType->IsBoolean()) {
             auto incoming = FindIncomingBoolStoreValue(
-                loopState, loopEntry, location, object, loopBlocks, entryBoolValue);
+                loopState, loopEntry, location, object, loopBlocks, entryBoolValue, incomingEdgeState);
             if (!incoming.has_value()) {
+                traceReject("unknown-loop-entry-bool");
                 return std::nullopt;
             }
             loopState.Update(object, std::make_unique<BoolRange>(BoolDomain::FromBool(incoming.value())));
             continue;
         }
-        auto incoming = FindIncomingSmallSignedStoreValues(
-            loopState, loopEntry, location, object, rootType, loopBlocks, entrySignedValues);
+        auto incoming = FindIncomingSmallIntegerStoreValues(
+            loopState, loopEntry, location, object, rootType, loopBlocks, entryIntegerValues, incomingEdgeState);
         if (!incoming.has_value() || incoming->size() != 1) {
+            traceReject("unknown-loop-entry-integer");
             return std::nullopt;
         }
-        auto exact = BuildSignedExactRange(rootType, incoming.value());
+        auto exact = BuildIntegerExactRange(rootType, std::move(incoming.value()));
         if (!exact.has_value()) {
+            traceReject("invalid-loop-entry-integer");
             return std::nullopt;
         }
         loopState.Update(object, std::make_unique<SIntRange>(std::move(exact.value())));
     }
 
+    std::vector<Value*> callPreservedScalarLocations;
+    std::unordered_set<Value*> seenCallPreservedLocations;
+    const auto collectCallPreservedLocation = [&](Value* location) {
+        auto rootType = GetBoundedLoopRefRootType(location);
+        if (location == nullptr || location->IsGlobal() || rootType == nullptr ||
+            (!rootType->IsInteger() && !rootType->IsBoolean()) ||
+            !HasOnlyDirectLoadStoreUsers(location) ||
+            !seenCallPreservedLocations.emplace(location).second) {
+            return;
+        }
+        callPreservedScalarLocations.emplace_back(location);
+    };
+    for (auto location : readLocations) {
+        collectCallPreservedLocation(location);
+    }
+    for (auto location : mutatedLocations) {
+        collectCallPreservedLocation(location);
+    }
+    std::vector<Value*> callPreservedScalarValues;
+    std::unordered_set<Value*> seenCallPreservedValues;
+    std::unordered_set<Value*> callProducedScalarValues;
+    for (auto callExpression : loopCallExpressions) {
+        if (callExpression != nullptr && callExpression->GetResult() != nullptr) {
+            callProducedScalarValues.emplace(callExpression->GetResult());
+        }
+    }
+    const auto collectCallPreservedValue = [&](Value* value) {
+        auto type = value == nullptr ? nullptr : value->GetType();
+        if (type != nullptr && !type->IsRef() && (type->IsInteger() || type->IsBoolean()) &&
+            callProducedScalarValues.find(value) == callProducedScalarValues.end() &&
+            seenCallPreservedValues.emplace(value).second) {
+            callPreservedScalarValues.emplace_back(value);
+        }
+    };
+    for (auto expression : loopExpressions) {
+        if (expression->GetExprKind() != ExprKind::APPLY &&
+            expression->GetExprKind() != ExprKind::INVOKE) {
+            collectCallPreservedValue(expression->GetResult());
+        }
+        if (expression->GetExprKind() == ExprKind::CONSTANT) {
+            continue;
+        }
+        for (auto operand : expression->GetOperands()) {
+            collectCallPreservedValue(operand);
+        }
+    }
+    for (auto value : externalValues) {
+        collectCallPreservedValue(value);
+    }
+
     std::sort(readLocations.begin(), readLocations.end());
     std::sort(externalValues.begin(), externalValues.end());
+    const bool cacheableLoop = std::none_of(
+        loopCallExpressions.begin(), loopCallExpressions.end(), [](const Expression* expression) {
+            return expression->GetExprKind() == ExprKind::INVOKE;
+        });
     std::stringstream cacheKey;
     cacheKey << branch << ":" << successor;
     for (auto location : readLocations) {
         if (IsLoopLocalScalarLocation(location, loopBlocks)) {
             continue;
         }
-        auto rootType = GetBoundedScalarRefRootType(location);
+        auto rootType = GetBoundedLoopRefRootType(location);
         auto object = loopState.CheckAbstractObjectRefBy(location);
+        if (IsBoundedFlatAggregateType(rootType)) {
+            traceReject("external-aggregate-location");
+            return std::nullopt;
+        }
         const bool isSingle = rootType != nullptr && object != nullptr && (rootType->IsBoolean()
             ? GetBoolDomainFromStateWithType(loopState, object, rootType).IsSingleValue()
             : ::Cangjie::CHIR::GetSIntDomainFromState(loopState, object, rootType).IsSingleValue());
         if (!isSingle) {
+            traceReject("non-single-read-location");
             return std::nullopt;
         }
         auto value = CaptureContextValue(loopState, object, rootType, /* preserveIntervals = */ true);
         if (value.IsTop()) {
+            traceReject("top-read-location");
             return std::nullopt;
         }
         cacheKey << ":mem@" << location << "=" << value.ToKeyString(rootType);
@@ -9807,13 +11168,14 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
             ? GetBoolDomainFromState(loopState, value).IsSingleValue()
             : GetSIntDomainFromState(loopState, value).IsSingleValue();
         if (!isSingle || captured.IsTop()) {
+            traceReject("non-single-external-value");
             return std::nullopt;
         }
         cacheKey << ":value@" << value << "=" << captured.ToKeyString(type);
     }
     auto key = cacheKey.str();
     std::optional<ContextLocationValues> cachedSummary;
-    {
+    if (cacheableLoop) {
         std::lock_guard<std::mutex> lock(GetBoundedLoopExitCacheMutex());
         auto ownerCache = GetBoundedLoopExitCaches().find(this);
         if (ownerCache != GetBoundedLoopExitCaches().end()) {
@@ -9828,9 +11190,9 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
     if (cachedSummary.has_value()) {
         auto result = state;
         for (const auto& [location, value] : cachedSummary.value()) {
-            auto rootType = GetBoundedScalarRefRootType(location);
+            auto rootType = GetBoundedLoopRefRootType(location);
             auto object = result.CheckAbstractObjectRefBy(location);
-            if (rootType == nullptr || object == nullptr) {
+            if (rootType == nullptr || object == nullptr || IsBoundedFlatAggregateType(rootType)) {
                 return std::nullopt;
             }
             ApplyContextValue(result, object, rootType, value);
@@ -9840,15 +11202,29 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
     }
 
     auto cacheResultState = [&](const RangeDomain& resultState) -> std::optional<RangeDomain> {
-        if (!isContextAnalysis) {
+        if (isContextAnalysis) {
+            for (const auto& [expression, range] : observedRanges) {
+                if (expression == nullptr || range == nullptr ||
+                    incompleteLocalBoundedLoopObservations.find(expression) !=
+                        incompleteLocalBoundedLoopObservations.end()) {
+                    continue;
+                }
+                auto current = localBoundedLoopObservations.find(expression);
+                if (current == localBoundedLoopObservations.end()) {
+                    localBoundedLoopObservations.emplace(expression, range->Clone());
+                } else if (auto joined = current->second->Join(*range); joined.has_value()) {
+                    current->second = std::move(joined.value());
+                }
+            }
+        } else {
             CommitBoundedLoopObservations(observedRanges);
         }
         ContextLocationValues summary;
         summary.reserve(loopCarriedLocations.size());
         for (auto location : loopCarriedLocations) {
-            auto rootType = GetBoundedScalarRefRootType(location);
+            auto rootType = GetBoundedLoopRefRootType(location);
             auto object = resultState.CheckAbstractObjectRefBy(location);
-            if (rootType == nullptr || object == nullptr) {
+            if (rootType == nullptr || object == nullptr || IsBoundedFlatAggregateType(rootType)) {
                 return std::nullopt;
             }
             auto value = CaptureContextValue(resultState, object, rootType, /* preserveIntervals = */ true);
@@ -9857,7 +11233,7 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
             }
             summary.emplace_back(location, std::move(value));
         }
-        {
+        if (cacheableLoop) {
             std::lock_guard<std::mutex> lock(GetBoundedLoopExitCacheMutex());
             auto& ownerCache = GetBoundedLoopExitCaches()[this];
             if (ownerCache.size() < MAX_BOUNDED_LOOP_CACHE_ENTRIES) {
@@ -9873,22 +11249,34 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
         return resultState;
     };
 
+    BoundedAggregateStoreMap concreteAggregateStores;
     struct EvaluationGuard {
-        EvaluationGuard(const RangeAnalysis* owner, BoundedLoopCallContextMap* callContexts)
-            : previous(boundedLoopEvaluationOwner), previousCallContexts(boundedLoopCallContextRecorder)
+        EvaluationGuard(const RangeAnalysis* owner, BoundedLoopCallContextMap* callContexts,
+            BoundedAggregateStoreMap* aggregateStores)
+            : previous(boundedLoopEvaluationOwner), previousCallContexts(boundedLoopCallContextRecorder),
+              previousAggregateStores(boundedAggregateStores)
         {
             boundedLoopEvaluationOwner = owner;
             boundedLoopCallContextRecorder = callContexts;
+            boundedAggregateStores = aggregateStores;
         }
         ~EvaluationGuard()
         {
             boundedLoopEvaluationOwner = previous;
             boundedLoopCallContextRecorder = previousCallContexts;
+            boundedAggregateStores = previousAggregateStores;
         }
         const RangeAnalysis* previous;
         BoundedLoopCallContextMap* previousCallContexts;
-    } guard(this, &observedCallContexts);
+        BoundedAggregateStoreMap* previousAggregateStores;
+    } guard(this, &observedCallContexts, &concreteAggregateStores);
 
+    if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
+        const auto& location = branch->GetDebugLocation();
+        std::cerr << "[RangeAnalysisBoundedExecute] loop-line=" << location.GetBeginPos().line
+                  << " blocks=" << loopBlocks.size()
+                  << " locations=" << mutatedLocations.size() << '\n';
+    }
     auto current = loopEntry;
     std::optional<RangeDomain> observedSuccessorState;
     for (size_t step = 0; step < MAX_BOUNDED_LOOP_STEPS; ++step) {
@@ -9911,21 +11299,96 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
             return std::nullopt;
         }
         for (auto expression : current->GetNonTerminatorExpressions()) {
+            if (expression->GetExprKind() == ExprKind::ALLOCATE) {
+                auto rootType = GetBoundedLoopRefRootType(expression->GetResult());
+                if (IsBoundedFlatAggregateType(rootType)) {
+                    concreteAggregateStores.erase(expression->GetResult());
+                }
+            }
+            ContextLocationValues preservedCallState;
+            ContextLocationValues preservedCallValues;
+            if (expression->GetExprKind() == ExprKind::INVOKE) {
+                preservedCallState.reserve(callPreservedScalarLocations.size());
+                for (auto location : callPreservedScalarLocations) {
+                    auto rootType = GetBoundedLoopRefRootType(location);
+                    auto object = loopState.CheckAbstractObjectRefBy(location);
+                    auto value = CaptureContextValue(
+                        loopState, object, rootType, /* preserveIntervals = */ true);
+                    if (!value.IsTop()) {
+                        preservedCallState.emplace_back(location, std::move(value));
+                    }
+                }
+                preservedCallValues.reserve(callPreservedScalarValues.size());
+                for (auto value : callPreservedScalarValues) {
+                    auto captured = CaptureContextValue(
+                        loopState, value, /* preserveIntervals = */ true);
+                    if (!captured.IsTop()) {
+                        preservedCallValues.emplace_back(value, std::move(captured));
+                    }
+                }
+            }
             PropagateExpressionEffect(loopState, expression);
+            for (const auto& [value, captured] : preservedCallValues) {
+                ApplyContextValue(loopState, value, captured);
+            }
+            for (const auto& [location, value] : preservedCallState) {
+                auto rootType = GetBoundedLoopRefRootType(location);
+                auto object = loopState.CheckAbstractObjectRefBy(location);
+                if (rootType != nullptr && object != nullptr) {
+                    ApplyContextValue(loopState, object, rootType, value);
+                }
+            }
             if (loopState.IsBottom()) {
+                traceReject("bottom-after-expression");
                 return std::nullopt;
+            }
+            if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
+                Value* tracedValue = expression->GetResult();
+                if (expression->GetExprKind() == ExprKind::STORE) {
+                    tracedValue = StaticCast<const Store*>(expression)->GetValue();
+                }
+                auto tracedRange = tracedValue == nullptr ? nullptr : loopState.CheckAbstractValue(tracedValue);
+                const auto& locationInfo = expression->GetDebugLocation();
+                std::cerr << "[RangeAnalysisBoundedStep] step=" << step
+                          << " kind=" << static_cast<int>(expression->GetExprKind())
+                          << " line=" << locationInfo.GetBeginPos().line
+                          << " value=" << (tracedRange == nullptr ? "Top" : tracedRange->ToString()) << '\n';
+                for (auto trackedLocation : mutatedLocations) {
+                    auto trackedObject = loopState.CheckAbstractObjectRefBy(trackedLocation);
+                    auto trackedRange =
+                        trackedObject == nullptr ? nullptr : loopState.CheckAbstractValue(trackedObject);
+                    std::cerr << "[RangeAnalysisBoundedMemory] step=" << step
+                              << " location=" << trackedLocation
+                              << " value=" << (trackedRange == nullptr ? "Top" : trackedRange->ToString()) << '\n';
+                }
             }
             observeExpression(expression);
             if (expression->GetExprKind() != ExprKind::STORE) {
                 continue;
             }
             auto location = StaticCast<const Store*>(expression)->GetLocation();
+            auto storedValue = StaticCast<const Store*>(expression)->GetValue();
             auto object = loopState.CheckAbstractObjectRefBy(location);
-            auto rootType = GetBoundedScalarRefRootType(location);
+            auto rootType = GetBoundedLoopRefRootType(location);
+            if (IsBoundedFlatAggregateType(rootType)) {
+                if (storedValue != nullptr && storedValue->GetType() != nullptr && storedValue->GetType()->IsEnum()) {
+                    concreteAggregateStores[location] = storedValue;
+                } else {
+                    concreteAggregateStores.erase(location);
+                }
+                continue;
+            }
             const bool isSingle = rootType != nullptr && object != nullptr && (rootType->IsBoolean()
                 ? GetBoolDomainFromStateWithType(loopState, object, rootType).IsSingleValue()
                 : ::Cangjie::CHIR::GetSIntDomainFromState(loopState, object, rootType).IsSingleValue());
             if (!isSingle) {
+                if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
+                    const auto& locationInfo = expression->GetDebugLocation();
+                    std::cerr << "[RangeAnalysisBoundedRejectDetail] store-line="
+                              << locationInfo.GetBeginPos().line << " location=" << location
+                              << " root-type=" << rootType << '\n';
+                }
+                traceReject("non-single-store");
                 return std::nullopt;
             }
         }
@@ -9939,15 +11402,18 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
             auto currentBranch = StaticCast<const Branch*>(terminator);
             auto condition = GetBoolDomainFromState(loopState, currentBranch->GetCondition());
             if (!condition.IsSingleValue()) {
+                traceReject("non-single-branch");
                 return std::nullopt;
             }
             next = condition.IsTrue() ? currentBranch->GetTrueBlock() : currentBranch->GetFalseBlock();
         }
         if (next == nullptr || (next != exitSuccessor && loopBlocks.find(next) == loopBlocks.end())) {
+            traceReject("invalid-next-block");
             return std::nullopt;
         }
         current = next;
     }
+    traceReject("step-budget");
     return std::nullopt;
 }
 
@@ -10109,6 +11575,11 @@ std::optional<Block*> RangeAnalysis::HandleTerminatorEffect(RangeDomain& state, 
 RangeDomain GetTerminatorStateForSuccessor(
     Analysis<RangeDomain>& analysis, const RangeDomain& state, const Terminator* terminator, const Block* successor)
 {
+    auto& rangeAnalysis = static_cast<RangeAnalysis&>(analysis);
+    auto recordAndReturn = [&](RangeDomain result) {
+        rangeAnalysis.RecordTerminatorEdgeState(terminator, successor, result);
+        return result;
+    };
     auto edgeState = state;
     switch (terminator->GetExprKind()) {
         case ExprKind::APPLY_WITH_EXCEPTION: {
@@ -10130,7 +11601,7 @@ RangeDomain GetTerminatorStateForSuccessor(
         case ExprKind::BRANCH: {
             auto branch = StaticCast<const Branch*>(terminator);
             if (branch->GetTrueBlock() == branch->GetFalseBlock()) {
-                return edgeState;
+                return recordAndReturn(std::move(edgeState));
             }
             if (successor == branch->GetTrueBlock() || successor == branch->GetFalseBlock()) {
                 if (std::getenv("CANGJIE_RA_DISABLE_EDGE_NARROWING") != nullptr) {
@@ -10141,10 +11612,23 @@ RangeDomain GetTerminatorStateForSuccessor(
                     break;
                 }
                 if (std::getenv("CANGJIE_RA_DISABLE_BOUNDED_LOOP") == nullptr) {
-                    if (auto exactExit = static_cast<RangeAnalysis&>(analysis).TryEvaluateBoundedScalarLoopExit(
-                            state, branch, successor);
+                    if (auto exactExit = rangeAnalysis.TryEvaluateBoundedScalarLoopExit(state, branch, successor);
                         exactExit.has_value()) {
-                        return std::move(exactExit.value());
+                        if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
+                            const auto& location = branch->GetDebugLocation();
+                            std::cerr << "[RangeAnalysisBoundedEdge] line="
+                                      << location.GetBeginPos().line
+                                      << " successor=" << successor->GetIdentifier()
+                                      << " exact=1 state=" << exactExit->ToString() << '\n';
+                        }
+                        return recordAndReturn(std::move(exactExit.value()));
+                    }
+                    if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
+                        const auto& location = branch->GetDebugLocation();
+                        std::cerr << "[RangeAnalysisBoundedEdge] line="
+                                  << location.GetBeginPos().line
+                                  << " successor=" << successor->GetIdentifier()
+                                  << " exact=0\n";
                     }
                 }
                 bool branchCondition = successor == branch->GetTrueBlock();
@@ -10198,7 +11682,7 @@ RangeDomain GetTerminatorStateForSuccessor(
         default:
             break;
     }
-    return edgeState;
+    return recordAndReturn(std::move(edgeState));
 }
 
 void RangeAnalysis::PrintBranchOptMessage(const Ptr<const Expression>& expr, bool isTrueBlockRemained) const
