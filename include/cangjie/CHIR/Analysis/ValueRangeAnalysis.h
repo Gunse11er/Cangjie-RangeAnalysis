@@ -158,6 +158,11 @@ public:
 
     static void ClearBoundedLoopObservedRanges();
 
+    static void SetQueryRefinementContext(
+        std::unordered_set<const Block*> blocks, std::unordered_set<const Value*> values);
+
+    static void ClearQueryRefinementBlocks();
+
     std::unique_ptr<ValueRange> GetLocalBoundedLoopObservedRange(const Expression* expression) const;
 
     /**

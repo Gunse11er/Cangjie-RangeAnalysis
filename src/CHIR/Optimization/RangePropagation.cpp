@@ -1454,6 +1454,110 @@ ContestReachability CanReachBlockForQueryMapping(const Block* start, const Block
     return ContestReachability::UNREACHABLE;
 }
 
+bool CollectQueryValueDependencies(Value* root, std::unordered_set<const Value*>& values)
+{
+    constexpr size_t MAX_QUERY_DEPENDENCIES = 4096;
+    // ponytail: use the existing CHIR use-def links; a capped local walk is
+    // cheaper than maintaining a second interprocedural dependency graph.
+    std::vector<Value*> worklist{root};
+    std::unordered_set<const Value*> expanded;
+    while (!worklist.empty()) {
+        auto value = worklist.back();
+        worklist.pop_back();
+        if (value == nullptr || !expanded.emplace(value).second) {
+            continue;
+        }
+        values.emplace(value);
+        if (values.size() >= MAX_QUERY_DEPENDENCIES) {
+            return false;
+        }
+        if (auto expression = GetLocalDefiningExpression(value); expression != nullptr) {
+            for (auto operand : expression->GetOperands()) {
+                auto type = operand == nullptr ? nullptr : operand->GetType();
+                if (type != nullptr && (type->IsRef() || type->IsInteger() || type->IsBoolean())) {
+                    worklist.emplace_back(operand);
+                }
+            }
+        }
+        auto type = value->GetType();
+        if (type == nullptr || !type->IsRef()) {
+            continue;
+        }
+        for (auto user : value->GetUsers()) {
+            if (user->GetExprKind() == ExprKind::STORE &&
+                StaticCast<const Store*>(user)->GetLocation() == value) {
+                worklist.emplace_back(StaticCast<const Store*>(user)->GetValue());
+            }
+        }
+    }
+    return true;
+}
+
+std::unordered_set<const Block*> CollectQueryRefinementBlocks(const Ptr<const Package>& package,
+    const std::vector<ContestQuery>& queries, const std::filesystem::path& contestRoot,
+    std::unordered_set<const Value*>& queryValues)
+{
+    constexpr size_t MAX_QUERY_REFINEMENT_BLOCKS = 4096;
+    std::unordered_set<const Block*> result;
+    for (auto function : package->GetGlobalFuncsWithBody()) {
+        if (function == nullptr || function->GetBody() == nullptr) {
+            continue;
+        }
+        std::vector<const Block*> queryBlocks;
+        auto blocks = function->GetBody()->GetAllBlocks();
+        for (auto block : blocks) {
+            bool containsQuery = false;
+            for (auto expression : block->GetExpressions()) {
+                if (expression != nullptr && expression->GetExprKind() == ExprKind::DEBUGEXPR) {
+                    auto debug = StaticCast<const Debug*>(expression);
+                    const bool namesQuery = std::any_of(queries.begin(), queries.end(), [&](const auto& query) {
+                        return query.valid && query.variableName == debug->GetSrcCodeIdentifier() &&
+                            debug->GetDebugLocation().GetBeginPos().line <= query.line &&
+                            IsSameQueryFile(query, debug->GetDebugLocation(), contestRoot);
+                    });
+                    if (namesQuery) {
+                        queryValues.emplace(debug->GetValue());
+                    }
+                }
+                if (expression != nullptr &&
+                    MayMatchAnyContestQuery(queries, expression->GetDebugLocation(), contestRoot)) {
+                    containsQuery = true;
+                }
+            }
+            if (containsQuery) {
+                queryBlocks.emplace_back(block);
+            }
+        }
+        if (queryBlocks.empty()) {
+            continue;
+        }
+        auto directQueryValues = queryValues;
+        for (auto value : directQueryValues) {
+            if (!CollectQueryValueDependencies(const_cast<Value*>(value), queryValues)) {
+                return {};
+            }
+        }
+        // ponytail: bounded CFG scans avoid a second dependency graph; replace
+        // with reverse reachability only if large contest functions make this hot.
+        for (auto block : blocks) {
+            if (IsBlockInContestCycle(block) != ContestReachability::REACHABLE) {
+                continue;
+            }
+            const bool reachesQuery = std::any_of(queryBlocks.begin(), queryBlocks.end(), [block](const auto queryBlock) {
+                return CanReachBlockForQueryMapping(block, queryBlock) == ContestReachability::REACHABLE;
+            });
+            if (!reachesQuery) {
+                continue;
+            }
+            if (result.size() >= MAX_QUERY_REFINEMENT_BLOCKS) {
+                return {};
+            }
+            result.emplace(block);
+        }
+    }
+    return result;
+}
+
 bool IsUnnamedLoopInductionLoad(const Expression& expression)
 {
     if (expression.GetExprKind() != ExprKind::LOAD || expression.GetResult() == nullptr ||
@@ -2672,6 +2776,18 @@ void RangePropagation::EmitContestOutput(const Ptr<const Package>& package, Rang
         });
     auto packageInit = package->GetPackageInitFunc();
 
+    RangeAnalysis::ClearQueryRefinementBlocks();
+    if (std::getenv("CANGJIE_RA_DISABLE_QGSR") == nullptr) {
+        std::unordered_set<const Value*> refinementValues;
+        auto refinementBlocks =
+            CollectQueryRefinementBlocks(package, queries.value(), contestRoot, refinementValues);
+        if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
+            std::cerr << "[RangeAnalysisQGSR] selectedBlocks=" << refinementBlocks.size()
+                      << " protectedValues=" << refinementValues.size() << '\n';
+        }
+        RangeAnalysis::SetQueryRefinementContext(
+            std::move(refinementBlocks), std::move(refinementValues));
+    }
     RangeAnalysis::ClearContextSensitiveResults();
     for (auto func : package->GetGlobalFuncsWithBody()) {
         if (!RangeAnalysis::Filter(*func) || relevantFunctions.find(func) == relevantFunctions.end()) {
@@ -2707,6 +2823,7 @@ void RangePropagation::EmitContestOutput(const Ptr<const Package>& package, Rang
                   << contextClosureComplete << '\n';
     }
     WriteContestOutput(queries.value(), inputContext.value());
+    RangeAnalysis::ClearQueryRefinementBlocks();
     RangeAnalysis::ClearContextSensitiveResults();
     RangeAnalysis::ClearBoundedLoopObservedRanges();
 }

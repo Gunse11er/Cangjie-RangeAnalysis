@@ -28,6 +28,8 @@ using LoopRangeSnapshot = std::unordered_map<Value*, std::unique_ptr<SIntDomain>
 using LoopRangeSnapshots = std::unordered_map<const Block*, LoopRangeSnapshot>;
 std::unordered_map<const RangeAnalysis*, LoopRangeSnapshots> loopRangeSnapshots;
 std::mutex loopRangeSnapshotsMtx;
+thread_local std::unordered_set<const Block*> queryRefinementBlocks;
+thread_local std::unordered_set<const Value*> queryRefinementValues;
 thread_local const RangeAnalysis* boundedLoopEvaluationOwner{nullptr};
 using BoundedAggregateStoreMap = std::unordered_map<Value*, Value*>;
 thread_local BoundedAggregateStoreMap* boundedAggregateStores{nullptr};
@@ -2779,6 +2781,19 @@ RangeAnalysis::~RangeAnalysis()
         std::lock_guard<std::mutex> lock(GetBoundedLoopExitCacheMutex());
         GetBoundedLoopExitCaches().erase(this);
     }
+}
+
+void RangeAnalysis::SetQueryRefinementContext(
+    std::unordered_set<const Block*> blocks, std::unordered_set<const Value*> values)
+{
+    queryRefinementBlocks = std::move(blocks);
+    queryRefinementValues = std::move(values);
+}
+
+void RangeAnalysis::ClearQueryRefinementBlocks()
+{
+    queryRefinementBlocks.clear();
+    queryRefinementValues.clear();
 }
 
 void RangeAnalysis::RecordTerminatorEdgeState(
@@ -10778,6 +10793,124 @@ bool IsBoundedScalarLoopExpressionSupported(const Expression* expression)
             return false;
     }
 }
+
+bool IsSafeQGSRProjectionExpression(
+    const Expression* expression, const std::unordered_set<const Value*>& ignoredValues)
+{
+    if (expression == nullptr) {
+        return false;
+    }
+    if (expression->GetExprMajorKind() == ExprMajorKind::UNARY_EXPR ||
+        expression->GetExprMajorKind() == ExprMajorKind::BINARY_EXPR) {
+        return true;
+    }
+    switch (expression->GetExprKind()) {
+        case ExprKind::ALLOCATE:
+        case ExprKind::LOAD:
+        case ExprKind::STORE:
+        case ExprKind::GET_ELEMENT_REF:
+        case ExprKind::GET_ELEMENT_BY_NAME:
+        case ExprKind::STORE_ELEMENT_REF:
+        case ExprKind::STORE_ELEMENT_BY_NAME:
+        case ExprKind::DEBUGEXPR:
+        case ExprKind::FIELD:
+        case ExprKind::FIELD_BY_NAME:
+        case ExprKind::TYPECAST:
+            return true;
+        case ExprKind::APPLY: {
+            auto apply = StaticCast<const Apply*>(expression);
+            auto arguments = apply->GetArgs();
+            auto callee = DynamicCast<Function*>(apply->GetCallee());
+            if (callee == nullptr || arguments.empty() ||
+                ignoredValues.find(arguments.front()) == ignoredValues.end()) {
+                return false;
+            }
+            auto globals = CollectTrackedMutableGlobals(callee);
+            return globals.complete && globals.size() == 0 &&
+                std::all_of(arguments.begin() + 1, arguments.end(), [](const Value* argument) {
+                    auto type = argument == nullptr ? nullptr : argument->GetType();
+                    return type != nullptr && !type->IsRef() && (type->IsInteger() || type->IsBoolean());
+                });
+        }
+        default:
+            return false;
+    }
+}
+
+struct QGSRLoopProjection {
+    std::unordered_set<const Expression*> ignoredExpressions;
+    std::unordered_set<const Value*> ignoredValues;
+    std::unordered_set<Value*> ignoredLocations;
+};
+
+// Project only chains rooted at an unsupported loop-local allocation. A call
+// is skipped only when it can affect the ignored receiver but no tracked
+// global; taint reaching loop control is rejected before execution.
+std::optional<QGSRLoopProjection> BuildQGSRLoopProjection(
+    const std::unordered_set<const Block*>& loopBlocks,
+    const std::unordered_set<const Value*>& queryValues)
+{
+    QGSRLoopProjection projection;
+    std::vector<const Expression*> expressions;
+    for (auto block : loopBlocks) {
+        for (auto expression : block->GetNonTerminatorExpressions()) {
+            expressions.emplace_back(expression);
+            if (expression->GetExprKind() != ExprKind::ALLOCATE ||
+                IsBoundedScalarLoopExpressionSupported(expression)) {
+                continue;
+            }
+            projection.ignoredExpressions.emplace(expression);
+            projection.ignoredValues.emplace(expression->GetResult());
+        }
+    }
+
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (auto expression : expressions) {
+            const auto operands = expression->GetOperands();
+            const bool usesIgnoredValue = std::any_of(operands.begin(), operands.end(), [&](Value* operand) {
+                return projection.ignoredValues.find(operand) != projection.ignoredValues.end();
+            });
+            if (!usesIgnoredValue) {
+                continue;
+            }
+            if (!IsSafeQGSRProjectionExpression(expression, projection.ignoredValues)) {
+                if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
+                    std::cerr << "[RangeAnalysisQGSR] unsafeDependency kind="
+                              << static_cast<int>(expression->GetExprKind()) << '\n';
+                }
+                return std::nullopt;
+            }
+            changed = projection.ignoredExpressions.emplace(expression).second || changed;
+            if (auto result = expression->GetResult(); result != nullptr) {
+                changed = projection.ignoredValues.emplace(result).second || changed;
+            }
+            if (expression->GetExprKind() == ExprKind::STORE) {
+                auto location = StaticCast<const Store*>(expression)->GetLocation();
+                changed = projection.ignoredValues.emplace(location).second || changed;
+                projection.ignoredLocations.emplace(location);
+            }
+        }
+    }
+
+    if (std::any_of(queryValues.begin(), queryValues.end(), [&projection](const Value* value) {
+            return projection.ignoredValues.find(value) != projection.ignoredValues.end();
+        })) {
+        return std::nullopt;
+    }
+    for (auto expression : expressions) {
+        if (projection.ignoredExpressions.find(expression) == projection.ignoredExpressions.end() &&
+            !IsBoundedScalarLoopExpressionSupported(expression)) {
+            if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
+                std::cerr << "[RangeAnalysisQGSR] unsupportedProjection kind="
+                          << static_cast<int>(expression->GetExprKind()) << '\n';
+            }
+            return std::nullopt;
+        }
+    }
+    return projection;
+}
 } // namespace
 
 std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
@@ -10815,6 +10948,42 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
     if (header == nullptr || loopBlocks.empty() || loopBlocks.size() > MAX_BOUNDED_LOOP_BLOCKS) {
         return std::nullopt;
     }
+    std::optional<QGSRLoopProjection> qgsrProjection;
+    const bool isQueryRelevantLoop =
+        std::any_of(queryRefinementBlocks.begin(), queryRefinementBlocks.end(), [this, header](const Block* block) {
+            if (block == nullptr || block->GetTopLevelFunc() != func) {
+                return false;
+            }
+            std::unordered_set<const Block*> visited;
+            if (!CanReachBlock(header, block, visited)) {
+                return false;
+            }
+            visited.clear();
+            return CanReachBlock(block, header, visited);
+        });
+    if (isQueryRelevantLoop) {
+        qgsrProjection = BuildQGSRLoopProjection(loopBlocks, queryRefinementValues);
+    }
+    const auto isProjectedExpression = [&qgsrProjection](const Expression* expression) {
+        return qgsrProjection.has_value() &&
+            qgsrProjection->ignoredExpressions.find(expression) != qgsrProjection->ignoredExpressions.end();
+    };
+    const auto havocProjectedLocations = [&qgsrProjection](RangeDomain& result) {
+        if (!qgsrProjection.has_value()) {
+            return;
+        }
+        for (auto location : qgsrProjection->ignoredLocations) {
+            auto rootType = GetBoundedLoopRefRootType(location);
+            if (rootType == nullptr || (!rootType->IsInteger() && !rootType->IsBoolean())) {
+                continue;
+            }
+            if (auto object = result.CheckAbstractObjectRefBy(location); object != nullptr) {
+                result.SetToBound(object, /* isTop = */ true);
+            } else {
+                result.SetToTopOrTopRef(location, /* isRef = */ true);
+            }
+        }
+    };
     auto analysisContext = isContextAnalysis
         ? BuildContextKey(func, contextArguments, contextGlobalArguments)
         : BuildRootAnalysisContextKey(func);
@@ -10892,6 +11061,9 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
     std::unordered_set<Value*> seenCallReceiverValues;
     for (auto block : loopBlocks) {
         for (auto expression : block->GetNonTerminatorExpressions()) {
+            if (isProjectedExpression(expression)) {
+                continue;
+            }
             if (!IsBoundedScalarLoopExpressionSupported(expression)) {
                 if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
                     const auto& location = expression->GetDebugLocation();
@@ -11293,11 +11465,14 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
             }
             ApplyContextValue(result, object, rootType, value);
         }
+        havocProjectedLocations(result);
         boundedContextAttempt.MarkSucceeded();
         return result;
     }
 
     auto cacheResultState = [&](const RangeDomain& resultState) -> std::optional<RangeDomain> {
+        auto result = resultState;
+        havocProjectedLocations(result);
         if (isContextAnalysis) {
             for (const auto& [expression, range] : observedRanges) {
                 if (expression == nullptr || range == nullptr ||
@@ -11319,11 +11494,11 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
         summary.reserve(loopCarriedLocations.size());
         for (auto location : loopCarriedLocations) {
             auto rootType = GetBoundedLoopRefRootType(location);
-            auto object = resultState.CheckAbstractObjectRefBy(location);
+            auto object = result.CheckAbstractObjectRefBy(location);
             if (rootType == nullptr || object == nullptr || IsBoundedFlatAggregateType(rootType)) {
                 return std::nullopt;
             }
-            auto value = CaptureContextValue(resultState, object, rootType, /* preserveIntervals = */ true);
+            auto value = CaptureContextValue(result, object, rootType, /* preserveIntervals = */ true);
             if (value.IsTop()) {
                 return std::nullopt;
             }
@@ -11342,7 +11517,7 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
             CommitBoundedLoopCallContexts(analysisContext, observedCallContexts);
         }
         boundedContextAttempt.MarkSucceeded();
-        return resultState;
+        return result;
     };
 
     BoundedAggregateStoreMap concreteAggregateStores;
@@ -11372,6 +11547,10 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
         std::cerr << "[RangeAnalysisBoundedExecute] loop-line=" << location.GetBeginPos().line
                   << " blocks=" << loopBlocks.size()
                   << " locations=" << mutatedLocations.size() << '\n';
+        if (qgsrProjection.has_value() && !qgsrProjection->ignoredExpressions.empty()) {
+            std::cerr << "[RangeAnalysisQGSR] projectedLoop line=" << location.GetBeginPos().line
+                      << " skippedExpressions=" << qgsrProjection->ignoredExpressions.size() << '\n';
+        }
     }
     auto current = loopEntry;
     std::optional<RangeDomain> observedSuccessorState;
@@ -11395,6 +11574,9 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
             return std::nullopt;
         }
         for (auto expression : current->GetNonTerminatorExpressions()) {
+            if (isProjectedExpression(expression)) {
+                continue;
+            }
             if (expression->GetExprKind() == ExprKind::ALLOCATE) {
                 auto rootType = GetBoundedLoopRefRootType(expression->GetResult());
                 if (IsBoundedFlatAggregateType(rootType)) {
@@ -11490,6 +11672,15 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
         }
 
         auto terminator = current->GetTerminator();
+        if (qgsrProjection.has_value()) {
+            const auto operands = terminator->GetOperands();
+            if (std::any_of(operands.begin(), operands.end(), [&](Value* operand) {
+                    return qgsrProjection->ignoredValues.find(operand) != qgsrProjection->ignoredValues.end();
+                })) {
+                traceReject("projected-value-controls-flow");
+                return std::nullopt;
+            }
+        }
         auto target = PropagateTerminatorEffect(loopState, terminator);
         Block* next = target.value_or(nullptr);
         if (next == nullptr && terminator->GetExprKind() == ExprKind::GOTO) {
