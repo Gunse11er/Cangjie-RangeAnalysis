@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -28,6 +29,78 @@ namespace Cangjie::CHIR {
 namespace {
 const std::string CONTEST_INPUT_FILE = "input.txt";
 const std::string CONTEST_OUTPUT_FILE = "output.txt";
+
+struct RangePropagationPerfStats {
+    uint64_t reverseCallGraphCalls{0};
+    uint64_t reverseCallGraphNanos{0};
+    uint64_t relevantFunctionCalls{0};
+    uint64_t relevantFunctionNanos{0};
+    uint64_t runFunctionCalls{0};
+    uint64_t runFunctionNanos{0};
+    uint64_t emitNanos{0};
+    size_t maxPackageFunctions{0};
+    size_t maxRelevantFunctions{0};
+    size_t maxContextRoots{0};
+};
+
+RangePropagationPerfStats rangePropagationPerfStats;
+
+bool IsRangePropagationPerfTraceEnabled()
+{
+    static const bool enabled = std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr;
+    return enabled;
+}
+
+class ScopedRangePropagationPerfTimer {
+public:
+    explicit ScopedRangePropagationPerfTimer(uint64_t* destination)
+        : destination(IsRangePropagationPerfTraceEnabled() ? destination : nullptr),
+          start(this->destination == nullptr ? Clock::time_point{} : Clock::now())
+    {
+    }
+
+    ~ScopedRangePropagationPerfTimer()
+    {
+        if (destination == nullptr) {
+            return;
+        }
+        *destination += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
+    }
+
+private:
+    using Clock = std::chrono::steady_clock;
+    uint64_t* destination;
+    Clock::time_point start;
+};
+
+double RangePropagationPerfMilliseconds(uint64_t nanoseconds)
+{
+    return static_cast<double>(nanoseconds) / 1000000.0;
+}
+
+void PrintAndResetRangePropagationPerfStats()
+{
+    if (IsRangePropagationPerfTraceEnabled()) {
+        std::cerr << "[RangePropagationPerf]"
+                  << " reverse-call-graph-calls=" << rangePropagationPerfStats.reverseCallGraphCalls
+                  << " reverse-call-graph-ms="
+                  << RangePropagationPerfMilliseconds(rangePropagationPerfStats.reverseCallGraphNanos)
+                  << " relevant-function-calls=" << rangePropagationPerfStats.relevantFunctionCalls
+                  << " relevant-function-ms="
+                  << RangePropagationPerfMilliseconds(rangePropagationPerfStats.relevantFunctionNanos)
+                  << " run-function-calls=" << rangePropagationPerfStats.runFunctionCalls
+                  << " run-function-ms="
+                  << RangePropagationPerfMilliseconds(rangePropagationPerfStats.runFunctionNanos)
+                  << " emit-ms="
+                  << RangePropagationPerfMilliseconds(rangePropagationPerfStats.emitNanos)
+                  << " max-package-functions=" << rangePropagationPerfStats.maxPackageFunctions
+                  << " max-relevant-functions=" << rangePropagationPerfStats.maxRelevantFunctions
+                  << " max-context-roots=" << rangePropagationPerfStats.maxContextRoots
+                  << '\n';
+    }
+    rangePropagationPerfStats = RangePropagationPerfStats{};
+}
 
 struct ContestInputContext {
     std::filesystem::path inputPath;
@@ -121,6 +194,8 @@ struct ContestQuery {
     Type* type{nullptr};
     GlobalVar* boundGlobal{nullptr};
     bool isGlobalDeclarationQuery{false};
+    bool isUnambiguousGlobalBinding{false};
+    bool hasBoundGlobalPointObservation{false};
     ContestQueryTypeHint typeHint{ContestQueryTypeHint::UNKNOWN};
     ContestResultOrigin resultOrigin{ContestResultOrigin::NONE};
     bool valid{true};
@@ -166,6 +241,7 @@ struct ContestContextCandidate {
     bool incompleteGlobalLifetime{false};
     bool hasUnknownObservation{false};
     bool auxiliaryOnly{false};
+    bool hasDirectPointLoadObservation{false};
 };
 
 using ContestContextCandidateMap = std::unordered_map<size_t, ContestContextCandidate>;
@@ -546,18 +622,6 @@ bool AreContestRangesEquivalent(const ValueRange& lhs, const ValueRange& rhs)
         lhsInt.GetExactValues() == rhsInt.GetExactValues();
 }
 
-bool IsContestRangeSubset(const ValueRange& candidate, const ValueRange& superset)
-{
-    if (candidate.GetRangeKind() != superset.GetRangeKind()) {
-        return false;
-    }
-    auto joined = superset.Clone();
-    if (auto updated = joined->Join(candidate); updated.has_value()) {
-        joined = std::move(updated.value());
-    }
-    return AreContestRangesEquivalent(*joined, superset);
-}
-
 bool IsContestTopRange(const ValueRange* range, Type* type)
 {
     if (range == nullptr) {
@@ -587,6 +651,18 @@ bool ShouldRecordContestResult(
     bool fromBeforeProgramPoint = false, bool refinesBeforeProgramPoint = false,
     bool aggregatesDeclaredBindingLifetime = false)
 {
+    if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
+        std::cerr << "[RangeAnalysisRecord] query=" << query.variableName << '@' << query.line
+                  << " candidate=" << result
+                  << " current=" << (query.resolved ? query.result : "<unresolved>")
+                  << " before=" << fromBeforeProgramPoint
+                  << " refine=" << refinesBeforeProgramPoint
+                  << " lifetime=" << aggregatesDeclaredBindingLifetime
+                  << " boundedPoint=" << query.hasBoundedPointResult
+                  << " boundedLifetime=" << query.hasBoundedLifetimeResult
+                  << " directLoad=" << query.hasDirectPointLoadResult
+                  << '\n';
+    }
     if (!aggregatesDeclaredBindingLifetime) {
         if (fromBeforeProgramPoint && query.hasDirectPointLoadResult) {
             return false;
@@ -1029,7 +1105,38 @@ bool IsSameQueryFile(const ContestQuery& query, const DebugLocation& location,
     return !HasDirectoryPart(query.sourceFileName) && query.fileName == BaseName(location.GetFileName());
 }
 
+bool MayMatchAnyContestQuery(
+    const std::vector<ContestQuery>& queries, const DebugLocation& location, const std::filesystem::path& contestRoot)
+{
+    return std::any_of(queries.begin(), queries.end(), [&](const auto& query) {
+        return query.valid && IsSameQueryLocation(query, location, contestRoot);
+    });
+}
+
 GlobalVar* GetDirectGlobalLocation(const Expression& expression);
+
+bool IsWithinGlobalDeclarationLocation(const ContestQuery& query, const GlobalVar& global,
+    const std::filesystem::path& contestRoot)
+{
+    const auto& location = global.GetDebugLocation();
+    if (!IsSameQueryFile(query, location, contestRoot)) {
+        return false;
+    }
+    const auto beginLine = location.GetBeginPos().line;
+    const auto endLine = location.GetEndPos().line;
+    if (beginLine == 0) {
+        return false;
+    }
+    return beginLine <= query.line &&
+        query.line <= std::max(beginLine, endLine);
+}
+
+bool IsGlobalInitializerStore(const Expression& expression, const GlobalVar& global)
+{
+    return expression.GetExprKind() == ExprKind::STORE &&
+        GetDirectGlobalLocation(expression) == &global &&
+        expression.GetTopLevelFunc() == global.GetInitFunc();
+}
 
 void BindGlobalQueries(const Ptr<const Package>& package, std::vector<ContestQuery>& queries,
     const std::filesystem::path& contestRoot)
@@ -1040,7 +1147,7 @@ void BindGlobalQueries(const Ptr<const Package>& package, std::vector<ContestQue
         bool ambiguous = false;
         for (auto global : package->GetGlobalVars()) {
             if (!IsGlobalVarInCurrentPackage(global) || query.variableName != global->GetSrcCodeIdentifier() ||
-                !IsSameQueryLocation(query, global->GetDebugLocation(), contestRoot)) {
+                !IsWithinGlobalDeclarationLocation(query, *global, contestRoot)) {
                 continue;
             }
             if (matchedGlobal != nullptr && matchedGlobal != global) {
@@ -1067,7 +1174,8 @@ void BindGlobalQueries(const Ptr<const Package>& package, std::vector<ContestQue
                             break;
                         }
                         matchedGlobal = global;
-                        matchedDeclaration = false;
+                        matchedDeclaration =
+                            matchedDeclaration || IsGlobalInitializerStore(*expression, *global);
                     }
                     if (ambiguous) {
                         break;
@@ -1079,12 +1187,26 @@ void BindGlobalQueries(const Ptr<const Package>& package, std::vector<ContestQue
             }
         }
         if (ambiguous || matchedGlobal == nullptr) {
+            if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
+                std::cerr << "[RangeAnalysisGlobalBind] mode=exact query="
+                          << query.variableName << '@' << query.line
+                          << " result=" << (ambiguous ? "ambiguous" : "unresolved") << '\n';
+            }
             continue;
         }
         query.boundGlobal = matchedGlobal;
         query.isGlobalDeclarationQuery = matchedDeclaration;
         query.type = GetQueryValueType(matchedGlobal);
         query.typeHint = GetQueryTypeHint(query.type);
+        if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
+            const auto& location = matchedGlobal->GetDebugLocation();
+            std::cerr << "[RangeAnalysisGlobalBind] mode=exact query="
+                      << query.variableName << '@' << query.line
+                      << " global=" << static_cast<const void*>(matchedGlobal)
+                      << " declaration=" << query.isGlobalDeclarationQuery
+                      << " global-range=" << location.GetBeginPos().line
+                      << '-' << location.GetEndPos().line << '\n';
+        }
     }
 }
 
@@ -1127,8 +1249,7 @@ void BindUnambiguousGlobalQueries(const Ptr<const Package>& package, std::vector
         bool ambiguous = false;
         for (auto global : package->GetGlobalVars()) {
             if (!IsGlobalVarInCurrentPackage(global) ||
-                query.variableName != global->GetSrcCodeIdentifier() ||
-                !IsSameQueryFile(query, global->GetDebugLocation(), contestRoot)) {
+                query.variableName != global->GetSrcCodeIdentifier()) {
                 continue;
             }
             if (matchedGlobal != nullptr && matchedGlobal != global) {
@@ -1138,44 +1259,82 @@ void BindUnambiguousGlobalQueries(const Ptr<const Package>& package, std::vector
             matchedGlobal = global;
         }
         if (ambiguous || matchedGlobal == nullptr) {
+            if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
+                std::cerr << "[RangeAnalysisGlobalBind] mode=unambiguous query="
+                          << query.variableName << '@' << query.line
+                          << " result=" << (ambiguous ? "ambiguous" : "unresolved") << '\n';
+            }
             continue;
         }
         query.boundGlobal = matchedGlobal;
-        query.isGlobalDeclarationQuery = false;
+        // BindGlobalQueries has already checked every surviving declaration,
+        // direct Load and direct Store at this source location. If the input
+        // still names a unique package global and no local binding can
+        // shadow it, the source occurrence was erased or wrapped while
+        // lowering. Its whole-program global lifetime is a sound
+        // over-approximation of that otherwise unmappable program point.
+        query.isGlobalDeclarationQuery = true;
+        query.isUnambiguousGlobalBinding = true;
         query.type = GetQueryValueType(matchedGlobal);
         query.typeHint = GetQueryTypeHint(query.type);
+        if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
+            const auto& location = matchedGlobal->GetDebugLocation();
+            std::cerr << "[RangeAnalysisGlobalBind] mode=unambiguous query="
+                      << query.variableName << '@' << query.line
+                      << " global=" << static_cast<const void*>(matchedGlobal)
+                      << " declaration=" << query.isGlobalDeclarationQuery
+                      << " global-range=" << location.GetBeginPos().line
+                      << '-' << location.GetEndPos().line << '\n';
+        }
     }
 }
 
-bool MayMatchAnyContestQuery(
-    const std::vector<ContestQuery>& queries, const DebugLocation& location, const std::filesystem::path& contestRoot)
-{
-    return std::any_of(queries.begin(), queries.end(), [&](const auto& query) {
-        return query.valid && IsSameQueryLocation(query, location, contestRoot);
-    });
-}
-
+// 判断某个值是否已关联指定源码变量名。
 bool FunctionMayContainContestQuery(
-    const Function* func, const std::vector<ContestQuery>& queries, const std::filesystem::path& contestRoot)
+    const Function* func, const ContestQuery& query, const std::filesystem::path& contestRoot)
 {
-    if (func == nullptr || func->GetBody() == nullptr) {
+    if (func == nullptr || func->GetBody() == nullptr || !query.valid) {
         return false;
     }
     for (auto block : func->GetBody()->GetAllBlocks()) {
         for (auto expr : block->GetExpressions()) {
-            if (MayMatchAnyContestQuery(queries, expr->GetDebugLocation(), contestRoot)) {
+            if (IsSameQueryLocation(query, expr->GetDebugLocation(), contestRoot)) {
                 return true;
             }
         }
         if (auto terminator = block->GetTerminator();
-            terminator != nullptr && MayMatchAnyContestQuery(queries, terminator->GetDebugLocation(), contestRoot)) {
+            terminator != nullptr &&
+            IsSameQueryLocation(query, terminator->GetDebugLocation(), contestRoot)) {
             return true;
         }
     }
     return false;
 }
 
-// 判断某个值是否已关联指定源码变量名。
+bool FunctionHasContestQueryBinding(
+    const Function* func, const ContestQuery& query, const std::filesystem::path& contestRoot)
+{
+    if (func == nullptr || func->GetBody() == nullptr || !query.valid) {
+        return false;
+    }
+    for (auto block : func->GetBody()->GetAllBlocks()) {
+        for (auto expr : block->GetExpressions()) {
+            if (expr->GetExprKind() == ExprKind::DEBUGEXPR) {
+                auto debug = StaticCast<const Debug*>(expr);
+                if (debug->GetSrcCodeIdentifier() == query.variableName &&
+                    IsSameQueryFile(query, debug->GetDebugLocation(), contestRoot)) {
+                    return true;
+                }
+            }
+            if (query.boundGlobal != nullptr &&
+                GetDirectGlobalLocation(*expr) == query.boundGlobal) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 using ReverseContestCallGraph = std::unordered_map<const Function*, std::vector<const Function*>>;
 
 void AddReverseContestCallGraphEdge(
@@ -1210,6 +1369,10 @@ void RecordContestCallExpression(
 
 ReverseContestCallGraph BuildReverseContestCallGraph(const Ptr<const Package>& package)
 {
+    if (IsRangePropagationPerfTraceEnabled()) {
+        ++rangePropagationPerfStats.reverseCallGraphCalls;
+    }
+    ScopedRangePropagationPerfTimer timer(&rangePropagationPerfStats.reverseCallGraphNanos);
     ReverseContestCallGraph reverseCallGraph;
     for (auto func : package->GetGlobalFuncsWithBody()) {
         if (func == nullptr || func->GetBody() == nullptr) {
@@ -1228,15 +1391,36 @@ ReverseContestCallGraph BuildReverseContestCallGraph(const Ptr<const Package>& p
 std::unordered_set<const Function*> CollectContestRelevantFunctions(
     const Ptr<const Package>& package, const std::vector<ContestQuery>& queries, const std::filesystem::path& contestRoot)
 {
+    if (IsRangePropagationPerfTraceEnabled()) {
+        ++rangePropagationPerfStats.relevantFunctionCalls;
+    }
+    ScopedRangePropagationPerfTimer timer(&rangePropagationPerfStats.relevantFunctionNanos);
     constexpr size_t MAX_CONTEST_CONTEXT_CALL_DEPTH = 6;
     constexpr size_t MAX_CONTEST_RELEVANT_FUNCTIONS = 64;
 
     std::unordered_set<const Function*> relevantFunctions;
     std::vector<std::pair<const Function*, size_t>> worklist;
-    for (auto func : package->GetGlobalFuncsWithBody()) {
-        if (FunctionMayContainContestQuery(func, queries, contestRoot) &&
-            relevantFunctions.emplace(func).second) {
-            worklist.emplace_back(func, 0);
+    for (const auto& query : queries) {
+        if (!query.valid) {
+            continue;
+        }
+        std::vector<const Function*> locationCandidates;
+        std::vector<const Function*> boundCandidates;
+        for (auto func : package->GetGlobalFuncsWithBody()) {
+            if (!FunctionMayContainContestQuery(func, query, contestRoot)) {
+                continue;
+            }
+            locationCandidates.emplace_back(func);
+            if (FunctionHasContestQueryBinding(func, query, contestRoot)) {
+                boundCandidates.emplace_back(func);
+            }
+        }
+        const auto& selected =
+            boundCandidates.empty() ? locationCandidates : boundCandidates;
+        for (auto func : selected) {
+            if (relevantFunctions.emplace(func).second) {
+                worklist.emplace_back(func, 0);
+            }
         }
     }
     const bool hasValidQuery = std::any_of(queries.begin(), queries.end(), [](const auto& query) {
@@ -1261,6 +1445,8 @@ std::unordered_set<const Function*> CollectContestRelevantFunctions(
         }
     }
     if (worklist.empty()) {
+        rangePropagationPerfStats.maxRelevantFunctions =
+            std::max(rangePropagationPerfStats.maxRelevantFunctions, relevantFunctions.size());
         return relevantFunctions;
     }
 
@@ -1276,6 +1462,8 @@ std::unordered_set<const Function*> CollectContestRelevantFunctions(
         }
         for (auto caller : callers->second) {
             if (relevantFunctions.size() >= MAX_CONTEST_RELEVANT_FUNCTIONS) {
+                rangePropagationPerfStats.maxRelevantFunctions =
+                    std::max(rangePropagationPerfStats.maxRelevantFunctions, relevantFunctions.size());
                 return relevantFunctions;
             }
             if (relevantFunctions.emplace(caller).second) {
@@ -1283,6 +1471,8 @@ std::unordered_set<const Function*> CollectContestRelevantFunctions(
             }
         }
     }
+    rangePropagationPerfStats.maxRelevantFunctions =
+        std::max(rangePropagationPerfStats.maxRelevantFunctions, relevantFunctions.size());
     return relevantFunctions;
 }
 
@@ -1307,6 +1497,19 @@ bool HasValueNameForQuery(const ValueNameMap& valueNames, Value* value, const Co
 void RememberValueName(ValueNameMap& valueNames, const Debug& debug, const std::filesystem::path& contestRoot)
 {
     auto value = debug.GetValue();
+    if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
+        auto definingExpr = value != nullptr && value->IsLocalVar()
+            ? StaticCast<LocalVar*>(value)->GetExpr()
+            : nullptr;
+        std::cerr << "[RangeAnalysisNameBinding] name=" << debug.GetSrcCodeIdentifier()
+                  << " line=" << debug.GetDebugLocation().GetBeginPos().line
+                  << " value=" << value
+                  << " parameter=" << (value != nullptr && value->IsParameter())
+                  << " exprKind=" << (definingExpr == nullptr ? -1 : static_cast<int>(definingExpr->GetExprKind()))
+                  << " exprLine=" << (definingExpr == nullptr ? 0 :
+                      definingExpr->GetDebugLocation().GetBeginPos().line)
+                  << '\n';
+    }
     auto& names = valueNames[value];
     ValueNameInfo info{debug.GetSrcCodeIdentifier(), GetLocationFileKey(debug.GetDebugLocation(), contestRoot),
         debug.GetDebugLocation().GetBeginPos().line, debug.GetDebugLocation().GetScopeInfo()};
@@ -1454,6 +1657,26 @@ ContestReachability CanReachBlockForQueryMapping(const Block* start, const Block
     return ContestReachability::UNREACHABLE;
 }
 
+bool IsIntegerConstantValue(Value* value)
+{
+    if (value == nullptr || value->GetType() == nullptr || !value->GetType()->IsInteger()) {
+        return false;
+    }
+    auto expression = GetLocalDefiningExpression(value);
+    if (expression == nullptr) {
+        return false;
+    }
+    if (expression->GetExprKind() == ExprKind::CONSTANT) {
+        return true;
+    }
+    if (expression->GetExprKind() != ExprKind::TYPECAST) {
+        return false;
+    }
+    auto source = StaticCast<const TypeCast*>(expression)->GetSourceValue();
+    return source != nullptr && source->GetType() != nullptr &&
+        source->GetType()->IsInteger() && IsIntegerConstantValue(source);
+}
+
 bool CollectQueryValueDependencies(Value* root, std::unordered_set<const Value*>& values)
 {
     constexpr size_t MAX_QUERY_DEPENDENCIES = 4096;
@@ -1537,22 +1760,20 @@ std::unordered_set<const Block*> CollectQueryRefinementBlocks(const Ptr<const Pa
                 return {};
             }
         }
-        // ponytail: bounded CFG scans avoid a second dependency graph; replace
-        // with reverse reachability only if large contest functions make this hot.
-        for (auto block : blocks) {
-            if (IsBlockInContestCycle(block) != ContestReachability::REACHABLE) {
-                continue;
-            }
-            const bool reachesQuery = std::any_of(queryBlocks.begin(), queryBlocks.end(), [block](const auto queryBlock) {
-                return CanReachBlockForQueryMapping(block, queryBlock) == ContestReachability::REACHABLE;
-            });
-            if (!reachesQuery) {
-                continue;
-            }
+        std::unordered_set<const Block*> reachesQuery(queryBlocks.begin(), queryBlocks.end());
+        std::vector<const Block*> worklist(queryBlocks.begin(), queryBlocks.end());
+        while (!worklist.empty()) {
+            auto block = worklist.back();
+            worklist.pop_back();
             if (result.size() >= MAX_QUERY_REFINEMENT_BLOCKS) {
                 return {};
             }
             result.emplace(block);
+            for (auto predecessor : block->GetPredecessors()) {
+                if (reachesQuery.emplace(predecessor).second) {
+                    worklist.emplace_back(predecessor);
+                }
+            }
         }
     }
     return result;
@@ -1585,13 +1806,16 @@ bool IsUnnamedLoopInductionLoad(const Expression& expression)
             continue;
         }
         auto binary = StaticCast<const BinaryExpression*>(storedExpression);
-        const bool readsLocation = IsLoadFromLocation(binary->GetLHSOperand(), location) ||
-            (storedExpression->GetExprKind() == ExprKind::ADD &&
-                IsLoadFromLocation(binary->GetRHSOperand(), location));
+        const bool lhsReadsLocation = IsLoadFromLocation(binary->GetLHSOperand(), location);
+        const bool rhsReadsLocation = IsLoadFromLocation(binary->GetRHSOperand(), location);
+        const bool hasConstantStep = storedExpression->GetExprKind() == ExprKind::ADD
+            ? (lhsReadsLocation && IsIntegerConstantValue(binary->GetRHSOperand())) ||
+                (rhsReadsLocation && IsIntegerConstantValue(binary->GetLHSOperand()))
+            : lhsReadsLocation && IsIntegerConstantValue(binary->GetRHSOperand());
         auto storeBlock = user->GetParentBlock();
         auto reachesStore = CanReachBlockForQueryMapping(loadBlock, storeBlock);
         auto reachesLoad = CanReachBlockForQueryMapping(storeBlock, loadBlock);
-        if (readsLocation && reachesStore == ContestReachability::REACHABLE &&
+        if (hasConstantStep && reachesStore == ContestReachability::REACHABLE &&
             reachesLoad == ContestReachability::REACHABLE) {
             return true;
         }
@@ -1615,7 +1839,8 @@ std::optional<size_t> FindUniqueUnnamedQueryAtLocation(const std::vector<Contest
     std::optional<size_t> match;
     for (size_t index = 0; index < queries.size(); ++index) {
         const auto& query = queries[index];
-        if (!query.valid || !IsSameQueryLocation(query, location, contestRoot) ||
+        if (!query.valid || query.boundGlobal != nullptr ||
+            !IsSameQueryLocation(query, location, contestRoot) ||
             HasVisibleNamedValueAtLocation(query, valueNames, location)) {
             continue;
         }
@@ -1654,6 +1879,49 @@ void ResolveQueryAtUnnamedLoopInductionLoad(std::vector<ContestQuery>& queries, 
     SetContestQueryResult(query, type, range, ContestResultOrigin::CHIR_ANALYSIS);
 }
 
+void ResolveQueryAtUnnamedLoopInductionOperand(std::vector<ContestQuery>& queries,
+    const ValueNameMap& valueNames, const Expression& expression, const RangeDomain& state,
+    const std::filesystem::path& contestRoot)
+{
+    auto queryIndex = FindUniqueUnnamedQueryAtLocation(
+        queries, valueNames, expression.GetDebugLocation(), contestRoot);
+    if (!queryIndex.has_value()) {
+        return;
+    }
+
+    Value* candidate = nullptr;
+    const Expression* candidateDefinition = nullptr;
+    for (auto operand : expression.GetOperands()) {
+        auto definingExpression = GetLocalDefiningExpression(operand);
+        if (definingExpression == nullptr || !IsUnnamedLoopInductionLoad(*definingExpression)) {
+            continue;
+        }
+        if (candidate != nullptr && candidate != operand) {
+            return;
+        }
+        candidate = operand;
+        candidateDefinition = definingExpression;
+    }
+    if (candidate == nullptr) {
+        return;
+    }
+
+    auto& query = queries[*queryIndex];
+    auto type = GetQueryValueType(candidate);
+    auto observedRange = RangeAnalysis::GetBoundedLoopObservedRange(candidateDefinition);
+    auto range = observedRange != nullptr
+        ? observedRange.get()
+        : GetContestRangeForValue(state, candidate);
+    query.hasBoundedPointResult = query.hasBoundedPointResult || observedRange != nullptr;
+    auto result = FormatContestRange(range, type);
+    if (!ShouldRecordContestResult(query, result, type, range,
+            /* fromBeforeProgramPoint = */ false,
+            /* refinesBeforeProgramPoint = */ observedRange != nullptr)) {
+        return;
+    }
+    SetContestQueryResult(query, type, range, ContestResultOrigin::CHIR_ANALYSIS);
+}
+
 void ResolveQueriesFromVisibleNames(std::vector<ContestQuery>& queries, const ValueNameMap& valueNames,
     const DebugLocation& location, const RangeDomain& state, const std::filesystem::path& contestRoot,
     bool beforeProgramPoint = false)
@@ -1663,7 +1931,8 @@ void ResolveQueriesFromVisibleNames(std::vector<ContestQuery>& queries, const Va
         if (!query.valid || !IsSameQueryLocation(query, location, contestRoot)) {
             continue;
         }
-        if (!beforeProgramPoint && query.hasBoundedLifetimeResult) {
+        if (!beforeProgramPoint &&
+            (query.hasBoundedLifetimeResult || query.hasBoundedPointResult)) {
             continue;
         }
         auto candidates = FindVisibleNamedValues(query, valueNames, useScope);
@@ -1744,7 +2013,8 @@ void ResolveQueryAtDebug(std::vector<ContestQuery>& queries, ValueNameMap& value
 
 // 通过已记录的 value-name 映射解析同源码行 operand 查询。
 void ResolveQueryAtValue(std::vector<ContestQuery>& queries, const ValueNameMap& valueNames, const DebugLocation& location,
-    Value* value, const RangeDomain& state, const std::filesystem::path& contestRoot)
+    Value* value, const RangeDomain& state, const std::filesystem::path& contestRoot,
+    const ValueRange* boundedPointObservation = nullptr)
 {
     for (auto& query : queries) {
         if (!query.valid || !HasValueNameForQuery(valueNames, value, query)) {
@@ -1754,12 +2024,16 @@ void ResolveQueryAtValue(std::vector<ContestQuery>& queries, const ValueNameMap&
             continue;
         }
         auto type = GetQueryValueType(value);
-        auto range = GetContestRangeForValue(state, value);
+        auto range = boundedPointObservation != nullptr ?
+            boundedPointObservation : GetContestRangeForValue(state, value);
+        query.hasBoundedPointResult = query.hasBoundedPointResult || boundedPointObservation != nullptr;
         if (value->IsParameter() && IsContestTopRange(range, type)) {
             query.hasUnknownPointObservation = true;
         }
         auto result = FormatContestRange(range, type);
-        if (!ShouldRecordContestResult(query, result, type, range)) {
+        if (!ShouldRecordContestResult(query, result, type, range,
+                /* fromBeforeProgramPoint = */ false,
+                /* refinesBeforeProgramPoint = */ boundedPointObservation != nullptr)) {
             continue;
         }
         SetContestQueryResult(query, type, range, ContestResultOrigin::CHIR_ANALYSIS);
@@ -1776,6 +2050,61 @@ GlobalVar* GetDirectGlobalLocation(const Expression& expression)
         location = StaticCast<const Store*>(&expression)->GetLocation();
     }
     return IsGlobalVarInCurrentPackage(location) ? DynamicCast<GlobalVar*>(location) : nullptr;
+}
+
+bool IsFirstExpressionForQueryInBlock(const ContestQuery& query, const Expression& expression,
+    const std::filesystem::path& contestRoot)
+{
+    auto block = expression.GetParentBlock();
+    if (block == nullptr) {
+        return false;
+    }
+    for (auto candidate : block->GetExpressions()) {
+        if (candidate == &expression) {
+            return true;
+        }
+        if (candidate != nullptr &&
+            IsSameQueryLocation(query, candidate->GetDebugLocation(), contestRoot)) {
+            return false;
+        }
+    }
+    return false;
+}
+
+void ResolveBoundGlobalQueryBeforeExpression(std::vector<ContestQuery>& queries,
+    const Expression& expression, const RangeDomain& state,
+    const std::filesystem::path& contestRoot)
+{
+    if (state.IsBottom()) {
+        return;
+    }
+    for (auto& query : queries) {
+        auto global = query.boundGlobal;
+        if (!query.valid ||
+            (query.isGlobalDeclarationQuery && !query.isUnambiguousGlobalBinding) ||
+            global == nullptr ||
+            !IsSameQueryLocation(query, expression.GetDebugLocation(), contestRoot) ||
+            !IsFirstExpressionForQueryInBlock(query, expression, contestRoot)) {
+            continue;
+        }
+        auto type = GetQueryValueType(global);
+        auto range = GetContestRangeForValue(state, global);
+        auto result = FormatContestRange(range, type);
+        const bool shouldRecord = ShouldRecordContestResult(
+            query, result, type, range, /* fromBeforeProgramPoint = */ true);
+        query.hasBeforePointResult = true;
+        query.hasBoundGlobalPointObservation = true;
+        if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
+            std::cerr << "[RangeAnalysisBoundGlobalBefore] query="
+                      << query.variableName << '@' << query.line
+                      << " exprKind=" << static_cast<int>(expression.GetExprKind())
+                      << " range=" << result << '\n';
+        }
+        if (shouldRecord) {
+            SetContestQueryResult(
+                query, type, range, ContestResultOrigin::CHIR_ANALYSIS);
+        }
+    }
 }
 
 void ResolveQueryBeforeGlobalAccess(std::vector<ContestQuery>& queries, const Expression& expression,
@@ -1805,12 +2134,15 @@ void ResolveQueryBeforeGlobalAccess(std::vector<ContestQuery>& queries, const Ex
 
 void MergeContestContextCandidate(
     ContestContextCandidateMap& candidates, size_t queryIndex, Type* type, const ValueRange* range,
-    bool unknownObservation = false, bool auxiliary = false)
+    bool unknownObservation = false, bool auxiliary = false,
+    bool directPointLoadObservation = false)
 {
     if (type == nullptr || (range == nullptr && !unknownObservation)) {
         return;
     }
     auto& candidate = candidates[queryIndex];
+    candidate.hasDirectPointLoadObservation =
+        candidate.hasDirectPointLoadObservation || directPointLoadObservation;
     const bool hadObservation = candidate.range != nullptr || candidate.hasUnknownObservation;
     const bool wasAuxiliaryOnly = candidate.auxiliaryOnly;
     if (candidate.type == nullptr) {
@@ -1861,7 +2193,8 @@ void MergeContestContextCandidate(
 
 void CollectContextCandidateAtGlobalAccess(const std::vector<ContestQuery>& queries,
     ContestContextCandidateMap& candidates, const Expression& expression, const RangeDomain& state,
-    const std::filesystem::path& contestRoot, bool boundDeclarationsOnly = false)
+    const std::filesystem::path& contestRoot, bool boundDeclarationsOnly = false,
+    const RangeAnalysis* contextAnalysis = nullptr)
 {
     auto global = GetDirectGlobalLocation(expression);
     if (global == nullptr || state.IsBottom()) {
@@ -1893,13 +2226,20 @@ void CollectContextCandidateAtGlobalAccess(const std::vector<ContestQuery>& quer
                 candidate.sawInitializerObservation = true;
             }
             auto storedValue = StaticCast<const Store*>(&expression)->GetValue();
-            auto observed = RangeAnalysis::GetBoundedLoopObservedRange(&expression);
+            auto observed = contextAnalysis == nullptr
+                ? nullptr
+                : contextAnalysis->GetLocalBoundedLoopObservedRange(&expression);
+            if (observed == nullptr) {
+                observed = RangeAnalysis::GetBoundedLoopObservedRange(&expression);
+            }
             auto type = GetQueryValueType(global);
             auto range = observed != nullptr ? observed.get() : GetContestRangeForValue(state, storedValue);
             if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
                 auto topLevelFunc = expression.GetTopLevelFunc();
                 std::cerr << "[RangeAnalysisGlobalLifetime] kind=store query="
                           << query.variableName << '@' << query.line
+                          << " global=" << static_cast<const void*>(global)
+                          << " bound=" << static_cast<const void*>(query.boundGlobal)
                           << " line=" << expression.GetDebugLocation().GetBeginPos().line
                           << " initializer=" << (topLevelFunc == global->GetInitFunc())
                           << " func=" << (topLevelFunc == nullptr ? "<null>" : topLevelFunc->GetIdentifier())
@@ -1966,6 +2306,8 @@ void CollectContextCandidateAtGlobalExit(const std::vector<ContestQuery>& querie
             auto topLevelFunc = terminator.GetTopLevelFunc();
             std::cerr << "[RangeAnalysisGlobalLifetime] kind=exit query="
                       << query.variableName << '@' << query.line
+                      << " global=" << static_cast<const void*>(global)
+                      << " bound=" << static_cast<const void*>(query.boundGlobal)
                       << " func=" << (topLevelFunc == nullptr ? "<null>" : topLevelFunc->GetIdentifier())
                       << " range=" << FormatContestRange(range, type) << '\n';
         }
@@ -2368,6 +2710,30 @@ void CollectContextCandidateAtExpressionOperands(const std::vector<ContestQuery>
     ContestContextCandidateMap& candidates, const ValueNameMap& valueNames, const Expression& expr,
     const RangeDomain& state, const std::filesystem::path& contestRoot)
 {
+    if (expr.GetExprKind() == ExprKind::STORE) {
+        auto store = StaticCast<const Store*>(&expr);
+        for (size_t index = 0; index < queries.size(); ++index) {
+            const auto& query = queries[index];
+            if (!query.valid ||
+                expr.GetDebugLocation().GetBeginPos().line != query.line ||
+                !IsQueryDeclarationBinding(
+                    query, valueNames, store->GetLocation(), expr.GetDebugLocation())) {
+                continue;
+            }
+            auto type = GetQueryValueType(store->GetLocation());
+            auto observation = ObserveContestRange(state, store->GetValue());
+            if (observation.kind == ContestRangeObservationKind::ABSENT) {
+                continue;
+            }
+            if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
+                std::cerr << "[RangeAnalysisContextCandidate] kind=declaration-store query="
+                          << query.variableName << '@' << query.line
+                          << " range=" << FormatContestRange(observation.range, type) << '\n';
+            }
+            MergeContestContextCandidate(candidates, index, type, observation.range,
+                observation.kind == ContestRangeObservationKind::UNKNOWN);
+        }
+    }
     if (expr.GetExprKind() == ExprKind::LOAD) {
         auto load = StaticCast<const Load*>(&expr);
         for (size_t index = 0; index < queries.size(); ++index) {
@@ -2380,7 +2746,8 @@ void CollectContextCandidateAtExpressionOperands(const std::vector<ContestQuery>
                     continue;
                 }
                 MergeContestContextCandidate(candidates, index, type, observation.range,
-                    observation.kind == ContestRangeObservationKind::UNKNOWN);
+                    observation.kind == ContestRangeObservationKind::UNKNOWN,
+                    /* auxiliary = */ false, /* directPointLoadObservation = */ true);
             }
         }
     }
@@ -2396,18 +2763,40 @@ void CollectContextCandidateAtExpressionOperands(const std::vector<ContestQuery>
 }
 
 void ResolveQueryAtExpressionOperands(std::vector<ContestQuery>& queries, const ValueNameMap& valueNames,
-    const Expression& expr, const RangeDomain& state,
+    const ValueNameMap& knownValueNames, const Expression& expr, const RangeDomain& state,
     const std::filesystem::path& contestRoot)
 {
-    ResolveQueryAtUnnamedLoopInductionLoad(queries, valueNames, expr, state, contestRoot);
+    // Debug expressions are emitted after the expression that defines a local
+    // binding. Consult the pre-indexed map here so the unnamed-IV fallback does
+    // not claim a named declaration before its Debug node is visited.
+    ResolveQueryAtUnnamedLoopInductionLoad(queries, knownValueNames, expr, state, contestRoot);
+    ResolveQueryAtUnnamedLoopInductionOperand(queries, knownValueNames, expr, state, contestRoot);
     ResolveQueryAtLoadResult(queries, valueNames, expr, state, contestRoot);
     ResolveQueryAtStoreValue(queries, valueNames, expr, state, contestRoot);
+    std::unique_ptr<ValueRange> boundedStoredValue;
+    Value* storedValue = nullptr;
+    if (expr.GetExprKind() == ExprKind::STORE) {
+        storedValue = StaticCast<const Store*>(&expr)->GetValue();
+        boundedStoredValue = RangeAnalysis::GetBoundedLoopObservedRange(&expr);
+    }
     for (auto operand : expr.GetOperands()) {
         if (expr.GetExprKind() == ExprKind::STORE &&
             operand == StaticCast<const Store*>(&expr)->GetLocation()) {
             continue;
         }
-        ResolveQueryAtValue(queries, valueNames, expr.GetDebugLocation(), operand, state, contestRoot);
+        std::unique_ptr<ValueRange> boundedDefinitionValue;
+        const ValueRange* boundedPointObservation =
+            operand == storedValue ? boundedStoredValue.get() : nullptr;
+        if (boundedPointObservation == nullptr) {
+            auto definingExpression = operand != nullptr && operand->IsLocalVar()
+                ? StaticCast<const LocalVar*>(operand)->GetExpr()
+                : nullptr;
+            boundedDefinitionValue =
+                RangeAnalysis::GetBoundedLoopObservedRange(definingExpression);
+            boundedPointObservation = boundedDefinitionValue.get();
+        }
+        ResolveQueryAtValue(queries, valueNames, expr.GetDebugLocation(), operand, state, contestRoot,
+            boundedPointObservation);
     }
     ResolveQueriesFromVisibleNames(queries, valueNames, expr.GetDebugLocation(), state, contestRoot);
 }
@@ -2464,6 +2853,14 @@ void ApplyContestContextCandidates(std::vector<ContestQuery>& queries,
             continue;
         }
         auto& query = queries[index];
+        if (query.hasBoundGlobalPointObservation && query.isGlobalDeclarationQuery &&
+            candidate.fromGlobalAccess) {
+            // The unique global binding was only a fallback for a source line
+            // without a direct GlobalVar operand. Once the caller-side CHIR
+            // program point is observed, its pre-state is authoritative; the
+            // declaration lifetime would mix in values from other points.
+            continue;
+        }
         if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
             std::cerr << "[RangeAnalysisContextApply] query=" << query.variableName << '@' << query.line
                       << " candidate=" << FormatContestRange(candidate.range.get(), candidate.type)
@@ -2475,6 +2872,7 @@ void ApplyContestContextCandidates(std::vector<ContestQuery>& queries,
                       << " global=" << candidate.fromGlobalAccess
                       << " rootUnknown=" << query.hasUnknownPointObservation
                       << " rootRmw=" << query.hasReadModifyWriteResult
+                      << " directLoad=" << candidate.hasDirectPointLoadObservation
                       << " rootTop=" << IsContestTopRange(query.resultRange.get(), query.type)
                       << " root=" << query.result << '\n';
         }
@@ -2485,7 +2883,8 @@ void ApplyContestContextCandidates(std::vector<ContestQuery>& queries,
         const bool hasCompleteContextCandidate = !candidate.fromGlobalAccess &&
             !candidate.incompleteGlobalLifetime && !candidate.hasUnknownObservation &&
             !candidate.auxiliaryOnly && candidate.range != nullptr &&
-            !query.hasReadModifyWriteResult;
+            (!query.hasReadModifyWriteResult ||
+                candidate.hasDirectPointLoadObservation);
         if (!contextClosureComplete && !candidate.fromGlobalAccess) {
             // A partial call closure is useful for diagnostics but is not an
             // exhaustive set of executions. Keep the root CHIR result, which
@@ -2497,8 +2896,13 @@ void ApplyContestContextCandidates(std::vector<ContestQuery>& queries,
             auto type = query.type == nullptr ? candidate.type : query.type;
             if (!query.hasBoundedPointResult && hasCompleteContextCandidate &&
                 AreContestTypesCompatible(type, candidate.type) &&
-                query.resultRange->GetRangeKind() == candidate.range->GetRangeKind() &&
-                IsContestRangeSubset(*candidate.range, *query.resultRange)) {
+                query.resultRange->GetRangeKind() == candidate.range->GetRangeKind()) {
+                // A complete context closure partitions all reachable calls to
+                // this function. Prefer that union even when a
+                // context-insensitive root result is not its superset: the
+                // root state may have lost aggregate alias identity at a CFG
+                // join, while each normalized context still has a sound
+                // memory state.
                 SetContestQueryResult(
                     query, type, candidate.range.get(), ContestResultOrigin::CONTEXT_SUMMARY);
             }
@@ -2669,6 +3073,9 @@ void RangePropagation::RunOnFunc(const Ptr<const Function>& func, bool isDebug)
 void RangePropagation::EmitContestOutput(const Ptr<const Package>& package, RangeAnalysisWrapper& rangeAnalysisWrapper,
     const std::vector<std::string>& contestRootHints, DiagnosticEngine& diag)
 {
+    const auto emitStart = IsRangePropagationPerfTraceEnabled()
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
     auto inputContext = FindContestInputContext(contestRootHints);
     if (!inputContext.has_value()) {
         return;
@@ -2681,6 +3088,7 @@ void RangePropagation::EmitContestOutput(const Ptr<const Package>& package, Rang
     BindGlobalQueries(package, queries.value(), contestRoot);
     BindUnambiguousGlobalQueries(package, queries.value(), contestRoot);
     ValueNameMap valueNames;
+    ValueNameMap knownValueNames;
     ContestAggregateMap aggregates;
     ContestContextCandidateMap contextCandidates;
     ContestContextLoopObservationMap contextLoopObservations;
@@ -2691,32 +3099,42 @@ void RangePropagation::EmitContestOutput(const Ptr<const Package>& package, Rang
         CollectContextCandidateAtGlobalAccess(
             queries.value(), contextCandidates, *expression, state, contestRoot,
             /* boundDeclarationsOnly = */ true);
+        ResolveBoundGlobalQueryBeforeExpression(
+            queries.value(), *expression, state, contestRoot);
         ResolveQueryBeforeGlobalAccess(queries.value(), *expression, state, contestRoot);
         ResolveQueriesFromVisibleNames(queries.value(), valueNames,
             expression->GetDebugLocation(), state, contestRoot, /* beforeProgramPoint = */ true);
     };
-    auto actionAfterVisitExpr = [&queries, &valueNames, &aggregates, &contestRoot](
+    auto actionAfterVisitExpr = [&queries, &valueNames, &knownValueNames, &aggregates, &contestRoot](
                                     const RangeDomain& state, Expression* expr, size_t) {
         if (expr->GetExprKind() == ExprKind::DEBUGEXPR) {
             ResolveQueryAtDebug(queries.value(), valueNames, aggregates, *StaticCast<Debug*>(expr), state, contestRoot);
             return;
         }
-        ResolveQueryAtExpressionOperands(queries.value(), valueNames, *expr, state, contestRoot);
+        ResolveQueryAtExpressionOperands(
+            queries.value(), valueNames, knownValueNames, *expr, state, contestRoot);
     };
-    const auto actionOnTerminator = [&queries, &valueNames, &contestRoot](
+    const auto actionOnTerminator = [&queries, &valueNames, &knownValueNames, &contestRoot](
                                         const RangeDomain& state, Terminator* terminator, std::optional<Block*>) {
         if (terminator == nullptr) {
             return;
         }
-        ResolveQueryAtExpressionOperands(queries.value(), valueNames, *terminator, state, contestRoot);
+        ResolveQueryAtExpressionOperands(
+            queries.value(), valueNames, knownValueNames, *terminator, state, contestRoot);
     };
     auto resolveQueries = [&](Results<RangeDomain>& result) {
+        const auto collectKnownBinding = [&knownValueNames, &contestRoot](
+                                             const RangeDomain&, Expression* expr, size_t) {
+            if (expr != nullptr && expr->GetExprKind() == ExprKind::DEBUGEXPR) {
+                RememberValueName(
+                    knownValueNames, *StaticCast<Debug*>(expr), contestRoot);
+            }
+        };
+        const auto ignoreBefore = [](const RangeDomain&, Expression*, size_t) {};
+        const auto ignoreTerminator = [](
+                                          const RangeDomain&, Terminator*, std::optional<Block*>) {};
+        result.VisitWith(ignoreBefore, collectKnownBinding, ignoreTerminator);
         result.VisitWith(actionBeforeVisitExpr, actionAfterVisitExpr, actionOnTerminator);
-    };
-    const auto contextActionBeforeVisitExpr = [&queries, &contextCandidates, &contestRoot](
-                                                  const RangeDomain& state, Expression* expression, size_t) {
-        CollectContextCandidateAtGlobalAccess(
-            queries.value(), contextCandidates, *expression, state, contestRoot);
     };
     const auto contextActionAfterVisitExpr = [&queries, &contextCandidates, &contextValueNames, &contestRoot](
                                                 const RangeDomain& state, Expression* expr, size_t) {
@@ -2741,35 +3159,67 @@ void RangePropagation::EmitContestOutput(const Ptr<const Package>& package, Rang
         CollectContextCandidateAtExpressionOperands(
             queries.value(), contextCandidates, contextValueNames, *terminator, state, contestRoot);
     };
-    const auto contextActionOnTerminator =
-        [&collectContextTerminator](
-            const RangeDomain& state, Terminator* terminator, std::optional<Block*>) {
-            collectContextTerminator(state, terminator, /* collectLifetimeExit = */ false);
-        };
     bool contextClosureComplete = true;
-    auto collectContextCandidates = [&](const Function* rootFunction, Results<RangeDomain>& root) {
-        const bool collectLifetimeExit = rootFunction != nullptr &&
-            rootFunction->GetFuncKind() == FuncKind::MAIN_ENTRY;
-        const auto contextRootActionOnTerminator =
+    const auto visitContextResult = [&](Results<RangeDomain>& result, bool collectLifetimeExit) {
+        auto contextAnalysis = dynamic_cast<RangeAnalysis*>(result.GetAnalysis());
+        const auto contextActionBeforeVisitExpr =
+            [&queries, &contextCandidates, &contestRoot, contextAnalysis](
+                const RangeDomain& state, Expression* expression, size_t) {
+                CollectContextCandidateAtGlobalAccess(
+                    queries.value(), contextCandidates, *expression, state, contestRoot,
+                    /* boundDeclarationsOnly = */ false, contextAnalysis);
+            };
+        const auto contextActionOnTerminator =
             [&collectContextTerminator, collectLifetimeExit](
                 const RangeDomain& state, Terminator* terminator, std::optional<Block*>) {
                 collectContextTerminator(state, terminator, collectLifetimeExit);
             };
-        root.VisitWith(
+        result.VisitWith(
             contextActionBeforeVisitExpr, contextActionAfterVisitExpr,
-            contextRootActionOnTerminator);
+            contextActionOnTerminator);
+    };
+    auto collectContextCandidates = [&](const Function* rootFunction, Results<RangeDomain>& root) {
+        const bool collectLifetimeExit = rootFunction != nullptr &&
+            rootFunction->GetFuncKind() == FuncKind::MAIN_ENTRY;
+        visitContextResult(root, collectLifetimeExit);
         contextClosureComplete = RangeAnalysis::VisitReachableContextSensitiveResults(rootFunction, root,
             [&](const Function*, const std::string&, Results<RangeDomain>& result) {
-                result.VisitWith(
-                    contextActionBeforeVisitExpr, contextActionAfterVisitExpr, contextActionOnTerminator);
+                visitContextResult(result, /* collectLifetimeExit = */ false);
                 contextClosureComplete =
                     CollectContestContextLoopObservations(
                         contextLoopObservations, result) &&
                     contextClosureComplete;
             }) && contextClosureComplete;
     };
+
+    // The contest path does not call AnalysisWrapper::RunOnPackage(), so its
+    // normal global-state setup would otherwise be skipped. Analyse each
+    // tracked readonly initializer before main and let ValueAnalysis populate
+    // the package-wide abstract global state from CHIR stores.
+    RangeAnalysis::ClearContextSensitiveResults();
+    std::unordered_set<const Function*> analysedReadonlyInitializers;
+    for (auto global : package->GetGlobalVarsWithInit()) {
+        if (global == nullptr || !IsGlobalVarInCurrentPackage(global) ||
+            !global->TestAttr(Attribute::READONLY) ||
+            !IsTrackedGV<RangeValueDomain>(*global)) {
+            continue;
+        }
+        auto initializer = global->GetInitFunc();
+        if (initializer == nullptr || initializer->GetBody() == nullptr ||
+            !analysedReadonlyInitializers.emplace(initializer).second) {
+            continue;
+        }
+        auto result = rangeAnalysisWrapper.RunOnFunc(initializer, /* isDebug = */ false, diag);
+        if (result != nullptr) {
+            resolveQueries(*result);
+            visitContextResult(*result, /* collectLifetimeExit = */ false);
+        }
+    }
+
     auto relevantFunctions = CollectContestRelevantFunctions(package, queries.value(), contestRoot);
     auto reverseCallGraph = BuildReverseContestCallGraph(package);
+    rangePropagationPerfStats.maxPackageFunctions = std::max(
+        rangePropagationPerfStats.maxPackageFunctions, package->GetGlobalFuncsWithBody().size());
     const bool hasMainContextRoot = std::any_of(
         relevantFunctions.begin(), relevantFunctions.end(), [](const auto* function) {
             return function != nullptr && function->GetFuncKind() == FuncKind::MAIN_ENTRY;
@@ -2789,6 +3239,7 @@ void RangePropagation::EmitContestOutput(const Ptr<const Package>& package, Rang
             std::move(refinementBlocks), std::move(refinementValues));
     }
     RangeAnalysis::ClearContextSensitiveResults();
+    size_t contextRootCount = 0;
     for (auto func : package->GetGlobalFuncsWithBody()) {
         if (!RangeAnalysis::Filter(*func) || relevantFunctions.find(func) == relevantFunctions.end()) {
             continue;
@@ -2798,7 +3249,15 @@ void RangePropagation::EmitContestOutput(const Ptr<const Package>& package, Rang
             callers != reverseCallGraph.end() && !callers->second.empty();
         const bool isContextRoot = func->GetFuncKind() == FuncKind::MAIN_ENTRY ||
             func == packageInit || (!hasMainContextRoot && !hasDirectCaller);
-        auto result = rangeAnalysisWrapper.RunOnFunc(func, /* isDebug = */ false, diag);
+        contextRootCount += isContextRoot ? 1 : 0;
+        if (IsRangePropagationPerfTraceEnabled()) {
+            ++rangePropagationPerfStats.runFunctionCalls;
+        }
+        std::unique_ptr<Results<RangeDomain>> result;
+        {
+            ScopedRangePropagationPerfTimer timer(&rangePropagationPerfStats.runFunctionNanos);
+            result = rangeAnalysisWrapper.RunOnFunc(func, /* isDebug = */ false, diag);
+        }
         if (result != nullptr) {
             resolveQueries(*result);
             if (isContextRoot) {
@@ -2811,6 +3270,8 @@ void RangePropagation::EmitContestOutput(const Ptr<const Package>& package, Rang
             }
         }
     }
+    rangePropagationPerfStats.maxContextRoots =
+        std::max(rangePropagationPerfStats.maxContextRoots, contextRootCount);
 
     FinalizeBoundGlobalCandidateCompleteness(
         queries.value(), contextCandidates, hasMainContextRoot);
@@ -2824,6 +3285,12 @@ void RangePropagation::EmitContestOutput(const Ptr<const Package>& package, Rang
     }
     WriteContestOutput(queries.value(), inputContext.value());
     RangeAnalysis::ClearQueryRefinementBlocks();
+    if (IsRangePropagationPerfTraceEnabled()) {
+        rangePropagationPerfStats.emitNanos += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - emitStart).count());
+    }
+    PrintAndResetRangePropagationPerfStats();
     RangeAnalysis::ClearContextSensitiveResults();
     RangeAnalysis::ClearBoundedLoopObservedRanges();
 }

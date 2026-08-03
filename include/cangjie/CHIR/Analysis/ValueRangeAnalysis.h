@@ -147,8 +147,6 @@ public:
 
     ~RangeAnalysis() override;
 
-    static void VisitContextSensitiveResults(const ContextResultVisitor& visitor);
-
     static bool VisitReachableContextSensitiveResults(
         const Function* rootFunction, Results<RangeDomain>& root, const ContextResultVisitor& visitor);
 
@@ -282,28 +280,26 @@ private:
 
     std::optional<ContextAbstractValue> AnalyzeCalleeWithContext(
         const Function* callee, const ContextArguments& arguments,
-        std::vector<std::optional<ContextAbstractValue>>& refArgValues, ContextGlobalValues& globalValues);
+        std::vector<std::optional<ContextAbstractValue>>& refArgValues, ContextGlobalValues& globalValues,
+        const std::string* precomputedKey = nullptr);
 
-    std::optional<ContextAbstractValue> SummarizeReturnValue(const Function* callee, Results<RangeDomain>& results);
-
-    std::vector<std::optional<ContextAbstractValue>> SummarizeRefParamValues(
-        const Function* callee, Results<RangeDomain>& results);
-
-    ContextGlobalValues SummarizeGlobalValues(
-        const ContextGlobalValues& globals, Results<RangeDomain>& results);
+    void SummarizeContextOutputs(const Function* callee, const ContextGlobalValues& globals,
+        Results<RangeDomain>& results, std::optional<ContextAbstractValue>& returnValue,
+        std::vector<std::optional<ContextAbstractValue>>& refArgValues,
+        ContextGlobalValues& globalValues);
 
     static std::string BuildContextKey(
         const Function* callee, const ContextArguments& arguments, const ContextGlobalValues& globalValues);
 
-    static std::optional<std::string> BuildContextKeyForCall(
-        const RangeDomain& state, Value* calleeValue, const std::vector<Value*>& args,
-        bool requireSingleton = false);
+    ContextAbstractValue CaptureContextValue(
+        const RangeDomain& state, Value* value, bool preserveIntervals) const;
 
-    static ContextAbstractValue CaptureContextValue(
-        const RangeDomain& state, Value* value, bool preserveIntervals);
+    ContextAbstractValue CaptureContextValue(
+        const RangeDomain& state, Value* value, Type* type, bool preserveIntervals) const;
 
-    static ContextAbstractValue CaptureContextValue(
-        const RangeDomain& state, Value* value, Type* type, bool preserveIntervals);
+    ClassType* GetRecordedContextObjectClass(const Value* object) const;
+
+    void RecordContextObjectClass(const Value* object, ClassType* exactClass) const;
 
     static ContextAbstractValue JoinContextValues(
         const ContextAbstractValue& lhs, const ContextAbstractValue& rhs);
@@ -323,6 +319,9 @@ private:
     bool MergeFiniteDispatchTargets(RangeDomain& state, const Expression* callExpression,
         const std::vector<Value*>& args, Value* result, const std::vector<Function*>& targets,
         size_t classCount);
+
+    std::optional<std::vector<GlobalVar*>> CollectContextMutableGlobals(
+        const Function* callee, const ContextArguments& arguments) const;
 
     void ApplyContextValue(RangeDomain& state, Value* dest, const ContextAbstractValue& value) const;
 
@@ -406,7 +405,11 @@ private:
 
     ContextGlobalValues contextGlobalArguments;
 
+    std::string analysisContextKey;
+
     bool isContextAnalysis{false};
+
+    mutable std::unordered_map<const Value*, ClassType*> contextObjectClasses;
 
     std::unordered_map<std::string, std::unique_ptr<LambdaContextualSummary>> lambdaContextSummaries;
 
@@ -414,9 +417,15 @@ private:
 
     std::unordered_map<const Expression*, std::unique_ptr<ValueRange>> localBoundedLoopObservations;
 
+    std::unordered_set<std::string> failedBoundedLoopContextAttempts;
+
     std::unordered_set<const Expression*> incompleteLocalBoundedLoopObservations;
 
     std::unordered_map<const Block*, uint32_t> inqueueTimes;
+
+    std::unordered_map<const Block*, std::unordered_set<Value*>> queryGuidedWideningValues;
+
+    std::unordered_set<const Block*> queryGuidedWideningFallbackBlocks;
 };
 
     // 构造 RangeAnalysis 在某条终结符后继边上传播的状态。
