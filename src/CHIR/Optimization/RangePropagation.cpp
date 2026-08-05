@@ -3174,9 +3174,20 @@ void RangePropagation::EmitContestOutput(const Ptr<const Package>& package, Rang
                 const RangeDomain& state, Terminator* terminator, std::optional<Block*>) {
                 collectContextTerminator(state, terminator, collectLifetimeExit);
             };
-        result.VisitWith(
+        result.VisitFunctionWith(
             contextActionBeforeVisitExpr, contextActionAfterVisitExpr,
             contextActionOnTerminator);
+        if (contextAnalysis != nullptr) {
+            const auto contextLambdaActionOnTerminator =
+                [&collectContextTerminator](const RangeDomain& state, Terminator* terminator,
+                    std::optional<Block*>) {
+                    collectContextTerminator(
+                        state, terminator, /* collectLifetimeExit = */ false);
+                };
+            contextAnalysis->VisitContextSensitiveLambdaResults(
+                contextActionBeforeVisitExpr, contextActionAfterVisitExpr,
+                contextLambdaActionOnTerminator);
+        }
     };
     auto collectContextCandidates = [&](const Function* rootFunction, Results<RangeDomain>& root) {
         const bool collectLifetimeExit = rootFunction != nullptr &&

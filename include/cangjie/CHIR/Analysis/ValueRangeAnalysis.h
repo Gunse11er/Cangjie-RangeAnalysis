@@ -134,6 +134,9 @@ template <> RangeValueDomain HandleNonNullLiteralValue<RangeValueDomain>(const L
 class RangeAnalysis final : public ValueAnalysis<RangeValueDomain> {
 public:
     using ContextResultVisitor = std::function<void(const Function*, const std::string&, Results<RangeDomain>&)>;
+    using ContextExpressionVisitor = std::function<void(const RangeDomain&, Expression*, size_t)>;
+    using ContextTerminatorVisitor =
+        std::function<void(const RangeDomain&, Terminator*, std::optional<Block*>)>;
 
     RangeAnalysis() = delete;
     /**
@@ -149,6 +152,10 @@ public:
 
     static bool VisitReachableContextSensitiveResults(
         const Function* rootFunction, Results<RangeDomain>& root, const ContextResultVisitor& visitor);
+
+    void VisitContextSensitiveLambdaResults(const ContextExpressionVisitor& actionBeforeVisitExpr,
+        const ContextExpressionVisitor& actionAfterVisitExpr,
+        const ContextTerminatorVisitor& actionOnTerminator);
 
     static void ClearContextSensitiveResults();
 
@@ -257,6 +264,10 @@ private:
 
     bool IsUniqueSpawnValueProjection(
         Value* future, Value* callee, Type* resultType, Type* parentType) const;
+
+    bool IsFullyModeledPureSpawnFutureInitializer(const Apply* apply) const;
+
+    bool IsFullyModeledPureSpawnFutureInitializer(const ApplyWithException* apply) const;
 
     bool ApplyPureSpawnLambdaResult(
         RangeDomain& state, const Lambda* lambda, Value* result, const Expression* callExpression);

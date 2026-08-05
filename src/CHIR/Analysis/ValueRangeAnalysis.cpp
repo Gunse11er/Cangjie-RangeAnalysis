@@ -1926,6 +1926,8 @@ struct RangeAnalysis::ContextualSummary {
 
 struct RangeAnalysis::LambdaContextualSummary {
     bool ready{false};
+    const Lambda* lambda{nullptr};
+    std::unordered_map<Block*, RangeDomain> entryStates;
     std::optional<ContextAbstractValue> returnValue;
     std::vector<std::optional<ContextAbstractValue>> refArgValues;
     std::vector<std::pair<Value*, ContextAbstractValue>> capturedValues;
@@ -2082,6 +2084,47 @@ bool RangeAnalysis::VisitReachableContextSensitiveResults(
     rangeAnalysisPerfStats.maxReachableContexts =
         std::max(rangeAnalysisPerfStats.maxReachableContexts, discovered.size());
     return complete;
+}
+
+void RangeAnalysis::VisitContextSensitiveLambdaResults(
+    const ContextExpressionVisitor& actionBeforeVisitExpr,
+    const ContextExpressionVisitor& actionAfterVisitExpr,
+    const ContextTerminatorVisitor& actionOnTerminator)
+{
+    std::vector<LambdaContextualSummary*> summaries;
+    summaries.reserve(lambdaContextSummaries.size());
+    for (auto& [_, summary] : lambdaContextSummaries) {
+        if (summary->ready && summary->lambda != nullptr && summary->lambda->GetBody() != nullptr) {
+            summaries.emplace_back(summary.get());
+        }
+    }
+
+    for (auto summary : summaries) {
+        for (auto block : summary->lambda->GetBody()->GetBlocks()) {
+            auto found = summary->entryStates.find(block);
+            if (found == summary->entryStates.end() || found->second.IsBottom()) {
+                continue;
+            }
+            auto state = found->second;
+            auto expressions = block->GetNonTerminatorExpressions();
+            for (size_t index = 0; index < expressions.size(); ++index) {
+                auto expression = expressions[index];
+                actionBeforeVisitExpr(state, expression, index);
+                if (expression->GetExprKind() == ExprKind::LAMBDA) {
+                    PreHandleLambdaExpression(state, StaticCast<const Lambda*>(expression));
+                } else {
+                    PropagateExpressionEffect(state, expression);
+                }
+                actionAfterVisitExpr(state, expression, index);
+            }
+            auto terminator = block->GetTerminator();
+            if (terminator == nullptr) {
+                continue;
+            }
+            auto target = PropagateTerminatorEffect(state, terminator);
+            actionOnTerminator(state, terminator, target);
+        }
+    }
 }
 
 void RangeAnalysis::ClearContextSensitiveResults()
@@ -3567,6 +3610,134 @@ bool RangeAnalysis::IsUniqueSpawnValueProjection(
     return valueProjectionMethods.size() == 1 && valueProjectionMethods.front() == callee;
 }
 
+bool RangeAnalysis::IsFullyModeledPureSpawnFutureInitializer(const Apply* initializer) const
+{
+    if (initializer == nullptr || initializer->GetArgs().size() < 2 || initializer->GetParentBlock() == nullptr) {
+        return false;
+    }
+    auto future = initializer->GetArgs().front();
+    const Lambda* lambda = nullptr;
+    for (size_t i = 1; i < initializer->GetArgs().size(); ++i) {
+        auto candidate = ResolveContextLambdaForValue(initializer->GetArgs()[i]);
+        if (candidate == nullptr) {
+            continue;
+        }
+        if (lambda != nullptr) {
+            return false;
+        }
+        lambda = candidate;
+    }
+    if (future == nullptr || !IsPureSpawnLambda(lambda)) {
+        return false;
+    }
+
+    auto block = initializer->GetParentBlock();
+    const auto& expressions = block->GetExpressions();
+    auto initializerPosition = std::find(expressions.begin(), expressions.end(), initializer);
+    if (initializerPosition == expressions.end()) {
+        return false;
+    }
+    const Spawn* spawn = nullptr;
+    for (auto user : future->GetUsers()) {
+        if (user->GetExprKind() != ExprKind::SPAWN) {
+            continue;
+        }
+        auto candidate = StaticCast<const Spawn*>(user);
+        if (candidate->IsExecuteClosure() || candidate->GetFuture() != future ||
+            candidate->GetParentBlock() != block) {
+            continue;
+        }
+        auto position = std::find(expressions.begin(), expressions.end(), candidate);
+        if (position == expressions.end() || position <= initializerPosition || spawn != nullptr) {
+            return false;
+        }
+        spawn = candidate;
+    }
+    if (spawn == nullptr) {
+        return false;
+    }
+    auto spawnPosition = std::find(expressions.begin(), expressions.end(), spawn);
+
+    for (auto user : future->GetUsers()) {
+        if (user->GetExprKind() != ExprKind::APPLY || user->GetParentBlock() != block) {
+            continue;
+        }
+        auto apply = StaticCast<const Apply*>(user);
+        auto position = std::find(expressions.begin(), expressions.end(), apply);
+        if (position == expressions.end()) {
+            return false;
+        }
+        if (position < spawnPosition) {
+            auto args = apply->GetArgs();
+            if (!args.empty() && args.front() == future && apply != initializer) {
+                return false;
+            }
+            continue;
+        }
+        if (apply != initializer && ResolvePureSpawnLambdaForApply(apply) == lambda) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool RangeAnalysis::IsFullyModeledPureSpawnFutureInitializer(const ApplyWithException* initializer) const
+{
+    if (initializer == nullptr || initializer->GetArgs().size() < 2 || initializer->GetSuccessBlock() == nullptr) {
+        return false;
+    }
+    auto future = initializer->GetArgs().front();
+    const Lambda* lambda = nullptr;
+    for (size_t i = 1; i < initializer->GetArgs().size(); ++i) {
+        auto candidate = ResolveContextLambdaForValue(initializer->GetArgs()[i]);
+        if (candidate == nullptr) {
+            continue;
+        }
+        if (lambda != nullptr) {
+            return false;
+        }
+        lambda = candidate;
+    }
+    if (future == nullptr || !IsPureSpawnLambda(lambda)) {
+        return false;
+    }
+
+    const SpawnWithException* spawn = nullptr;
+    for (auto user : future->GetUsers()) {
+        if (user->GetExprKind() != ExprKind::SPAWN_WITH_EXCEPTION) {
+            continue;
+        }
+        auto candidate = StaticCast<const SpawnWithException*>(user);
+        if (candidate->IsExecuteClosure() || candidate->GetFuture() != future ||
+            candidate->GetParentBlock() != initializer->GetSuccessBlock() || spawn != nullptr) {
+            continue;
+        }
+        spawn = candidate;
+    }
+    if (spawn == nullptr || spawn->GetSuccessBlock() == nullptr) {
+        return false;
+    }
+
+    for (auto user : future->GetUsers()) {
+        if (user->GetExprKind() != ExprKind::APPLY_WITH_EXCEPTION) {
+            continue;
+        }
+        auto apply = StaticCast<const ApplyWithException*>(user);
+        if (apply->GetSuccessBlock() == spawn->GetParentBlock()) {
+            auto args = apply->GetArgs();
+            if (!args.empty() && args.front() == future && apply != initializer) {
+                return false;
+            }
+            continue;
+        }
+        if (apply != initializer && apply->GetParentBlock() == spawn->GetSuccessBlock() &&
+            ResolvePureSpawnLambdaForApply(apply) == lambda) {
+            return true;
+        }
+    }
+    return false;
+}
+
 const Lambda* RangeAnalysis::ResolvePureSpawnLambdaForApply(const Apply* apply) const
 {
     if (apply == nullptr || apply->GetResult() == nullptr || apply->GetArgs().size() != 1 ||
@@ -3785,6 +3956,7 @@ void RangeAnalysis::HandleContextSensitiveCall(RangeDomain& state, const Express
     }
     if (IsContextAnalysisBudgetExhausted()) {
         RecordContextTopSource("call-budget");
+        RecordUnmodeledCallContext(analysisContextKey, callExpression);
         HavocCallEffects(state, args, result, lambda);
         return;
     }
@@ -3798,12 +3970,28 @@ void RangeAnalysis::HandleContextSensitiveCall(RangeDomain& state, const Express
     }
     if (calleeValue == nullptr || !calleeValue->IsFuncWithBody()) {
         RecordContextTopSource("call-target-without-body");
+        bool fullyModeled = false;
+        if (callExpression != nullptr && callExpression->GetExprKind() == ExprKind::APPLY) {
+            fullyModeled = IsFullyModeledPureSpawnFutureInitializer(StaticCast<const Apply*>(callExpression));
+        } else if (callExpression != nullptr && callExpression->GetExprKind() == ExprKind::APPLY_WITH_EXCEPTION) {
+            fullyModeled =
+                IsFullyModeledPureSpawnFutureInitializer(StaticCast<const ApplyWithException*>(callExpression));
+        }
+        if (fullyModeled) {
+            RecordFullyModeledCallContext(analysisContextKey, callExpression);
+            if (boundedLoopCallContextRecorder != nullptr && boundedLoopEvaluationOwner == this) {
+                (void)(*boundedLoopCallContextRecorder)[callExpression];
+            }
+        } else {
+            RecordUnmodeledCallContext(analysisContextKey, callExpression);
+        }
         HavocCallEffects(state, args, result, lambda);
         return;
     }
     auto callee = DynamicCast<Function*>(calleeValue);
     if (callee == nullptr || callee->GetBody() == nullptr || callee->GetParams().size() != args.size()) {
         RecordContextTopSource("call-signature-or-body");
+        RecordUnmodeledCallContext(analysisContextKey, callExpression);
         HavocCallEffects(state, args, result, lambda);
         return;
     }
@@ -3862,6 +4050,7 @@ void RangeAnalysis::HandleContextSensitiveCall(RangeDomain& state, const Express
         contextualGlobals = CollectContextMutableGlobals(callee, contextArgs);
         if (!contextualGlobals.has_value()) {
             RecordContextTopSource("call-effect-closure");
+            RecordUnmodeledCallContext(analysisContextKey, callExpression);
             HavocCallEffects(state, args, result, lambda);
             return;
         }
@@ -4215,6 +4404,8 @@ bool RangeAnalysis::AnalyzeLambdaWithContext(const Lambda* lambda, const std::ve
         summary.globalValues.emplace_back(global,
             CaptureContextValue(joinedExitState.value(), object, baseType, /* preserveIntervals = */ true));
     }
+    summary.lambda = lambda;
+    summary.entryStates = std::move(entryStates);
     return true;
 }
 
@@ -8321,14 +8512,19 @@ Function* ResolveExactInvokeTarget(
 void RangeAnalysis::PreHandleFieldExpr(RangeDomain& state, const Field* field)
 {
     if (field != nullptr && field->GetBase() != nullptr && field->GetPath().size() == 1) {
-        auto object = state.CheckAbstractObjectRefBy(field->GetBase());
-        if (object != nullptr) {
-            auto children = state.GetChildren(object);
-            auto index = static_cast<size_t>(field->GetPath().front());
-            if (index < children.size()) {
-                state.Propagate(children[index], field->GetResult());
-                return;
+        auto base = field->GetBase();
+        std::vector<AbstractObject*> children;
+        if (base->GetType() != nullptr && base->GetType()->IsRef()) {
+            if (auto object = state.CheckAbstractObjectRefBy(base); object != nullptr) {
+                children = state.GetChildren(object);
             }
+        } else {
+            children = state.GetChildren(base);
+        }
+        auto index = static_cast<size_t>(field->GetPath().front());
+        if (index < children.size()) {
+            state.Propagate(children[index], field->GetResult());
+            return;
         }
     }
     ValueAnalysis<RangeValueDomain>::PreHandleFieldExpr(state, field);
@@ -8369,6 +8565,7 @@ void RangeAnalysis::HandleOthersExpr(RangeDomain& state, const Expression* expre
             return;
         case ExprKind::INVOKESTATIC: {
             auto invoke = StaticCast<const InvokeStatic*>(expression);
+            RecordUnmodeledCallContext(analysisContextKey, expression);
             HavocCallEffects(state, invoke->GetArgs(), invoke->GetResult());
             return;
         }
@@ -15794,6 +15991,7 @@ std::optional<Block*> RangeAnalysis::HandleTerminatorEffect(RangeDomain& state, 
             break;
         case ExprKind::INVOKESTATIC_WITH_EXCEPTION: {
             auto invoke = StaticCast<const InvokeStaticWithException*>(terminator);
+            RecordUnmodeledCallContext(analysisContextKey, terminator);
             HavocCallEffects(state, invoke->GetArgs(), invoke->GetResult());
             break;
         }

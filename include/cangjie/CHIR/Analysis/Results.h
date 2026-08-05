@@ -54,9 +54,7 @@ public:
         std::function<void(const Domain&, Expression*, size_t)> actionAfterVisitExpr,
         std::function<void(const Domain&, Terminator*, std::optional<Block*>)> actionOnTerminator)
     {
-        for (auto bb : func->GetBody()->GetBlocks()) {
-            VisitBlockWith(actionBeforeVisitExpr, actionAfterVisitExpr, actionOnTerminator, *bb, entrySets.get());
-        }
+        VisitFunctionWith(actionBeforeVisitExpr, actionAfterVisitExpr, actionOnTerminator);
         for (auto& lambdaUnit : lambdaResults) {
             if (!lambdaUnit.lambda->GetBody()) {
                 // This lambda maybe in a dead block and thus it has been deleted.
@@ -66,6 +64,15 @@ public:
                 VisitBlockWith(
                     actionBeforeVisitExpr, actionAfterVisitExpr, actionOnTerminator, *bb, lambdaUnit.entrySets.get());
             }
+        }
+    }
+
+    void VisitFunctionWith(std::function<void(const Domain&, Expression*, size_t)> actionBeforeVisitExpr,
+        std::function<void(const Domain&, Expression*, size_t)> actionAfterVisitExpr,
+        std::function<void(const Domain&, Terminator*, std::optional<Block*>)> actionOnTerminator)
+    {
+        for (auto bb : func->GetBody()->GetBlocks()) {
+            VisitBlockWith(actionBeforeVisitExpr, actionAfterVisitExpr, actionOnTerminator, *bb, entrySets.get());
         }
     }
 
