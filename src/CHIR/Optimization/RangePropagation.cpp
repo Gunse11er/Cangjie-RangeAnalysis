@@ -183,6 +183,109 @@ enum class ContestResultOrigin {
     CONTEXT_SUMMARY,
     UNRESOLVED_CHIR_TOP,
 };
+
+enum class ContestProgramPointKind : uint8_t {
+    BEFORE_EXPRESSION,
+    AFTER_EXPRESSION,
+    DIRECT_LOAD_RESULT,
+    BOUNDED_LOOP_POINT,
+    BOUNDED_LOOP_LIFETIME,
+    DECLARATION_STORE,
+    DECLARATION_LIFETIME,
+    READ_MODIFY_WRITE,
+    BOUND_GLOBAL_PRESTATE,
+    GLOBAL_PRESTATE,
+    LOOP_LIFETIME_SUMMARY,
+    CONTEXT_SUMMARY,
+};
+
+struct ContestProgramPoint {
+    static constexpr size_t INVALID_EXPRESSION_INDEX = std::numeric_limits<size_t>::max();
+
+    const Block* block{nullptr};
+    const Expression* expression{nullptr};
+    size_t expressionIndex{INVALID_EXPRESSION_INDEX};
+    ContestProgramPointKind kind{ContestProgramPointKind::AFTER_EXPRESSION};
+
+    bool IsBeforeExpression() const
+    {
+        return kind == ContestProgramPointKind::BEFORE_EXPRESSION ||
+            kind == ContestProgramPointKind::BOUND_GLOBAL_PRESTATE ||
+            kind == ContestProgramPointKind::GLOBAL_PRESTATE;
+    }
+
+    bool RefinesBeforeExpression() const
+    {
+        return kind == ContestProgramPointKind::DIRECT_LOAD_RESULT ||
+            kind == ContestProgramPointKind::BOUNDED_LOOP_POINT;
+    }
+
+    bool AggregatesDeclaredBindingLifetime() const
+    {
+        return kind == ContestProgramPointKind::BOUNDED_LOOP_LIFETIME ||
+            kind == ContestProgramPointKind::DECLARATION_STORE ||
+            kind == ContestProgramPointKind::DECLARATION_LIFETIME ||
+            kind == ContestProgramPointKind::READ_MODIFY_WRITE ||
+            kind == ContestProgramPointKind::LOOP_LIFETIME_SUMMARY;
+    }
+};
+
+ContestProgramPoint MakeContestProgramPoint(
+    const Expression* expression, ContestProgramPointKind kind)
+{
+    ContestProgramPoint point;
+    point.expression = expression;
+    point.kind = kind;
+    if (expression == nullptr) {
+        return point;
+    }
+    point.block = expression->GetParentBlock();
+    if (point.block == nullptr) {
+        return point;
+    }
+    size_t index = 0;
+    for (auto candidate : point.block->GetExpressions()) {
+        if (candidate == expression) {
+            point.expressionIndex = index;
+            return point;
+        }
+        ++index;
+    }
+    if (point.block->GetTerminator() == expression) {
+        point.expressionIndex = index;
+    }
+    return point;
+}
+
+struct ContestProgramPointState {
+    uint32_t observedKinds{0};
+    bool hasUnknownObservation{false};
+    std::optional<ContestProgramPoint> selectedPoint;
+
+    void Observe(const ContestProgramPoint& point)
+    {
+        observedKinds |= 1U << static_cast<uint8_t>(point.kind);
+    }
+
+    bool Has(ContestProgramPointKind kind) const
+    {
+        return (observedKinds & (1U << static_cast<uint8_t>(kind))) != 0;
+    }
+
+    bool HasBeforeResult() const
+    {
+        return Has(ContestProgramPointKind::BEFORE_EXPRESSION) ||
+            Has(ContestProgramPointKind::BOUND_GLOBAL_PRESTATE) ||
+            Has(ContestProgramPointKind::GLOBAL_PRESTATE);
+    }
+
+    void Select(const ContestProgramPoint& point)
+    {
+        Observe(point);
+        selectedPoint = point;
+    }
+};
+
 struct ContestQuery {
     std::string fileName;
     std::string sourceFileName;
@@ -195,18 +298,11 @@ struct ContestQuery {
     GlobalVar* boundGlobal{nullptr};
     bool isGlobalDeclarationQuery{false};
     bool isUnambiguousGlobalBinding{false};
-    bool hasBoundGlobalPointObservation{false};
     ContestQueryTypeHint typeHint{ContestQueryTypeHint::UNKNOWN};
     ContestResultOrigin resultOrigin{ContestResultOrigin::NONE};
     bool valid{true};
     bool resolved{false};
-    bool hasBeforePointResult{false};
-    bool hasDirectPointLoadResult{false};
-    bool hasUnknownPointObservation{false};
-    bool hasBoundedLifetimeResult{false};
-    bool hasBoundedPointResult{false};
-    bool hasDeclarationStoreResult{false};
-    bool hasReadModifyWriteResult{false};
+    ContestProgramPointState programPoints;
 };
 
 struct ValueNameInfo {
@@ -464,6 +560,57 @@ std::string FormatContestIntegerInterval(const ConstantRange& range, const Type&
     return ss.str();
 }
 
+std::optional<std::string> FormatContestStridedInterval(
+    const ConstantRange& range, const Type& type, const SIntCongruence& congruence)
+{
+    if (!congruence.IsUseful() || range.IsEmptySet()) {
+        return std::nullopt;
+    }
+    if (!range.IsFullSet() &&
+        (type.IsUnsignedInteger() ? range.IsWrappedSet() : range.IsSignWrappedSet())) {
+        return std::nullopt;
+    }
+    auto stride = static_cast<__int128>(congruence.stride);
+    auto residue = static_cast<__int128>(congruence.residue);
+    auto lower = type.IsUnsignedInteger()
+        ? static_cast<__int128>(range.IsFullSet() ? SInt::UMinValue(ToWidth(type)).UVal()
+                                                  : range.UMinValue().UVal())
+        : static_cast<__int128>(range.IsFullSet() ? SInt::SMinValue(ToWidth(type)).SVal()
+                                                  : range.SMinValue().SVal());
+    auto upper = type.IsUnsignedInteger()
+        ? static_cast<__int128>(range.IsFullSet() ? SInt::UMaxValue(ToWidth(type)).UVal()
+                                                  : range.UMaxValue().UVal())
+        : static_cast<__int128>(range.IsFullSet() ? SInt::SMaxValue(ToWidth(type)).SVal()
+                                                  : range.SMaxValue().SVal());
+    auto lowerResidue = lower % stride;
+    if (lowerResidue < 0) {
+        lowerResidue += stride;
+    }
+    auto first = lower + (residue - lowerResidue + stride) % stride;
+    auto upperResidue = upper % stride;
+    if (upperResidue < 0) {
+        upperResidue += stride;
+    }
+    auto last = upper - (upperResidue - residue + stride) % stride;
+    if (first > last) {
+        return std::nullopt;
+    }
+    if (first == last) {
+        return type.IsUnsignedInteger()
+            ? FormatUnsignedInt(static_cast<uint64_t>(first))
+            : FormatSignedInt(static_cast<int64_t>(first));
+    }
+    std::stringstream ss;
+    ss << "[";
+    if (type.IsUnsignedInteger()) {
+        ss << static_cast<uint64_t>(first) << ", " << static_cast<uint64_t>(last);
+    } else {
+        ss << static_cast<int64_t>(first) << ", " << static_cast<int64_t>(last);
+    }
+    ss << ":" << congruence.stride << "]";
+    return ss.str();
+}
+
 std::string FormatExactSIntValues(std::vector<SInt> values, const Type& type)
 {
     std::sort(values.begin(), values.end(), [&type](const SInt& lhs, const SInt& rhs) {
@@ -568,6 +715,13 @@ std::string FormatContestRange(const ValueRange* range, Type* type)
         if (intRange.IsSingleValue()) {
             return FormatSIntValue(numeric.GetSingleElement(), *type);
         }
+        if (sintRange.GetCongruence().has_value()) {
+            auto strided = FormatContestStridedInterval(
+                numeric, *type, *sintRange.GetCongruence());
+            if (strided.has_value()) {
+                return *strided;
+            }
+        }
         if (IsContestPrintableIntegerInterval(numeric, *type)) {
             return FormatContestIntegerInterval(numeric, *type);
         }
@@ -619,7 +773,8 @@ bool AreContestRangesEquivalent(const ValueRange& lhs, const ValueRange& rhs)
     const auto& lhsInt = StaticCast<const SIntRange&>(lhs);
     const auto& rhsInt = StaticCast<const SIntRange&>(rhs);
     return lhsInt.GetVal().IsSame(rhsInt.GetVal()) &&
-        lhsInt.GetExactValues() == rhsInt.GetExactValues();
+        lhsInt.GetExactValues() == rhsInt.GetExactValues() &&
+        lhsInt.GetCongruence() == rhsInt.GetCongruence();
 }
 
 bool IsContestTopRange(const ValueRange* range, Type* type)
@@ -633,7 +788,8 @@ bool IsContestTopRange(const ValueRange* range, Type* type)
 }
 
 void SetContestQueryResult(
-    ContestQuery& query, Type* type, const ValueRange* range, ContestResultOrigin origin)
+    ContestQuery& query, Type* type, const ValueRange* range, ContestResultOrigin origin,
+    const ContestProgramPoint* programPoint = nullptr)
 {
     if (type != nullptr) {
         query.type = type;
@@ -644,13 +800,23 @@ void SetContestQueryResult(
     query.result = FormatContestRange(query.resultRange.get(), type);
     query.resolved = true;
     query.resultOrigin = origin;
+    if (programPoint != nullptr) {
+        query.programPoints.Select(*programPoint);
+    }
 }
 
 bool ShouldRecordContestResult(
     ContestQuery& query, const std::string& result, Type* type, const ValueRange* range,
-    bool fromBeforeProgramPoint = false, bool refinesBeforeProgramPoint = false,
-    bool aggregatesDeclaredBindingLifetime = false)
+    const ContestProgramPoint& programPoint)
 {
+    const bool hadDirectLoadResult =
+        query.programPoints.Has(ContestProgramPointKind::DIRECT_LOAD_RESULT);
+    const bool hadBeforeResult = query.programPoints.HasBeforeResult();
+    query.programPoints.Observe(programPoint);
+    const bool fromBeforeProgramPoint = programPoint.IsBeforeExpression();
+    const bool refinesBeforeProgramPoint = programPoint.RefinesBeforeExpression();
+    const bool aggregatesDeclaredBindingLifetime =
+        programPoint.AggregatesDeclaredBindingLifetime();
     if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
         std::cerr << "[RangeAnalysisRecord] query=" << query.variableName << '@' << query.line
                   << " candidate=" << result
@@ -658,20 +824,25 @@ bool ShouldRecordContestResult(
                   << " before=" << fromBeforeProgramPoint
                   << " refine=" << refinesBeforeProgramPoint
                   << " lifetime=" << aggregatesDeclaredBindingLifetime
-                  << " boundedPoint=" << query.hasBoundedPointResult
-                  << " boundedLifetime=" << query.hasBoundedLifetimeResult
-                  << " directLoad=" << query.hasDirectPointLoadResult
+                  << " block=" << programPoint.block
+                  << " exprIndex=" << programPoint.expressionIndex
+                  << " boundedPoint=" << query.programPoints.Has(
+                         ContestProgramPointKind::BOUNDED_LOOP_POINT)
+                  << " boundedLifetime=" << query.programPoints.Has(
+                         ContestProgramPointKind::BOUNDED_LOOP_LIFETIME)
+                  << " directLoad=" << query.programPoints.Has(
+                         ContestProgramPointKind::DIRECT_LOAD_RESULT)
                   << '\n';
     }
     if (!aggregatesDeclaredBindingLifetime) {
-        if (fromBeforeProgramPoint && query.hasDirectPointLoadResult) {
+        if (fromBeforeProgramPoint && hadDirectLoadResult) {
             return false;
         }
-        if (query.hasBeforePointResult && !fromBeforeProgramPoint) {
+        if (hadBeforeResult && !fromBeforeProgramPoint) {
             if (!refinesBeforeProgramPoint) {
                 return false;
             }
-            if (!query.hasDirectPointLoadResult) {
+            if (!hadDirectLoadResult) {
                 return true;
             }
         }
@@ -687,13 +858,14 @@ bool ShouldRecordContestResult(
     }
     if (!AreContestTypesCompatible(currentType, type) ||
         current->GetRangeKind() != candidate->GetRangeKind()) {
-        SetContestQueryResult(query, currentType, nullptr, query.resultOrigin);
+        SetContestQueryResult(query, currentType, nullptr, query.resultOrigin, &programPoint);
         return false;
     }
     if (auto updated = current->Join(*candidate); updated.has_value()) {
         current = std::move(updated.value());
         query.result = FormatContestRange(current.get(), currentType);
         query.resultRange = std::move(current);
+        query.programPoints.Select(programPoint);
         if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
             std::cerr << "[RangeAnalysisJoin] query=" << query.variableName << '@' << query.line
                       << " candidate=" << result << " joined=" << query.result << '\n';
@@ -1040,7 +1212,7 @@ void ApplyContestAggregates(
         if (!AreContestTypesCompatible(type, combined.type) && combined.range != nullptr) {
             combined.complete = false;
         }
-        if (query.hasUnknownPointObservation || combined.range == nullptr) {
+        if (query.programPoints.hasUnknownObservation || combined.range == nullptr) {
             combined.complete = false;
         }
         if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
@@ -1066,8 +1238,10 @@ void ApplyContestAggregates(
                 updated.has_value()) {
                 joined = std::move(updated.value());
             }
+            auto point = MakeContestProgramPoint(
+                nullptr, ContestProgramPointKind::LOOP_LIFETIME_SUMMARY);
             SetContestQueryResult(
-                query, type, joined.get(), query.resultOrigin);
+                query, type, joined.get(), query.resultOrigin, &point);
             continue;
         }
         if (query.resolved && query.resultOrigin == ContestResultOrigin::CONTEXT_SUMMARY &&
@@ -1078,7 +1252,10 @@ void ApplyContestAggregates(
             // for parameter-derived loop bindings and must not widen it to Top.
             continue;
         }
-        SetContestQueryResult(query, type, aggregateRange, ContestResultOrigin::CHIR_ANALYSIS);
+        auto point = MakeContestProgramPoint(
+            nullptr, ContestProgramPointKind::LOOP_LIFETIME_SUMMARY);
+        SetContestQueryResult(
+            query, type, aggregateRange, ContestResultOrigin::CHIR_ANALYSIS, &point);
     }
 }
 
@@ -1868,15 +2045,17 @@ void ResolveQueryAtUnnamedLoopInductionLoad(std::vector<ContestQuery>& queries, 
     auto type = GetQueryValueType(value);
     auto range = GetContestRangeForValue(state, value);
     auto observedRange = RangeAnalysis::GetBoundedLoopObservedRange(&expression);
-    query.hasBoundedPointResult = query.hasBoundedPointResult || observedRange != nullptr;
+    auto point = MakeContestProgramPoint(&expression, observedRange != nullptr
+        ? ContestProgramPointKind::BOUNDED_LOOP_POINT
+        : ContestProgramPointKind::AFTER_EXPRESSION);
     if (observedRange != nullptr && IsContestTopRange(range, type)) {
         range = observedRange.get();
     }
     auto result = FormatContestRange(range, type);
-    if (!ShouldRecordContestResult(query, result, type, range)) {
+    if (!ShouldRecordContestResult(query, result, type, range, point)) {
         return;
     }
-    SetContestQueryResult(query, type, range, ContestResultOrigin::CHIR_ANALYSIS);
+    SetContestQueryResult(query, type, range, ContestResultOrigin::CHIR_ANALYSIS, &point);
 }
 
 void ResolveQueryAtUnnamedLoopInductionOperand(std::vector<ContestQuery>& queries,
@@ -1912,19 +2091,19 @@ void ResolveQueryAtUnnamedLoopInductionOperand(std::vector<ContestQuery>& querie
     auto range = observedRange != nullptr
         ? observedRange.get()
         : GetContestRangeForValue(state, candidate);
-    query.hasBoundedPointResult = query.hasBoundedPointResult || observedRange != nullptr;
+    auto point = MakeContestProgramPoint(&expression, observedRange != nullptr
+        ? ContestProgramPointKind::BOUNDED_LOOP_POINT
+        : ContestProgramPointKind::AFTER_EXPRESSION);
     auto result = FormatContestRange(range, type);
-    if (!ShouldRecordContestResult(query, result, type, range,
-            /* fromBeforeProgramPoint = */ false,
-            /* refinesBeforeProgramPoint = */ observedRange != nullptr)) {
+    if (!ShouldRecordContestResult(query, result, type, range, point)) {
         return;
     }
-    SetContestQueryResult(query, type, range, ContestResultOrigin::CHIR_ANALYSIS);
+    SetContestQueryResult(query, type, range, ContestResultOrigin::CHIR_ANALYSIS, &point);
 }
 
 void ResolveQueriesFromVisibleNames(std::vector<ContestQuery>& queries, const ValueNameMap& valueNames,
     const DebugLocation& location, const RangeDomain& state, const std::filesystem::path& contestRoot,
-    bool beforeProgramPoint = false)
+    bool beforeProgramPoint = false, const Expression* programExpression = nullptr)
 {
     auto useScope = location.GetScopeInfo();
     for (auto& query : queries) {
@@ -1932,7 +2111,8 @@ void ResolveQueriesFromVisibleNames(std::vector<ContestQuery>& queries, const Va
             continue;
         }
         if (!beforeProgramPoint &&
-            (query.hasBoundedLifetimeResult || query.hasBoundedPointResult)) {
+            (query.programPoints.Has(ContestProgramPointKind::BOUNDED_LOOP_LIFETIME) ||
+                query.programPoints.Has(ContestProgramPointKind::BOUNDED_LOOP_POINT))) {
             continue;
         }
         auto candidates = FindVisibleNamedValues(query, valueNames, useScope);
@@ -1949,7 +2129,7 @@ void ResolveQueriesFromVisibleNames(std::vector<ContestQuery>& queries, const Va
                 continue;
             }
             if (value->IsParameter() && IsContestTopRange(range, candidateType)) {
-                query.hasUnknownPointObservation = true;
+                query.programPoints.hasUnknownObservation = true;
             }
             if (range == nullptr) {
                 continue;
@@ -1967,15 +2147,14 @@ void ResolveQueriesFromVisibleNames(std::vector<ContestQuery>& queries, const Va
             continue;
         }
         auto result = FormatContestRange(joined.get(), type);
-        const bool shouldRecord =
-            ShouldRecordContestResult(query, result, type, joined.get(), beforeProgramPoint);
-        if (beforeProgramPoint) {
-            query.hasBeforePointResult = true;
-        }
+        auto point = MakeContestProgramPoint(programExpression, beforeProgramPoint
+            ? ContestProgramPointKind::BEFORE_EXPRESSION
+            : ContestProgramPointKind::AFTER_EXPRESSION);
+        const bool shouldRecord = ShouldRecordContestResult(query, result, type, joined.get(), point);
         if (!shouldRecord) {
             continue;
         }
-        SetContestQueryResult(query, type, joined.get(), ContestResultOrigin::CHIR_ANALYSIS);
+        SetContestQueryResult(query, type, joined.get(), ContestResultOrigin::CHIR_ANALYSIS, &point);
     }
 }
 
@@ -1997,24 +2176,27 @@ void ResolveQueryAtDebug(std::vector<ContestQuery>& queries, ValueNameMap& value
             if (!IsSameQueryLocation(query, debug.GetDebugLocation(), contestRoot)) {
                 continue;
             }
-            query.hasBoundedPointResult = query.hasBoundedPointResult || observed != nullptr;
+            auto point = MakeContestProgramPoint(&debug, observed != nullptr
+                ? ContestProgramPointKind::BOUNDED_LOOP_POINT
+                : ContestProgramPointKind::AFTER_EXPRESSION);
             if (debug.GetValue()->IsParameter() && IsContestTopRange(range, type)) {
-                query.hasUnknownPointObservation = true;
+                query.programPoints.hasUnknownObservation = true;
             }
             auto result = FormatContestRange(range, type);
-            if (!ShouldRecordContestResult(query, result, type, range)) {
+            if (!ShouldRecordContestResult(query, result, type, range, point)) {
                 continue;
             }
-            SetContestQueryResult(query, type, range, ContestResultOrigin::CHIR_ANALYSIS);
+            SetContestQueryResult(query, type, range, ContestResultOrigin::CHIR_ANALYSIS, &point);
         }
     }
-    ResolveQueriesFromVisibleNames(queries, valueNames, debug.GetDebugLocation(), state, contestRoot);
+    ResolveQueriesFromVisibleNames(
+        queries, valueNames, debug.GetDebugLocation(), state, contestRoot, false, &debug);
 }
 
 // 通过已记录的 value-name 映射解析同源码行 operand 查询。
 void ResolveQueryAtValue(std::vector<ContestQuery>& queries, const ValueNameMap& valueNames, const DebugLocation& location,
     Value* value, const RangeDomain& state, const std::filesystem::path& contestRoot,
-    const ValueRange* boundedPointObservation = nullptr)
+    const Expression* programExpression, const ValueRange* boundedPointObservation = nullptr)
 {
     for (auto& query : queries) {
         if (!query.valid || !HasValueNameForQuery(valueNames, value, query)) {
@@ -2026,17 +2208,17 @@ void ResolveQueryAtValue(std::vector<ContestQuery>& queries, const ValueNameMap&
         auto type = GetQueryValueType(value);
         auto range = boundedPointObservation != nullptr ?
             boundedPointObservation : GetContestRangeForValue(state, value);
-        query.hasBoundedPointResult = query.hasBoundedPointResult || boundedPointObservation != nullptr;
+        auto point = MakeContestProgramPoint(programExpression, boundedPointObservation != nullptr
+            ? ContestProgramPointKind::BOUNDED_LOOP_POINT
+            : ContestProgramPointKind::AFTER_EXPRESSION);
         if (value->IsParameter() && IsContestTopRange(range, type)) {
-            query.hasUnknownPointObservation = true;
+            query.programPoints.hasUnknownObservation = true;
         }
         auto result = FormatContestRange(range, type);
-        if (!ShouldRecordContestResult(query, result, type, range,
-                /* fromBeforeProgramPoint = */ false,
-                /* refinesBeforeProgramPoint = */ boundedPointObservation != nullptr)) {
+        if (!ShouldRecordContestResult(query, result, type, range, point)) {
             continue;
         }
-        SetContestQueryResult(query, type, range, ContestResultOrigin::CHIR_ANALYSIS);
+        SetContestQueryResult(query, type, range, ContestResultOrigin::CHIR_ANALYSIS, &point);
     }
 }
 
@@ -2090,10 +2272,10 @@ void ResolveBoundGlobalQueryBeforeExpression(std::vector<ContestQuery>& queries,
         auto type = GetQueryValueType(global);
         auto range = GetContestRangeForValue(state, global);
         auto result = FormatContestRange(range, type);
-        const bool shouldRecord = ShouldRecordContestResult(
-            query, result, type, range, /* fromBeforeProgramPoint = */ true);
-        query.hasBeforePointResult = true;
-        query.hasBoundGlobalPointObservation = true;
+        auto point = MakeContestProgramPoint(
+            &expression, ContestProgramPointKind::BOUND_GLOBAL_PRESTATE);
+        const bool shouldRecord =
+            ShouldRecordContestResult(query, result, type, range, point);
         if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
             std::cerr << "[RangeAnalysisBoundGlobalBefore] query="
                       << query.variableName << '@' << query.line
@@ -2102,7 +2284,7 @@ void ResolveBoundGlobalQueryBeforeExpression(std::vector<ContestQuery>& queries,
         }
         if (shouldRecord) {
             SetContestQueryResult(
-                query, type, range, ContestResultOrigin::CHIR_ANALYSIS);
+                query, type, range, ContestResultOrigin::CHIR_ANALYSIS, &point);
         }
     }
 }
@@ -2122,13 +2304,14 @@ void ResolveQueryBeforeGlobalAccess(std::vector<ContestQuery>& queries, const Ex
             continue;
         }
         auto result = FormatContestRange(range, type);
-        const bool shouldRecord = ShouldRecordContestResult(
-            query, result, type, range, /* fromBeforeProgramPoint = */ true);
-        query.hasBeforePointResult = true;
+        auto point = MakeContestProgramPoint(
+            &expression, ContestProgramPointKind::GLOBAL_PRESTATE);
+        const bool shouldRecord =
+            ShouldRecordContestResult(query, result, type, range, point);
         if (!shouldRecord) {
             continue;
         }
-        SetContestQueryResult(query, type, range, ContestResultOrigin::CHIR_ANALYSIS);
+        SetContestQueryResult(query, type, range, ContestResultOrigin::CHIR_ANALYSIS, &point);
     }
 }
 
@@ -2406,24 +2589,26 @@ void ResolveQueryAtLoadResult(std::vector<ContestQuery>& queries, const ValueNam
         auto type = GetQueryValueType(load->GetResult());
         auto observed = RangeAnalysis::GetBoundedLoopObservedRange(&expr);
         auto range = observed != nullptr ? observed.get() : GetContestRangeForValue(state, load->GetResult());
-        query.hasBoundedPointResult = query.hasBoundedPointResult || observed != nullptr;
-        if (lifetimeObservation && query.hasDeclarationStoreResult) {
+        auto point = MakeContestProgramPoint(&expr, lifetimeObservation
+            ? ContestProgramPointKind::DECLARATION_LIFETIME
+            : ContestProgramPointKind::DIRECT_LOAD_RESULT);
+        if (observed != nullptr) {
+            query.programPoints.Observe(MakeContestProgramPoint(
+                &expr, ContestProgramPointKind::BOUNDED_LOOP_POINT));
+        }
+        if (lifetimeObservation &&
+            query.programPoints.Has(ContestProgramPointKind::DECLARATION_STORE)) {
             continue;
         }
         auto result = FormatContestRange(range, type);
         if (range == nullptr) {
-            query.hasUnknownPointObservation = true;
+            query.programPoints.hasUnknownObservation = true;
         }
-        const bool shouldRecord = ShouldRecordContestResult(query, result, type, range,
-            /* fromBeforeProgramPoint = */ false, /* refinesBeforeProgramPoint = */ !lifetimeObservation,
-            /* aggregatesDeclaredBindingLifetime = */ lifetimeObservation);
-        if (!lifetimeObservation) {
-            query.hasDirectPointLoadResult = true;
-        }
+        const bool shouldRecord = ShouldRecordContestResult(query, result, type, range, point);
         if (!shouldRecord) {
             continue;
         }
-        SetContestQueryResult(query, type, range, ContestResultOrigin::CHIR_ANALYSIS);
+        SetContestQueryResult(query, type, range, ContestResultOrigin::CHIR_ANALYSIS, &point);
     }
 }
 
@@ -2565,18 +2750,25 @@ void ResolveQueryAtStoreValue(std::vector<ContestQuery>& queries, const ValueNam
         }
         auto type = GetQueryValueType(location);
         auto observed = RangeAnalysis::GetBoundedLoopObservedRange(&expr);
-        query.hasBoundedLifetimeResult = query.hasBoundedLifetimeResult || observed != nullptr;
-        query.hasBoundedPointResult = query.hasBoundedPointResult || observed != nullptr;
+        if (observed != nullptr) {
+            query.programPoints.Observe(MakeContestProgramPoint(
+                &expr, ContestProgramPointKind::BOUNDED_LOOP_LIFETIME));
+            query.programPoints.Observe(MakeContestProgramPoint(
+                &expr, ContestProgramPointKind::BOUNDED_LOOP_POINT));
+        }
         auto range = observed != nullptr ? observed.get() : GetContestRangeForValue(state, store->GetValue());
         auto readModifyWrite = GetReadModifyWriteObservation(state, *store);
-        const bool hadReadModifyWriteResult = query.hasReadModifyWriteResult;
-        query.hasReadModifyWriteResult = query.hasReadModifyWriteResult ||
-            (readModifyWrite.found && readModifyWrite.complete && readModifyWrite.range != nullptr);
+        const bool hadReadModifyWriteResult =
+            query.programPoints.Has(ContestProgramPointKind::READ_MODIFY_WRITE);
+        if (readModifyWrite.found && readModifyWrite.complete && readModifyWrite.range != nullptr) {
+            query.programPoints.Observe(MakeContestProgramPoint(
+                &expr, ContestProgramPointKind::READ_MODIFY_WRITE));
+        }
         // A plain assignment executes after the query point and must not
         // overwrite a value already observed before that source line. Keep
         // read-modify-write observations, because they intentionally describe
         // both the value read at the point and the value written back.
-        if (query.hasBeforePointResult && !readModifyWrite.found) {
+        if (query.programPoints.HasBeforeResult() && !readModifyWrite.found) {
             continue;
         }
         std::unique_ptr<ValueRange> combined;
@@ -2597,29 +2789,35 @@ void ResolveQueryAtStoreValue(std::vector<ContestQuery>& queries, const ValueNam
                       << " combined=" << result << '\n';
         }
         if (range == nullptr || !readModifyWrite.complete) {
-            query.hasUnknownPointObservation = true;
+            query.programPoints.hasUnknownObservation = true;
         }
+        auto point = MakeContestProgramPoint(&expr, readModifyWrite.found
+            ? ContestProgramPointKind::READ_MODIFY_WRITE
+            : ContestProgramPointKind::DECLARATION_LIFETIME);
         const bool hasCompleteBoundedPointObservation = observed != nullptr &&
             readModifyWrite.found && readModifyWrite.complete && range != nullptr &&
             !IsContestTopRange(range, type);
         if (hasCompleteBoundedPointObservation && !hadReadModifyWriteResult &&
             (!query.resolved || IsContestTopRange(query.resultRange.get(), type))) {
-            SetContestQueryResult(query, type, range, ContestResultOrigin::CHIR_ANALYSIS);
+            SetContestQueryResult(
+                query, type, range, ContestResultOrigin::CHIR_ANALYSIS, &point);
             continue;
         }
-        if (query.hasUnknownPointObservation || !readModifyWrite.complete ||
+        if (query.programPoints.hasUnknownObservation || !readModifyWrite.complete ||
             IsContestTopRange(range, type)) {
-            SetContestQueryResult(query, type, nullptr, ContestResultOrigin::CHIR_ANALYSIS);
+            SetContestQueryResult(
+                query, type, nullptr, ContestResultOrigin::CHIR_ANALYSIS, &point);
             continue;
         }
-        if (!ShouldRecordContestResult(query, result, type, range,
-                /* fromBeforeProgramPoint = */ false, /* refinesBeforeProgramPoint = */ false,
-                /* aggregatesDeclaredBindingLifetime = */ true)) {
+        if (!ShouldRecordContestResult(query, result, type, range, point)) {
             continue;
         }
-        SetContestQueryResult(query, type, range, ContestResultOrigin::CHIR_ANALYSIS);
-        query.hasDeclarationStoreResult = !readModifyWrite.found &&
-            IsQueryDeclarationBinding(query, valueNames, location, store->GetDebugLocation());
+        SetContestQueryResult(query, type, range, ContestResultOrigin::CHIR_ANALYSIS, &point);
+        if (!readModifyWrite.found &&
+            IsQueryDeclarationBinding(query, valueNames, location, store->GetDebugLocation())) {
+            query.programPoints.Observe(MakeContestProgramPoint(
+                &expr, ContestProgramPointKind::DECLARATION_STORE));
+        }
     }
 }
 
@@ -2796,9 +2994,10 @@ void ResolveQueryAtExpressionOperands(std::vector<ContestQuery>& queries, const 
             boundedPointObservation = boundedDefinitionValue.get();
         }
         ResolveQueryAtValue(queries, valueNames, expr.GetDebugLocation(), operand, state, contestRoot,
-            boundedPointObservation);
+            &expr, boundedPointObservation);
     }
-    ResolveQueriesFromVisibleNames(queries, valueNames, expr.GetDebugLocation(), state, contestRoot);
+    ResolveQueriesFromVisibleNames(
+        queries, valueNames, expr.GetDebugLocation(), state, contestRoot, false, &expr);
 }
 
 // 带 visited 集合检查 CFG 可达性，避免环路递归。
@@ -2853,7 +3052,8 @@ void ApplyContestContextCandidates(std::vector<ContestQuery>& queries,
             continue;
         }
         auto& query = queries[index];
-        if (query.hasBoundGlobalPointObservation && query.isGlobalDeclarationQuery &&
+        if (query.programPoints.Has(ContestProgramPointKind::BOUND_GLOBAL_PRESTATE) &&
+            query.isGlobalDeclarationQuery &&
             candidate.fromGlobalAccess) {
             // The unique global binding was only a fallback for a source line
             // without a direct GlobalVar operand. Once the caller-side CHIR
@@ -2870,20 +3070,21 @@ void ApplyContestContextCandidates(std::vector<ContestQuery>& queries,
                       << " initializerSeen=" << candidate.sawInitializerObservation
                       << " exitSeen=" << candidate.sawExitObservation
                       << " global=" << candidate.fromGlobalAccess
-                      << " rootUnknown=" << query.hasUnknownPointObservation
-                      << " rootRmw=" << query.hasReadModifyWriteResult
+                      << " rootUnknown=" << query.programPoints.hasUnknownObservation
+                      << " rootRmw=" << query.programPoints.Has(
+                             ContestProgramPointKind::READ_MODIFY_WRITE)
                       << " directLoad=" << candidate.hasDirectPointLoadObservation
                       << " rootTop=" << IsContestTopRange(query.resultRange.get(), query.type)
                       << " root=" << query.result << '\n';
         }
         const bool hasCompleteRootResult = query.resolved &&
             query.resultOrigin != ContestResultOrigin::NONE && query.resultRange != nullptr &&
-            !query.hasUnknownPointObservation &&
+            !query.programPoints.hasUnknownObservation &&
             !IsContestTopRange(query.resultRange.get(), query.type);
         const bool hasCompleteContextCandidate = !candidate.fromGlobalAccess &&
             !candidate.incompleteGlobalLifetime && !candidate.hasUnknownObservation &&
             !candidate.auxiliaryOnly && candidate.range != nullptr &&
-            (!query.hasReadModifyWriteResult ||
+            (!query.programPoints.Has(ContestProgramPointKind::READ_MODIFY_WRITE) ||
                 candidate.hasDirectPointLoadObservation);
         if (!contextClosureComplete && !candidate.fromGlobalAccess) {
             // A partial call closure is useful for diagnostics but is not an
@@ -2894,7 +3095,8 @@ void ApplyContestContextCandidates(std::vector<ContestQuery>& queries,
         }
         if (hasCompleteRootResult && !candidate.fromGlobalAccess) {
             auto type = query.type == nullptr ? candidate.type : query.type;
-            if (!query.hasBoundedPointResult && hasCompleteContextCandidate &&
+            if (!query.programPoints.Has(ContestProgramPointKind::BOUNDED_LOOP_POINT) &&
+                hasCompleteContextCandidate &&
                 AreContestTypesCompatible(type, candidate.type) &&
                 query.resultRange->GetRangeKind() == candidate.range->GetRangeKind()) {
                 // A complete context closure partitions all reachable calls to
@@ -2903,13 +3105,15 @@ void ApplyContestContextCandidates(std::vector<ContestQuery>& queries,
                 // root state may have lost aggregate alias identity at a CFG
                 // join, while each normalized context still has a sound
                 // memory state.
-                SetContestQueryResult(
-                    query, type, candidate.range.get(), ContestResultOrigin::CONTEXT_SUMMARY);
+                auto point = MakeContestProgramPoint(
+                    nullptr, ContestProgramPointKind::CONTEXT_SUMMARY);
+                SetContestQueryResult(query, type, candidate.range.get(),
+                    ContestResultOrigin::CONTEXT_SUMMARY, &point);
             }
             continue;
         }
         if (candidate.hasUnknownObservation) {
-            query.hasUnknownPointObservation = true;
+            query.programPoints.hasUnknownObservation = true;
         }
         auto type = query.type == nullptr ? candidate.type : query.type;
         auto joined = candidate.incompleteGlobalLifetime || candidate.hasUnknownObservation
@@ -2937,8 +3141,10 @@ void ApplyContestContextCandidates(std::vector<ContestQuery>& queries,
                       << " candidateType=" << static_cast<int>(GetQueryTypeHint(candidate.type))
                       << " selected=" << FormatContestRange(joined.get(), type) << '\n';
         }
+        auto point = MakeContestProgramPoint(
+            nullptr, ContestProgramPointKind::CONTEXT_SUMMARY);
         SetContestQueryResult(
-            query, type, joined.get(), ContestResultOrigin::CONTEXT_SUMMARY);
+            query, type, joined.get(), ContestResultOrigin::CONTEXT_SUMMARY, &point);
     }
 }
 
@@ -3103,7 +3309,8 @@ void RangePropagation::EmitContestOutput(const Ptr<const Package>& package, Rang
             queries.value(), *expression, state, contestRoot);
         ResolveQueryBeforeGlobalAccess(queries.value(), *expression, state, contestRoot);
         ResolveQueriesFromVisibleNames(queries.value(), valueNames,
-            expression->GetDebugLocation(), state, contestRoot, /* beforeProgramPoint = */ true);
+            expression->GetDebugLocation(), state, contestRoot,
+            /* beforeProgramPoint = */ true, expression);
     };
     auto actionAfterVisitExpr = [&queries, &valueNames, &knownValueNames, &aggregates, &contestRoot](
                                     const RangeDomain& state, Expression* expr, size_t) {

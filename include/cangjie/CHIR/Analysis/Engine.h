@@ -224,7 +224,7 @@ public:
                     if (auto lambda = IsApplyToLambda(exp); lambda) {
                         analysis->HandleVarStateCapturedByLambda(state, lambda);
                     }
-                    analysis->PropagateExpressionEffect(state, exp);
+                    analysis->PropagateExpressionEffect(state, exp);           // 顺序执行 block 中每条表达式的抽象转移
                 }
 #ifdef AnalysisDevDebug
                 std::cout << exp->GetResult()->ToString() << std::endl;
@@ -234,11 +234,11 @@ public:
             if (auto lambda = IsApplyToLambda(terminator); lambda) {
                 analysis->HandleVarStateCapturedByLambda(state, lambda);
             }
-            std::optional<Block*> targetSucc = analysis->PropagateTerminatorEffect(state, terminator);
+            std::optional<Block*> targetSucc = analysis->PropagateTerminatorEffect(state, terminator);       // 处理 branch/goto 等终结符
 #ifdef AnalysisDevDebug
             std::cout << "exit: " << state.ToString() << std::endl;
 #endif
-            if (analysis->CheckInQueueTimes(bb, state)) {
+            if (analysis->CheckInQueueTimes(bb, state)) {                               // widening 超限保护
                 // if inqueue over certain times, quit analysis and set top to state.
                 //   then spread top state to its successors
                 targetSucc = std::nullopt;
@@ -250,8 +250,8 @@ public:
                 std::cout << succ->GetIdentifier() << ":\n" << entryStates->at(succ).ToString() << std::endl;
                 std::cout << bb->GetIdentifier() << ":\n" << state.ToString() << std::endl;
 #endif
-                auto succState = GetTerminatorStateForSuccessor(*analysis, state, terminator, succ);
-                auto hasChanged = entryStates->at(succ).Join(succState);
+                auto succState = GetTerminatorStateForSuccessor(*analysis, state, terminator, succ);         // 向每条后继边传播
+                auto hasChanged = entryStates->at(succ).Join(succState);                      // 合流
                 if (hasChanged && worklistSet.find(succ) == worklistSet.end()) {
                     worklist.push_back(succ);
                     worklistSet.insert(succ);

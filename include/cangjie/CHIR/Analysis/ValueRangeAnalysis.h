@@ -69,11 +69,32 @@ private:
     BoolDomain domain;
 };
 
+/// A congruence component for a strided integer interval.  It denotes values
+/// satisfying value == residue (mod stride).  stride <= 1 carries no useful
+/// information and is therefore not stored by SIntRange.
+struct SIntCongruence {
+    uint64_t stride{1};
+    uint64_t residue{0};
+
+    bool IsUseful() const
+    {
+        return stride > 1;
+    }
+
+    bool operator==(const SIntCongruence& rhs) const
+    {
+        return stride == rhs.stride && residue == rhs.residue;
+    }
+};
+
 class SIntRange : public ValueRange {
 public:
     explicit SIntRange(SIntDomain domain);
 
     SIntRange(SIntDomain domain, std::optional<std::vector<SInt>> exactValues);
+
+    SIntRange(SIntDomain domain, std::optional<std::vector<SInt>> exactValues,
+        std::optional<SIntCongruence> congruence);
 
     ~SIntRange() override = default;
 
@@ -89,9 +110,12 @@ public:
 
     const std::optional<std::vector<SInt>>& GetExactValues() const;
 
+    const std::optional<SIntCongruence>& GetCongruence() const;
+
 private:
     SIntDomain domain;
     std::optional<std::vector<SInt>> exactValues;
+    std::optional<SIntCongruence> congruence;
 };
 
 /**
