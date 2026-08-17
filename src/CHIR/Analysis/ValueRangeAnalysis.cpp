@@ -337,6 +337,7 @@ void ClearLoopForestCache()
 
 thread_local std::unordered_set<const Block*> queryRefinementBlocks;
 thread_local std::unordered_set<const Value*> queryRefinementValues;
+thread_local std::unordered_set<const Value*> queryRefinementRoots;
 thread_local const RangeAnalysis* boundedLoopEvaluationOwner{nullptr};
 using BoundedAggregateStoreMap = std::unordered_map<Value*, Value*>;
 thread_local BoundedAggregateStoreMap* boundedAggregateStores{nullptr};
@@ -793,6 +794,7 @@ size_t contextSummaryBudgetRejectCount{0};
 size_t contextSummaryFailedCount{0};
 size_t contextSummaryPeakDepth{0};
 thread_local size_t contextSummaryAnalysisDepth{0};
+thread_local std::vector<const Function*> contextSummaryFunctionStack;
 
 std::unordered_map<const Value*, size_t> contextObjectIdentities;
 std::mutex contextObjectIdentitiesMtx;
@@ -969,6 +971,9 @@ BoundedLoopObservationMap boundedLoopObservations;
 bool boundedLoopObservationsComplete{true};
 std::mutex boundedLoopObservationsMtx;
 
+std::optional<std::unique_ptr<ValueRange>> JoinBoundedLoopObservationRanges(
+    const ValueRange& current, const ValueRange& incoming);
+
 void CommitBoundedLoopObservations(const BoundedLoopObservationMap& observations)
 {
     std::lock_guard<std::mutex> lock(boundedLoopObservationsMtx);
@@ -1003,7 +1008,7 @@ void CommitBoundedLoopObservations(const BoundedLoopObservationMap& observations
             }
             continue;
         }
-        if (auto joined = current->second->Join(*range); joined.has_value()) {
+        if (auto joined = JoinBoundedLoopObservationRanges(*current->second, *range); joined.has_value()) {
             current->second = std::move(joined.value());
         }
     }
@@ -1253,6 +1258,205 @@ std::optional<SIntCongruence> NormalizeCongruence(std::optional<SIntCongruence> 
     return congruence;
 }
 
+uint64_t GetSIntWidthMask(IntWidth width)
+{
+    return width == IntWidth::I64 ? UINT64_MAX : ((uint64_t{1} << static_cast<unsigned>(width)) - 1U);
+}
+
+std::optional<SIntKnownBits> NormalizeKnownBits(
+    std::optional<SIntKnownBits> knownBits, IntWidth width)
+{
+    if (!knownBits.has_value()) {
+        return std::nullopt;
+    }
+    auto mask = GetSIntWidthMask(width);
+    knownBits->knownZero &= mask;
+    knownBits->knownOne &= mask;
+    if ((knownBits->knownZero & knownBits->knownOne) != 0 || !knownBits->IsUseful()) {
+        return std::nullopt;
+    }
+    return knownBits;
+}
+
+std::optional<SIntKnownBits> InferKnownBitsFromExactValues(
+    const std::optional<std::vector<SInt>>& exactValues, IntWidth width)
+{
+    if (!exactValues.has_value() || exactValues->empty()) {
+        return std::nullopt;
+    }
+    auto mask = GetSIntWidthMask(width);
+    uint64_t commonOne = mask;
+    uint64_t anyOne = 0;
+    for (const auto& value : *exactValues) {
+        auto raw = value.UVal() & mask;
+        commonOne &= raw;
+        anyOne |= raw;
+    }
+    return NormalizeKnownBits(SIntKnownBits{(~anyOne) & mask, commonOne}, width);
+}
+
+std::optional<SIntKnownBits> InferKnownBitsFromCongruence(
+    const std::optional<SIntCongruence>& congruence, IntWidth width)
+{
+    auto normalized = NormalizeCongruence(congruence);
+    if (!normalized.has_value()) {
+        return std::nullopt;
+    }
+    auto fixedLowBits = static_cast<unsigned>(__builtin_ctzll(normalized->stride));
+    if (fixedLowBits == 0) {
+        return std::nullopt;
+    }
+    auto lowMask = (uint64_t{1} << fixedLowBits) - 1U;
+    auto knownOne = normalized->residue & lowMask;
+    return NormalizeKnownBits(SIntKnownBits{(~knownOne) & lowMask, knownOne}, width);
+}
+
+std::optional<SIntKnownBits> InferKnownBitsFromInterval(const SIntDomain& domain)
+{
+    if (domain.IsBottom()) {
+        return std::nullopt;
+    }
+    const auto& interval = domain.NumericBound();
+    uint64_t minimum = 0;
+    uint64_t maximum = 0;
+    if (domain.IsUnsigned()) {
+        if (interval.IsWrappedSet()) {
+            return std::nullopt;
+        }
+        minimum = interval.UMinValue().UVal();
+        maximum = interval.UMaxValue().UVal();
+    } else {
+        if (interval.IsSignWrappedSet()) {
+            return std::nullopt;
+        }
+        auto signedMinimum = interval.SMinValue();
+        auto signedMaximum = interval.SMaxValue();
+        if (signedMinimum.Slt(0) != signedMaximum.Slt(0)) {
+            return std::nullopt;
+        }
+        minimum = signedMinimum.UVal();
+        maximum = signedMaximum.UVal();
+    }
+
+    const auto width = domain.Width();
+    const auto widthMask = GetSIntWidthMask(width);
+    minimum &= widthMask;
+    maximum &= widthMask;
+    auto varyingMask = minimum ^ maximum;
+    varyingMask |= varyingMask >> 1U;
+    varyingMask |= varyingMask >> 2U;
+    varyingMask |= varyingMask >> 4U;
+    varyingMask |= varyingMask >> 8U;
+    varyingMask |= varyingMask >> 16U;
+    varyingMask |= varyingMask >> 32U;
+    const auto fixedMask = widthMask & ~varyingMask;
+    return NormalizeKnownBits(
+        SIntKnownBits{(~minimum) & fixedMask, minimum & fixedMask}, width);
+}
+
+std::optional<SIntKnownBits> IntersectSIntKnownBits(const std::optional<SIntKnownBits>& lhs,
+    const std::optional<SIntKnownBits>& rhs, IntWidth width, bool& compatible)
+{
+    compatible = true;
+    auto normalizedLhs = NormalizeKnownBits(lhs, width);
+    auto normalizedRhs = NormalizeKnownBits(rhs, width);
+    if (!normalizedLhs.has_value()) {
+        return normalizedRhs;
+    }
+    if (!normalizedRhs.has_value()) {
+        return normalizedLhs;
+    }
+    SIntKnownBits result{normalizedLhs->knownZero | normalizedRhs->knownZero,
+        normalizedLhs->knownOne | normalizedRhs->knownOne};
+    if ((result.knownZero & result.knownOne) != 0) {
+        compatible = false;
+        return std::nullopt;
+    }
+    return NormalizeKnownBits(result, width);
+}
+
+std::optional<SIntKnownBits> GetEffectiveKnownBits(const SIntDomain& domain,
+    const std::optional<std::vector<SInt>>& exactValues,
+    const std::optional<SIntCongruence>& congruence,
+    const std::optional<SIntKnownBits>& explicitKnownBits)
+{
+    bool compatible = true;
+    auto result = IntersectSIntKnownBits(explicitKnownBits,
+        InferKnownBitsFromExactValues(exactValues, domain.Width()), domain.Width(), compatible);
+    if (!compatible) {
+        return std::nullopt;
+    }
+    result = IntersectSIntKnownBits(result,
+        InferKnownBitsFromCongruence(congruence, domain.Width()), domain.Width(), compatible);
+    if (!compatible) {
+        return std::nullopt;
+    }
+    return IntersectSIntKnownBits(
+        result, InferKnownBitsFromInterval(domain), domain.Width(), compatible);
+}
+
+std::optional<SIntKnownBits> MergeSIntKnownBitsForUnion(const SIntDomain& lhsDomain,
+    const std::optional<SIntKnownBits>& lhs, const SIntDomain& rhsDomain,
+    const std::optional<SIntKnownBits>& rhs)
+{
+    if (lhsDomain.IsBottom()) {
+        return NormalizeKnownBits(rhs, rhsDomain.Width());
+    }
+    if (rhsDomain.IsBottom()) {
+        return NormalizeKnownBits(lhs, lhsDomain.Width());
+    }
+    if (lhsDomain.Width() != rhsDomain.Width() || lhsDomain.IsUnsigned() != rhsDomain.IsUnsigned()) {
+        return std::nullopt;
+    }
+    auto normalizedLhs = NormalizeKnownBits(lhs, lhsDomain.Width());
+    auto normalizedRhs = NormalizeKnownBits(rhs, rhsDomain.Width());
+    if (!normalizedLhs.has_value() || !normalizedRhs.has_value()) {
+        return std::nullopt;
+    }
+    return NormalizeKnownBits(SIntKnownBits{normalizedLhs->knownZero & normalizedRhs->knownZero,
+        normalizedLhs->knownOne & normalizedRhs->knownOne}, lhsDomain.Width());
+}
+
+std::optional<SIntCongruence> InferCongruenceFromKnownBits(
+    const std::optional<SIntKnownBits>& knownBits, IntWidth width)
+{
+    auto normalized = NormalizeKnownBits(knownBits, width);
+    if (!normalized.has_value()) {
+        return std::nullopt;
+    }
+    auto fixed = normalized->knownZero | normalized->knownOne;
+    unsigned fixedLowBits = 0;
+    while (fixedLowBits < static_cast<unsigned>(width) &&
+        (fixed & (uint64_t{1} << fixedLowBits)) != 0) {
+        ++fixedLowBits;
+    }
+    if (fixedLowBits == 0 || fixedLowBits >= 64) {
+        return std::nullopt;
+    }
+    auto stride = uint64_t{1} << fixedLowBits;
+    return SIntCongruence{stride, normalized->knownOne & (stride - 1U)};
+}
+
+SIntDomain DomainFromKnownBits(
+    const std::optional<SIntKnownBits>& knownBits, IntWidth width, bool isUnsigned)
+{
+    auto normalized = NormalizeKnownBits(knownBits, width);
+    if (!normalized.has_value()) {
+        return SIntDomain::Top(width, isUnsigned);
+    }
+    auto mask = GetSIntWidthMask(width);
+    auto unknown = (~(normalized->knownZero | normalized->knownOne)) & mask;
+    auto signBit = uint64_t{1} << (static_cast<unsigned>(width) - 1U);
+    if (!isUnsigned && (unknown & signBit) != 0) {
+        return SIntDomain::Top(width, false);
+    }
+    SInt minimum{width, normalized->knownOne};
+    SInt maximum{width, normalized->knownOne | unknown};
+    auto lower = ConstantRange::From(RelationalOperation::GE, minimum, !isUnsigned);
+    auto upper = ConstantRange::From(RelationalOperation::LE, maximum, !isUnsigned);
+    return SIntDomain{lower.IntersectWith(upper, PreferFromBool(isUnsigned)), isUnsigned};
+}
+
 struct CongruenceSummary {
     bool constrained{false};
     unsigned __int128 modulus{1};
@@ -1374,6 +1578,447 @@ bool ExactValueSatisfiesDomain(const SInt& value, const SIntDomain& domain)
     return !SIntDomain::Intersects(singleton, domain).IsBottom();
 }
 
+constexpr size_t MAX_EXCLUDED_SINT_VALUES = 8;
+constexpr size_t MAX_DISJOINT_SINT_INTERVALS = 4;
+
+std::optional<std::vector<SInt>> NormalizeExcludedSIntValues(
+    std::vector<SInt> values, const SIntDomain& domain)
+{
+    values = NormalizeExactIntValues(std::move(values));
+    values.erase(std::remove_if(values.begin(), values.end(), [&domain](const SInt& value) {
+        return value.Width() != domain.Width() || !ExactValueSatisfiesDomain(value, domain);
+    }), values.end());
+    if (values.empty() || values.size() > MAX_EXCLUDED_SINT_VALUES) {
+        return std::nullopt;
+    }
+    return values;
+}
+
+std::optional<std::vector<SIntIntervalFragment>> NormalizeSIntIntervalFragments(
+    std::vector<SIntIntervalFragment> fragments, const SIntDomain& domain)
+{
+    if (fragments.empty() || domain.IsBottom()) {
+        return std::nullopt;
+    }
+    const auto mathematical = [&domain](const SInt& value) {
+        return ToMathematicalInteger(value, domain.IsUnsigned());
+    };
+    const auto& numeric = domain.NumericBound();
+    const bool hasConvexBounds = numeric.IsFullSet() ||
+        !(domain.IsUnsigned() ? numeric.IsWrappedSet() : numeric.IsSignWrappedSet());
+    const auto domainLower = domain.IsUnsigned()
+        ? static_cast<__int128>(numeric.IsFullSet()
+                ? SInt::UMinValue(domain.Width()).UVal()
+                : numeric.MinValue(true).UVal())
+        : static_cast<__int128>(numeric.IsFullSet()
+                ? SInt::SMinValue(domain.Width()).SVal()
+                : numeric.MinValue(false).SVal());
+    const auto domainUpper = domain.IsUnsigned()
+        ? static_cast<__int128>(numeric.IsFullSet()
+                ? SInt::UMaxValue(domain.Width()).UVal()
+                : numeric.MaxValue(true).UVal())
+        : static_cast<__int128>(numeric.IsFullSet()
+                ? SInt::SMaxValue(domain.Width()).SVal()
+                : numeric.MaxValue(false).SVal());
+    fragments.erase(std::remove_if(fragments.begin(), fragments.end(),
+        [&](SIntIntervalFragment& fragment) {
+            if (fragment.stride <= 1) {
+                fragment.stride = 1;
+                fragment.residue = 0;
+            } else {
+                fragment.residue %= fragment.stride;
+            }
+            if (fragment.lower.Width() != domain.Width() ||
+                fragment.upper.Width() != domain.Width() ||
+                mathematical(fragment.lower) > mathematical(fragment.upper)) {
+                return true;
+            }
+            if (!hasConvexBounds) {
+                return !ExactValueSatisfiesDomain(fragment.lower, domain) ||
+                    !ExactValueSatisfiesDomain(fragment.upper, domain);
+            }
+            auto lower = std::max(mathematical(fragment.lower), domainLower);
+            auto upper = std::min(mathematical(fragment.upper), domainUpper);
+            if (lower > upper) {
+                return true;
+            }
+            fragment.lower = SInt{domain.Width(), static_cast<uint64_t>(lower)};
+            fragment.upper = SInt{domain.Width(), static_cast<uint64_t>(upper)};
+            return false;
+        }), fragments.end());
+
+    // Keep each fragment's endpoints on its own progression. This matters for
+    // signed negative ranges as well, so align in the mathematical domain and
+    // only then convert back to the fixed-width representation.
+    fragments.erase(std::remove_if(fragments.begin(), fragments.end(),
+        [&](SIntIntervalFragment& fragment) {
+            if (fragment.stride == 1) {
+                return false;
+            }
+            const auto stride = static_cast<__int128>(fragment.stride);
+            const auto residue = static_cast<__int128>(fragment.residue);
+            auto lower = mathematical(fragment.lower);
+            auto upper = mathematical(fragment.upper);
+            auto lowerResidue = lower % stride;
+            if (lowerResidue < 0) {
+                lowerResidue += stride;
+            }
+            auto upperResidue = upper % stride;
+            if (upperResidue < 0) {
+                upperResidue += stride;
+            }
+            lower += (residue - lowerResidue + stride) % stride;
+            upper -= (upperResidue - residue + stride) % stride;
+            if (lower > upper) {
+                return true;
+            }
+            fragment.lower = SInt{domain.Width(), static_cast<uint64_t>(lower)};
+            fragment.upper = SInt{domain.Width(), static_cast<uint64_t>(upper)};
+            return false;
+        }), fragments.end());
+    std::sort(fragments.begin(), fragments.end(),
+        [&](const SIntIntervalFragment& lhs, const SIntIntervalFragment& rhs) {
+            if (mathematical(lhs.lower) != mathematical(rhs.lower)) {
+                return mathematical(lhs.lower) < mathematical(rhs.lower);
+            }
+            if (mathematical(lhs.upper) != mathematical(rhs.upper)) {
+                return mathematical(lhs.upper) < mathematical(rhs.upper);
+            }
+            if (lhs.stride != rhs.stride) {
+                return lhs.stride < rhs.stride;
+            }
+            return lhs.residue < rhs.residue;
+        });
+
+    std::vector<SIntIntervalFragment> normalized;
+    normalized.reserve(fragments.size());
+    for (const auto& fragment : fragments) {
+        const bool sameProgression = !normalized.empty() &&
+            fragment.stride == normalized.back().stride &&
+            fragment.residue == normalized.back().residue;
+        if (!sameProgression || mathematical(fragment.lower) >
+                mathematical(normalized.back().upper) +
+                    static_cast<__int128>(fragment.stride)) {
+            normalized.emplace_back(fragment);
+            continue;
+        }
+        if (mathematical(fragment.upper) > mathematical(normalized.back().upper)) {
+            normalized.back().upper = fragment.upper;
+        }
+    }
+
+    const auto contains = [&](const SIntIntervalFragment& outer,
+                              const SIntIntervalFragment& inner) {
+        if (mathematical(outer.lower) > mathematical(inner.lower) ||
+            mathematical(outer.upper) < mathematical(inner.upper)) {
+            return false;
+        }
+        if (outer.stride == 1) {
+            return true;
+        }
+        if (inner.lower == inner.upper) {
+            return CanonicalResidue(
+                mathematical(inner.lower), outer.stride) == outer.residue;
+        }
+        return inner.stride % outer.stride == 0 &&
+            inner.residue % outer.stride == outer.residue;
+    };
+    std::vector<SIntIntervalFragment> reduced;
+    reduced.reserve(normalized.size());
+    for (const auto& fragment : normalized) {
+        if (std::any_of(reduced.begin(), reduced.end(),
+                [&](const auto& existing) { return contains(existing, fragment); })) {
+            continue;
+        }
+        reduced.erase(std::remove_if(reduced.begin(), reduced.end(),
+            [&](const auto& existing) { return contains(fragment, existing); }), reduced.end());
+        reduced.emplace_back(fragment);
+    }
+    std::sort(reduced.begin(), reduced.end(),
+        [&](const SIntIntervalFragment& lhs, const SIntIntervalFragment& rhs) {
+            return mathematical(lhs.lower) < mathematical(rhs.lower);
+        });
+    if (reduced.empty() || reduced.size() > MAX_DISJOINT_SINT_INTERVALS) {
+        return std::nullopt;
+    }
+    return reduced;
+}
+
+std::optional<std::vector<SIntIntervalFragment>> RefineSIntIntervalFragmentsByCongruence(
+    std::optional<std::vector<SIntIntervalFragment>> fragments,
+    const std::optional<SIntCongruence>& congruence, const SIntDomain& domain)
+{
+    auto normalizedCongruence = NormalizeCongruence(congruence);
+    if (!fragments.has_value() || !normalizedCongruence.has_value()) {
+        return fragments;
+    }
+    const auto mathematical = [&domain](const SInt& value) {
+        return ToMathematicalInteger(value, domain.IsUnsigned());
+    };
+    fragments->erase(std::remove_if(fragments->begin(), fragments->end(),
+        [&](SIntIntervalFragment& fragment) {
+            if (fragment.lower == fragment.upper) {
+                return CanonicalResidue(mathematical(fragment.lower),
+                           normalizedCongruence->stride) !=
+                    normalizedCongruence->residue;
+            }
+            if (fragment.stride <= 1) {
+                fragment.stride = normalizedCongruence->stride;
+                fragment.residue = normalizedCongruence->residue;
+                return false;
+            }
+            const auto common = std::gcd(
+                fragment.stride, normalizedCongruence->stride);
+            const auto difference = fragment.residue >= normalizedCongruence->residue
+                ? fragment.residue - normalizedCongruence->residue
+                : normalizedCongruence->residue - fragment.residue;
+            if (difference % common != 0) {
+                return true;
+            }
+            if (normalizedCongruence->stride % fragment.stride == 0 &&
+                normalizedCongruence->residue % fragment.stride == fragment.residue) {
+                fragment.stride = normalizedCongruence->stride;
+                fragment.residue = normalizedCongruence->residue;
+            }
+            return false;
+        }), fragments->end());
+    return NormalizeSIntIntervalFragments(std::move(*fragments), domain);
+}
+
+std::optional<std::vector<SIntIntervalFragment>> GetSIntIntervalFragmentsForUnion(
+    const SIntRange& range)
+{
+    if (range.GetIntervalFragments().has_value()) {
+        return range.GetIntervalFragments();
+    }
+    const auto& domain = range.GetVal();
+    const auto& numeric = domain.NumericBound();
+    if (domain.IsBottom()) {
+        return std::vector<SIntIntervalFragment>{};
+    }
+    if (numeric.IsFullSet() || numeric.IsEmptySet() ||
+        (domain.IsUnsigned() ? numeric.IsWrappedSet() : numeric.IsSignWrappedSet())) {
+        return std::nullopt;
+    }
+    if (range.GetExactValues().has_value() && range.GetExactValues()->size() == 1) {
+        return std::vector<SIntIntervalFragment>{{
+            range.GetExactValues()->front(), range.GetExactValues()->front(), 1, 0}};
+    }
+    auto congruence = NormalizeCongruence(range.GetCongruence());
+    return std::vector<SIntIntervalFragment>{{
+        numeric.MinValue(domain.IsUnsigned()), numeric.MaxValue(domain.IsUnsigned()),
+        congruence.has_value() ? congruence->stride : 1,
+        congruence.has_value() ? congruence->residue : 0}};
+}
+
+std::optional<std::vector<SIntIntervalFragment>> MergeSIntIntervalFragmentsForUnion(
+    const SIntRange& lhs, const SIntRange& rhs, const SIntDomain& joinedDomain)
+{
+    if (lhs.GetVal().IsBottom()) {
+        return rhs.GetIntervalFragments();
+    }
+    if (rhs.GetVal().IsBottom()) {
+        return lhs.GetIntervalFragments();
+    }
+
+    // Ordinary joins overwhelmingly combine two convex ranges. Detect the
+    // common overlapping/adjacent case without constructing and sorting two
+    // temporary vectors; allocate fragment storage only when a real gap is
+    // present or an operand already carries a non-convex union.
+    if (!lhs.GetIntervalFragments().has_value() && !rhs.GetIntervalFragments().has_value()) {
+        const auto& lhsDomain = lhs.GetVal();
+        const auto& rhsDomain = rhs.GetVal();
+        const auto& lhsNumeric = lhsDomain.NumericBound();
+        const auto& rhsNumeric = rhsDomain.NumericBound();
+        const bool lhsUnsupported = lhsNumeric.IsFullSet() || lhsNumeric.IsEmptySet() ||
+            (lhsDomain.IsUnsigned() ? lhsNumeric.IsWrappedSet() : lhsNumeric.IsSignWrappedSet());
+        const bool rhsUnsupported = rhsNumeric.IsFullSet() || rhsNumeric.IsEmptySet() ||
+            (rhsDomain.IsUnsigned() ? rhsNumeric.IsWrappedSet() : rhsNumeric.IsSignWrappedSet());
+        if (lhsUnsupported || rhsUnsupported || lhsDomain.Width() != rhsDomain.Width() ||
+            lhsDomain.IsUnsigned() != rhsDomain.IsUnsigned()) {
+            return std::nullopt;
+        }
+
+        const auto lhsLower = ToMathematicalInteger(
+            lhsNumeric.MinValue(lhsDomain.IsUnsigned()), lhsDomain.IsUnsigned());
+        const auto lhsUpper = ToMathematicalInteger(
+            lhsNumeric.MaxValue(lhsDomain.IsUnsigned()), lhsDomain.IsUnsigned());
+        const auto rhsLower = ToMathematicalInteger(
+            rhsNumeric.MinValue(rhsDomain.IsUnsigned()), rhsDomain.IsUnsigned());
+        const auto rhsUpper = ToMathematicalInteger(
+            rhsNumeric.MaxValue(rhsDomain.IsUnsigned()), rhsDomain.IsUnsigned());
+        if (lhsLower <= rhsUpper + 1 && rhsLower <= lhsUpper + 1) {
+            return std::nullopt;
+        }
+
+        auto lhsFragments = GetSIntIntervalFragmentsForUnion(lhs);
+        auto rhsFragments = GetSIntIntervalFragmentsForUnion(rhs);
+        CJC_ASSERT(lhsFragments.has_value() && rhsFragments.has_value());
+        lhsFragments->insert(
+            lhsFragments->end(), rhsFragments->begin(), rhsFragments->end());
+        return NormalizeSIntIntervalFragments(std::move(*lhsFragments), joinedDomain);
+    }
+
+    auto lhsFragments = GetSIntIntervalFragmentsForUnion(lhs);
+    auto rhsFragments = GetSIntIntervalFragmentsForUnion(rhs);
+    if (!lhsFragments.has_value() || !rhsFragments.has_value()) {
+        return std::nullopt;
+    }
+    lhsFragments->insert(
+        lhsFragments->end(), rhsFragments->begin(), rhsFragments->end());
+    return NormalizeSIntIntervalFragments(std::move(*lhsFragments), joinedDomain);
+}
+
+std::optional<std::vector<SIntIntervalFragment>> SelectSIntIntervalFragmentsForNarrowing(
+    const SIntRange& current, const SIntRange& candidate, const SIntDomain& intersection)
+{
+    // A narrowing candidate is a fresh sound evaluation under the current
+    // over-approximation. Prefer its non-convex partition when available; if
+    // it is convex, retain an older partition only when it still lies inside
+    // the narrowed interval. Intersecting two fragment unions exactly is not
+    // required for soundness here: either partition is already a superset of
+    // the concrete intersection.
+    if (candidate.GetIntervalFragments().has_value()) {
+        return NormalizeSIntIntervalFragments(
+            *candidate.GetIntervalFragments(), intersection);
+    }
+    if (current.GetIntervalFragments().has_value()) {
+        return NormalizeSIntIntervalFragments(
+            *current.GetIntervalFragments(), intersection);
+    }
+    return std::nullopt;
+}
+
+bool IsExplicitlyExcluded(const std::optional<std::vector<SInt>>& excludedValues, const SInt& value)
+{
+    return excludedValues.has_value() &&
+        std::find(excludedValues->begin(), excludedValues->end(), value) != excludedValues->end();
+}
+
+bool SIntRangeMayContain(const SIntDomain& domain,
+    const std::optional<std::vector<SInt>>& excludedValues, const SInt& value)
+{
+    return ExactValueSatisfiesDomain(value, domain) && !IsExplicitlyExcluded(excludedValues, value);
+}
+
+void AddSmallGapExclusions(const SIntDomain& lhsDomain, const SIntDomain& rhsDomain,
+    std::vector<SInt>& candidates)
+{
+    if (lhsDomain.Width() != rhsDomain.Width() || lhsDomain.IsUnsigned() != rhsDomain.IsUnsigned()) {
+        return;
+    }
+    const auto& lhs = lhsDomain.NumericBound();
+    const auto& rhs = rhsDomain.NumericBound();
+    if (lhs.IsEmptySet() || rhs.IsEmptySet() || lhs.IsFullSet() || rhs.IsFullSet() ||
+        (lhsDomain.IsUnsigned() ? lhs.IsWrappedSet() || rhs.IsWrappedSet()
+                                : lhs.IsSignWrappedSet() || rhs.IsSignWrappedSet())) {
+        return;
+    }
+    auto lhsMin = ToMathematicalInteger(lhs.MinValue(lhsDomain.IsUnsigned()), lhsDomain.IsUnsigned());
+    auto lhsMax = ToMathematicalInteger(lhs.MaxValue(lhsDomain.IsUnsigned()), lhsDomain.IsUnsigned());
+    auto rhsMin = ToMathematicalInteger(rhs.MinValue(rhsDomain.IsUnsigned()), rhsDomain.IsUnsigned());
+    auto rhsMax = ToMathematicalInteger(rhs.MaxValue(rhsDomain.IsUnsigned()), rhsDomain.IsUnsigned());
+    auto gapLower = lhsMax < rhsMin ? lhsMax + 1 : rhsMax < lhsMin ? rhsMax + 1 : __int128{1};
+    auto gapUpper = lhsMax < rhsMin ? rhsMin - 1 : rhsMax < lhsMin ? lhsMin - 1 : __int128{0};
+    if (gapLower > gapUpper) {
+        return;
+    }
+    auto gapSize = gapUpper - gapLower + 1;
+    if (gapSize > static_cast<__int128>(MAX_EXCLUDED_SINT_VALUES) ||
+        candidates.size() + static_cast<size_t>(gapSize) > MAX_EXCLUDED_SINT_VALUES) {
+        return;
+    }
+    for (auto value = gapLower; value <= gapUpper; ++value) {
+        candidates.emplace_back(lhsDomain.Width(), static_cast<uint64_t>(value));
+    }
+}
+
+std::optional<std::vector<SInt>> MergeExcludedSIntValuesForUnion(const SIntDomain& lhsDomain,
+    const std::optional<std::vector<SInt>>& lhsExcluded, const SIntDomain& rhsDomain,
+    const std::optional<std::vector<SInt>>& rhsExcluded, const SIntDomain& joinedDomain)
+{
+    if (!lhsExcluded.has_value() && !rhsExcluded.has_value()) {
+        return std::nullopt;
+    }
+    std::vector<SInt> candidates;
+    if (lhsExcluded.has_value()) {
+        candidates.insert(candidates.end(), lhsExcluded->begin(), lhsExcluded->end());
+    }
+    if (rhsExcluded.has_value()) {
+        candidates.insert(candidates.end(), rhsExcluded->begin(), rhsExcluded->end());
+    }
+    candidates = NormalizeExactIntValues(std::move(candidates));
+    candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+        [&](const SInt& value) {
+            return SIntRangeMayContain(lhsDomain, lhsExcluded, value) ||
+                SIntRangeMayContain(rhsDomain, rhsExcluded, value);
+        }), candidates.end());
+    return NormalizeExcludedSIntValues(std::move(candidates), joinedDomain);
+}
+
+std::optional<std::unique_ptr<ValueRange>> JoinBoundedLoopObservationRanges(
+    const ValueRange& current, const ValueRange& incoming)
+{
+    auto joined = current.Join(incoming);
+    if (!joined.has_value() || current.GetRangeKind() != ValueRange::RangeKind::SINT ||
+        incoming.GetRangeKind() != ValueRange::RangeKind::SINT) {
+        return joined;
+    }
+    const auto& lhs = StaticCast<const SIntRange&>(current);
+    const auto& rhs = StaticCast<const SIntRange&>(incoming);
+    auto* joinedRange = StaticCast<const SIntRange*>(joined.value().get());
+    const auto& joinedCongruence = joinedRange->GetCongruence();
+    const auto& joinedKnownBits = joinedRange->GetKnownBits();
+    if (joinedRange->GetIntervalFragments().has_value()) {
+        return joined;
+    }
+    if ((joinedCongruence.has_value() && joinedCongruence->stride > 1) ||
+        (joinedKnownBits.has_value() && joinedKnownBits->IsUseful())) {
+        // Congruence and KnownBits already retain regular non-convex spacing.
+        // Enumerating those gaps as exclusions adds no precision and makes
+        // every bounded-loop observation allocate short-lived hole sets.
+        return joined;
+    }
+    std::vector<SInt> excluded;
+    if (joinedRange->GetExcludedValues().has_value()) {
+        excluded = *joinedRange->GetExcludedValues();
+    }
+    AddSmallGapExclusions(lhs.GetVal(), rhs.GetVal(), excluded);
+    auto excludedValues = NormalizeExcludedSIntValues(std::move(excluded), joinedRange->GetVal());
+    if (excludedValues == joinedRange->GetExcludedValues()) {
+        return joined;
+    }
+    std::unique_ptr<ValueRange> refined = std::make_unique<SIntRange>(joinedRange->GetVal(),
+        joinedRange->GetExactValues(), joinedRange->GetCongruence(), joinedRange->GetKnownBits(),
+        std::move(excludedValues));
+    return std::optional<std::unique_ptr<ValueRange>>{std::move(refined)};
+}
+
+std::optional<std::vector<SInt>> IntersectExcludedSIntValues(const SIntRange& lhs,
+    const SIntRange& rhs, const SIntDomain& intersection)
+{
+    std::vector<SInt> excluded;
+    if (lhs.GetExcludedValues().has_value()) {
+        excluded.insert(excluded.end(), lhs.GetExcludedValues()->begin(), lhs.GetExcludedValues()->end());
+    }
+    if (rhs.GetExcludedValues().has_value()) {
+        excluded.insert(excluded.end(), rhs.GetExcludedValues()->begin(), rhs.GetExcludedValues()->end());
+    }
+    return NormalizeExcludedSIntValues(std::move(excluded), intersection);
+}
+
+std::optional<std::vector<SInt>> FilterExactValuesByExclusions(
+    std::optional<std::vector<SInt>> exactValues,
+    const std::optional<std::vector<SInt>>& excludedValues)
+{
+    if (!exactValues.has_value() || !excludedValues.has_value()) {
+        return exactValues;
+    }
+    exactValues->erase(std::remove_if(exactValues->begin(), exactValues->end(),
+        [&](const SInt& value) { return IsExplicitlyExcluded(excludedValues, value); }), exactValues->end());
+    return exactValues->empty() ? std::nullopt : NormalizeExactIntSet(std::move(*exactValues));
+}
+
 std::optional<std::vector<SInt>> IntersectExactIntSets(
     const SIntRange& lhs, const SIntRange& rhs, const SIntDomain& intersection)
 {
@@ -1405,7 +2050,9 @@ std::optional<std::vector<SInt>> IntersectExactIntSets(
 bool IsUsefulNarrowingSeed(const SIntRange& range)
 {
     const auto& domain = range.GetVal();
-    if (range.GetExactValues().has_value() || range.GetCongruence().has_value() || domain.IsSingleValue()) {
+    if (range.GetExactValues().has_value() || range.GetCongruence().has_value() ||
+        range.GetKnownBits().has_value() || range.GetExcludedValues().has_value() ||
+        range.GetIntervalFragments().has_value() || domain.IsSingleValue()) {
         return true;
     }
     const auto& numeric = domain.NumericBound();
@@ -1479,12 +2126,25 @@ bool NarrowRangeValue(RangeValueDomain& current, const RangeValueDomain& candida
     if (!congruencesCompatible) {
         return false;
     }
+    bool knownBitsCompatible = true;
+    auto knownBits = IntersectSIntKnownBits(
+        lhs.GetKnownBits(), rhs.GetKnownBits(), intersection.Width(), knownBitsCompatible);
+    if (!knownBitsCompatible) {
+        return false;
+    }
+    auto excludedValues = IntersectExcludedSIntValues(lhs, rhs, intersection);
+    exactValues = FilterExactValuesByExclusions(std::move(exactValues), excludedValues);
+    auto intervalFragments =
+        SelectSIntIntervalFragmentsForNarrowing(lhs, rhs, intersection);
     if (lhs.GetVal().IsSame(intersection) && lhs.GetExactValues() == exactValues &&
-        lhs.GetCongruence() == congruence) {
+        lhs.GetCongruence() == congruence && lhs.GetKnownBits() == knownBits &&
+        lhs.GetExcludedValues() == excludedValues &&
+        lhs.GetIntervalFragments() == intervalFragments) {
         return false;
     }
     current = std::make_unique<SIntRange>(
-        std::move(intersection), std::move(exactValues), std::move(congruence));
+        std::move(intersection), std::move(exactValues), std::move(congruence), std::move(knownBits),
+        std::move(excludedValues), std::move(intervalFragments));
     return true;
 }
 
@@ -1582,6 +2242,10 @@ struct TrackedMutableGlobals {
 TrackedMutableGlobals CollectTrackedMutableGlobals(const Function* function, const Package* package = nullptr);
 TrackedMutableGlobals CollectTrackedMutableGlobals(const Lambda* lambda, const Package* package = nullptr);
 void ClearTrackedMutableGlobalCache();
+const Expression* GetDefiningExpr(Value* value);
+std::optional<SInt> GetSingleIntFromDefiningConstant(Value* value);
+RelationalOperation ToRelationalOperation(ExprKind kind);
+RelationalOperation NegateRelation(RelationalOperation rel);
 }
 
 ClassType* ResolveExactAllocatedClass(Value* value, std::unordered_set<Value*>& visited, unsigned depth = 0);
@@ -1597,6 +2261,9 @@ struct RangeAnalysis::ContextAbstractValue {
     std::unique_ptr<SIntDomain> sintValue;
     std::optional<std::vector<SInt>> exactSIntValues;
     std::optional<SIntCongruence> sintCongruence;
+    std::optional<SIntKnownBits> sintKnownBits;
+    std::optional<std::vector<SInt>> excludedSIntValues;
+    std::optional<std::vector<SIntIntervalFragment>> sintIntervalFragments;
     ClassType* classValue{nullptr};
     const Lambda* lambdaValue{nullptr};
     std::vector<ContextAbstractValue> lambdaCapturedValues;
@@ -1611,13 +2278,26 @@ struct RangeAnalysis::ContextAbstractValue {
     }
 
     explicit ContextAbstractValue(const SIntDomain& value, std::optional<std::vector<SInt>> exactValues = std::nullopt,
-        std::optional<SIntCongruence> congruence = std::nullopt)
+        std::optional<SIntCongruence> congruence = std::nullopt,
+        std::optional<SIntKnownBits> knownBits = std::nullopt,
+        std::optional<std::vector<SInt>> excludedValues = std::nullopt,
+        std::optional<std::vector<SIntIntervalFragment>> intervalFragments = std::nullopt)
         : kind(Kind::SINT), sintValue(std::make_unique<SIntDomain>(value)),
           exactSIntValues(exactValues.has_value() ? NormalizeExactIntSet(std::move(*exactValues)) : std::nullopt),
-          sintCongruence(NormalizeCongruence(std::move(congruence)))
+          sintCongruence(NormalizeCongruence(std::move(congruence))),
+          sintKnownBits(NormalizeKnownBits(std::move(knownBits), value.Width())),
+          excludedSIntValues(excludedValues.has_value()
+                  ? NormalizeExcludedSIntValues(std::move(*excludedValues), value)
+                  : std::nullopt),
+          sintIntervalFragments(intervalFragments.has_value()
+                  ? NormalizeSIntIntervalFragments(std::move(*intervalFragments), value)
+                  : std::nullopt)
     {
         if (!sintCongruence.has_value()) {
             sintCongruence = InferCongruenceFromExactValues(exactSIntValues, value.IsUnsigned());
+        }
+        if (!sintCongruence.has_value()) {
+            sintCongruence = InferCongruenceFromKnownBits(sintKnownBits, value.Width());
         }
     }
 
@@ -1641,7 +2321,9 @@ struct RangeAnalysis::ContextAbstractValue {
 
     ContextAbstractValue(const ContextAbstractValue& other)
         : kind(other.kind), boolValue(other.boolValue), exactSIntValues(other.exactSIntValues),
-          sintCongruence(other.sintCongruence),
+          sintCongruence(other.sintCongruence), sintKnownBits(other.sintKnownBits),
+          excludedSIntValues(other.excludedSIntValues),
+          sintIntervalFragments(other.sintIntervalFragments),
           classValue(other.classValue), lambdaValue(other.lambdaValue),
           lambdaCapturedValues(other.lambdaCapturedValues), objectFields(other.objectFields),
           aliasGroup(other.aliasGroup), objectIdentity(other.objectIdentity)
@@ -1663,6 +2345,9 @@ struct RangeAnalysis::ContextAbstractValue {
         sintValue = other.sintValue ? std::make_unique<SIntDomain>(*other.sintValue) : nullptr;
         exactSIntValues = other.exactSIntValues;
         sintCongruence = other.sintCongruence;
+        sintKnownBits = other.sintKnownBits;
+        excludedSIntValues = other.excludedSIntValues;
+        sintIntervalFragments = other.sintIntervalFragments;
         classValue = other.classValue;
         lambdaValue = other.lambdaValue;
         lambdaCapturedValues = other.lambdaCapturedValues;
@@ -1732,6 +2417,31 @@ struct RangeAnalysis::ContextAbstractValue {
             if (sintCongruence.has_value()) {
                 ss << ":congruence{" << sintCongruence->residue << "mod"
                    << sintCongruence->stride << "}";
+            }
+            if (sintKnownBits.has_value()) {
+                ss << ":knownbits{" << sintKnownBits->knownZero << ","
+                   << sintKnownBits->knownOne << "}";
+            }
+            if (excludedSIntValues.has_value()) {
+                ss << ":exclude{";
+                for (size_t i = 0; i < excludedSIntValues->size(); ++i) {
+                    if (i != 0) {
+                        ss << ",";
+                    }
+                    ss << (*excludedSIntValues)[i].UVal();
+                }
+                ss << "}";
+            }
+            if (sintIntervalFragments.has_value()) {
+                ss << ":fragments{";
+                for (size_t i = 0; i < sintIntervalFragments->size(); ++i) {
+                    if (i != 0) {
+                        ss << ",";
+                    }
+                    ss << "[" << (*sintIntervalFragments)[i].lower.UVal() << ","
+                       << (*sintIntervalFragments)[i].upper.UVal() << "]";
+                }
+                ss << "}";
             }
             return ss.str();
         }
@@ -1851,6 +2561,454 @@ struct RangeAnalysis::ContextAbstractValue {
     }
 
 };
+
+namespace {
+struct AffineRecursiveSummaryDescriptor {
+    Type* type{nullptr};
+    Parameter* parameter{nullptr};
+    RelationalOperation baseRelation{RelationalOperation::EQ};
+    __int128 bound{0};
+    __int128 parameterStep{0};
+    __int128 baseResult{0};
+    __int128 resultStep{0};
+};
+
+std::optional<__int128> GetMathematicalConstant(Value* value, bool isUnsigned)
+{
+    auto constant = GetSingleIntFromDefiningConstant(value);
+    if (!constant.has_value()) {
+        return std::nullopt;
+    }
+    return ToMathematicalInteger(constant.value(), isUnsigned);
+}
+
+bool IsRelationalKindForRecursiveSummary(ExprKind kind)
+{
+    return kind == ExprKind::LT || kind == ExprKind::LE || kind == ExprKind::GT ||
+        kind == ExprKind::GE || kind == ExprKind::EQUAL || kind == ExprKind::NOTEQUAL;
+}
+
+std::optional<__int128> GetAffineConstantDelta(Value* value, Value* base)
+{
+    if (value == base) {
+        return __int128{0};
+    }
+    auto expression = GetDefiningExpr(value);
+    if (expression == nullptr ||
+        (expression->GetExprKind() != ExprKind::ADD && expression->GetExprKind() != ExprKind::SUB)) {
+        return std::nullopt;
+    }
+    auto binary = StaticCast<const BinaryExpression*>(expression);
+    auto lhs = binary->GetLHSOperand();
+    auto rhs = binary->GetRHSOperand();
+    const bool isUnsigned = base->GetType()->IsUnsignedInteger();
+    if (lhs == base) {
+        auto constant = GetMathematicalConstant(rhs, isUnsigned);
+        if (!constant.has_value()) {
+            return std::nullopt;
+        }
+        return expression->GetExprKind() == ExprKind::ADD
+            ? constant.value()
+            : -constant.value();
+    }
+    if (expression->GetExprKind() == ExprKind::ADD && rhs == base) {
+        return GetMathematicalConstant(lhs, isUnsigned);
+    }
+    return std::nullopt;
+}
+
+std::optional<AffineRecursiveSummaryDescriptor> ExtractAffineRecursiveSummaryDescriptor(const Function* callee)
+{
+    if (callee == nullptr || callee->GetBody() == nullptr || !callee->HasReturnValue()) {
+        return std::nullopt;
+    }
+    auto params = callee->GetParams();
+    auto returnValue = callee->GetReturnValue();
+    auto rawReturnType = returnValue == nullptr ? nullptr : returnValue->GetType();
+    auto returnType = rawReturnType != nullptr && rawReturnType->IsRef()
+        ? GetRefRootBaseType(rawReturnType)
+        : rawReturnType;
+    if (params.size() != 1 || params.front() == nullptr || returnValue == nullptr ||
+        params.front()->GetType() == nullptr || returnType == nullptr ||
+        !params.front()->GetType()->IsInteger() || !returnType->IsInteger() ||
+        ToWidth(*params.front()->GetType()) != ToWidth(*returnType) ||
+        params.front()->GetType()->IsUnsignedInteger() != returnType->IsUnsignedInteger()) {
+        return std::nullopt;
+    }
+    const auto& blocks = callee->GetBody()->GetBlocks();
+    auto entry = callee->GetEntryBlock();
+    if (blocks.size() != 3 || entry == nullptr || entry->GetTerminator() == nullptr ||
+        entry->GetTerminator()->GetExprKind() != ExprKind::BRANCH) {
+        return std::nullopt;
+    }
+    auto branch = StaticCast<const Branch*>(entry->GetTerminator());
+    auto conditionExpression = GetDefiningExpr(branch->GetCondition());
+    if (conditionExpression == nullptr || !IsRelationalKindForRecursiveSummary(conditionExpression->GetExprKind())) {
+        return std::nullopt;
+    }
+    auto condition = StaticCast<const BinaryExpression*>(conditionExpression);
+    auto parameter = params.front();
+    auto lhs = condition->GetLHSOperand();
+    auto rhs = condition->GetRHSOperand();
+    const bool isUnsigned = parameter->GetType()->IsUnsignedInteger();
+    RelationalOperation trueRelation;
+    std::optional<__int128> bound;
+    if (lhs == parameter) {
+        trueRelation = ToRelationalOperation(conditionExpression->GetExprKind());
+        bound = GetMathematicalConstant(rhs, isUnsigned);
+    } else if (rhs == parameter) {
+        auto relation = ToRelationalOperation(conditionExpression->GetExprKind());
+        switch (relation) {
+            case RelationalOperation::LT:
+                trueRelation = RelationalOperation::GT;
+                break;
+            case RelationalOperation::LE:
+                trueRelation = RelationalOperation::GE;
+                break;
+            case RelationalOperation::GT:
+                trueRelation = RelationalOperation::LT;
+                break;
+            case RelationalOperation::GE:
+                trueRelation = RelationalOperation::LE;
+                break;
+            case RelationalOperation::EQ:
+            case RelationalOperation::NE:
+                trueRelation = relation;
+                break;
+        }
+        bound = GetMathematicalConstant(lhs, isUnsigned);
+    } else {
+        return std::nullopt;
+    }
+    if (!bound.has_value()) {
+        return std::nullopt;
+    }
+
+    const Apply* recursiveApply = nullptr;
+    std::vector<const Store*> returnStores;
+    std::vector<const BinaryExpression*> binaryExpressions;
+    for (auto block : blocks) {
+        auto terminator = block->GetTerminator();
+        if (block == entry) {
+            if (terminator != branch) {
+                return std::nullopt;
+            }
+        } else if (terminator == nullptr || terminator->GetExprKind() != ExprKind::EXIT) {
+            return std::nullopt;
+        }
+        for (auto expression : block->GetNonTerminatorExpressions()) {
+            switch (expression->GetExprKind()) {
+                case ExprKind::CONSTANT:
+                case ExprKind::DEBUGEXPR:
+                    break;
+                case ExprKind::ALLOCATE:
+                    if (expression->GetResult() != returnValue) {
+                        return std::nullopt;
+                    }
+                    break;
+                case ExprKind::ADD:
+                case ExprKind::SUB:
+                case ExprKind::LT:
+                case ExprKind::LE:
+                case ExprKind::GT:
+                case ExprKind::GE:
+                case ExprKind::EQUAL:
+                case ExprKind::NOTEQUAL:
+                    binaryExpressions.emplace_back(StaticCast<const BinaryExpression*>(expression));
+                    break;
+                case ExprKind::APPLY: {
+                    auto apply = StaticCast<const Apply*>(expression);
+                    if (recursiveApply != nullptr || DynamicCast<Function*>(apply->GetCallee()) != callee) {
+                        return std::nullopt;
+                    }
+                    recursiveApply = apply;
+                    break;
+                }
+                case ExprKind::STORE: {
+                    auto store = StaticCast<const Store*>(expression);
+                    if (store->GetLocation() != returnValue) {
+                        return std::nullopt;
+                    }
+                    returnStores.emplace_back(store);
+                    break;
+                }
+                default:
+                    return std::nullopt;
+            }
+        }
+    }
+    if (recursiveApply == nullptr || recursiveApply->GetArgs().size() != 1 || returnStores.size() != 2) {
+        return std::nullopt;
+    }
+
+    const Store* baseStore = nullptr;
+    const Store* recursiveStore = nullptr;
+    std::optional<__int128> baseResult;
+    for (auto store : returnStores) {
+        auto constant = GetMathematicalConstant(store->GetValue(), isUnsigned);
+        if (constant.has_value()) {
+            if (baseStore != nullptr) {
+                return std::nullopt;
+            }
+            baseStore = store;
+            baseResult = constant;
+        } else {
+            if (recursiveStore != nullptr) {
+                return std::nullopt;
+            }
+            recursiveStore = store;
+        }
+    }
+    if (baseStore == nullptr || recursiveStore == nullptr || !baseResult.has_value()) {
+        return std::nullopt;
+    }
+    auto baseBlock = baseStore->GetParentBlock();
+    auto recursiveBlock = recursiveStore->GetParentBlock();
+    if (baseBlock == nullptr || recursiveBlock == nullptr || baseBlock == recursiveBlock ||
+        recursiveApply->GetParentBlock() != recursiveBlock ||
+        !((branch->GetTrueBlock() == baseBlock && branch->GetFalseBlock() == recursiveBlock) ||
+            (branch->GetFalseBlock() == baseBlock && branch->GetTrueBlock() == recursiveBlock))) {
+        return std::nullopt;
+    }
+    auto parameterStep = GetAffineConstantDelta(recursiveApply->GetArgs().front(), parameter);
+    auto resultStep = GetAffineConstantDelta(recursiveStore->GetValue(), recursiveApply->GetResult());
+    if (!parameterStep.has_value() || !resultStep.has_value() || parameterStep.value() == 0) {
+        return std::nullopt;
+    }
+    std::unordered_set<const BinaryExpression*> requiredBinaries{condition};
+    if (recursiveApply->GetArgs().front() != parameter) {
+        requiredBinaries.emplace(StaticCast<const BinaryExpression*>(
+            GetDefiningExpr(recursiveApply->GetArgs().front())));
+    }
+    if (recursiveStore->GetValue() != recursiveApply->GetResult()) {
+        requiredBinaries.emplace(
+            StaticCast<const BinaryExpression*>(GetDefiningExpr(recursiveStore->GetValue())));
+    }
+    if (binaryExpressions.size() != requiredBinaries.size() ||
+        std::any_of(binaryExpressions.begin(), binaryExpressions.end(),
+            [&requiredBinaries](const BinaryExpression* binary) {
+                return requiredBinaries.find(binary) == requiredBinaries.end();
+            })) {
+        return std::nullopt;
+    }
+
+    auto baseRelation = branch->GetTrueBlock() == baseBlock
+        ? trueRelation
+        : NegateRelation(trueRelation);
+    const bool descendsToLowerBase =
+        baseRelation == RelationalOperation::LT || baseRelation == RelationalOperation::LE;
+    const bool ascendsToUpperBase =
+        baseRelation == RelationalOperation::GT || baseRelation == RelationalOperation::GE;
+    if ((!descendsToLowerBase && !ascendsToUpperBase) ||
+        (descendsToLowerBase && parameterStep.value() >= 0) ||
+        (ascendsToUpperBase && parameterStep.value() <= 0)) {
+        return std::nullopt;
+    }
+    return AffineRecursiveSummaryDescriptor{parameter->GetType(), parameter, baseRelation,
+        bound.value(), parameterStep.value(), baseResult.value(), resultStep.value()};
+}
+
+bool RelationHolds(__int128 value, RelationalOperation relation, __int128 bound)
+{
+    switch (relation) {
+        case RelationalOperation::LT:
+            return value < bound;
+        case RelationalOperation::LE:
+            return value <= bound;
+        case RelationalOperation::GT:
+            return value > bound;
+        case RelationalOperation::GE:
+            return value >= bound;
+        case RelationalOperation::EQ:
+            return value == bound;
+        case RelationalOperation::NE:
+            return value != bound;
+    }
+}
+
+std::optional<uint64_t> GetAffineRecursionIterationCount(
+    __int128 input, const AffineRecursiveSummaryDescriptor& descriptor)
+{
+    if (RelationHolds(input, descriptor.baseRelation, descriptor.bound)) {
+        return uint64_t{0};
+    }
+    unsigned __int128 distance = 0;
+    unsigned __int128 step = 0;
+    bool strict = false;
+    switch (descriptor.baseRelation) {
+        case RelationalOperation::LE:
+            distance = static_cast<unsigned __int128>(input - descriptor.bound);
+            step = static_cast<unsigned __int128>(-descriptor.parameterStep);
+            break;
+        case RelationalOperation::LT:
+            distance = static_cast<unsigned __int128>(input - descriptor.bound);
+            step = static_cast<unsigned __int128>(-descriptor.parameterStep);
+            strict = true;
+            break;
+        case RelationalOperation::GE:
+            distance = static_cast<unsigned __int128>(descriptor.bound - input);
+            step = static_cast<unsigned __int128>(descriptor.parameterStep);
+            break;
+        case RelationalOperation::GT:
+            distance = static_cast<unsigned __int128>(descriptor.bound - input);
+            step = static_cast<unsigned __int128>(descriptor.parameterStep);
+            strict = true;
+            break;
+        case RelationalOperation::EQ:
+        case RelationalOperation::NE:
+            return std::nullopt;
+    }
+    auto count = strict ? distance / step + 1 : (distance + step - 1) / step;
+    if (count > std::numeric_limits<uint64_t>::max()) {
+        return std::nullopt;
+    }
+    return static_cast<uint64_t>(count);
+}
+
+bool IsWithin(__int128 value, __int128 lower, __int128 upper)
+{
+    return value >= lower && value <= upper;
+}
+
+std::optional<__int128> EvaluateAffineRecursiveResult(__int128 input,
+    const AffineRecursiveSummaryDescriptor& descriptor, __int128 resultLower, __int128 resultUpper)
+{
+    auto iterations = GetAffineRecursionIterationCount(input, descriptor);
+    if (!iterations.has_value()) {
+        return std::nullopt;
+    }
+    auto count = static_cast<__int128>(iterations.value());
+    if (descriptor.resultStep > 0 &&
+        count > (resultUpper - descriptor.baseResult) / descriptor.resultStep) {
+        return std::nullopt;
+    }
+    if (descriptor.resultStep < 0 &&
+        count > (descriptor.baseResult - resultLower) / -descriptor.resultStep) {
+        return std::nullopt;
+    }
+    auto result = descriptor.baseResult + count * descriptor.resultStep;
+    return IsWithin(result, resultLower, resultUpper)
+        ? std::optional<__int128>{result}
+        : std::nullopt;
+}
+
+SInt MakeSIntFromMathematicalInteger(IntWidth width, __int128 value)
+{
+    return SInt{width, static_cast<uint64_t>(value)};
+}
+}
+
+std::optional<RangeAnalysis::ContextAbstractValue> RangeAnalysis::TryAnalyzeAffineRecursiveCallee(
+    const Function* callee, const ContextArguments& arguments,
+    const ContextGlobalValues& globalValues) const
+{
+    if (callee == nullptr || arguments.size() != 1 || !globalValues.empty() ||
+        arguments.front().kind != ContextAbstractValue::Kind::SINT ||
+        arguments.front().sintValue == nullptr) {
+        return std::nullopt;
+    }
+    static std::mutex descriptorMutex;
+    static std::unordered_map<const Function*, std::optional<AffineRecursiveSummaryDescriptor>> descriptorCache;
+    std::optional<AffineRecursiveSummaryDescriptor> descriptor;
+    {
+        std::lock_guard<std::mutex> lock(descriptorMutex);
+        auto found = descriptorCache.find(callee);
+        if (found == descriptorCache.end()) {
+            found = descriptorCache.emplace(callee, ExtractAffineRecursiveSummaryDescriptor(callee)).first;
+        }
+        descriptor = found->second;
+    }
+    if (!descriptor.has_value()) {
+        return std::nullopt;
+    }
+    const auto& input = *arguments.front().sintValue;
+    if (input.IsBottom() || input.Width() != ToWidth(*descriptor->type) ||
+        input.IsUnsigned() != descriptor->type->IsUnsignedInteger()) {
+        return std::nullopt;
+    }
+    const auto width = input.Width();
+    const bool isUnsigned = input.IsUnsigned();
+    const __int128 typeLower = isUnsigned
+        ? __int128{0}
+        : static_cast<__int128>(SInt::SMinValue(width).SVal());
+    const __int128 typeUpper = isUnsigned
+        ? static_cast<__int128>(SInt::UMaxValue(width).UVal())
+        : static_cast<__int128>(SInt::SMaxValue(width).SVal());
+    if (!IsWithin(descriptor->bound, typeLower, typeUpper) ||
+        !IsWithin(descriptor->baseResult, typeLower, typeUpper)) {
+        return std::nullopt;
+    }
+    __int128 terminalLower = descriptor->bound;
+    __int128 terminalUpper = descriptor->bound;
+    switch (descriptor->baseRelation) {
+        case RelationalOperation::LE:
+            terminalLower = descriptor->bound + descriptor->parameterStep + 1;
+            break;
+        case RelationalOperation::LT:
+            terminalLower = descriptor->bound + descriptor->parameterStep;
+            terminalUpper = descriptor->bound - 1;
+            break;
+        case RelationalOperation::GE:
+            terminalUpper = descriptor->bound + descriptor->parameterStep - 1;
+            break;
+        case RelationalOperation::GT:
+            terminalLower = descriptor->bound + 1;
+            terminalUpper = descriptor->bound + descriptor->parameterStep;
+            break;
+        case RelationalOperation::EQ:
+        case RelationalOperation::NE:
+            return std::nullopt;
+    }
+    if (!IsWithin(terminalLower, typeLower, typeUpper) ||
+        !IsWithin(terminalUpper, typeLower, typeUpper)) {
+        return std::nullopt;
+    }
+    const auto& numeric = input.NumericBound();
+    if (numeric.IsEmptySet() ||
+        (isUnsigned ? numeric.IsWrappedSet() : numeric.IsSignWrappedSet())) {
+        return std::nullopt;
+    }
+    const auto inputLower = ToMathematicalInteger(numeric.MinValue(isUnsigned), isUnsigned);
+    const auto inputUpper = ToMathematicalInteger(numeric.MaxValue(isUnsigned), isUnsigned);
+    auto lowerResult = EvaluateAffineRecursiveResult(
+        inputLower, descriptor.value(), typeLower, typeUpper);
+    auto upperResult = EvaluateAffineRecursiveResult(
+        inputUpper, descriptor.value(), typeLower, typeUpper);
+    if (!lowerResult.has_value() || !upperResult.has_value()) {
+        return std::nullopt;
+    }
+    auto resultLower = std::min(lowerResult.value(), upperResult.value());
+    auto resultUpper = std::max(lowerResult.value(), upperResult.value());
+
+    std::optional<std::vector<SInt>> exactValues;
+    if (arguments.front().exactSIntValues.has_value()) {
+        std::vector<SInt> results;
+        results.reserve(arguments.front().exactSIntValues->size());
+        for (const auto& value : *arguments.front().exactSIntValues) {
+            auto exactResult = EvaluateAffineRecursiveResult(
+                ToMathematicalInteger(value, isUnsigned), descriptor.value(), typeLower, typeUpper);
+            if (!exactResult.has_value()) {
+                return std::nullopt;
+            }
+            results.emplace_back(MakeSIntFromMathematicalInteger(width, exactResult.value()));
+        }
+        exactValues = NormalizeExactIntSet(std::move(results));
+    }
+    auto lower = MakeSIntFromMathematicalInteger(width, resultLower);
+    auto upper = MakeSIntFromMathematicalInteger(width, resultUpper);
+    auto domain = SIntDomain::Intersects(
+        SIntDomain::FromNumeric(RelationalOperation::GE, lower, isUnsigned),
+        SIntDomain::FromNumeric(RelationalOperation::LE, upper, isUnsigned));
+    std::optional<SIntCongruence> congruence;
+    auto absoluteResultStep = descriptor->resultStep < 0
+        ? static_cast<unsigned __int128>(-descriptor->resultStep)
+        : static_cast<unsigned __int128>(descriptor->resultStep);
+    if (absoluteResultStep > 1 && absoluteResultStep <= std::numeric_limits<uint64_t>::max()) {
+        auto stride = static_cast<uint64_t>(absoluteResultStep);
+        congruence = SIntCongruence{stride, CanonicalResidue(descriptor->baseResult, stride)};
+    }
+    return ContextAbstractValue{domain, std::move(exactValues), std::move(congruence)};
+}
 
 std::optional<std::vector<GlobalVar*>> RangeAnalysis::CollectContextMutableGlobals(
     const Function* callee, const ContextArguments& arguments) const
@@ -3020,7 +4178,9 @@ RangeAnalysis::ContextAbstractValue RangeAnalysis::CaptureContextValue(
                 if (literalRange != nullptr && literalRange->GetRangeKind() == ValueRange::RangeKind::SINT) {
                     const auto* sintRange = StaticCast<const SIntRange*>(literalRange);
                     return ContextAbstractValue{
-                        sintRange->GetVal(), sintRange->GetExactValues(), sintRange->GetCongruence()};
+                        sintRange->GetVal(), sintRange->GetExactValues(), sintRange->GetCongruence(),
+                        sintRange->GetKnownBits(), sintRange->GetExcludedValues(),
+                        sintRange->GetIntervalFragments()};
                 }
             }
         }
@@ -3112,11 +4272,17 @@ RangeAnalysis::ContextAbstractValue RangeAnalysis::CaptureContextValue(
                 if (absVal->GetRangeKind() == ValueRange::RangeKind::SINT) {
                     const auto* sintRange = StaticCast<const SIntRange*>(absVal);
                     const auto& sintDomain = sintRange->GetVal();
-                    fields.emplace_back((sintDomain.IsNonTrivial() || sintRange->GetCongruence().has_value()) &&
+                    fields.emplace_back((sintDomain.IsNonTrivial() || sintRange->GetCongruence().has_value() ||
+                            sintRange->GetKnownBits().has_value() || sintRange->GetExcludedValues().has_value() ||
+                            sintRange->GetIntervalFragments().has_value()) &&
                             (preserveIntervals || sintDomain.IsSingleValue() ||
-                                sintRange->GetExactValues().has_value() || sintRange->GetCongruence().has_value())
+                                sintRange->GetExactValues().has_value() || sintRange->GetCongruence().has_value() ||
+                                sintRange->GetKnownBits().has_value() || sintRange->GetExcludedValues().has_value() ||
+                                sintRange->GetIntervalFragments().has_value())
                         ? ContextAbstractValue{
-                              sintDomain, sintRange->GetExactValues(), sintRange->GetCongruence()}
+                              sintDomain, sintRange->GetExactValues(), sintRange->GetCongruence(),
+                              sintRange->GetKnownBits(), sintRange->GetExcludedValues(),
+                              sintRange->GetIntervalFragments()}
                         : ContextAbstractValue{});
                     continue;
                 }
@@ -3152,12 +4318,18 @@ RangeAnalysis::ContextAbstractValue RangeAnalysis::CaptureContextValue(
         const auto* sintRange = StaticCast<const SIntRange*>(absVal);
         const auto& sintDomain = sintRange->GetVal();
         const auto& exactValues = sintRange->GetExactValues();
-        if ((!sintDomain.IsNonTrivial() && !sintRange->GetCongruence().has_value()) ||
+        if ((!sintDomain.IsNonTrivial() && !sintRange->GetCongruence().has_value() &&
+                !sintRange->GetKnownBits().has_value() && !sintRange->GetExcludedValues().has_value() &&
+                !sintRange->GetIntervalFragments().has_value()) ||
             (!preserveIntervals && !sintDomain.IsSingleValue() && !exactValues.has_value() &&
-                !sintRange->GetCongruence().has_value())) {
+                !sintRange->GetCongruence().has_value() && !sintRange->GetKnownBits().has_value() &&
+                !sintRange->GetExcludedValues().has_value() &&
+                !sintRange->GetIntervalFragments().has_value())) {
             return ContextAbstractValue{};
         }
-        return ContextAbstractValue{sintDomain, exactValues, sintRange->GetCongruence()};
+        return ContextAbstractValue{
+            sintDomain, exactValues, sintRange->GetCongruence(), sintRange->GetKnownBits(),
+            sintRange->GetExcludedValues(), sintRange->GetIntervalFragments()};
     }
     return ContextAbstractValue{};
 }
@@ -3174,10 +4346,28 @@ RangeAnalysis::ContextAbstractValue RangeAnalysis::JoinContextValues(
     if (lhs.kind == ContextAbstractValue::Kind::SINT && lhs.sintValue && rhs.sintValue &&
         lhs.sintValue->Width() == rhs.sintValue->Width() &&
         lhs.sintValue->IsUnsigned() == rhs.sintValue->IsUnsigned()) {
-        return ContextAbstractValue{SIntDomain::Unions(*lhs.sintValue, *rhs.sintValue),
+        auto lhsKnownBits = lhs.sintKnownBits;
+        auto rhsKnownBits = rhs.sintKnownBits;
+        if (lhsKnownBits.has_value() || rhsKnownBits.has_value()) {
+            lhsKnownBits = GetEffectiveKnownBits(
+                *lhs.sintValue, lhs.exactSIntValues, lhs.sintCongruence, lhsKnownBits);
+            rhsKnownBits = GetEffectiveKnownBits(
+                *rhs.sintValue, rhs.exactSIntValues, rhs.sintCongruence, rhsKnownBits);
+        }
+        auto joinedDomain = SIntDomain::Unions(*lhs.sintValue, *rhs.sintValue);
+        SIntRange lhsRange{*lhs.sintValue, lhs.exactSIntValues, lhs.sintCongruence,
+            lhs.sintKnownBits, lhs.excludedSIntValues, lhs.sintIntervalFragments};
+        SIntRange rhsRange{*rhs.sintValue, rhs.exactSIntValues, rhs.sintCongruence,
+            rhs.sintKnownBits, rhs.excludedSIntValues, rhs.sintIntervalFragments};
+        return ContextAbstractValue{joinedDomain,
             MergeExactIntSets(lhs.exactSIntValues, rhs.exactSIntValues),
             MergeSIntCongruencesForUnion(*lhs.sintValue, lhs.exactSIntValues, lhs.sintCongruence,
-                *rhs.sintValue, rhs.exactSIntValues, rhs.sintCongruence)};
+                *rhs.sintValue, rhs.exactSIntValues, rhs.sintCongruence),
+            MergeSIntKnownBitsForUnion(
+                *lhs.sintValue, lhsKnownBits, *rhs.sintValue, rhsKnownBits),
+            MergeExcludedSIntValuesForUnion(*lhs.sintValue, lhs.excludedSIntValues,
+                *rhs.sintValue, rhs.excludedSIntValues, joinedDomain),
+            MergeSIntIntervalFragmentsForUnion(lhsRange, rhsRange, joinedDomain)};
     }
     if (lhs.kind == ContextAbstractValue::Kind::CLASS) {
         return lhs.classValue == rhs.classValue ? ContextAbstractValue{lhs.classValue} : ContextAbstractValue{};
@@ -3770,7 +4960,8 @@ void RangeAnalysis::ApplyContextValue(RangeDomain& state, Value* dest, Type* typ
     }
     if ((type == nullptr || type->IsInteger()) && value.kind == ContextAbstractValue::Kind::SINT && value.sintValue) {
         state.Update(dest, std::make_unique<SIntRange>(
-            *value.sintValue, value.exactSIntValues, value.sintCongruence));
+            *value.sintValue, value.exactSIntValues, value.sintCongruence, value.sintKnownBits,
+            value.excludedSIntValues, value.sintIntervalFragments));
         return;
     }
     if (type != nullptr && type->IsRawArray() && value.kind == ContextAbstractValue::Kind::OBJECT) {
@@ -4924,9 +6115,38 @@ std::optional<RangeAnalysis::ContextAbstractValue> RangeAnalysis::AnalyzeCalleeW
         ++rangeAnalysisPerfStats.contextAnalysisCalls;
     }
     ScopedRangeAnalysisPerfTimer timer(&rangeAnalysisPerfStats.contextAnalysisNanos);
+    if (auto affineRecursiveSummary =
+            TryAnalyzeAffineRecursiveCallee(callee, arguments, globalValues);
+        affineRecursiveSummary.has_value()) {
+        refArgValues.clear();
+        return affineRecursiveSummary;
+    }
     auto key = precomputedKey == nullptr
         ? BuildContextKey(callee, arguments, globalValues)
         : *precomputedKey;
+    // Exact scalar recursion carries no abstract memory and each context has a
+    // single concrete argument tuple.  A separate, still-bounded budget lets
+    // finite descending recurrences finish without weakening the general
+    // context limits used by interval, reference, and side-effecting calls.
+    constexpr size_t MAX_EXACT_SCALAR_RECURSION_DEPTH = 512;
+    constexpr size_t MAX_EXACT_SCALAR_RECURSION_CONTEXTS_PER_FUNCTION = 512;
+    const auto params = callee == nullptr ? std::vector<Parameter*>{} : callee->GetParams();
+    auto returnType = callee == nullptr || !callee->HasReturnValue()
+        ? nullptr
+        : callee->GetReturnValue()->GetType();
+    const bool hasScalarReturn = IsSupportedLambdaResultType(returnType);
+    const bool isRecursiveCall = callee != nullptr &&
+        std::find(contextSummaryFunctionStack.begin(), contextSummaryFunctionStack.end(), callee) !=
+            contextSummaryFunctionStack.end();
+    const bool isExactScalarRecursiveContext = isRecursiveCall && globalValues.empty() &&
+        hasScalarReturn &&
+        params.size() == arguments.size() &&
+        std::all_of(arguments.begin(), arguments.end(),
+            [](const auto& argument) { return argument.IsSingleValue(); }) &&
+        std::all_of(params.begin(), params.end(), [](const Parameter* parameter) {
+            auto type = parameter == nullptr ? nullptr : parameter->GetType();
+            return type != nullptr && !type->IsRef() && (type->IsInteger() || type->IsBoolean());
+        });
     const auto setUnknownOutputs = [&refArgValues, &globalValues]() {
         refArgValues.clear();
         for (auto& entry : globalValues) {
@@ -5028,7 +6248,31 @@ std::optional<RangeAnalysis::ContextAbstractValue> RangeAnalysis::AnalyzeCalleeW
         const bool summaryLimitReached = boundedLoopEvaluationOwner != nullptr
             ? boundedSummaryCount >= MAX_TOTAL_BOUNDED_LOOP_CONTEXT_SUMMARIES
             : regularSummaryCount >= rangeAnalysisConfig.maxTotalContextSummaries;
-        if (contextSummaryAnalysisDepth >= rangeAnalysisConfig.maxContextAnalysisDepth ||
+        const auto contextDepthLimit = isExactScalarRecursiveContext
+            ? MAX_EXACT_SCALAR_RECURSION_DEPTH
+            : rangeAnalysisConfig.maxContextAnalysisDepth;
+        if (IsOverrideTraceEnabled() &&
+            (contextSummaryAnalysisDepth >= contextDepthLimit || summaryLimitReached ||
+                GetContextSummaryOrder().size() >= MaxTotalReachableContextSummaries() ||
+                IsContextAnalysisBudgetExhausted())) {
+            std::cerr << "[RangeAnalysisRecursiveBudget] callee="
+                      << (callee == nullptr ? "<null>" : callee->GetIdentifier())
+                      << " recursive=" << isRecursiveCall
+                      << " exact-scalar=" << isExactScalarRecursiveContext
+                      << " globals=" << globalValues.size()
+                      << " params=" << params.size()
+                      << " arguments=" << arguments.size()
+                      << " scalar-return=" << hasScalarReturn
+                      << " all-single="
+                      << std::all_of(arguments.begin(), arguments.end(),
+                             [](const auto& argument) { return argument.IsSingleValue(); })
+                      << " depth=" << contextSummaryAnalysisDepth
+                      << " depth-limit=" << contextDepthLimit
+                      << " regular-summaries=" << regularSummaryCount
+                      << " summary-limit=" << summaryLimitReached
+                      << '\n';
+        }
+        if (contextSummaryAnalysisDepth >= contextDepthLimit ||
             summaryLimitReached ||
             GetContextSummaryOrder().size() >= MaxTotalReachableContextSummaries() ||
             IsContextAnalysisBudgetExhausted()) {
@@ -5046,9 +6290,10 @@ std::optional<RangeAnalysis::ContextAbstractValue> RangeAnalysis::AnalyzeCalleeW
             ++boundedCount;
         } else {
             auto& count = GetContextCounts()[callee];
-            auto contextLimit = globalValues.empty()
-                ? rangeAnalysisConfig.maxContextPerFunction
-                : MAX_GLOBAL_CONTEXT_PER_FUNCTION;
+            auto contextLimit = isExactScalarRecursiveContext
+                ? MAX_EXACT_SCALAR_RECURSION_CONTEXTS_PER_FUNCTION
+                : globalValues.empty() ? rangeAnalysisConfig.maxContextPerFunction
+                                       : MAX_GLOBAL_CONTEXT_PER_FUNCTION;
             if (count >= contextLimit) {
                 rejectContext();
                 setUnknownOutputs();
@@ -5077,16 +6322,18 @@ std::optional<RangeAnalysis::ContextAbstractValue> RangeAnalysis::AnalyzeCalleeW
     }
 
     struct ContextDepthGuard {
-        ContextDepthGuard()
+        explicit ContextDepthGuard(const Function* function)
         {
             ++contextSummaryAnalysisDepth;
+            contextSummaryFunctionStack.emplace_back(function);
         }
 
         ~ContextDepthGuard()
         {
+            contextSummaryFunctionStack.pop_back();
             --contextSummaryAnalysisDepth;
         }
-    } depthGuard;
+    } depthGuard{callee};
 
     std::optional<ContextAbstractValue> returnValue;
     std::vector<std::optional<ContextAbstractValue>> summarizedRefArgs;
@@ -5337,7 +6584,7 @@ BoolRange::BoolRange(BoolDomain domain) : ValueRange(RangeKind::BOOL), domain(st
 std::optional<std::unique_ptr<ValueRange>> BoolRange::Join(const ValueRange& rhs) const
 {
     CJC_ASSERT(rhs.GetRangeKind() == RangeKind::BOOL);
-    auto rhsRange = StaticCast<const BoolRange&>(rhs);
+    const auto& rhsRange = StaticCast<const BoolRange&>(rhs);
     auto joinedDomain = BoolDomain::Union(domain, rhsRange.domain);
     if (domain.IsSame(joinedDomain)) {
         return std::nullopt;
@@ -5362,11 +6609,9 @@ const BoolDomain& BoolRange::GetVal() const
     return domain;
 }
 
-SIntRange::SIntRange(SIntDomain domain) : ValueRange(RangeKind::SINT), domain(std::move(domain))
+SIntRange::SIntRange(SIntDomain domain)
+    : SIntRange(std::move(domain), std::nullopt, std::nullopt, std::nullopt, std::nullopt)
 {
-    if (this->domain.IsSingleValue()) {
-        exactValues = std::vector<SInt>{this->domain.NumericBound().GetSingleElement()};
-    }
 }
 
 SIntRange::SIntRange(SIntDomain domain, std::optional<std::vector<SInt>> exactValues)
@@ -5376,9 +6621,26 @@ SIntRange::SIntRange(SIntDomain domain, std::optional<std::vector<SInt>> exactVa
 
 SIntRange::SIntRange(SIntDomain domain, std::optional<std::vector<SInt>> exactValues,
     std::optional<SIntCongruence> congruence)
+    : SIntRange(std::move(domain), std::move(exactValues), std::move(congruence), std::nullopt)
+{
+}
+
+SIntRange::SIntRange(SIntDomain domain, std::optional<std::vector<SInt>> exactValues,
+    std::optional<SIntCongruence> congruence, std::optional<SIntKnownBits> knownBits)
+    : SIntRange(std::move(domain), std::move(exactValues), std::move(congruence),
+          std::move(knownBits), std::nullopt)
+{
+}
+
+SIntRange::SIntRange(SIntDomain domain, std::optional<std::vector<SInt>> exactValues,
+    std::optional<SIntCongruence> congruence, std::optional<SIntKnownBits> knownBits,
+    std::optional<std::vector<SInt>> excludedValues,
+    std::optional<std::vector<SIntIntervalFragment>> intervalFragments)
     : ValueRange(RangeKind::SINT), domain(std::move(domain)),
       exactValues(exactValues.has_value() ? NormalizeExactIntSet(std::move(*exactValues)) : std::nullopt),
-      congruence(NormalizeCongruence(std::move(congruence)))
+      congruence(NormalizeCongruence(std::move(congruence))),
+      knownBits(NormalizeKnownBits(std::move(knownBits), this->domain.Width())),
+      excludedValues(nullptr), intervalFragments(nullptr)
 {
     if (!this->exactValues.has_value() && this->domain.IsSingleValue()) {
         this->exactValues = std::vector<SInt>{this->domain.NumericBound().GetSingleElement()};
@@ -5386,34 +6648,125 @@ SIntRange::SIntRange(SIntDomain domain, std::optional<std::vector<SInt>> exactVa
     if (!this->congruence.has_value()) {
         this->congruence = InferCongruenceFromExactValues(this->exactValues, this->domain.IsUnsigned());
     }
+    if (this->knownBits.has_value()) {
+        this->domain = SIntDomain::Intersects(this->domain,
+            DomainFromKnownBits(this->knownBits, this->domain.Width(), this->domain.IsUnsigned()));
+    }
+    auto normalizedExcludedValues = excludedValues.has_value()
+        ? NormalizeExcludedSIntValues(std::move(*excludedValues), this->domain)
+        : std::nullopt;
+    if (normalizedExcludedValues.has_value()) {
+        this->exactValues = FilterExactValuesByExclusions(
+            std::move(this->exactValues), normalizedExcludedValues);
+    }
+    if (!this->exactValues.has_value() && this->domain.IsSingleValue()) {
+        const auto singleton = this->domain.NumericBound().GetSingleElement();
+        if (!IsExplicitlyExcluded(normalizedExcludedValues, singleton)) {
+            this->exactValues = std::vector<SInt>{singleton};
+        }
+    }
+    if (!this->congruence.has_value()) {
+        this->congruence = InferCongruenceFromKnownBits(this->knownBits, this->domain.Width());
+    }
+    if (normalizedExcludedValues.has_value()) {
+        this->excludedValues =
+            std::make_unique<std::optional<std::vector<SInt>>>(std::move(normalizedExcludedValues));
+    }
+    auto normalizedFragments = intervalFragments.has_value()
+        ? NormalizeSIntIntervalFragments(std::move(*intervalFragments), this->domain)
+        : std::nullopt;
+    normalizedFragments = RefineSIntIntervalFragmentsByCongruence(
+        std::move(normalizedFragments), this->congruence, this->domain);
+    if (normalizedFragments.has_value()) {
+        this->intervalFragments =
+            std::make_unique<std::optional<std::vector<SIntIntervalFragment>>>(
+                std::move(normalizedFragments));
+    }
 }
 
 std::optional<std::unique_ptr<ValueRange>> SIntRange::Join(const ValueRange& rhs) const
 {
     CJC_ASSERT(rhs.GetRangeKind() == RangeKind::SINT);
-    auto rhsRange = StaticCast<const SIntRange&>(rhs);
+    const auto& rhsRange = StaticCast<const SIntRange&>(rhs);
     auto mergedExactValues = MergeExactIntSets(exactValues, rhsRange.exactValues);
     auto mergedCongruence = MergeSIntCongruencesForUnion(domain, exactValues, congruence,
         rhsRange.domain, rhsRange.exactValues, rhsRange.congruence);
+    auto lhsKnownBits = knownBits;
+    auto rhsKnownBits = rhsRange.knownBits;
+    if (knownBits.has_value() || rhsRange.knownBits.has_value()) {
+        lhsKnownBits = GetEffectiveKnownBits(domain, exactValues, congruence, knownBits);
+        rhsKnownBits = GetEffectiveKnownBits(
+            rhsRange.domain, rhsRange.exactValues, rhsRange.congruence, rhsRange.knownBits);
+    }
+    auto mergedKnownBits = MergeSIntKnownBitsForUnion(
+        domain, lhsKnownBits, rhsRange.domain, rhsKnownBits);
     auto joinedDomain = SIntDomain::Unions(domain, rhsRange.domain);
+    auto mergedExcludedValues = MergeExcludedSIntValuesForUnion(domain, GetExcludedValues(),
+        rhsRange.domain, rhsRange.GetExcludedValues(), joinedDomain);
+    // Exact sets and bounded individual exclusions already describe the
+    // non-convex union without loss. Avoid carrying a second representation
+    // (and its vector allocations) through ordinary small joins.
+    auto mergedIntervalFragments =
+        mergedExactValues.has_value() || mergedExcludedValues.has_value()
+        ? std::optional<std::vector<SIntIntervalFragment>>{}
+        : MergeSIntIntervalFragmentsForUnion(*this, rhsRange, joinedDomain);
     if (domain.IsSame(joinedDomain) && exactValues == mergedExactValues && congruence == mergedCongruence &&
+        knownBits == mergedKnownBits && GetExcludedValues() == mergedExcludedValues &&
+        GetIntervalFragments() == mergedIntervalFragments &&
         !(domain.NumericBound().IsFullSet() && !domain.SymbolicBounds().Empty())) {
         return std::nullopt;
     }
     return std::make_unique<SIntRange>(
-        SIntRange{std::move(joinedDomain), std::move(mergedExactValues), std::move(mergedCongruence)});
+        SIntRange{std::move(joinedDomain), std::move(mergedExactValues), std::move(mergedCongruence),
+            std::move(mergedKnownBits), std::move(mergedExcludedValues),
+            std::move(mergedIntervalFragments)});
 }
 
 std::string SIntRange::ToString() const
 {
     std::stringstream ss;
     ss << domain;
+    const auto& exclusions = GetExcludedValues();
+    if (exclusions.has_value()) {
+        ss << "\\{";
+        for (size_t i = 0; i < exclusions->size(); ++i) {
+            if (i != 0) {
+                ss << ",";
+            }
+            if (domain.IsUnsigned()) {
+                ss << (*exclusions)[i].UVal();
+            } else {
+                ss << (*exclusions)[i].SVal();
+            }
+        }
+        ss << "}";
+    }
+    const auto& fragments = GetIntervalFragments();
+    if (fragments.has_value()) {
+        ss << " fragments{";
+        for (size_t i = 0; i < fragments->size(); ++i) {
+            if (i != 0) {
+                ss << ",";
+            }
+            if (domain.IsUnsigned()) {
+                ss << "[" << (*fragments)[i].lower.UVal() << ","
+                   << (*fragments)[i].upper.UVal() << ":"
+                   << (*fragments)[i].stride << "]";
+            } else {
+                ss << "[" << (*fragments)[i].lower.SVal() << ","
+                   << (*fragments)[i].upper.SVal() << ":"
+                   << (*fragments)[i].stride << "]";
+            }
+        }
+        ss << "}";
+    }
     return ss.str();
 }
 
 std::unique_ptr<ValueRange> SIntRange::Clone() const
 {
-    return std::make_unique<SIntRange>(domain, exactValues, congruence);
+    return std::make_unique<SIntRange>(
+        domain, exactValues, congruence, knownBits, GetExcludedValues(), GetIntervalFragments());
 }
 
 const SIntDomain& SIntRange::GetVal() const
@@ -5429,6 +6782,23 @@ const std::optional<std::vector<SInt>>& SIntRange::GetExactValues() const
 const std::optional<SIntCongruence>& SIntRange::GetCongruence() const
 {
     return congruence;
+}
+
+const std::optional<SIntKnownBits>& SIntRange::GetKnownBits() const
+{
+    return knownBits;
+}
+
+const std::optional<std::vector<SInt>>& SIntRange::GetExcludedValues() const
+{
+    static const std::optional<std::vector<SInt>> noExcludedValues;
+    return excludedValues == nullptr ? noExcludedValues : *excludedValues;
+}
+
+const std::optional<std::vector<SIntIntervalFragment>>& SIntRange::GetIntervalFragments() const
+{
+    static const std::optional<std::vector<SIntIntervalFragment>> noIntervalFragments;
+    return intervalFragments == nullptr ? noIntervalFragments : *intervalFragments;
 }
 
 template <> bool IsTrackedGV<RangeValueDomain>(const GlobalVar& gv)
@@ -5504,17 +6874,19 @@ RangeAnalysis::~RangeAnalysis()
     }
 }
 
-void RangeAnalysis::SetQueryRefinementContext(
-    std::unordered_set<const Block*> blocks, std::unordered_set<const Value*> values)
+void RangeAnalysis::SetQueryRefinementContext(std::unordered_set<const Block*> blocks,
+    std::unordered_set<const Value*> values, std::unordered_set<const Value*> roots)
 {
     queryRefinementBlocks = std::move(blocks);
     queryRefinementValues = std::move(values);
+    queryRefinementRoots = std::move(roots);
 }
 
 void RangeAnalysis::ClearQueryRefinementBlocks()
 {
     queryRefinementBlocks.clear();
     queryRefinementValues.clear();
+    queryRefinementRoots.clear();
 }
 
 void RangeAnalysis::RecordTerminatorEdgeState(
@@ -5749,8 +7121,46 @@ bool StrictlyGreater(const SInt& lhs, const SInt& rhs, bool isUnsigned)
     return isUnsigned ? lhs.Ugt(rhs) : lhs.Sgt(rhs);
 }
 
+std::optional<SInt> FindUpperWideningThreshold(
+    const std::vector<SInt>& thresholds, const SInt& bound, bool isUnsigned)
+{
+    std::optional<SInt> result;
+    for (const auto& threshold : thresholds) {
+        if (threshold.Width() != bound.Width() || StrictlyLess(threshold, bound, isUnsigned)) {
+            continue;
+        }
+        if (!result.has_value() || StrictlyLess(threshold, result.value(), isUnsigned)) {
+            result = threshold;
+        }
+    }
+    return result;
+}
+
+std::optional<SInt> FindLowerWideningThreshold(
+    const std::vector<SInt>& thresholds, const SInt& bound, bool isUnsigned)
+{
+    std::optional<SInt> result;
+    for (const auto& threshold : thresholds) {
+        if (threshold.Width() != bound.Width() || StrictlyGreater(threshold, bound, isUnsigned)) {
+            continue;
+        }
+        if (!result.has_value() || StrictlyGreater(threshold, result.value(), isUnsigned)) {
+            result = threshold;
+        }
+    }
+    return result;
+}
+
+SIntDomain MakeFiniteWideningRange(const SInt& lower, const SInt& upper, bool isUnsigned)
+{
+    return SIntDomain::Intersects(
+        SIntDomain::FromNumeric(RelationalOperation::GE, lower, isUnsigned),
+        SIntDomain::FromNumeric(RelationalOperation::LE, upper, isUnsigned));
+}
+
 // 对整数区间执行单边 widening，保证循环不动点收敛。
-SIntDomain WidenSIntDomain(const SIntDomain& previous, const SIntDomain& current)
+SIntDomain WidenSIntDomain(const SIntDomain& previous, const SIntDomain& current,
+    const std::vector<SInt>& thresholds)
 {
     auto width = current.Width();
     auto isUnsigned = current.IsUnsigned();
@@ -5776,12 +7186,26 @@ SIntDomain WidenSIntDomain(const SIntDomain& previous, const SIntDomain& current
     auto lowerMovedDown = StrictlyLess(joinedMin, previousMin, isUnsigned);
     auto upperMovedUp = StrictlyGreater(joinedMax, previousMax, isUnsigned);
     if (lowerMovedDown && upperMovedUp) {
-        return SIntDomain::Top(width, isUnsigned);
+        auto thresholdMin = FindLowerWideningThreshold(thresholds, joinedMin, isUnsigned);
+        auto thresholdMax = FindUpperWideningThreshold(thresholds, joinedMax, isUnsigned);
+        auto lower = thresholdMin.value_or(
+            isUnsigned ? SInt::UMinValue(width) : SInt::SMinValue(width));
+        auto upper = thresholdMax.value_or(
+            isUnsigned ? SInt::UMaxValue(width) : SInt::SMaxValue(width));
+        return MakeFiniteWideningRange(lower, upper, isUnsigned);
     }
     if (upperMovedUp) {
+        if (auto threshold = FindUpperWideningThreshold(thresholds, joinedMax, isUnsigned);
+            threshold.has_value()) {
+            return MakeFiniteWideningRange(joinedMin, threshold.value(), isUnsigned);
+        }
         return SIntDomain::FromNumeric(RelationalOperation::GE, joinedMin, isUnsigned);
     }
     if (lowerMovedDown) {
+        if (auto threshold = FindLowerWideningThreshold(thresholds, joinedMin, isUnsigned);
+            threshold.has_value()) {
+            return MakeFiniteWideningRange(threshold.value(), joinedMax, isUnsigned);
+        }
         return SIntDomain::FromNumeric(RelationalOperation::LE, joinedMax, isUnsigned);
     }
     return SIntDomain{joinedNumeric, isUnsigned};
@@ -5861,6 +7285,71 @@ const Expression* GetDefiningExprForWidening(Value* value)
         return nullptr;
     }
     return local->GetExpr();
+}
+
+std::vector<SInt> CollectLoopWideningThresholds(
+    const Block* block, IntWidth width, bool isUnsigned)
+{
+    std::vector<SInt> thresholds;
+    auto forest = GetLoopForest(block);
+    auto loop = forest == nullptr ? nullptr : forest->FindInnermost(block);
+    if (loop == nullptr) {
+        return thresholds;
+    }
+    const auto addThreshold = [&](const SInt& threshold) {
+        if (threshold.Width() == width) {
+            thresholds.emplace_back(threshold);
+        }
+    };
+    const auto getConstant = [](Value* value) -> std::optional<SInt> {
+        auto expression = GetDefiningExprForWidening(value);
+        if (expression == nullptr || expression->GetExprKind() != ExprKind::CONSTANT) {
+            return std::nullopt;
+        }
+        auto literal = StaticCast<const Constant*>(expression)->GetValue();
+        if (literal == nullptr || !literal->IsIntLiteral()) {
+            return std::nullopt;
+        }
+        auto domain = SIntDomain::From(*literal);
+        return domain.IsSingleValue()
+            ? std::optional<SInt>{domain.NumericBound().GetSingleElement()}
+            : std::nullopt;
+    };
+    for (auto loopBlock : loop->blocks) {
+        for (auto expression : loopBlock->GetExpressions()) {
+            if (expression == nullptr ||
+                !IsRelationalExprKindForWidening(expression->GetExprKind())) {
+                continue;
+            }
+            auto binary = StaticCast<const BinaryExpression*>(expression);
+            for (auto operand : {binary->GetLHSOperand(), binary->GetRHSOperand()}) {
+                if (operand == nullptr || operand->GetType() == nullptr ||
+                    !operand->GetType()->IsInteger() ||
+                    operand->GetType()->IsUnsignedInteger() != isUnsigned ||
+                    ToWidth(*operand->GetType()) != width) {
+                    continue;
+                }
+                auto constant = getConstant(operand);
+                if (!constant.has_value()) {
+                    continue;
+                }
+                addThreshold(constant.value());
+                auto minimum = isUnsigned ? SInt::UMinValue(width) : SInt::SMinValue(width);
+                auto maximum = isUnsigned ? SInt::UMaxValue(width) : SInt::SMaxValue(width);
+                if (StrictlyGreater(constant.value(), minimum, isUnsigned)) {
+                    addThreshold(constant.value() - 1U);
+                }
+                if (StrictlyLess(constant.value(), maximum, isUnsigned)) {
+                    addThreshold(constant.value() + 1U);
+                }
+            }
+        }
+    }
+    std::sort(thresholds.begin(), thresholds.end(), [isUnsigned](const SInt& lhs, const SInt& rhs) {
+        return StrictlyLess(lhs, rhs, isUnsigned);
+    });
+    thresholds.erase(std::unique(thresholds.begin(), thresholds.end()), thresholds.end());
+    return thresholds;
 }
 
 // 判断某个值是否是循环 guard 直接使用的 load。
@@ -6225,8 +7714,10 @@ LoopRangeSnapshot CaptureLoopRangeSnapshot(
 }
 
 // 对重复访问的循环 block 应用候选整数值 widening。
-void ApplyLoopWidening(RangeDomain& state, const LoopRangeSnapshot& previousRanges)
+void ApplyLoopWidening(
+    RangeDomain& state, const LoopRangeSnapshot& previousRanges, const Block* block)
 {
+    std::map<std::pair<IntWidth, bool>, std::vector<SInt>> thresholdCache;
     for (const auto& [value, entry] : previousRanges) {
         if (entry.preserveDuringBodyWidening) {
             continue;
@@ -6238,16 +7729,44 @@ void ApplyLoopWidening(RangeDomain& state, const LoopRangeSnapshot& previousRang
                 abstractValue->GetRangeKind() == ValueRange::RangeKind::SINT
             ? StaticCast<const SIntRange*>(abstractValue)
             : nullptr;
-        auto widened = WidenSIntDomain(entry.range->GetVal(), current);
+        auto thresholdKey = std::make_pair(current.Width(), current.IsUnsigned());
+        auto foundThresholds = thresholdCache.find(thresholdKey);
+        if (foundThresholds == thresholdCache.end()) {
+            foundThresholds = thresholdCache.emplace(thresholdKey,
+                CollectLoopWideningThresholds(
+                    block, current.Width(), current.IsUnsigned())).first;
+        }
+        auto widened = WidenSIntDomain(
+            entry.range->GetVal(), current, foundThresholds->second);
         auto widenedCongruence = MergeSIntCongruencesForUnion(entry.range->GetVal(),
             entry.range->GetExactValues(), entry.range->GetCongruence(), current,
             currentRange == nullptr ? std::nullopt : currentRange->GetExactValues(),
             currentRange == nullptr ? std::nullopt : currentRange->GetCongruence());
+        auto previousKnownBits = entry.range->GetKnownBits();
+        auto currentKnownBits = currentRange == nullptr
+            ? std::optional<SIntKnownBits>{}
+            : currentRange->GetKnownBits();
+        if (previousKnownBits.has_value() || currentKnownBits.has_value()) {
+            previousKnownBits = GetEffectiveKnownBits(entry.range->GetVal(),
+                entry.range->GetExactValues(), entry.range->GetCongruence(), previousKnownBits);
+            if (currentRange != nullptr) {
+                currentKnownBits = GetEffectiveKnownBits(current, currentRange->GetExactValues(),
+                    currentRange->GetCongruence(), currentKnownBits);
+            }
+        }
+        auto widenedKnownBits = MergeSIntKnownBitsForUnion(
+            entry.range->GetVal(), previousKnownBits, current, currentKnownBits);
+        auto widenedExcludedValues = MergeExcludedSIntValuesForUnion(entry.range->GetVal(),
+            entry.range->GetExcludedValues(), current,
+            currentRange == nullptr ? std::nullopt : currentRange->GetExcludedValues(), widened);
         const bool droppedSymbolics = widened.SymbolicBounds().Empty() && !current.SymbolicBounds().Empty();
         if (!widened.IsSame(current) || droppedSymbolics ||
-            (currentRange != nullptr && currentRange->GetCongruence() != widenedCongruence)) {
+            (currentRange != nullptr && (currentRange->GetCongruence() != widenedCongruence ||
+                currentRange->GetKnownBits() != widenedKnownBits ||
+                currentRange->GetExcludedValues() != widenedExcludedValues))) {
             state.Update(value, std::make_unique<SIntRange>(
-                std::move(widened), std::nullopt, std::move(widenedCongruence)));
+                std::move(widened), std::nullopt, std::move(widenedCongruence), std::move(widenedKnownBits),
+                std::move(widenedExcludedValues)));
         }
     }
 }
@@ -6540,6 +8059,115 @@ std::optional<SIntDomain> TryComputeBitwiseRange(ExprKind kind, const SIntDomain
         }
     }
     return std::nullopt;
+}
+
+std::optional<SIntKnownBits> GetTransferKnownBits(
+    const SIntRange* range, const SIntDomain& domain)
+{
+    if (range != nullptr) {
+        return GetEffectiveKnownBits(domain, range->GetExactValues(),
+            range->GetCongruence(), range->GetKnownBits());
+    }
+    return InferKnownBitsFromInterval(domain);
+}
+
+std::optional<SIntKnownBits> ComputeBitwiseKnownBits(ExprKind kind, const SIntRange* lhsRange,
+    const SIntRange* rhsRange, const SIntDomain& lhs, const SIntDomain& rhs,
+    bool rhsUnsigned, bool destUnsigned)
+{
+    auto width = lhs.Width();
+    auto mask = GetSIntWidthMask(width);
+    auto lhsBits = GetTransferKnownBits(lhsRange, lhs).value_or(SIntKnownBits{});
+    auto rhsBits = GetTransferKnownBits(rhsRange, rhs).value_or(SIntKnownBits{});
+    SIntKnownBits result;
+    switch (kind) {
+        case ExprKind::BITAND:
+            result.knownZero = lhsBits.knownZero | rhsBits.knownZero;
+            result.knownOne = lhsBits.knownOne & rhsBits.knownOne;
+            break;
+        case ExprKind::BITOR:
+            result.knownZero = lhsBits.knownZero & rhsBits.knownZero;
+            result.knownOne = lhsBits.knownOne | rhsBits.knownOne;
+            break;
+        case ExprKind::BITXOR:
+            result.knownZero = (lhsBits.knownZero & rhsBits.knownZero) |
+                (lhsBits.knownOne & rhsBits.knownOne);
+            result.knownOne = (lhsBits.knownZero & rhsBits.knownOne) |
+                (lhsBits.knownOne & rhsBits.knownZero);
+            break;
+        case ExprKind::LSHIFT:
+        case ExprKind::RSHIFT: {
+            auto amount = GetShiftAmount(rhs, rhsUnsigned, width);
+            if (!amount.has_value()) {
+                return std::nullopt;
+            }
+            if (*amount == 0) {
+                return NormalizeKnownBits(lhsBits, width);
+            }
+            if (kind == ExprKind::LSHIFT) {
+                auto lowZeros = (uint64_t{1} << *amount) - 1U;
+                result.knownZero = ((lhsBits.knownZero << *amount) | lowZeros) & mask;
+                result.knownOne = (lhsBits.knownOne << *amount) & mask;
+                break;
+            }
+            auto remaining = static_cast<unsigned>(width) - *amount;
+            auto retainedMask = remaining == 64 ? UINT64_MAX : ((uint64_t{1} << remaining) - 1U);
+            auto highMask = mask & ~retainedMask;
+            result.knownZero = lhsBits.knownZero >> *amount;
+            result.knownOne = lhsBits.knownOne >> *amount;
+            if (destUnsigned) {
+                result.knownZero |= highMask;
+                break;
+            }
+            auto signBit = uint64_t{1} << (static_cast<unsigned>(width) - 1U);
+            if ((lhsBits.knownZero & signBit) != 0) {
+                result.knownZero |= highMask;
+            } else if ((lhsBits.knownOne & signBit) != 0) {
+                result.knownOne |= highMask;
+            }
+            break;
+        }
+        default:
+            return std::nullopt;
+    }
+    return NormalizeKnownBits(result, width);
+}
+
+std::optional<SIntRange> TryComputeAbstractBitwiseRange(ExprKind kind,
+    const SIntRange* lhsRange, const SIntRange* rhsRange, const SIntDomain& lhs,
+    const SIntDomain& rhs, Value* lhsValue, Value* rhsValue, bool rhsUnsigned,
+    bool destUnsigned)
+{
+    auto interval = TryComputeBitwiseRange(
+        kind, lhs, rhs, lhsValue, rhsValue, rhsUnsigned, destUnsigned);
+    auto knownBits = ComputeBitwiseKnownBits(
+        kind, lhsRange, rhsRange, lhs, rhs, rhsUnsigned, destUnsigned);
+    if (!knownBits.has_value()) {
+        if (!interval.has_value() || !interval->IsNonTrivial()) {
+            return std::nullopt;
+        }
+        return SIntRange{std::move(*interval)};
+    }
+    auto domain = interval.has_value()
+        ? SIntDomain::Intersects(*interval,
+              DomainFromKnownBits(knownBits, lhs.Width(), destUnsigned))
+        : DomainFromKnownBits(knownBits, lhs.Width(), destUnsigned);
+    return SIntRange{
+        std::move(domain), std::nullopt, std::nullopt, std::move(knownBits)};
+}
+
+SIntRange ComputeBitNotSIntRange(
+    const SIntRange* operandRange, const SIntDomain& operand, bool destUnsigned)
+{
+    auto domain = ComputeBitNotRange(operand, destUnsigned);
+    auto sourceBits = GetTransferKnownBits(operandRange, operand);
+    if (!sourceBits.has_value()) {
+        return SIntRange{std::move(domain)};
+    }
+    auto knownBits = NormalizeKnownBits(
+        SIntKnownBits{sourceBits->knownOne, sourceBits->knownZero}, operand.Width());
+    return SIntRange{
+        std::move(domain), std::nullopt, std::nullopt, std::move(knownBits)};
 }
 
 template <> const std::string Analysis<RangeDomain>::name = "range-analysis";
@@ -6983,9 +8611,10 @@ std::optional<SIntCongruence> ComputeArithmeticCongruence(ExprKind kind, const S
         lhsRange->GetExactValues(), lhsRange->GetCongruence(), lhsDomain.IsUnsigned());
     auto rhs = DescribeCongruence(
         rhsRange->GetExactValues(), rhsRange->GetCongruence(), rhsDomain.IsUnsigned());
-    if (!lhs.constrained || !rhs.constrained) {
-        return std::nullopt;
-    }
+    // An unconstrained integer is still the congruence 0 (mod 1).  Keeping
+    // that neutral element is essential for affine multiplication: if x is
+    // arbitrary and c is constant, c*x is 0 (mod |c|).  Requiring both
+    // operands to be constrained discarded this fact before the MUL rule.
 
     unsigned __int128 modulus = 0;
     switch (kind) {
@@ -7099,6 +8728,8 @@ std::optional<SIntRange> TryComputeSimpleInductionLoadExitRange(const RangeDomai
 std::optional<SIntRange> TryComputeCountedAccumulatorLoadExitRange(const RangeDomain& state, const Load* load);
 std::optional<SIntRange> TryComputeCountedAccumulatorBodyLoadRange(const RangeDomain& state, const Load* load);
 std::optional<SIntRange> TryComputeLockstepDifferenceRange(
+    const RangeDomain& state, const BinaryExpression* binaryExpr);
+std::optional<SIntRange> TryComputeCommonSymbolDifferenceRange(
     const RangeDomain& state, const BinaryExpression* binaryExpr);
 namespace {
 std::optional<SIntRange> TryComputeSimpleLoopLoadRange(const RangeDomain& state, Value* value);
@@ -7497,7 +9128,7 @@ bool RangeAnalysis::CheckInQueueTimes(const Block* block, RangeDomain& curState)
     if (static_cast<size_t>(times) >= rangeAnalysisConfig.loopWideningStartTimes) {
         auto previous = snapshots.find(block);
         if (previous != snapshots.end()) {
-            ApplyLoopWidening(curState, previous->second);
+            ApplyLoopWidening(curState, previous->second, block);
             if (IsRangeAnalysisPerfCollectionEnabled()) {
                 ++rangeAnalysisTuningStats.loopWideningApplications;
             }
@@ -7549,8 +9180,10 @@ void RangeAnalysis::HandleUnaryExpr(RangeDomain& state, const UnaryExpression* u
                 return state.Update(dest, std::make_unique<SIntRange>(std::move(range)));
             }
         } else if (unaryExpr->GetExprKind() == ExprKind::BITNOT) {
-            auto range = ComputeBitNotRange(operandRange, dest->GetType()->IsUnsignedInteger());
-            if (range.IsNonTrivial()) {
+            auto range = ComputeBitNotSIntRange(
+                GetSIntRangeFromState(state, operand), operandRange,
+                dest->GetType()->IsUnsignedInteger());
+            if (range.GetVal().IsNonTrivial() || range.GetKnownBits().has_value()) {
                 return state.Update(dest, std::make_unique<SIntRange>(std::move(range)));
             }
         }
@@ -7661,6 +9294,12 @@ void RangeAnalysis::HandleBinaryExpr(RangeDomain& state, const BinaryExpression*
             return state.SetToBound(binaryExpr->GetResult(), true);
         }
         if (boundedLoopEvaluationOwner != this) {
+            if (auto symbolicDifference =
+                    TryComputeCommonSymbolDifferenceRange(state, binaryExpr);
+                symbolicDifference.has_value()) {
+                return state.Update(
+                    dest, std::make_unique<SIntRange>(std::move(symbolicDifference.value())));
+            }
             if (auto lockstepRange = TryComputeLockstepDifferenceRange(state, binaryExpr);
                 lockstepRange.has_value()) {
                 return state.Update(dest, std::make_unique<SIntRange>(std::move(lockstepRange.value())));
@@ -7677,18 +9316,21 @@ void RangeAnalysis::HandleBinaryExpr(RangeDomain& state, const BinaryExpression*
         const auto& lRange = GetSIntDomainFromState(state, lhs);
         const auto& rRange = GetSIntDomainFromState(state, rhs);
         if (IsBitwiseBinaryExpr(kind) || IsShiftBinaryExpr(kind)) {
+            auto lhsSIntRange = GetSIntRangeFromState(state, lhs);
+            auto rhsSIntRange = GetSIntRangeFromState(state, rhs);
             auto lhsValues = GetExactValuesOrSmallRange(
-                GetSIntRangeFromState(state, lhs), lhs->GetType()->IsUnsignedInteger());
+                lhsSIntRange, lhs->GetType()->IsUnsignedInteger());
             auto rhsValues = GetExactValuesOrSmallRange(
-                GetSIntRangeFromState(state, rhs), rhs->GetType()->IsUnsignedInteger());
+                rhsSIntRange, rhs->GetType()->IsUnsignedInteger());
             if (auto exactRes = TryComputeExactBitwiseRange(kind, lhsValues, rhsValues,
                     rhs->GetType()->IsUnsignedInteger(), dest->GetType()->IsUnsignedInteger());
                 exactRes.has_value()) {
                 return state.Update(dest, std::make_unique<SIntRange>(std::move(exactRes.value())));
             }
-            auto res = TryComputeBitwiseRange(kind, lRange, rRange, lhs, rhs, rhs->GetType()->IsUnsignedInteger(),
+            auto res = TryComputeAbstractBitwiseRange(kind, lhsSIntRange, rhsSIntRange,
+                lRange, rRange, lhs, rhs, rhs->GetType()->IsUnsignedInteger(),
                 dest->GetType()->IsUnsignedInteger());
-            if (res && res->IsNonTrivial()) {
+            if (res.has_value()) {
                 return state.Update(dest, std::make_unique<SIntRange>(std::move(*res)));
             }
             return state.SetToBound(binaryExpr->GetResult(), true);
@@ -7798,8 +9440,10 @@ RangeAnalysis::ExceptionKind RangeAnalysis::HandleIntOpWithException(RangeDomain
             }
             return ExceptionKind::NA;
         }
-        auto range = ComputeBitNotRange(operandRange, dest->GetType()->IsUnsignedInteger());
-        if (range.IsNonTrivial()) {
+        auto range = ComputeBitNotSIntRange(
+            GetSIntRangeFromState(state, operand), operandRange,
+            dest->GetType()->IsUnsignedInteger());
+        if (range.GetVal().IsNonTrivial() || range.GetKnownBits().has_value()) {
             state.Update(dest, std::make_unique<SIntRange>(std::move(range)));
         } else {
             state.SetToBound(dest, true);
@@ -7826,9 +9470,11 @@ RangeAnalysis::ExceptionKind RangeAnalysis::HandleIntOpWithException(RangeDomain
     auto destUnsigned = dest->GetType()->IsUnsignedInteger();
     auto rhsUnsigned = rhs->GetType()->IsUnsignedInteger();
     if (IsBitwiseBinaryExpr(kind) || IsShiftBinaryExpr(kind)) {
+        auto lhsSIntRange = GetSIntRangeFromState(state, lhs);
+        auto rhsSIntRange = GetSIntRangeFromState(state, rhs);
         auto lhsValues = GetExactValuesOrSmallRange(
-            GetSIntRangeFromState(state, lhs), lhs->GetType()->IsUnsignedInteger());
-        auto rhsValues = GetExactValuesOrSmallRange(GetSIntRangeFromState(state, rhs), rhsUnsigned);
+            lhsSIntRange, lhs->GetType()->IsUnsignedInteger());
+        auto rhsValues = GetExactValuesOrSmallRange(rhsSIntRange, rhsUnsigned);
         if (lhsValues.has_value() && rhsValues.has_value() &&
             !ExceedsExactIntSetProduct(lhsValues->size(), rhsValues->size())) {
             std::vector<SInt> values;
@@ -7862,8 +9508,9 @@ RangeAnalysis::ExceptionKind RangeAnalysis::HandleIntOpWithException(RangeDomain
                 return ExceptionKind::FAIL;
             }
         }
-        auto res = TryComputeBitwiseRange(kind, lRange, rRange, lhs, rhs, rhsUnsigned, destUnsigned);
-        if (res && res->IsNonTrivial()) {
+        auto res = TryComputeAbstractBitwiseRange(kind, lhsSIntRange, rhsSIntRange,
+            lRange, rRange, lhs, rhs, rhsUnsigned, destUnsigned);
+        if (res.has_value()) {
             state.Update(dest, std::make_unique<SIntRange>(std::move(*res)));
         } else {
             state.SetToBound(dest, true);
@@ -7916,6 +9563,80 @@ RangeAnalysis::ExceptionKind RangeAnalysis::HandleIntOpWithException(RangeDomain
     return ExceptionKind::NA;
 }
 
+bool CanProveTypeCastWithoutOverflow(
+    const SIntDomain& source, IntWidth targetWidth, bool targetUnsigned)
+{
+    auto bounds = GetMathematicalBounds(source);
+    if (!bounds.has_value()) {
+        return false;
+    }
+    const auto width = static_cast<unsigned>(targetWidth);
+    const __int128 minimum = targetUnsigned
+        ? 0
+        : -(static_cast<__int128>(1) << (width - 1U));
+    const __int128 maximum = targetUnsigned
+        ? (static_cast<__int128>(1) << width) - 1
+        : (static_cast<__int128>(1) << (width - 1U)) - 1;
+    return bounds->minimum >= minimum && bounds->maximum <= maximum;
+}
+
+std::optional<SIntKnownBits> TransformKnownBitsForIntegerCast(
+    const SIntRange* sourceRange, const SIntDomain& sourceDomain,
+    Type* sourceType, Type* targetType, OverflowStrategy overflowStrategy)
+{
+    if (sourceType == nullptr || targetType == nullptr ||
+        !sourceType->IsInteger() || !targetType->IsInteger()) {
+        return std::nullopt;
+    }
+    auto sourceBits = sourceRange == nullptr
+        ? InferKnownBitsFromInterval(sourceDomain)
+        : GetEffectiveKnownBits(sourceDomain, sourceRange->GetExactValues(),
+              sourceRange->GetCongruence(), sourceRange->GetKnownBits());
+    if (!sourceBits.has_value()) {
+        return std::nullopt;
+    }
+
+    const auto sourceWidth = sourceDomain.Width();
+    const auto targetWidth = ToWidth(*targetType);
+    const bool targetUnsigned = targetType->IsUnsignedInteger();
+    const bool noOverflow =
+        CanProveTypeCastWithoutOverflow(sourceDomain, targetWidth, targetUnsigned);
+    if (!noOverflow && overflowStrategy != OverflowStrategy::WRAPPING &&
+        overflowStrategy != OverflowStrategy::THROWING) {
+        // Saturating and checked conversions can replace overflowing inputs
+        // with values whose bits are unrelated to the source bit pattern.
+        return std::nullopt;
+    }
+
+    const auto sourceMask = GetSIntWidthMask(sourceWidth);
+    const auto targetMask = GetSIntWidthMask(targetWidth);
+    const auto retainedMask = sourceWidth < targetWidth ? sourceMask : targetMask;
+    SIntKnownBits result{sourceBits->knownZero & retainedMask,
+        sourceBits->knownOne & retainedMask};
+    if (targetWidth <= sourceWidth) {
+        return NormalizeKnownBits(result, targetWidth);
+    }
+
+    const auto extensionMask = targetMask & ~sourceMask;
+    const bool sourceUnsigned = sourceType->IsUnsignedInteger();
+    const bool zeroExtend = sourceUnsigned ||
+        (!sourceUnsigned && targetUnsigned &&
+            (noOverflow || overflowStrategy == OverflowStrategy::THROWING));
+    if (zeroExtend) {
+        result.knownZero |= extensionMask;
+        return NormalizeKnownBits(result, targetWidth);
+    }
+
+    const auto sourceSignBit =
+        uint64_t{1} << (static_cast<unsigned>(sourceWidth) - 1U);
+    if ((sourceBits->knownZero & sourceSignBit) != 0) {
+        result.knownZero |= extensionMask;
+    } else if ((sourceBits->knownOne & sourceSignBit) != 0) {
+        result.knownOne |= extensionMask;
+    }
+    return NormalizeKnownBits(result, targetWidth);
+}
+
 RangeAnalysis::ExceptionKind RangeAnalysis::HandleTypeCastWithException(
     RangeDomain& state, const TypeCastWithException* cast)
 {
@@ -7958,10 +9679,9 @@ RangeAnalysis::ExceptionKind RangeAnalysis::HandleTypeCastWithException(
         }
     }
 
-    const auto& sourceDomain = GetSIntDomainFromState(state, value);
-    auto res = ComputeTypeCast(
-        state, value, sourceDomain, ToWidth(*to), to->IsUnsignedInteger(), cast->GetOverflowStrategy());
-    state.Update(dest, std::make_unique<SIntRange>(res));
+    auto range = ComputeTypeCastRange(
+        state, value, from, to, cast->GetOverflowStrategy());
+    state.Update(dest, std::make_unique<SIntRange>(std::move(range)));
     return ExceptionKind::NA;
 }
 
@@ -7992,6 +9712,34 @@ SIntDomain RangeAnalysis::ComputeTypeCast(RangeDomain& state, PtrSymbol oldSymbo
     }
     mp.emplace(oldSymbol, ConstantRange{{dstSize, 0u}});
     return SIntDomain{numericRange, std::move(mp), dstUnsigned};
+}
+
+SIntRange RangeAnalysis::ComputeTypeCastRange(RangeDomain& state, PtrSymbol value,
+    Type* sourceType, Type* targetType, OverflowStrategy overflowStrategy) const
+{
+    const auto& sourceDomain = GetSIntDomainFromState(state, value);
+    auto resultDomain = ComputeTypeCast(state, value, sourceDomain,
+        ToWidth(*targetType), targetType->IsUnsignedInteger(), overflowStrategy);
+    const auto* sourceRange = GetSIntRangeFromState(state, value);
+
+    std::optional<std::vector<SInt>> exactValues;
+    if (sourceRange != nullptr && sourceRange->GetExactValues().has_value()) {
+        std::vector<SInt> converted;
+        converted.reserve(sourceRange->GetExactValues()->size());
+        for (const auto& sourceValue : *sourceRange->GetExactValues()) {
+            auto convertedValue = ApplyExactTypeCast(
+                sourceValue, sourceType, targetType, overflowStrategy);
+            if (convertedValue.has_value()) {
+                converted.emplace_back(convertedValue.value());
+            }
+        }
+        exactValues = NormalizeExactIntSet(std::move(converted));
+    }
+
+    auto knownBits = TransformKnownBitsForIntegerCast(sourceRange, sourceDomain,
+        sourceType, targetType, overflowStrategy);
+    return SIntRange{std::move(resultDomain), std::move(exactValues),
+        std::nullopt, std::move(knownBits)};
 }
 
 // 处理 typecast 等其它表达式，并对未知结果设置保守 Top 或 TopRef。
@@ -9381,6 +11129,8 @@ std::optional<SIntRange> BuildSignedExactRange(Type* type, const std::vector<int
 bool ApplyConditionConstraint(RangeDomain& state, Value* condition, bool branchCondition);
 Type* GetIntegerRefRootType(Value* location);
 
+constexpr size_t MAX_BOUNDED_LOOP_STEPS = 16384;
+
 // 获取局部 SSA 值的定义表达式。
 const Expression* GetDefiningExpr(Value* value)
 {
@@ -9474,7 +11224,10 @@ bool NarrowSIntValue(RangeDomain& state, Value* value, const SIntDomain& constra
     auto exactValues =
         currentRange == nullptr ? std::nullopt : FilterExactValuesByConstraint(currentRange->GetExactValues(), constraint);
     state.Update(value, std::make_unique<SIntRange>(std::move(narrowed), std::move(exactValues),
-        currentRange == nullptr ? std::nullopt : currentRange->GetCongruence()));
+        currentRange == nullptr ? std::nullopt : currentRange->GetCongruence(),
+        currentRange == nullptr ? std::nullopt : currentRange->GetKnownBits(),
+        currentRange == nullptr ? std::nullopt : currentRange->GetExcludedValues(),
+        currentRange == nullptr ? std::nullopt : currentRange->GetIntervalFragments()));
     return true;
 }
 
@@ -9507,8 +11260,71 @@ bool NarrowLoadedSIntLocation(RangeDomain& state, Value* value, const SIntDomain
         return true;
     }
     state.Update(object, std::make_unique<SIntRange>(std::move(narrowed),
-        currentRange == nullptr ? std::nullopt : currentRange->GetExactValues(),
-        currentRange == nullptr ? std::nullopt : currentRange->GetCongruence()));
+        currentRange == nullptr ? std::nullopt
+                                : FilterExactValuesByConstraint(
+                                      currentRange->GetExactValues(), constraint),
+        currentRange == nullptr ? std::nullopt : currentRange->GetCongruence(),
+        currentRange == nullptr ? std::nullopt : currentRange->GetKnownBits(),
+        currentRange == nullptr ? std::nullopt : currentRange->GetExcludedValues(),
+        currentRange == nullptr ? std::nullopt : currentRange->GetIntervalFragments()));
+    return true;
+}
+
+std::unique_ptr<SIntRange> ExcludeSIntConstant(
+    const SIntDomain& current, const SIntRange* currentRange, const SInt& constant)
+{
+    if (!ExactValueSatisfiesDomain(constant, current)) {
+        if (currentRange != nullptr) {
+            auto clone = currentRange->Clone();
+            return std::unique_ptr<SIntRange>(static_cast<SIntRange*>(clone.release()));
+        }
+        return std::make_unique<SIntRange>(current);
+    }
+    if (current.IsSingleValue()) {
+        return std::make_unique<SIntRange>(SIntDomain::Bottom(current.Width(), current.IsUnsigned()));
+    }
+    std::optional<std::vector<SInt>> exactValues =
+        currentRange == nullptr ? std::nullopt : currentRange->GetExactValues();
+    if (exactValues.has_value()) {
+        exactValues->erase(std::remove(exactValues->begin(), exactValues->end(), constant), exactValues->end());
+        if (exactValues->empty()) {
+            return std::make_unique<SIntRange>(SIntDomain::Bottom(current.Width(), current.IsUnsigned()));
+        }
+        exactValues = NormalizeExactIntSet(std::move(*exactValues));
+    }
+    std::vector<SInt> excluded;
+    if (currentRange != nullptr && currentRange->GetExcludedValues().has_value()) {
+        excluded = *currentRange->GetExcludedValues();
+    }
+    excluded.emplace_back(constant);
+    auto excludedValues = NormalizeExcludedSIntValues(std::move(excluded), current);
+    return std::make_unique<SIntRange>(current, std::move(exactValues),
+        currentRange == nullptr ? std::nullopt : currentRange->GetCongruence(),
+        currentRange == nullptr ? std::nullopt : currentRange->GetKnownBits(),
+        std::move(excludedValues));
+}
+
+bool ExcludeLoadedSIntConstant(RangeDomain& state, Value* value, const SInt& constant)
+{
+    auto expr = GetDefiningExpr(value);
+    if (expr == nullptr || expr->GetExprKind() != ExprKind::LOAD) {
+        return true;
+    }
+    auto location = StaticCast<const Load*>(expr)->GetLocation();
+    if (location == nullptr || !location->GetType()->IsRef()) {
+        return true;
+    }
+    auto rootType = StaticCast<RefType*>(location->GetType())->GetRootBaseType();
+    if (rootType == nullptr || !rootType->IsInteger() || ToWidth(*rootType) != constant.Width()) {
+        return true;
+    }
+    auto object = state.CheckAbstractObjectRefBy(location);
+    if (object == nullptr) {
+        return true;
+    }
+    const auto& current = GetSIntDomainFromState(state, object, rootType);
+    const auto* currentRange = GetSIntRangeFromState(state, object, rootType);
+    state.Update(object, ExcludeSIntConstant(current, currentRange, constant));
     return true;
 }
 
@@ -9516,12 +11332,15 @@ bool NarrowLoadedSIntLocation(RangeDomain& state, Value* value, const SIntDomain
 bool NarrowSIntByRelationToConstant(RangeDomain& state, Value* value, RelationalOperation rel, const SInt& constant)
 {
     auto type = value->GetType();
+    if (rel == RelationalOperation::NE) {
+        const auto& current = RangeAnalysis::GetSIntDomainFromState(state, value);
+        const auto* currentRange = GetSIntRangeFromState(state, value);
+        state.Update(value, ExcludeSIntConstant(current, currentRange, constant));
+        return ExcludeLoadedSIntConstant(state, value, constant);
+    }
     auto constraint = SIntDomain::FromNumeric(rel, constant, type->IsUnsignedInteger());
     if (!NarrowSIntValue(state, value, constraint)) {
         return false;
-    }
-    if (rel == RelationalOperation::NE) {
-        return true;
     }
     if (!NarrowLoadedSIntLocation(state, value, constraint)) {
         return false;
@@ -9940,6 +11759,43 @@ std::optional<int64_t> FindSingleBackedgeStep(const Block* header, Value* locati
     return step;
 }
 
+// Collect one constant update for every backedge. Unlike
+// FindSingleBackedgeStep, different backedges may use different steps. The
+// result is available only when every backedge writes the same induction
+// location exactly once using load(location) +/- constant.
+std::optional<std::vector<int64_t>> FindAllBackedgeSteps(const Block* header, Value* location)
+{
+    std::vector<int64_t> steps;
+    for (auto pred : header->GetPredecessors()) {
+        if (!IsBackedgePredecessor(header, pred)) {
+            continue;
+        }
+        std::optional<int64_t> predStep;
+        for (auto expr : pred->GetExpressions()) {
+            if (expr->GetExprKind() != ExprKind::STORE) {
+                continue;
+            }
+            auto store = StaticCast<const Store*>(expr);
+            if (store->GetLocation() != location) {
+                continue;
+            }
+            if (predStep.has_value()) {
+                return std::nullopt;
+            }
+            predStep = GetUpdateStepFromLocation(store->GetValue(), location);
+            if (!predStep.has_value() || predStep.value() == 0) {
+                return std::nullopt;
+            }
+        }
+        if (!predStep.has_value()) {
+            return std::nullopt;
+        }
+        steps.emplace_back(predStep.value());
+    }
+    return steps.empty() ? std::nullopt
+                         : std::optional<std::vector<int64_t>>{std::move(steps)};
+}
+
 // 查找循环入口边写入的唯一有符号常量。
 std::optional<int64_t> FindIncomingSignedStoreConstant(const Block* header, Value* location)
 {
@@ -10005,6 +11861,14 @@ struct SimpleInductionCondition {
     int64_t bound;
 };
 
+struct ReplayInductionCondition {
+    Value* loadValue;
+    Value* location;
+    RelationalOperation relation;
+    int64_t bound;
+    bool isUnsigned;
+};
+
 // 识别 load(location) 与有符号常量比较形成的循环 guard。
 std::optional<SimpleInductionCondition> GetSimpleInductionCondition(Value* condition)
 {
@@ -10034,6 +11898,40 @@ std::optional<SimpleInductionCondition> GetSimpleInductionCondition(Value* condi
             return std::nullopt;
         }
         return SimpleInductionCondition{rhs, rhsLocation, SwapRelation(rel), bound.value()};
+    }
+    return std::nullopt;
+}
+
+// Extract the same constant-guard shape for replay selection. Unsigned values
+// are accepted only while their constants fit the signed host representation;
+// this keeps the trip-count proof overflow-free without changing transfers.
+std::optional<ReplayInductionCondition> GetReplayInductionCondition(Value* condition)
+{
+    auto expr = GetDefiningExpr(condition);
+    if (expr == nullptr || !IsRelationalExprKind(expr->GetExprKind())) {
+        return std::nullopt;
+    }
+    auto binary = StaticCast<const BinaryExpression*>(expr);
+    auto lhs = binary->GetLHSOperand();
+    auto rhs = binary->GetRHSOperand();
+    if (!lhs->GetType()->IsInteger() || !rhs->GetType()->IsInteger() ||
+        lhs->GetType()->IsUnsignedInteger() != rhs->GetType()->IsUnsignedInteger()) {
+        return std::nullopt;
+    }
+    auto relation = ToRelationalOperation(expr->GetExprKind());
+    if (auto location = GetLoadLocation(lhs); location != nullptr) {
+        auto bound = GetSignedConstantFromDefiningConstant(rhs);
+        if (bound.has_value()) {
+            return ReplayInductionCondition{
+                lhs, location, relation, bound.value(), lhs->GetType()->IsUnsignedInteger()};
+        }
+    }
+    if (auto location = GetLoadLocation(rhs); location != nullptr) {
+        auto bound = GetSignedConstantFromDefiningConstant(lhs);
+        if (bound.has_value()) {
+            return ReplayInductionCondition{
+                rhs, location, SwapRelation(relation), bound.value(), rhs->GetType()->IsUnsignedInteger()};
+        }
     }
     return std::nullopt;
 }
@@ -10345,6 +12243,178 @@ RelationalOperation GetLoopContinuationRelation(
     return branch->GetTrueBlock() == exitSuccessor
         ? NegateRelation(conditionRelation)
         : conditionRelation;
+}
+
+std::optional<int64_t> FindProvenInductionInitialValue(const RangeDomain& state,
+    const Branch* branch, const Block* exitSuccessor, Value* location)
+{
+    auto header = branch == nullptr ? nullptr : branch->GetParentBlock();
+    if (header == nullptr || exitSuccessor == nullptr) {
+        return std::nullopt;
+    }
+    auto init = FindIncomingSignedStoreConstant(header, location);
+    if (!init.has_value()) {
+        init = FindIncomingSignedStoreConstantThroughPredecessors(header, location);
+    }
+    if (!init.has_value()) {
+        auto loopBlocks = CollectLoopBackPathBlockSet(branch, exitSuccessor, header);
+        init = FindIncomingSignedStoreValueBeforeLoop(state, header, location, loopBlocks);
+    }
+    return init;
+}
+
+std::optional<__int128> ComputeProvenInductionTripCount(int64_t init, int64_t step,
+    RelationalOperation relation, int64_t bound, IntWidth width, bool isUnsigned)
+{
+    auto exactExit = ComputeExactInductionExit(init, step, relation, bound, width);
+    if (!exactExit.has_value()) {
+        return std::nullopt;
+    }
+    auto exactExitValue = static_cast<__int128>(exactExit->SVal());
+    if (isUnsigned && exactExitValue < 0) {
+        return std::nullopt;
+    }
+    auto distance = exactExitValue - static_cast<__int128>(init);
+    if (distance == 0 || distance % static_cast<__int128>(step) != 0) {
+        return std::nullopt;
+    }
+    auto tripCount = distance / static_cast<__int128>(step);
+    return tripCount > 0 ? std::optional<__int128>{tripCount} : std::nullopt;
+}
+
+// Large scalar induction loops are represented more cheaply by the regular
+// worklist plus guard/exit narrowing than by replaying every concrete step.
+// Keep replay for small loops and for every loop with additional memory or
+// call effects, where concrete observations still add precision.
+bool ShouldPreferAnalyticInductionOverBoundedReplay(
+    const RangeDomain& state, const Branch* branch)
+{
+    const Block* exitSuccessor = nullptr;
+    for (auto candidate : {branch->GetTrueBlock(), branch->GetFalseBlock()}) {
+        if (!IsLoopExitSuccessor(branch, candidate)) {
+            continue;
+        }
+        if (exitSuccessor != nullptr && exitSuccessor != candidate) {
+            return false;
+        }
+        exitSuccessor = candidate;
+    }
+    if (exitSuccessor == nullptr) {
+        return false;
+    }
+    auto condition = GetReplayInductionCondition(branch->GetCondition());
+    if (!condition.has_value()) {
+        return false;
+    }
+    auto storageType = GetIntegerRefRootType(condition->location);
+    if (storageType == nullptr) {
+        storageType = condition->loadValue->GetType();
+    }
+    if (storageType == nullptr || !storageType->IsInteger() ||
+        storageType->IsUnsignedInteger() != condition->isUnsigned) {
+        return false;
+    }
+    auto relation =
+        GetLoopContinuationRelation(branch, exitSuccessor, condition->relation);
+    const auto singleStep = FindSingleBackedgeStep(branch->GetParentBlock(), condition->location);
+    const bool hasDifferentBackedgeSteps = !singleStep.has_value();
+    std::optional<int64_t> analyticStep = singleStep;
+    std::optional<int64_t> init;
+    __int128 replayThreshold = rangeAnalysisConfig.maxExactIntSetSize;
+    if (hasDifferentBackedgeSteps) {
+        auto backedgeSteps = FindAllBackedgeSteps(
+            branch->GetParentBlock(), condition->location);
+        if (!backedgeSteps.has_value() || backedgeSteps->size() < 2) {
+            return false;
+        }
+        if (relation == RelationalOperation::LT || relation == RelationalOperation::LE) {
+            if (std::any_of(backedgeSteps->begin(), backedgeSteps->end(),
+                    [](int64_t candidate) { return candidate <= 0; })) {
+                return false;
+            }
+            analyticStep = *std::max_element(backedgeSteps->begin(), backedgeSteps->end());
+        } else if (relation == RelationalOperation::GT || relation == RelationalOperation::GE) {
+            if (std::any_of(backedgeSteps->begin(), backedgeSteps->end(),
+                    [](int64_t candidate) { return candidate >= 0; })) {
+                return false;
+            }
+            analyticStep = *std::min_element(backedgeSteps->begin(), backedgeSteps->end());
+        } else {
+            return false;
+        }
+        init = FindProvenInductionInitialValue(
+            state, branch, exitSuccessor, condition->location);
+        // Replay counts basic-block transitions, so proving more loop
+        // iterations than the entire transition budget is deliberately
+        // conservative even for a multi-block body.
+        replayThreshold = MAX_BOUNDED_LOOP_STEPS;
+    } else {
+        if (singleStep.value() == 0) {
+            return false;
+        }
+        init = FindSimpleInductionInitialValue(
+            state, branch, exitSuccessor, condition->location, storageType, singleStep.value());
+    }
+    if (!analyticStep.has_value() || !init.has_value() ||
+        (condition->isUnsigned && init.value() < 0)) {
+        return false;
+    }
+    auto tripCount = ComputeProvenInductionTripCount(init.value(), analyticStep.value(),
+        relation, condition->bound, ToWidth(*storageType), condition->isUnsigned);
+    if (!tripCount.has_value() || tripCount.value() <= replayThreshold) {
+        return false;
+    }
+
+    auto header = branch->GetParentBlock();
+    auto loopBlocks = CollectLoopBackPathBlockSet(branch, exitSuccessor, header);
+    if (header == nullptr || loopBlocks.empty()) {
+        return false;
+    }
+    for (auto block : loopBlocks) {
+        auto terminator = block->GetTerminator();
+        if (terminator == nullptr || (terminator->GetExprKind() != ExprKind::GOTO &&
+            terminator->GetExprKind() != ExprKind::BRANCH)) {
+            return false;
+        }
+        if (hasDifferentBackedgeSteps) {
+            for (auto successor : block->GetSuccessors()) {
+                if (loopBlocks.find(successor) != loopBlocks.end()) {
+                    continue;
+                }
+                if (block != header || successor != exitSuccessor) {
+                    return false;
+                }
+            }
+        }
+        for (auto expression : block->GetNonTerminatorExpressions()) {
+            if (expression->GetExprMajorKind() == ExprMajorKind::UNARY_EXPR ||
+                expression->GetExprMajorKind() == ExprMajorKind::BINARY_EXPR) {
+                continue;
+            }
+            switch (expression->GetExprKind()) {
+                case ExprKind::CONSTANT:
+                case ExprKind::DEBUGEXPR:
+                case ExprKind::TYPECAST:
+                    break;
+                case ExprKind::LOAD:
+                    if (StaticCast<const Load*>(expression)->GetLocation() != condition->location) {
+                        return false;
+                    }
+                    break;
+                case ExprKind::STORE:
+                    if (StaticCast<const Store*>(expression)->GetLocation() != condition->location) {
+                        return false;
+                    }
+                    if (hasDifferentBackedgeSteps && !IsBackedgePredecessor(header, block)) {
+                        return false;
+                    }
+                    break;
+                default:
+                    return false;
+            }
+        }
+    }
+    return true;
 }
 
 bool TryNarrowSimpleInductionBody(RangeDomain& state, const Branch* branch, const Block* successor)
@@ -11094,10 +13164,74 @@ std::optional<VariableBoundInductionExit> TryBuildVariableBoundInductionCandidat
         loopRelation};
 }
 
-std::optional<VariableBoundInductionExit> GetVariableBoundInductionExit(
-    const RangeDomain& state, const Branch* branch, const Block* successor)
+Value* ResolveLocallyForwardedBooleanCondition(Value* condition)
 {
-    auto expr = GetDefiningExpr(branch->GetCondition());
+    constexpr size_t MAX_LOCAL_CONDITION_FORWARD_DEPTH = 4;
+    auto current = condition;
+    std::unordered_set<Value*> visitedLocations;
+    for (size_t depth = 0; depth < MAX_LOCAL_CONDITION_FORWARD_DEPTH; ++depth) {
+        auto loadExpression = GetDefiningExpr(current);
+        if (loadExpression == nullptr || loadExpression->GetExprKind() != ExprKind::LOAD ||
+            current->GetType() == nullptr || !current->GetType()->IsBoolean()) {
+            return current;
+        }
+        auto location = StaticCast<const Load*>(loadExpression)->GetLocation();
+        auto locationDefinition = GetDefiningExpr(location);
+        if (locationDefinition == nullptr || locationDefinition->GetExprKind() != ExprKind::ALLOCATE ||
+            !visitedLocations.emplace(location).second) {
+            return condition;
+        }
+        for (auto user : location->GetUsers()) {
+            if (user == nullptr || user->GetExprKind() == ExprKind::DEBUGEXPR ||
+                (user->GetExprKind() == ExprKind::LOAD &&
+                    StaticCast<const Load*>(user)->GetLocation() == location) ||
+                (user->GetExprKind() == ExprKind::STORE &&
+                    StaticCast<const Store*>(user)->GetLocation() == location)) {
+                continue;
+            }
+            return condition;
+        }
+        auto block = loadExpression->GetParentBlock();
+        if (block == nullptr) {
+            return condition;
+        }
+        auto expressions = block->GetExpressions();
+        auto loadPosition = std::find(expressions.begin(), expressions.end(), loadExpression);
+        if (loadPosition == expressions.end()) {
+            return condition;
+        }
+        Value* storedCondition = nullptr;
+        for (auto it = std::make_reverse_iterator(loadPosition); it != expressions.rend(); ++it) {
+            auto expression = *it;
+            if (expression->GetExprKind() == ExprKind::APPLY ||
+                expression->GetExprKind() == ExprKind::INVOKE ||
+                expression->GetExprKind() == ExprKind::APPLY_WITH_EXCEPTION ||
+                expression->GetExprKind() == ExprKind::INVOKE_WITH_EXCEPTION) {
+                return condition;
+            }
+            if (expression->GetExprKind() == ExprKind::STORE &&
+                StaticCast<const Store*>(expression)->GetLocation() == location) {
+                storedCondition = StaticCast<const Store*>(expression)->GetValue();
+                break;
+            }
+        }
+        if (storedCondition == nullptr || storedCondition->GetType() == nullptr ||
+            !storedCondition->GetType()->IsBoolean()) {
+            return condition;
+        }
+        current = storedCondition;
+    }
+    return current;
+}
+
+std::optional<VariableBoundInductionExit> GetVariableBoundInductionExit(
+    const RangeDomain& state, const Branch* branch, const Block* successor,
+    bool resolveForwardedCondition = false)
+{
+    auto condition = resolveForwardedCondition
+        ? ResolveLocallyForwardedBooleanCondition(branch->GetCondition())
+        : branch->GetCondition();
+    auto expr = GetDefiningExpr(condition);
     if (expr == nullptr || !IsRelationalExprKind(expr->GetExprKind())) {
         return std::nullopt;
     }
@@ -13643,6 +15777,112 @@ std::optional<SIntRange> TryComputeLockstepDifferenceRangeImpl(
     return BuildSignedExactRange(binaryExpr->GetResult()->GetType(), {difference.value()});
 }
 
+std::optional<SIntRange> TryComputeCommonSymbolDifferenceRangeImpl(
+    const RangeDomain& state, const BinaryExpression* binaryExpr)
+{
+    if (binaryExpr == nullptr || binaryExpr->GetExprKind() != ExprKind::SUB ||
+        binaryExpr->GetOverflowStrategy() != OverflowStrategy::THROWING ||
+        binaryExpr->GetResult() == nullptr || binaryExpr->GetResult()->GetType() == nullptr ||
+        !binaryExpr->GetResult()->GetType()->IsInteger() ||
+        binaryExpr->GetResult()->GetType()->IsUnsignedInteger()) {
+        return std::nullopt;
+    }
+    auto lhs = binaryExpr->GetLHSOperand();
+    auto rhs = binaryExpr->GetRHSOperand();
+    if (lhs == nullptr || rhs == nullptr || lhs->GetType() == nullptr || rhs->GetType() == nullptr ||
+        !lhs->GetType()->IsInteger() || !rhs->GetType()->IsInteger() ||
+        lhs->GetType()->IsUnsignedInteger() || rhs->GetType()->IsUnsignedInteger()) {
+        return std::nullopt;
+    }
+    auto resultWidth = ToWidth(*binaryExpr->GetResult()->GetType());
+    if (ToWidth(*lhs->GetType()) != resultWidth || ToWidth(*rhs->GetType()) != resultWidth) {
+        return std::nullopt;
+    }
+
+    constexpr size_t MAX_SYMBOLIC_ANCESTOR_DEPTH = 6;
+    constexpr size_t MAX_SYMBOLIC_ANCESTORS = 32;
+    using AncestorOffsets = std::map<Value*, int64_t>;
+    struct PendingAncestor {
+        Value* value;
+        int64_t offset;
+        size_t depth;
+    };
+    auto collectAncestors = [&](Value* start) -> std::optional<AncestorOffsets> {
+        AncestorOffsets offsets{{start, 0}};
+        std::vector<PendingAncestor> pending{{start, 0, 0}};
+        for (size_t index = 0; index < pending.size(); ++index) {
+            auto current = pending[index];
+            if (current.depth >= MAX_SYMBOLIC_ANCESTOR_DEPTH) {
+                continue;
+            }
+            const auto& domain = RangeAnalysis::GetSIntDomainFromState(state, current.value);
+            for (auto symbolic = domain.SymbolicBounds().Begin();
+                symbolic != domain.SymbolicBounds().End(); ++symbolic) {
+                auto ancestor = symbolic->first.get();
+                if (ancestor == nullptr || ancestor->GetType() == nullptr ||
+                    !ancestor->GetType()->IsInteger() || ancestor->GetType()->IsUnsignedInteger() ||
+                    ToWidth(*ancestor->GetType()) != resultWidth || !symbolic->second.IsSingleElement()) {
+                    continue;
+                }
+                auto candidate = static_cast<__int128>(current.offset) +
+                    static_cast<__int128>(symbolic->second.GetSingleElement().SVal());
+                if (!FitsSignedWidth(candidate, resultWidth)) {
+                    return std::nullopt;
+                }
+                auto exact = static_cast<int64_t>(candidate);
+                if (auto found = offsets.find(ancestor); found != offsets.end()) {
+                    if (found->second != exact) {
+                        return std::nullopt;
+                    }
+                    continue;
+                }
+                if (offsets.size() >= MAX_SYMBOLIC_ANCESTORS) {
+                    return std::nullopt;
+                }
+                offsets.emplace(ancestor, exact);
+                pending.push_back(PendingAncestor{ancestor, exact, current.depth + 1});
+            }
+        }
+        return offsets;
+    };
+
+    auto lhsAncestors = collectAncestors(lhs);
+    auto rhsAncestors = collectAncestors(rhs);
+    if (!lhsAncestors.has_value() || !rhsAncestors.has_value()) {
+        return std::nullopt;
+    }
+    const auto& lhsDomain = RangeAnalysis::GetSIntDomainFromState(state, lhs);
+    const auto& rhsDomain = RangeAnalysis::GetSIntDomainFromState(state, rhs);
+    auto genericDifference = ComputeArithmeticBinop(CHIRArithmeticBinopArgs{
+        lhsDomain, rhsDomain, lhs, rhs, ExprKind::SUB,
+        binaryExpr->GetOverflowStrategy(), false});
+    std::optional<int64_t> inferredDifference;
+    for (const auto& [ancestor, lhsOffset] : lhsAncestors.value()) {
+        auto rhsOffset = rhsAncestors->find(ancestor);
+        if (rhsOffset == rhsAncestors->end()) {
+            continue;
+        }
+        auto difference = static_cast<__int128>(lhsOffset) - rhsOffset->second;
+        if (!FitsSignedWidth(difference, resultWidth)) {
+            continue;
+        }
+        auto exact = static_cast<int64_t>(difference);
+        if (inferredDifference.has_value() && inferredDifference.value() != exact) {
+            return std::nullopt;
+        }
+        inferredDifference = exact;
+    }
+    if (!inferredDifference.has_value()) {
+        return std::nullopt;
+    }
+    auto exactValue = SInt{resultWidth, static_cast<uint64_t>(inferredDifference.value())};
+    if (!genericDifference.NumericBound().Contains(exactValue)) {
+        return std::nullopt;
+    }
+    return BuildSignedExactRange(
+        binaryExpr->GetResult()->GetType(), {inferredDifference.value()});
+}
+
 std::optional<SIntRange> BuildSignedValuesRange(Type* type, std::vector<int64_t> values)
 {
     if (type == nullptr || values.empty()) {
@@ -14122,6 +16362,152 @@ bool NarrowMultiBranchCondition(RangeDomain& state, Value* cond, RelationalOpera
     return true;
 }
 
+std::optional<SIntCongruence> RefineCongruenceWithKnownBits(
+    const std::optional<SIntCongruence>& current,
+    const std::optional<SIntKnownBits>& knownBits, IntWidth width)
+{
+    auto fromBits = InferCongruenceFromKnownBits(knownBits, width);
+    if (!current.has_value()) {
+        return fromBits;
+    }
+    if (!fromBits.has_value() || fromBits->stride % current->stride != 0 ||
+        fromBits->residue % current->stride != current->residue) {
+        return current;
+    }
+    return fromBits;
+}
+
+std::unique_ptr<SIntRange> IntersectRangeWithKnownBits(const SIntDomain& current,
+    const SIntRange* currentRange, const SIntKnownBits& constraint)
+{
+    bool compatible = true;
+    auto currentBits = currentRange == nullptr
+        ? InferKnownBitsFromInterval(current)
+        : GetEffectiveKnownBits(current, currentRange->GetExactValues(),
+              currentRange->GetCongruence(), currentRange->GetKnownBits());
+    auto knownBits = IntersectSIntKnownBits(
+        currentBits, constraint, current.Width(), compatible);
+    if (!compatible) {
+        return std::make_unique<SIntRange>(
+            SIntDomain::Bottom(current.Width(), current.IsUnsigned()));
+    }
+
+    auto narrowed = SIntDomain::Intersects(current,
+        DomainFromKnownBits(knownBits, current.Width(), current.IsUnsigned()));
+    std::optional<std::vector<SInt>> exactValues;
+    if (currentRange != nullptr && currentRange->GetExactValues().has_value()) {
+        const auto mask = GetSIntWidthMask(current.Width());
+        std::vector<SInt> filtered;
+        for (const auto& value : *currentRange->GetExactValues()) {
+            const auto raw = value.UVal() & mask;
+            if ((raw & constraint.knownZero) == 0 &&
+                (raw & constraint.knownOne) == constraint.knownOne) {
+                filtered.emplace_back(value);
+            }
+        }
+        exactValues = NormalizeExactIntSet(std::move(filtered));
+        if (!exactValues.has_value()) {
+            return std::make_unique<SIntRange>(
+                SIntDomain::Bottom(current.Width(), current.IsUnsigned()));
+        }
+    }
+    auto congruence = RefineCongruenceWithKnownBits(
+        currentRange == nullptr ? std::nullopt : currentRange->GetCongruence(),
+        knownBits, current.Width());
+    return std::make_unique<SIntRange>(std::move(narrowed), std::move(exactValues),
+        std::move(congruence), std::move(knownBits),
+        currentRange == nullptr ? std::nullopt : currentRange->GetExcludedValues(),
+        currentRange == nullptr ? std::nullopt : currentRange->GetIntervalFragments());
+}
+
+bool NarrowSIntByKnownBits(
+    RangeDomain& state, Value* value, const SIntKnownBits& constraint)
+{
+    if (!IsIntegerValue(value)) {
+        return true;
+    }
+    const auto& current = RangeAnalysis::GetSIntDomainFromState(state, value);
+    const auto* currentRange = GetSIntRangeFromState(state, value);
+    auto narrowed = IntersectRangeWithKnownBits(current, currentRange, constraint);
+    const bool reachable = !narrowed->GetVal().IsBottom();
+    state.Update(value, std::move(narrowed));
+
+    auto expr = GetDefiningExpr(value);
+    if (expr == nullptr || expr->GetExprKind() != ExprKind::LOAD) {
+        return reachable;
+    }
+    auto location = StaticCast<const Load*>(expr)->GetLocation();
+    auto rootType = location == nullptr || !location->GetType()->IsRef()
+        ? nullptr
+        : StaticCast<RefType*>(location->GetType())->GetRootBaseType();
+    auto object = location == nullptr ? nullptr : state.CheckAbstractObjectRefBy(location);
+    if (rootType == nullptr || !rootType->IsInteger() || object == nullptr) {
+        return reachable;
+    }
+    const auto& objectDomain = GetSIntDomainFromState(state, object, rootType);
+    const auto* objectRange = GetSIntRangeFromState(state, object, rootType);
+    auto narrowedObject =
+        IntersectRangeWithKnownBits(objectDomain, objectRange, constraint);
+    const bool objectReachable = !narrowedObject->GetVal().IsBottom();
+    state.Update(object, std::move(narrowedObject));
+    return reachable && objectReachable;
+}
+
+bool ApplyBitMaskComparisonConstraint(RangeDomain& state, Value* maskedValue,
+    RelationalOperation relation, const SInt& comparedValue)
+{
+    if (relation != RelationalOperation::EQ && relation != RelationalOperation::NE) {
+        return true;
+    }
+    auto expr = GetDefiningExpr(maskedValue);
+    if (expr == nullptr || expr->GetExprKind() != ExprKind::BITAND ||
+        expr->GetExprMajorKind() != ExprMajorKind::BINARY_EXPR) {
+        return true;
+    }
+    auto binary = StaticCast<const BinaryExpression*>(expr);
+    auto lhs = binary->GetLHSOperand();
+    auto rhs = binary->GetRHSOperand();
+    auto lhsConstant = GetSingleIntFromDefiningConstant(lhs);
+    auto rhsConstant = GetSingleIntFromDefiningConstant(rhs);
+    Value* source = nullptr;
+    std::optional<SInt> mask;
+    if (lhsConstant.has_value() && !rhsConstant.has_value()) {
+        source = rhs;
+        mask = lhsConstant.value();
+    } else if (rhsConstant.has_value() && !lhsConstant.has_value()) {
+        source = lhs;
+        mask = rhsConstant.value();
+    } else {
+        return true;
+    }
+    if (!IsIntegerValue(source) || source->GetType() == nullptr ||
+        ToWidth(*source->GetType()) != mask->Width() || mask->Width() != comparedValue.Width()) {
+        return true;
+    }
+
+    const auto widthMask = GetSIntWidthMask(mask->Width());
+    const auto rawMask = mask->UVal() & widthMask;
+    const auto rawCompared = comparedValue.UVal() & widthMask;
+    if ((rawCompared & ~rawMask & widthMask) != 0) {
+        return relation == RelationalOperation::NE;
+    }
+    if (rawMask == 0) {
+        const bool equality = rawCompared == 0;
+        return relation == RelationalOperation::EQ ? equality : !equality;
+    }
+
+    uint64_t required = rawCompared;
+    if (relation == RelationalOperation::NE) {
+        if ((rawMask & (rawMask - 1U)) != 0) {
+            return true;
+        }
+        required = rawCompared == 0 ? rawMask : 0;
+    }
+    SIntKnownBits constraint{
+        rawMask & ~required & widthMask, rawMask & required};
+    return NarrowSIntByKnownBits(state, source, constraint);
+}
+
 // 将整数比较约束应用到分支边状态。
 bool ApplyIntComparisonConstraint(
     RangeDomain& state, Value* lhs, Value* rhs, RelationalOperation rel, bool branchCondition)
@@ -14145,8 +16531,14 @@ bool ApplyIntComparisonConstraint(
         if (!NarrowSIntByRelationToConstant(state, lhs, rel, rhsValue.value())) {
             return false;
         }
+        if (!ApplyBitMaskComparisonConstraint(state, lhs, rel, rhsValue.value())) {
+            return false;
+        }
     } else if (auto rhsConstant = GetSingleIntFromDefiningConstant(rhs)) {
         if (!NarrowSIntByRelationToConstant(state, lhs, rel, rhsConstant.value())) {
+            return false;
+        }
+        if (!ApplyBitMaskComparisonConstraint(state, lhs, rel, rhsConstant.value())) {
             return false;
         }
     }
@@ -14154,8 +16546,16 @@ bool ApplyIntComparisonConstraint(
         if (!NarrowSIntByRelationToConstant(state, rhs, SwapRelation(rel), lhsValue.value())) {
             return false;
         }
+        if (!ApplyBitMaskComparisonConstraint(
+                state, rhs, SwapRelation(rel), lhsValue.value())) {
+            return false;
+        }
     } else if (auto lhsConstant = GetSingleIntFromDefiningConstant(lhs)) {
         if (!NarrowSIntByRelationToConstant(state, rhs, SwapRelation(rel), lhsConstant.value())) {
+            return false;
+        }
+        if (!ApplyBitMaskComparisonConstraint(
+                state, rhs, SwapRelation(rel), lhsConstant.value())) {
             return false;
         }
     }
@@ -14859,6 +17259,317 @@ std::optional<QGSRLoopProjection> BuildQGSRLoopProjection(
     }
     return projection;
 }
+
+struct PureAffineQueryForm {
+    __int128 coefficient{0};
+    __int128 constant{0};
+};
+
+bool IsSameModeledIntegerType(Type* lhs, Type* rhs)
+{
+    return lhs != nullptr && rhs != nullptr && lhs->IsInteger() && rhs->IsInteger() &&
+        lhs->IsUnsignedInteger() == rhs->IsUnsignedInteger() && ToWidth(*lhs) == ToWidth(*rhs);
+}
+
+bool CheckedAffineAdd(__int128 lhs, __int128 rhs, __int128& result)
+{
+    if (!FitsSignedWidth(lhs, IntWidth::I64) || !FitsSignedWidth(rhs, IntWidth::I64)) {
+        return false;
+    }
+    result = lhs + rhs;
+    return FitsSignedWidth(result, IntWidth::I64);
+}
+
+bool CheckedAffineSub(__int128 lhs, __int128 rhs, __int128& result)
+{
+    if (!FitsSignedWidth(lhs, IntWidth::I64) || !FitsSignedWidth(rhs, IntWidth::I64)) {
+        return false;
+    }
+    result = lhs - rhs;
+    return FitsSignedWidth(result, IntWidth::I64);
+}
+
+bool CheckedAffineMul(__int128 lhs, __int128 rhs, __int128& result)
+{
+    if (!FitsSignedWidth(lhs, IntWidth::I64) || !FitsSignedWidth(rhs, IntWidth::I64)) {
+        return false;
+    }
+    result = lhs * rhs;
+    return FitsSignedWidth(result, IntWidth::I64);
+}
+
+bool AffineFormFitsTypeAcrossInduction(
+    const PureAffineQueryForm& form, __int128 inductionMin, __int128 inductionMax, Type* type)
+{
+    __int128 firstProduct = 0;
+    __int128 secondProduct = 0;
+    __int128 first = 0;
+    __int128 second = 0;
+    if (!FitsSignedWidth(form.coefficient, IntWidth::I64) ||
+        !FitsSignedWidth(form.constant, IntWidth::I64) ||
+        !FitsSignedWidth(inductionMin, IntWidth::I64) ||
+        !FitsSignedWidth(inductionMax, IntWidth::I64)) {
+        return false;
+    }
+    firstProduct = form.coefficient * inductionMin;
+    secondProduct = form.coefficient * inductionMax;
+    first = firstProduct + form.constant;
+    second = secondProduct + form.constant;
+    return FitsModeledIntegerWidth(std::min(first, second), type) &&
+        FitsModeledIntegerWidth(std::max(first, second), type);
+}
+
+Value* GetUniqueLoopLocalStoreValue(
+    Value* location, const std::unordered_set<const Block*>& loopBlocks)
+{
+    auto definition = GetDefiningExpr(location);
+    if (definition == nullptr || definition->GetExprKind() != ExprKind::ALLOCATE ||
+        loopBlocks.find(definition->GetParentBlock()) == loopBlocks.end()) {
+        return nullptr;
+    }
+    const Store* definingStore = nullptr;
+    for (auto user : location->GetUsers()) {
+        if (user == nullptr || user->GetExprKind() == ExprKind::DEBUGEXPR) {
+            continue;
+        }
+        if (user->GetExprKind() == ExprKind::LOAD &&
+            StaticCast<const Load*>(user)->GetLocation() == location) {
+            continue;
+        }
+        if (user->GetExprKind() == ExprKind::STORE &&
+            StaticCast<const Store*>(user)->GetLocation() == location &&
+            loopBlocks.find(user->GetParentBlock()) != loopBlocks.end() && definingStore == nullptr) {
+            definingStore = StaticCast<const Store*>(user);
+            continue;
+        }
+        return nullptr;
+    }
+    return definingStore == nullptr ? nullptr : definingStore->GetValue();
+}
+
+std::optional<PureAffineQueryForm> GetPureAffineQueryForm(Value* value, Value* inductionLocation,
+    Type* modeledType, __int128 inductionMin, __int128 inductionMax,
+    const std::unordered_set<const Block*>& loopBlocks, std::unordered_set<Value*>& expandingLocations,
+    size_t depth = 0)
+{
+    constexpr size_t MAX_AFFINE_QUERY_DEPTH = 12;
+    if (value == nullptr || inductionLocation == nullptr || modeledType == nullptr ||
+        depth > MAX_AFFINE_QUERY_DEPTH || !IsSameModeledIntegerType(value->GetType(), modeledType) ||
+        modeledType->IsUnsignedInteger()) {
+        return std::nullopt;
+    }
+    if (auto constant = GetSignedConstantFromDefiningConstant(value); constant.has_value()) {
+        PureAffineQueryForm result{0, constant.value()};
+        return AffineFormFitsTypeAcrossInduction(result, inductionMin, inductionMax, modeledType)
+            ? std::optional<PureAffineQueryForm>{result}
+            : std::nullopt;
+    }
+    auto loadLocation = GetLoadLocation(value);
+    if (loadLocation == inductionLocation) {
+        PureAffineQueryForm result{1, 0};
+        return AffineFormFitsTypeAcrossInduction(result, inductionMin, inductionMax, modeledType)
+            ? std::optional<PureAffineQueryForm>{result}
+            : std::nullopt;
+    }
+    if (loadLocation != nullptr) {
+        if (!expandingLocations.emplace(loadLocation).second) {
+            return std::nullopt;
+        }
+        auto storedValue = GetUniqueLoopLocalStoreValue(loadLocation, loopBlocks);
+        auto result = storedValue == nullptr ? std::nullopt :
+            GetPureAffineQueryForm(storedValue, inductionLocation, modeledType,
+                inductionMin, inductionMax, loopBlocks, expandingLocations, depth + 1);
+        expandingLocations.erase(loadLocation);
+        return result;
+    }
+    auto expression = GetDefiningExpr(value);
+    if (expression == nullptr || (expression->GetExprKind() != ExprKind::ADD &&
+        expression->GetExprKind() != ExprKind::SUB && expression->GetExprKind() != ExprKind::MUL)) {
+        return std::nullopt;
+    }
+    auto binary = StaticCast<const BinaryExpression*>(expression);
+    if (binary->GetOverflowStrategy() != OverflowStrategy::THROWING ||
+        !IsSameModeledIntegerType(binary->GetLHSOperand()->GetType(), modeledType) ||
+        !IsSameModeledIntegerType(binary->GetRHSOperand()->GetType(), modeledType)) {
+        return std::nullopt;
+    }
+    auto lhs = GetPureAffineQueryForm(binary->GetLHSOperand(), inductionLocation, modeledType,
+        inductionMin, inductionMax, loopBlocks, expandingLocations, depth + 1);
+    auto rhs = GetPureAffineQueryForm(binary->GetRHSOperand(), inductionLocation, modeledType,
+        inductionMin, inductionMax, loopBlocks, expandingLocations, depth + 1);
+    if (!lhs.has_value() || !rhs.has_value()) {
+        return std::nullopt;
+    }
+
+    PureAffineQueryForm result;
+    if (expression->GetExprKind() == ExprKind::ADD) {
+        if (!CheckedAffineAdd(lhs->coefficient, rhs->coefficient, result.coefficient) ||
+            !CheckedAffineAdd(lhs->constant, rhs->constant, result.constant)) {
+            return std::nullopt;
+        }
+    } else if (expression->GetExprKind() == ExprKind::SUB) {
+        if (!CheckedAffineSub(lhs->coefficient, rhs->coefficient, result.coefficient) ||
+            !CheckedAffineSub(lhs->constant, rhs->constant, result.constant)) {
+            return std::nullopt;
+        }
+    } else {
+        const bool lhsConstant = lhs->coefficient == 0;
+        const bool rhsConstant = rhs->coefficient == 0;
+        if (!lhsConstant && !rhsConstant) {
+            return std::nullopt;
+        }
+        const auto& affine = lhsConstant ? rhs.value() : lhs.value();
+        const auto factor = lhsConstant ? lhs->constant : rhs->constant;
+        if (!CheckedAffineMul(affine.coefficient, factor, result.coefficient) ||
+            !CheckedAffineMul(affine.constant, factor, result.constant)) {
+            return std::nullopt;
+        }
+    }
+    return AffineFormFitsTypeAcrossInduction(result, inductionMin, inductionMax, modeledType)
+        ? std::optional<PureAffineQueryForm>{result}
+        : std::nullopt;
+}
+
+bool IsCallExpressionKind(ExprKind kind)
+{
+    return kind == ExprKind::APPLY || kind == ExprKind::INVOKE ||
+        kind == ExprKind::APPLY_WITH_EXCEPTION || kind == ExprKind::INVOKE_WITH_EXCEPTION;
+}
+
+bool QueryRootTouchesLoop(const Value* root, const std::unordered_set<const Block*>& loopBlocks)
+{
+    auto definition = GetDefiningExpr(const_cast<Value*>(root));
+    if (definition != nullptr && loopBlocks.find(definition->GetParentBlock()) != loopBlocks.end()) {
+        return true;
+    }
+    auto users = root->GetUsers();
+    return std::any_of(users.begin(), users.end(), [&loopBlocks](const Expression* user) {
+        return user != nullptr && loopBlocks.find(user->GetParentBlock()) != loopBlocks.end();
+    });
+}
+
+bool IsPureAffineQueryBlockUnconditional(const Block* block,
+    const VariableBoundInductionExit& induction, const Branch* branch,
+    const Block* exitSuccessor, const std::unordered_set<const Block*>& loopBlocks)
+{
+    if (block == induction.header) {
+        return true;
+    }
+    return IsProvenSingleExecutionPerLoopIteration(
+        induction, branch, exitSuccessor, block, loopBlocks);
+}
+
+bool IsPureAffineQueryRoot(Value* root, const std::unordered_set<const Block*>& loopBlocks,
+    const VariableBoundInductionExit& induction, const Branch* branch,
+    const Block* exitSuccessor, __int128 inductionMin, __int128 inductionMax)
+{
+    auto definition = GetDefiningExpr(root);
+    if (definition == nullptr || loopBlocks.find(definition->GetParentBlock()) == loopBlocks.end()) {
+        return false;
+    }
+    if (!IsPureAffineQueryBlockUnconditional(
+            definition->GetParentBlock(), induction, branch, exitSuccessor, loopBlocks)) {
+        return false;
+    }
+    if (root->GetType() != nullptr && root->GetType()->IsInteger()) {
+        if (root->GetType()->IsUnsignedInteger() ||
+            !IsSameModeledIntegerType(root->GetType(), induction.loadValue->GetType())) {
+            return false;
+        }
+        std::unordered_set<Value*> expandingLocations;
+        return GetPureAffineQueryForm(root, induction.location, root->GetType(),
+            inductionMin, inductionMax, loopBlocks, expandingLocations).has_value();
+    }
+    if (definition->GetExprKind() != ExprKind::ALLOCATE) {
+        return false;
+    }
+    auto modeledType = GetBoundedLoopRefRootType(root);
+    if (modeledType == nullptr || !modeledType->IsInteger() || modeledType->IsUnsignedInteger() ||
+        !IsSameModeledIntegerType(modeledType, induction.loadValue->GetType())) {
+        return false;
+    }
+
+    const Store* definingStore = nullptr;
+    for (auto user : root->GetUsers()) {
+        if (user == nullptr || user->GetExprKind() == ExprKind::DEBUGEXPR) {
+            continue;
+        }
+        if (user->GetExprKind() == ExprKind::LOAD &&
+            StaticCast<const Load*>(user)->GetLocation() == root) {
+            continue;
+        }
+        if (user->GetExprKind() == ExprKind::STORE &&
+            StaticCast<const Store*>(user)->GetLocation() == root &&
+            loopBlocks.find(user->GetParentBlock()) != loopBlocks.end() && definingStore == nullptr) {
+            definingStore = StaticCast<const Store*>(user);
+            continue;
+        }
+        return false;
+    }
+    std::unordered_set<Value*> expandingLocations{root};
+    return definingStore != nullptr &&
+        IsPureAffineQueryBlockUnconditional(definingStore->GetParentBlock(), induction,
+            branch, exitSuccessor, loopBlocks) &&
+        GetPureAffineQueryForm(definingStore->GetValue(), induction.location, modeledType,
+            inductionMin, inductionMax, loopBlocks, expandingLocations).has_value();
+}
+
+bool CanSkipBoundedReplayForPureAffineQueries(const RangeDomain& state, const Branch* branch,
+    const Block* exitSuccessor, const std::unordered_set<const Block*>& loopBlocks)
+{
+    auto induction = GetVariableBoundInductionExit(
+        state, branch, exitSuccessor, /* resolveForwardedCondition = */ true);
+    if (!induction.has_value() || induction->step != 1 ||
+        induction->loadValue->GetType()->IsUnsignedInteger()) {
+        return false;
+    }
+    auto forest = GetLoopForest(induction->header);
+    auto loop = forest == nullptr ? nullptr : forest->FindByHeader(induction->header);
+    if (loop == nullptr || loop->incoming.size() != 1 || loop->latches.empty() ||
+        loop->latches.size() > 2 || loop->exits.size() != 1 ||
+        !loop->IsExitEdge(branch->GetParentBlock(), exitSuccessor)) {
+        return false;
+    }
+    for (auto block : loopBlocks) {
+        if (forest->FindInnermost(block) != loop) {
+            return false;
+        }
+        for (auto expression : block->GetExpressions()) {
+            if (expression != nullptr && IsCallExpressionKind(expression->GetExprKind())) {
+                return false;
+            }
+        }
+    }
+
+    auto bound = GetSignedConstantFromDefiningConstant(induction->boundValue);
+    if (!bound.has_value() ||
+        !SatisfiesSignedRelation(induction->init, induction->relation, bound.value())) {
+        return false;
+    }
+    auto exactExit = ComputeExactInductionExit(induction->init, induction->step,
+        induction->relation, bound.value(), ToWidth(*induction->loadValue->GetType()));
+    if (!exactExit.has_value()) {
+        return false;
+    }
+    const __int128 inductionMin = induction->init;
+    const __int128 inductionMax = static_cast<__int128>(exactExit->SVal()) - induction->step;
+    if (inductionMax < inductionMin) {
+        return false;
+    }
+
+    size_t relevantRoots = 0;
+    for (auto queryRoot : queryRefinementRoots) {
+        if (queryRoot == nullptr || !QueryRootTouchesLoop(queryRoot, loopBlocks)) {
+            continue;
+        }
+        ++relevantRoots;
+        if (!IsPureAffineQueryRoot(const_cast<Value*>(queryRoot), loopBlocks,
+            induction.value(), branch, exitSuccessor, inductionMin, inductionMax)) {
+            return false;
+        }
+    }
+    return relevantRoots != 0;
+}
 } // namespace
 
 std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
@@ -14866,7 +17577,6 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
 {
     constexpr size_t MAX_BOUNDED_LOOP_BLOCKS = 128;
     constexpr size_t MAX_BOUNDED_LOOP_LOCATIONS = 64;
-    constexpr size_t MAX_BOUNDED_LOOP_STEPS = 16384;
     // Repeated static calls that hit an existing scalar summary are cheap,
     // while a new context or a virtual dispatch can trigger more analysis.
     // Keep the conservative Invoke limit, but let deterministic loops reuse
@@ -14901,8 +17611,27 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
     }
     const bool evaluateExitEdge = successor == exitSuccessor;
     auto header = branch->GetParentBlock();
+    if (auto forest = GetLoopForest(header); forest != nullptr) {
+        auto enclosingLoop = forest->FindInnermost(header);
+        auto enclosingTerminator = enclosingLoop == nullptr || enclosingLoop->header == header
+            ? nullptr
+            : enclosingLoop->header->GetTerminator();
+        if (enclosingTerminator != nullptr &&
+            enclosingTerminator->GetExprKind() == ExprKind::BRANCH &&
+            ShouldPreferAnalyticInductionOverBoundedReplay(
+                state, StaticCast<const Branch*>(enclosingTerminator))) {
+            traceReject("analytic-enclosing-loop");
+            return std::nullopt;
+        }
+    }
     auto loopBlocks = CollectLoopBackPathBlockSet(branch, exitSuccessor, header);
     if (header == nullptr || loopBlocks.empty() || loopBlocks.size() > MAX_BOUNDED_LOOP_BLOCKS) {
+        return std::nullopt;
+    }
+    if (CanSkipBoundedReplayForPureAffineQueries(state, branch, exitSuccessor, loopBlocks)) {
+        if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
+            std::cerr << "[RangeAnalysisBoundedSkip] reason=pure-affine-query\n";
+        }
         return std::nullopt;
     }
     std::optional<QGSRLoopProjection> qgsrProjection;
@@ -15656,7 +18385,7 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
         auto current = observedRanges.find(expression);
         if (current == observedRanges.end()) {
             observedRanges.emplace(expression, range->Clone());
-        } else if (auto joined = current->second->Join(*range); joined.has_value()) {
+        } else if (auto joined = JoinBoundedLoopObservationRanges(*current->second, *range); joined.has_value()) {
             current->second = std::move(joined.value());
         }
     };
@@ -16228,7 +18957,8 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
                 auto current = localBoundedLoopObservations.find(expression);
                 if (current == localBoundedLoopObservations.end()) {
                     localBoundedLoopObservations.emplace(expression, range->Clone());
-                } else if (auto joined = current->second->Join(*range); joined.has_value()) {
+                } else if (auto joined = JoinBoundedLoopObservationRanges(*current->second, *range);
+                    joined.has_value()) {
                     current->second = std::move(joined.value());
                 }
             }
@@ -16578,6 +19308,12 @@ std::optional<SIntRange> TryComputeLockstepDifferenceRange(
     return TryComputeLockstepDifferenceRangeImpl(state, binaryExpr);
 }
 
+std::optional<SIntRange> TryComputeCommonSymbolDifferenceRange(
+    const RangeDomain& state, const BinaryExpression* binaryExpr)
+{
+    return TryComputeCommonSymbolDifferenceRangeImpl(state, binaryExpr);
+}
+
 std::optional<SIntRange> TryComputeSimpleInductionLoadExitRange(const RangeDomain& state, const Load* load)
 {
     return TryComputeSimpleInductionLoadExitRangeImpl(state, load);
@@ -16779,7 +19515,10 @@ RangeDomain GetTerminatorStateForSuccessor(
                     }
                     break;
                 }
-                if (std::getenv("CANGJIE_RA_DISABLE_BOUNDED_LOOP") == nullptr) {
+                const bool preferAnalyticInduction =
+                    ShouldPreferAnalyticInductionOverBoundedReplay(state, branch);
+                if (std::getenv("CANGJIE_RA_DISABLE_BOUNDED_LOOP") == nullptr &&
+                    !preferAnalyticInduction) {
                     if (auto exactExit = rangeAnalysis.TryEvaluateBoundedScalarLoopExit(state, branch, successor);
                         exactExit.has_value()) {
                         if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
@@ -16798,6 +19537,11 @@ RangeDomain GetTerminatorStateForSuccessor(
                                   << " successor=" << successor->GetIdentifier()
                                   << " exact=0\n";
                     }
+                } else if (preferAnalyticInduction &&
+                    std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
+                    const auto& location = branch->GetDebugLocation();
+                    std::cerr << "[RangeAnalysisAnalyticInduction] line="
+                              << location.GetBeginPos().line << " replay=skipped\n";
                 }
                 bool branchCondition = successor == branch->GetTrueBlock();
                 if (!ApplyConditionConstraint(edgeState, branch->GetCondition(), branchCondition)) {

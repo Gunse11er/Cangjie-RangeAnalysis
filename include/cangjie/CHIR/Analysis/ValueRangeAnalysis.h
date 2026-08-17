@@ -92,6 +92,50 @@ struct SIntCongruence {
     }
 };
 
+/// Bit facts preserved independently from the convex numeric interval.
+/// A set bit in knownZero/knownOne means that bit is zero/one for every
+/// concrete value represented by the abstract value.
+struct SIntKnownBits {
+    uint64_t knownZero{0};
+    uint64_t knownOne{0};
+
+    bool IsUseful() const
+    {
+        return knownZero != 0 || knownOne != 0;
+    }
+
+    bool operator==(const SIntKnownBits& rhs) const
+    {
+        return knownZero == rhs.knownZero && knownOne == rhs.knownOne;
+    }
+
+    bool operator!=(const SIntKnownBits& rhs) const
+    {
+        return !(*this == rhs);
+    }
+};
+
+/// A closed, non-wrapping strided interval fragment. A short normalized list
+/// preserves non-convex unions whose individual congruences would otherwise
+/// be lost when their common congruence is weaker.
+struct SIntIntervalFragment {
+    SInt lower;
+    SInt upper;
+    uint64_t stride{1};
+    uint64_t residue{0};
+
+    bool operator==(const SIntIntervalFragment& rhs) const
+    {
+        return lower == rhs.lower && upper == rhs.upper &&
+            stride == rhs.stride && residue == rhs.residue;
+    }
+
+    bool operator!=(const SIntIntervalFragment& rhs) const
+    {
+        return !(*this == rhs);
+    }
+};
+
 class SIntRange : public ValueRange {
 public:
     explicit SIntRange(SIntDomain domain);
@@ -100,6 +144,19 @@ public:
 
     SIntRange(SIntDomain domain, std::optional<std::vector<SInt>> exactValues,
         std::optional<SIntCongruence> congruence);
+
+    SIntRange(SIntDomain domain, std::optional<std::vector<SInt>> exactValues,
+        std::optional<SIntCongruence> congruence, std::optional<SIntKnownBits> knownBits);
+
+    SIntRange(SIntDomain domain, std::optional<std::vector<SInt>> exactValues,
+        std::optional<SIntCongruence> congruence, std::optional<SIntKnownBits> knownBits,
+        std::optional<std::vector<SInt>> excludedValues,
+        std::optional<std::vector<SIntIntervalFragment>> intervalFragments = std::nullopt);
+
+    SIntRange(const SIntRange&) = delete;
+    SIntRange& operator=(const SIntRange&) = delete;
+    SIntRange(SIntRange&&) noexcept = default;
+    SIntRange& operator=(SIntRange&&) noexcept = default;
 
     ~SIntRange() override = default;
 
@@ -117,10 +174,22 @@ public:
 
     const std::optional<SIntCongruence>& GetCongruence() const;
 
+    const std::optional<SIntKnownBits>& GetKnownBits() const;
+
+    const std::optional<std::vector<SInt>>& GetExcludedValues() const;
+
+    const std::optional<std::vector<SIntIntervalFragment>>& GetIntervalFragments() const;
+
 private:
     SIntDomain domain;
     std::optional<std::vector<SInt>> exactValues;
     std::optional<SIntCongruence> congruence;
+    std::optional<SIntKnownBits> knownBits;
+    // Most integer ranges have no holes. Keep the uncommon exclusion set out
+    // of line so ordinary transfer and join operations do not carry an empty
+    // vector-sized payload through every abstract state.
+    std::unique_ptr<std::optional<std::vector<SInt>>> excludedValues;
+    std::unique_ptr<std::optional<std::vector<SIntIntervalFragment>>> intervalFragments;
 };
 
 /**
@@ -192,8 +261,8 @@ public:
 
     static void ClearBoundedLoopObservedRanges();
 
-    static void SetQueryRefinementContext(
-        std::unordered_set<const Block*> blocks, std::unordered_set<const Value*> values);
+    static void SetQueryRefinementContext(std::unordered_set<const Block*> blocks,
+        std::unordered_set<const Value*> values, std::unordered_set<const Value*> roots);
 
     static void ClearQueryRefinementBlocks();
 
@@ -323,6 +392,10 @@ private:
         std::vector<std::optional<ContextAbstractValue>>& refArgValues, ContextGlobalValues& globalValues,
         const std::string* precomputedKey = nullptr);
 
+    std::optional<ContextAbstractValue> TryAnalyzeAffineRecursiveCallee(
+        const Function* callee, const ContextArguments& arguments,
+        const ContextGlobalValues& globalValues) const;
+
     void SummarizeContextOutputs(const Function* callee, const ContextGlobalValues& globals,
         Results<RangeDomain>& results, std::optional<ContextAbstractValue>& returnValue,
         std::vector<std::optional<ContextAbstractValue>>& refArgValues,
@@ -410,6 +483,9 @@ private:
     SIntDomain ComputeTypeCast(RangeDomain& state, PtrSymbol oldSymbol, const SIntDomain& v, IntWidth dstSize,
         bool dstUnsigned, OverflowStrategy ov) const;
 
+    SIntRange ComputeTypeCastRange(RangeDomain& state, PtrSymbol value, Type* sourceType,
+        Type* targetType, OverflowStrategy ov) const;
+
     template <typename TTypeCast> ExceptionKind HandleTypeCast(RangeDomain& state, const TTypeCast* cast)
     {
         auto from = cast->GetSourceTy();
@@ -428,10 +504,9 @@ private:
             return ExceptionKind::NA;
         }
         auto value = cast->GetSourceValue();
-        const auto& sourceDomain = GetSIntDomainFromState(state, value);
-        auto res = ComputeTypeCast(
-            state, value, sourceDomain, ToWidth(*to), to->IsUnsignedInteger(), cast->GetOverflowStrategy());
-        state.Update(cast->GetResult(), std::make_unique<SIntRange>(res));
+        auto range = ComputeTypeCastRange(
+            state, value, from, to, cast->GetOverflowStrategy());
+        state.Update(cast->GetResult(), std::make_unique<SIntRange>(std::move(range)));
         return ExceptionKind::NA;
     }
 
