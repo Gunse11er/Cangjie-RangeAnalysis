@@ -85,6 +85,11 @@ struct SIntCongruence {
     {
         return stride == rhs.stride && residue == rhs.residue;
     }
+
+    bool operator!=(const SIntCongruence& rhs) const
+    {
+        return !(*this == rhs);
+    }
 };
 
 class SIntRange : public ValueRange {

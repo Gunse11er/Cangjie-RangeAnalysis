@@ -4438,7 +4438,7 @@ void RangeAnalysis::HandleContextSensitiveCall(RangeDomain& state, const Express
             ValueAnalysis<RangeValueDomain>::HandleVarStateCapturedByLambda(state, lambda);
         }
     }
-    if (calleeValue == nullptr || !calleeValue->IsFuncWithBody()) {
+    if (calleeValue == nullptr || !calleeValue->IsFuncWithBody()) {      //intrinsic/外部函数等
         RecordContextTopSource("call-target-without-body");
         bool fullyModeled = false;
         if (callExpression != nullptr && callExpression->GetExprKind() == ExprKind::APPLY) {
@@ -6921,7 +6921,6 @@ bool CanProveNoArithmeticOverflow(ExprKind kind, const SIntDomain& lhs, const SI
     if (resultUnsigned && lhs.IsUnsigned() && rhs.IsUnsigned()) {
         auto lhsMinimum = static_cast<unsigned __int128>(lhsBounds->minimum);
         auto lhsMaximum = static_cast<unsigned __int128>(lhsBounds->maximum);
-        auto rhsMinimum = static_cast<unsigned __int128>(rhsBounds->minimum);
         auto rhsMaximum = static_cast<unsigned __int128>(rhsBounds->maximum);
         auto typeMaximum = static_cast<unsigned __int128>(SInt::UMaxValue(resultWidth).UVal());
         switch (kind) {
