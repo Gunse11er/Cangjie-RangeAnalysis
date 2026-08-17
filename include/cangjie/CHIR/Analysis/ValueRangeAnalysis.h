@@ -259,6 +259,11 @@ public:
 
     static std::unique_ptr<ValueRange> GetBoundedLoopObservedRange(const Expression* expression);
 
+    static std::unique_ptr<ValueRange> GetBoundedLoopPrefixObservedRange(const Expression* expression);
+
+    static std::unique_ptr<ValueRange> JoinSupplementalLoopEvidence(
+        const ValueRange& complete, const ValueRange& evidence);
+
     static void ClearBoundedLoopObservedRanges();
 
     static void SetQueryRefinementContext(std::unordered_set<const Block*> blocks,
@@ -267,6 +272,8 @@ public:
     static void ClearQueryRefinementBlocks();
 
     std::unique_ptr<ValueRange> GetLocalBoundedLoopObservedRange(const Expression* expression) const;
+
+    std::unique_ptr<ValueRange> GetLocalBoundedLoopPrefixObservedRange(const Expression* expression) const;
 
     /**
      * @brief get bool domain of CHIR value from state.
@@ -471,7 +478,8 @@ private:
     std::optional<Block*> HandleMultiBranchTerminator(const RangeDomain& state, const MultiBranch* multi) const;
 
     std::optional<RangeDomain> TryEvaluateBoundedScalarLoopExit(
-        const RangeDomain& state, const Branch* branch, const Block* successor);
+        const RangeDomain& state, const Branch* branch, const Block* successor,
+        size_t stepBudget, bool publishPrefixOnBudget);
 
     enum class ExceptionKind : uint8_t { SUCCESS, FAIL, NA };
 

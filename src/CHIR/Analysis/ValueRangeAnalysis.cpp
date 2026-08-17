@@ -968,6 +968,11 @@ void ClearContextObjectIdentities()
 
 using BoundedLoopObservationMap = std::unordered_map<const Expression*, std::unique_ptr<ValueRange>>;
 BoundedLoopObservationMap boundedLoopObservations;
+BoundedLoopObservationMap boundedLoopPrefixObservations;
+std::unordered_map<const RangeAnalysis*, BoundedLoopObservationMap>
+    localBoundedLoopPrefixObservations;
+std::unordered_map<const RangeAnalysis*, std::unordered_set<std::string>>
+    completedBoundedLoopPrefixAttempts;
 bool boundedLoopObservationsComplete{true};
 std::mutex boundedLoopObservationsMtx;
 
@@ -1009,6 +1014,29 @@ void CommitBoundedLoopObservations(const BoundedLoopObservationMap& observations
             continue;
         }
         if (auto joined = JoinBoundedLoopObservationRanges(*current->second, *range); joined.has_value()) {
+            current->second = std::move(joined.value());
+        }
+    }
+}
+
+void CommitBoundedLoopPrefixObservations(const BoundedLoopObservationMap& observations)
+{
+    std::lock_guard<std::mutex> lock(boundedLoopObservationsMtx);
+    for (const auto& [expression, range] : observations) {
+        if (expression == nullptr || range == nullptr) {
+            continue;
+        }
+        auto current = boundedLoopPrefixObservations.find(expression);
+        if (current == boundedLoopPrefixObservations.end()) {
+            if (boundedLoopPrefixObservations.size() >=
+                rangeAnalysisConfig.maxBoundedLoopObservations) {
+                continue;
+            }
+            boundedLoopPrefixObservations.emplace(expression, range->Clone());
+            continue;
+        }
+        if (auto joined = JoinBoundedLoopObservationRanges(*current->second, *range);
+            joined.has_value()) {
             current->second = std::move(joined.value());
         }
     }
@@ -1992,6 +2020,55 @@ std::optional<std::unique_ptr<ValueRange>> JoinBoundedLoopObservationRanges(
         joinedRange->GetExactValues(), joinedRange->GetCongruence(), joinedRange->GetKnownBits(),
         std::move(excludedValues));
     return std::optional<std::unique_ptr<ValueRange>>{std::move(refined)};
+}
+
+bool SIntFragmentContainsValue(
+    const SIntIntervalFragment& fragment, const SInt& value, bool isUnsigned)
+{
+    const auto mathematical = [isUnsigned](const SInt& candidate) {
+        return ToMathematicalInteger(candidate, isUnsigned);
+    };
+    const auto candidate = mathematical(value);
+    return candidate >= mathematical(fragment.lower) &&
+        candidate <= mathematical(fragment.upper) &&
+        (fragment.stride <= 1 ||
+            CanonicalResidue(candidate, fragment.stride) == fragment.residue);
+}
+
+bool SIntRangeContainsExactValue(const SIntRange& range, const SInt& value)
+{
+    if (value.Width() != range.GetVal().Width()) {
+        return false;
+    }
+    if (range.GetExactValues().has_value()) {
+        return std::find(range.GetExactValues()->begin(),
+                   range.GetExactValues()->end(), value) !=
+            range.GetExactValues()->end();
+    }
+    if (!SIntRangeMayContain(range.GetVal(), range.GetExcludedValues(), value)) {
+        return false;
+    }
+    if (range.GetCongruence().has_value() &&
+        CanonicalResidue(ToMathematicalInteger(value, range.GetVal().IsUnsigned()),
+            range.GetCongruence()->stride) != range.GetCongruence()->residue) {
+        return false;
+    }
+    if (range.GetKnownBits().has_value()) {
+        const auto raw = value.UVal();
+        if ((raw & range.GetKnownBits()->knownZero) != 0 ||
+            (raw & range.GetKnownBits()->knownOne) !=
+                range.GetKnownBits()->knownOne) {
+            return false;
+        }
+    }
+    if (range.GetIntervalFragments().has_value()) {
+        return std::any_of(range.GetIntervalFragments()->begin(),
+            range.GetIntervalFragments()->end(), [&](const auto& fragment) {
+                return SIntFragmentContainsValue(
+                    fragment, value, range.GetVal().IsUnsigned());
+            });
+    }
+    return true;
 }
 
 std::optional<std::vector<SInt>> IntersectExcludedSIntValues(const SIntRange& lhs,
@@ -3626,6 +3703,72 @@ std::unique_ptr<ValueRange> RangeAnalysis::GetBoundedLoopObservedRange(const Exp
     return found == boundedLoopObservations.end() ? nullptr : found->second->Clone();
 }
 
+std::unique_ptr<ValueRange> RangeAnalysis::GetBoundedLoopPrefixObservedRange(
+    const Expression* expression)
+{
+    std::lock_guard<std::mutex> lock(boundedLoopObservationsMtx);
+    auto found = boundedLoopPrefixObservations.find(expression);
+    return found == boundedLoopPrefixObservations.end()
+        ? nullptr : found->second->Clone();
+}
+
+std::unique_ptr<ValueRange> RangeAnalysis::JoinSupplementalLoopEvidence(
+    const ValueRange& complete, const ValueRange& evidence)
+{
+    if (complete.GetRangeKind() != evidence.GetRangeKind()) {
+        return complete.Clone();
+    }
+    const auto ordinaryJoin = [&]() {
+        auto result = complete.Clone();
+        if (auto joined = result->Join(evidence); joined.has_value()) {
+            result = std::move(joined.value());
+        }
+        return result;
+    };
+    if (complete.GetRangeKind() != ValueRange::RangeKind::SINT) {
+        return ordinaryJoin();
+    }
+
+    const auto& completeRange = StaticCast<const SIntRange&>(complete);
+    const auto& evidenceRange = StaticCast<const SIntRange&>(evidence);
+    if (!evidenceRange.GetExactValues().has_value()) {
+        return ordinaryJoin();
+    }
+    std::vector<SInt> missingValues;
+    for (const auto& value : *evidenceRange.GetExactValues()) {
+        if (!SIntRangeContainsExactValue(completeRange, value)) {
+            missingValues.emplace_back(value);
+        }
+    }
+    if (missingValues.empty()) {
+        return complete.Clone();
+    }
+
+    auto joined = ordinaryJoin();
+    auto* joinedRange = StaticCast<const SIntRange*>(joined.get());
+    if (completeRange.GetExactValues().has_value() ||
+        completeRange.GetExcludedValues().has_value() ||
+        joinedRange->GetExactValues().has_value()) {
+        return joined;
+    }
+    auto fragments = GetSIntIntervalFragmentsForUnion(completeRange);
+    if (!fragments.has_value()) {
+        return joined;
+    }
+    for (const auto& value : missingValues) {
+        fragments->emplace_back(SIntIntervalFragment{value, value, 1, 0});
+    }
+    auto normalizedFragments = NormalizeSIntIntervalFragments(
+        std::move(*fragments), joinedRange->GetVal());
+    if (!normalizedFragments.has_value()) {
+        return joined;
+    }
+    return std::make_unique<SIntRange>(joinedRange->GetVal(),
+        joinedRange->GetExactValues(), joinedRange->GetCongruence(),
+        joinedRange->GetKnownBits(), joinedRange->GetExcludedValues(),
+        std::move(normalizedFragments));
+}
+
 std::unique_ptr<ValueRange> RangeAnalysis::GetLocalBoundedLoopObservedRange(
     const Expression* expression) const
 {
@@ -3638,10 +3781,25 @@ std::unique_ptr<ValueRange> RangeAnalysis::GetLocalBoundedLoopObservedRange(
     return found == localBoundedLoopObservations.end() ? nullptr : found->second->Clone();
 }
 
+std::unique_ptr<ValueRange> RangeAnalysis::GetLocalBoundedLoopPrefixObservedRange(
+    const Expression* expression) const
+{
+    std::lock_guard<std::mutex> lock(boundedLoopObservationsMtx);
+    auto owner = localBoundedLoopPrefixObservations.find(this);
+    if (owner == localBoundedLoopPrefixObservations.end()) {
+        return nullptr;
+    }
+    auto found = owner->second.find(expression);
+    return found == owner->second.end() ? nullptr : found->second->Clone();
+}
+
 void RangeAnalysis::ClearBoundedLoopObservedRanges()
 {
     std::lock_guard<std::mutex> lock(boundedLoopObservationsMtx);
     boundedLoopObservations.clear();
+    boundedLoopPrefixObservations.clear();
+    localBoundedLoopPrefixObservations.clear();
+    completedBoundedLoopPrefixAttempts.clear();
     boundedLoopObservationsComplete = true;
 }
 
@@ -6872,6 +7030,11 @@ RangeAnalysis::~RangeAnalysis()
         std::lock_guard<std::mutex> lock(GetBoundedLoopExitCacheMutex());
         GetBoundedLoopExitCaches().erase(this);
     }
+    {
+        std::lock_guard<std::mutex> lock(boundedLoopObservationsMtx);
+        localBoundedLoopPrefixObservations.erase(this);
+        completedBoundedLoopPrefixAttempts.erase(this);
+    }
 }
 
 void RangeAnalysis::SetQueryRefinementContext(std::unordered_set<const Block*> blocks,
@@ -7288,7 +7451,7 @@ const Expression* GetDefiningExprForWidening(Value* value)
 }
 
 std::vector<SInt> CollectLoopWideningThresholds(
-    const Block* block, IntWidth width, bool isUnsigned)
+    const RangeDomain& state, const Block* block, IntWidth width, bool isUnsigned)
 {
     std::vector<SInt> thresholds;
     auto forest = GetLoopForest(block);
@@ -7301,10 +7464,22 @@ std::vector<SInt> CollectLoopWideningThresholds(
             thresholds.emplace_back(threshold);
         }
     };
-    const auto getConstant = [](Value* value) -> std::optional<SInt> {
+    const auto getConstant = [&state](Value* value) -> std::optional<SInt> {
         auto expression = GetDefiningExprForWidening(value);
         if (expression == nullptr || expression->GetExprKind() != ExprKind::CONSTANT) {
-            return std::nullopt;
+            // CHIR commonly materializes a loop bound through a load or a
+            // same-width cast. It remains a sound threshold when the current
+            // abstract state proves that operand is a singleton.
+            auto abstractDomain = state.CheckAbstractValueWithTopBottom(value);
+            auto abstractValue = abstractDomain == nullptr ? nullptr : abstractDomain->CheckAbsVal();
+            if (abstractValue == nullptr ||
+                abstractValue->GetRangeKind() != ValueRange::RangeKind::SINT) {
+                return std::nullopt;
+            }
+            const auto& domain = StaticCast<const SIntRange*>(abstractValue)->GetVal();
+            return domain.IsSingleValue()
+                ? std::optional<SInt>{domain.NumericBound().GetSingleElement()}
+                : std::nullopt;
         }
         auto literal = StaticCast<const Constant*>(expression)->GetValue();
         if (literal == nullptr || !literal->IsIntLiteral()) {
@@ -7734,7 +7909,7 @@ void ApplyLoopWidening(
         if (foundThresholds == thresholdCache.end()) {
             foundThresholds = thresholdCache.emplace(thresholdKey,
                 CollectLoopWideningThresholds(
-                    block, current.Width(), current.IsUnsigned())).first;
+                    state, block, current.Width(), current.IsUnsigned())).first;
         }
         auto widened = WidenSIntDomain(
             entry.range->GetVal(), current, foundThresholds->second);
@@ -16344,9 +16519,8 @@ bool NarrowMultiBranchTarget(RangeDomain& state, Value* value, RelationalOperati
     if (!IsIntegerValue(value)) {
         return true;
     }
-    auto width = ToWidth(*value->GetType());
-    return NarrowSIntValue(
-        state, value, SIntDomain::FromNumeric(rel, SInt{width, caseVal}, value->GetType()->IsUnsignedInteger()));
+    return NarrowSIntByRelationToConstant(
+        state, value, rel, SInt{ToWidth(*value->GetType()), caseVal});
 }
 
 // 收窄 MultiBranch 条件，并在存在同宽 typecast 时回推源值。
@@ -16797,19 +16971,11 @@ bool ApplyMultiBranchConstraint(RangeDomain& state, const MultiBranch* multi, co
     if (!IsIntegerValue(cond)) {
         return true;
     }
-    auto width = ToWidth(*cond->GetType());
-    auto isUnsigned = cond->GetType()->IsUnsignedInteger();
     if (successor == multi->GetDefaultBlock()) {
         for (auto caseVal : multi->GetCaseVals()) {
-            if (!NarrowSIntValue(
-                state, cond, SIntDomain::FromNumeric(RelationalOperation::NE, SInt{width, caseVal}, isUnsigned))) {
+            if (!NarrowMultiBranchCondition(
+                    state, cond, RelationalOperation::NE, caseVal)) {
                 return false;
-            }
-            auto source = GetSameWidthTypeCastSource(cond);
-            if (source != nullptr && source != cond) {
-                if (!NarrowMultiBranchTarget(state, source, RelationalOperation::NE, caseVal)) {
-                    return false;
-                }
             }
         }
         return true;
@@ -17573,7 +17739,8 @@ bool CanSkipBoundedReplayForPureAffineQueries(const RangeDomain& state, const Br
 } // namespace
 
 std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
-    const RangeDomain& state, const Branch* branch, const Block* successor)
+    const RangeDomain& state, const Branch* branch, const Block* successor,
+    size_t stepBudget, bool publishPrefixOnBudget)
 {
     constexpr size_t MAX_BOUNDED_LOOP_BLOCKS = 128;
     constexpr size_t MAX_BOUNDED_LOOP_LOCATIONS = 64;
@@ -17587,6 +17754,9 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
         MAX_TOTAL_BOUNDED_LOOP_CONTEXT_SUMMARIES;
     constexpr size_t MAX_BOUNDED_LOOP_UNIQUE_INVOKE_CONTEXTS = 256;
     constexpr size_t MAX_BOUNDED_LOOP_CACHE_ENTRIES = 64;
+    if (stepBudget == 0 || stepBudget > MAX_BOUNDED_LOOP_STEPS) {
+        return std::nullopt;
+    }
     const auto traceReject = [branch](const char* reason) {
         if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") == nullptr) {
             return;
@@ -17682,6 +17852,7 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
             }
         }
     }
+    const std::vector<const Expression*> noCallExpressions;
     struct BoundedContextAttempt {
         ~BoundedContextAttempt()
         {
@@ -17711,9 +17882,10 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
         BoundedLoopCallContextMap* parentRecorder;
         std::unordered_set<const Expression*>* incompleteObservations;
         bool succeeded{false};
-    } boundedContextAttempt{analysisContext, loopExpressions, loopCallExpressions,
+    } boundedContextAttempt{analysisContext, loopExpressions,
+        publishPrefixOnBudget ? noCallExpressions : loopCallExpressions,
         parentCallContextRecorder,
-        isContextAnalysis ? &incompleteLocalBoundedLoopObservations : nullptr};
+        isContextAnalysis && !publishPrefixOnBudget ? &incompleteLocalBoundedLoopObservations : nullptr};
     const Block* loopEntry = nullptr;
     for (auto block : loopBlocks) {
         bool hasOutsidePredecessor = false;
@@ -18559,8 +18731,17 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
         cacheKey << ":receiver@" << receiver << "=" << captured.ToKeyString(type);
     }
     auto key = cacheKey.str();
+    if (publishPrefixOnBudget) {
+        key += ":prefix";
+        std::lock_guard<std::mutex> lock(boundedLoopObservationsMtx);
+        auto owner = completedBoundedLoopPrefixAttempts.find(this);
+        if (owner != completedBoundedLoopPrefixAttempts.end() &&
+            owner->second.find(key) != owner->second.end()) {
+            return std::nullopt;
+        }
+    }
     std::optional<ContextLocationValues> cachedSummary;
-    if (cacheableLoop) {
+    if (cacheableLoop && !publishPrefixOnBudget) {
         std::lock_guard<std::mutex> lock(GetBoundedLoopExitCacheMutex());
         auto ownerCache = GetBoundedLoopExitCaches().find(this);
         if (ownerCache != GetBoundedLoopExitCaches().end()) {
@@ -19020,7 +19201,7 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
     std::unordered_set<std::string> uniqueApplyContexts;
     std::unordered_set<std::string> uniqueInvokeContexts;
     std::optional<RangeDomain> observedSuccessorState;
-    for (size_t step = 0; step < MAX_BOUNDED_LOOP_STEPS; ++step) {
+    for (size_t step = 0; step < stepBudget; ++step) {
         if (current == exitSuccessor) {
             if (evaluateExitEdge) {
                 return cacheResultState(loopState);
@@ -19292,6 +19473,32 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
         }
         current = next;
     }
+    if (publishPrefixOnBudget) {
+        if (isContextAnalysis) {
+            std::lock_guard<std::mutex> lock(boundedLoopObservationsMtx);
+            auto& ownerObservations = localBoundedLoopPrefixObservations[this];
+            for (const auto& [expression, range] : observedRanges) {
+                if (expression == nullptr || range == nullptr) {
+                    continue;
+                }
+                auto currentRange = ownerObservations.find(expression);
+                if (currentRange == ownerObservations.end()) {
+                    ownerObservations.emplace(expression, range->Clone());
+                } else if (auto joined = JoinBoundedLoopObservationRanges(
+                    *currentRange->second, *range); joined.has_value()) {
+                    currentRange->second = std::move(joined.value());
+                }
+            }
+        } else {
+            CommitBoundedLoopPrefixObservations(observedRanges);
+        }
+        {
+            std::lock_guard<std::mutex> lock(boundedLoopObservationsMtx);
+            completedBoundedLoopPrefixAttempts[this].emplace(key);
+        }
+        boundedContextAttempt.MarkSucceeded();
+        failedContextAttempt.MarkSucceeded();
+    }
     traceReject("step-budget");
     return std::nullopt;
 }
@@ -19519,7 +19726,9 @@ RangeDomain GetTerminatorStateForSuccessor(
                     ShouldPreferAnalyticInductionOverBoundedReplay(state, branch);
                 if (std::getenv("CANGJIE_RA_DISABLE_BOUNDED_LOOP") == nullptr &&
                     !preferAnalyticInduction) {
-                    if (auto exactExit = rangeAnalysis.TryEvaluateBoundedScalarLoopExit(state, branch, successor);
+                    if (auto exactExit = rangeAnalysis.TryEvaluateBoundedScalarLoopExit(
+                        state, branch, successor, MAX_BOUNDED_LOOP_STEPS,
+                        /* publishPrefixOnBudget = */ false);
                         exactExit.has_value()) {
                         if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
                             const auto& location = branch->GetDebugLocation();
@@ -19537,11 +19746,18 @@ RangeDomain GetTerminatorStateForSuccessor(
                                   << " successor=" << successor->GetIdentifier()
                                   << " exact=0\n";
                     }
-                } else if (preferAnalyticInduction &&
-                    std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
-                    const auto& location = branch->GetDebugLocation();
-                    std::cerr << "[RangeAnalysisAnalyticInduction] line="
-                              << location.GetBeginPos().line << " replay=skipped\n";
+                } else if (preferAnalyticInduction) {
+                    constexpr size_t MAX_ANALYTIC_LOOP_PREFIX_STEPS = 64;
+                    if (IsLoopExitSuccessor(branch, successor)) {
+                        (void)rangeAnalysis.TryEvaluateBoundedScalarLoopExit(
+                            state, branch, successor, MAX_ANALYTIC_LOOP_PREFIX_STEPS,
+                            /* publishPrefixOnBudget = */ true);
+                    }
+                    if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
+                        const auto& location = branch->GetDebugLocation();
+                        std::cerr << "[RangeAnalysisAnalyticInduction] line="
+                                  << location.GetBeginPos().line << " replay=skipped\n";
+                    }
                 }
                 bool branchCondition = successor == branch->GetTrueBlock();
                 if (!ApplyConditionConstraint(edgeState, branch->GetCondition(), branchCondition)) {

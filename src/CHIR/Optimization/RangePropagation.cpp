@@ -1120,6 +1120,7 @@ struct ContestLoopLifetime {
 
 struct ContestContextLoopObservation {
     std::unique_ptr<ValueRange> range;
+    std::unique_ptr<ValueRange> prefixRange;
     bool complete{true};
 };
 
@@ -1159,6 +1160,7 @@ ContestLoopLifetime CollectContestLoopLifetime(const ContestAggregateBinding& ag
     auto type = GetQueryValueType(binding);
     bool escaped = false;
     bool hasLoopStore = false;
+    std::unique_ptr<ValueRange> prefixEvidence;
     size_t loopUses = 0;
     for (auto user : binding->GetUsers()) {
         if (user == nullptr) {
@@ -1195,6 +1197,7 @@ ContestLoopLifetime CollectContestLoopLifetime(const ContestAggregateBinding& ag
             continue;
         }
         std::unique_ptr<ValueRange> observed;
+        std::unique_ptr<ValueRange> prefix;
         auto contextObservation = contextObservations.find(user);
         if (contextObservation != contextObservations.end()) {
             lifetime.hasContextObservation = true;
@@ -1204,20 +1207,39 @@ ContestLoopLifetime CollectContestLoopLifetime(const ContestAggregateBinding& ag
                 continue;
             }
             observed = contextObservation->second.range->Clone();
+            if (contextObservation->second.prefixRange != nullptr) {
+                prefix = contextObservation->second.prefixRange->Clone();
+            }
         } else {
             observed = RangeAnalysis::GetBoundedLoopObservedRange(user);
+            prefix = RangeAnalysis::GetBoundedLoopPrefixObservedRange(user);
         }
         if (observed == nullptr) {
             lifetime.complete = false;
             continue;
         }
         MergeContestLoopLifetime(lifetime, type, observed.get());
+        if (prefix != nullptr &&
+            observed->GetRangeKind() == prefix->GetRangeKind()) {
+            if (prefixEvidence == nullptr) {
+                prefixEvidence = std::move(prefix);
+            } else if (auto joined = prefixEvidence->Join(*prefix);
+                joined.has_value()) {
+                prefixEvidence = std::move(joined.value());
+            }
+        }
     }
     if (!hasLoopStore) {
         return ContestLoopLifetime{};
     }
     if (lifetime.hasLoopUse && escaped) {
         lifetime.complete = false;
+    }
+    if (lifetime.complete && lifetime.range != nullptr &&
+        prefixEvidence != nullptr &&
+        lifetime.range->GetRangeKind() == prefixEvidence->GetRangeKind()) {
+        lifetime.range = RangeAnalysis::JoinSupplementalLoopEvidence(
+            *lifetime.range, *prefixEvidence);
     }
     return lifetime;
 }
@@ -1252,6 +1274,10 @@ bool CollectContestContextLoopObservations(
         auto type = GetQueryValueType(value);
         auto bounded = analysis->GetLocalBoundedLoopObservedRange(expression);
         auto sharedBounded = RangeAnalysis::GetBoundedLoopObservedRange(expression);
+        auto prefix = analysis->GetLocalBoundedLoopPrefixObservedRange(expression);
+        if (prefix == nullptr) {
+            prefix = RangeAnalysis::GetBoundedLoopPrefixObservedRange(expression);
+        }
         auto direct = ObserveContestRange(state, value);
         const ValueRange* selected = bounded.get();
         if ((selected == nullptr || IsContestTopRange(selected, type)) &&
@@ -1289,6 +1315,17 @@ bool CollectContestContextLoopObservations(
         } else if (auto joined = found->second.range->Join(*selected);
             joined.has_value()) {
             found->second.range = std::move(joined.value());
+        }
+        if (prefix != nullptr) {
+            if (found->second.prefixRange == nullptr) {
+                found->second.prefixRange = std::move(prefix);
+            } else if (found->second.prefixRange->GetRangeKind() !=
+                prefix->GetRangeKind()) {
+                found->second.complete = false;
+            } else if (auto joined = found->second.prefixRange->Join(*prefix);
+                joined.has_value()) {
+                found->second.prefixRange = std::move(joined.value());
+            }
         }
     };
     result.VisitWith(
