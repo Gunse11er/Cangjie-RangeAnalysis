@@ -339,6 +339,8 @@ struct ContestContextCandidate {
     bool hasUnknownObservation{false};
     bool auxiliaryOnly{false};
     bool hasDirectPointLoadObservation{false};
+    bool exactSIntObservationUnionComplete{true};
+    std::vector<SInt> exactSIntObservations;
 };
 
 using ContestContextCandidateMap = std::unordered_map<size_t, ContestContextCandidate>;
@@ -1279,6 +1281,7 @@ bool CollectContestContextLoopObservations(
             prefix = RangeAnalysis::GetBoundedLoopPrefixObservedRange(expression);
         }
         auto direct = ObserveContestRange(state, value);
+        std::unique_ptr<ValueRange> selectedWithPrefix;
         const ValueRange* selected = bounded.get();
         if ((selected == nullptr || IsContestTopRange(selected, type)) &&
             sharedBounded != nullptr &&
@@ -1288,6 +1291,12 @@ bool CollectContestContextLoopObservations(
         if ((selected == nullptr || IsContestTopRange(selected, type)) &&
             direct.kind == ContestRangeObservationKind::KNOWN) {
             selected = direct.range;
+        }
+        if (selected != nullptr && prefix != nullptr &&
+            selected->GetRangeKind() == prefix->GetRangeKind()) {
+            selectedWithPrefix = RangeAnalysis::JoinSupplementalLoopEvidence(
+                *selected, *prefix);
+            selected = selectedWithPrefix.get();
         }
         if (selected == nullptr &&
             direct.kind == ContestRangeObservationKind::UNKNOWN) {
@@ -2500,6 +2509,68 @@ void ResolveQueryBeforeGlobalAccess(std::vector<ContestQuery>& queries, const Ex
     }
 }
 
+constexpr size_t MAX_CONTEXT_EXACT_SINT_OBSERVATIONS = 4096;
+
+void InvalidateExactSIntObservationUnion(ContestContextCandidate& candidate)
+{
+    candidate.exactSIntObservationUnionComplete = false;
+    candidate.exactSIntObservations.clear();
+}
+
+void RecordExactSIntObservation(
+    ContestContextCandidate& candidate, const ValueRange& range)
+{
+    if (!candidate.exactSIntObservationUnionComplete) {
+        return;
+    }
+    if (range.GetRangeKind() != ValueRange::RangeKind::SINT) {
+        InvalidateExactSIntObservationUnion(candidate);
+        return;
+    }
+    const auto& domain = StaticCast<const SIntRange&>(range).GetVal();
+    if (!domain.IsSingleValue() ||
+        candidate.exactSIntObservations.size() >=
+            MAX_CONTEXT_EXACT_SINT_OBSERVATIONS) {
+        InvalidateExactSIntObservationUnion(candidate);
+        return;
+    }
+    candidate.exactSIntObservations.emplace_back(
+        domain.NumericBound().GetSingleElement());
+}
+
+std::unique_ptr<ValueRange> BuildDeterministicExactSIntObservationUnion(
+    const ContestContextCandidate& candidate)
+{
+    if (!candidate.exactSIntObservationUnionComplete ||
+        candidate.exactSIntObservations.empty() || candidate.type == nullptr ||
+        !candidate.type->IsInteger()) {
+        return nullptr;
+    }
+    auto values = candidate.exactSIntObservations;
+    const bool isUnsigned = candidate.type->IsUnsignedInteger();
+    std::sort(values.begin(), values.end(), [isUnsigned](const SInt& lhs, const SInt& rhs) {
+        return isUnsigned ? lhs.UVal() < rhs.UVal() : lhs.SVal() < rhs.SVal();
+    });
+    values.erase(std::unique(values.begin(), values.end()), values.end());
+    if (values.empty()) {
+        return nullptr;
+    }
+
+    const auto makeSingleton = [isUnsigned](const SInt& value) {
+        return std::make_unique<SIntRange>(
+            SIntDomain::FromNumeric(RelationalOperation::EQ, value, isUnsigned),
+            std::vector<SInt>{value});
+    };
+    std::unique_ptr<ValueRange> result = makeSingleton(values.front());
+    for (size_t index = 1; index < values.size(); ++index) {
+        auto singleton = makeSingleton(values[index]);
+        if (auto joined = result->Join(*singleton); joined.has_value()) {
+            result = std::move(joined.value());
+        }
+    }
+    return result;
+}
+
 void MergeContestContextCandidate(
     ContestContextCandidateMap& candidates, size_t queryIndex, Type* type, const ValueRange* range,
     bool unknownObservation = false, bool auxiliary = false,
@@ -2519,6 +2590,7 @@ void MergeContestContextCandidate(
     if (!AreContestTypesCompatible(candidate.type, type)) {
         candidate.range = MakeContestTopRange(candidate.type);
         candidate.incompleteGlobalLifetime = true;
+        InvalidateExactSIntObservationUnion(candidate);
         candidate.hasUnknownObservation = true;
         candidate.auxiliaryOnly = hadObservation ? wasAuxiliaryOnly && auxiliary : auxiliary;
         return;
@@ -2531,6 +2603,7 @@ void MergeContestContextCandidate(
         candidate.hasUnknownObservation || (incomingUnknown && !auxiliary);
     candidate.auxiliaryOnly = hadObservation ? wasAuxiliaryOnly && auxiliary : auxiliary;
     if (candidate.hasUnknownObservation) {
+        InvalidateExactSIntObservationUnion(candidate);
         candidate.range = MakeContestTopRange(candidate.type);
         return;
     }
@@ -2539,6 +2612,9 @@ void MergeContestContextCandidate(
         return;
     }
     if (candidate.range == nullptr) {
+        if (!auxiliary) {
+            RecordExactSIntObservation(candidate, *incoming);
+        }
         candidate.range = std::move(incoming);
         return;
     }
@@ -2546,14 +2622,19 @@ void MergeContestContextCandidate(
         return;
     }
     if (!auxiliary && wasAuxiliaryOnly) {
+        candidate.exactSIntObservationUnionComplete = true;
+        candidate.exactSIntObservations.clear();
+        RecordExactSIntObservation(candidate, *incoming);
         candidate.range = std::move(incoming);
         return;
     }
     if (candidate.range->GetRangeKind() != incoming->GetRangeKind()) {
+        InvalidateExactSIntObservationUnion(candidate);
         candidate.range = MakeContestTopRange(candidate.type);
         candidate.incompleteGlobalLifetime = true;
         return;
     }
+    RecordExactSIntObservation(candidate, *incoming);
     if (auto joined = candidate.range->Join(*incoming); joined.has_value()) {
         candidate.range = std::move(joined.value());
     }
@@ -3269,6 +3350,11 @@ void ApplyContestContextCandidates(std::vector<ContestQuery>& queries,
             continue;
         }
         auto& query = queries[index];
+        auto deterministicSIntUnion =
+            BuildDeterministicExactSIntObservationUnion(candidate);
+        const ValueRange* candidateRange = deterministicSIntUnion != nullptr
+            ? deterministicSIntUnion.get()
+            : candidate.range.get();
         if (query.programPoints.Has(ContestProgramPointKind::BOUND_GLOBAL_PRESTATE) &&
             query.isGlobalDeclarationQuery &&
             candidate.fromGlobalAccess) {
@@ -3280,7 +3366,7 @@ void ApplyContestContextCandidates(std::vector<ContestQuery>& queries,
         }
         if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr) {
             std::cerr << "[RangeAnalysisContextApply] query=" << query.variableName << '@' << query.line
-                      << " candidate=" << FormatContestRange(candidate.range.get(), candidate.type)
+                      << " candidate=" << FormatContestRange(candidateRange, candidate.type)
                       << " unknown=" << candidate.hasUnknownObservation
                       << " auxiliaryOnly=" << candidate.auxiliaryOnly
                       << " incomplete=" << candidate.incompleteGlobalLifetime
@@ -3301,7 +3387,7 @@ void ApplyContestContextCandidates(std::vector<ContestQuery>& queries,
             !IsContestTopRange(query.resultRange.get(), query.type);
         const bool hasCompleteContextCandidate = !candidate.fromGlobalAccess &&
             !candidate.incompleteGlobalLifetime && !candidate.hasUnknownObservation &&
-            !candidate.auxiliaryOnly && candidate.range != nullptr &&
+            !candidate.auxiliaryOnly && candidateRange != nullptr &&
             (!query.programPoints.Has(ContestProgramPointKind::READ_MODIFY_WRITE) ||
                 candidate.hasDirectPointLoadObservation);
         if (!contextClosureComplete && !candidate.fromGlobalAccess) {
@@ -3316,7 +3402,7 @@ void ApplyContestContextCandidates(std::vector<ContestQuery>& queries,
             if (!query.programPoints.Has(ContestProgramPointKind::BOUNDED_LOOP_POINT) &&
                 hasCompleteContextCandidate &&
                 AreContestTypesCompatible(type, candidate.type) &&
-                query.resultRange->GetRangeKind() == candidate.range->GetRangeKind()) {
+                query.resultRange->GetRangeKind() == candidateRange->GetRangeKind()) {
                 // A complete context closure partitions all reachable calls to
                 // this function. Prefer that union even when a
                 // context-insensitive root result is not its superset: the
@@ -3325,7 +3411,7 @@ void ApplyContestContextCandidates(std::vector<ContestQuery>& queries,
                 // memory state.
                 auto point = MakeContestProgramPoint(
                     nullptr, ContestProgramPointKind::CONTEXT_SUMMARY);
-                SetContestQueryResult(query, type, candidate.range.get(),
+                SetContestQueryResult(query, type, candidateRange,
                     ContestResultOrigin::CONTEXT_SUMMARY, &point);
             }
             continue;
@@ -3336,7 +3422,7 @@ void ApplyContestContextCandidates(std::vector<ContestQuery>& queries,
         auto type = query.type == nullptr ? candidate.type : query.type;
         auto joined = candidate.incompleteGlobalLifetime || candidate.hasUnknownObservation
             ? MakeContestTopRange(type)
-            : CloneContestRangeOrTop(candidate.type, candidate.range.get());
+            : CloneContestRangeOrTop(candidate.type, candidateRange);
         if (joined == nullptr) {
             continue;
         }

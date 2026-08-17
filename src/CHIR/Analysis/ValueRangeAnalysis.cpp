@@ -7464,9 +7464,34 @@ std::vector<SInt> CollectLoopWideningThresholds(
             thresholds.emplace_back(threshold);
         }
     };
-    const auto getConstant = [&state](Value* value) -> std::optional<SInt> {
+    const auto addThresholdAndNeighbors = [&](const SInt& threshold) {
+        addThreshold(threshold);
+        auto minimum = isUnsigned ? SInt::UMinValue(width) : SInt::SMinValue(width);
+        auto maximum = isUnsigned ? SInt::UMaxValue(width) : SInt::SMaxValue(width);
+        if (StrictlyGreater(threshold, minimum, isUnsigned)) {
+            addThreshold(threshold - 1U);
+        }
+        if (StrictlyLess(threshold, maximum, isUnsigned)) {
+            addThreshold(threshold + 1U);
+        }
+    };
+    const auto getLiteralConstant = [](Value* value) -> std::optional<SInt> {
         auto expression = GetDefiningExprForWidening(value);
         if (expression == nullptr || expression->GetExprKind() != ExprKind::CONSTANT) {
+            return std::nullopt;
+        }
+        auto literal = StaticCast<const Constant*>(expression)->GetValue();
+        if (literal == nullptr || !literal->IsIntLiteral()) {
+            return std::nullopt;
+        }
+        auto domain = SIntDomain::From(*literal);
+        return domain.IsSingleValue()
+            ? std::optional<SInt>{domain.NumericBound().GetSingleElement()}
+            : std::nullopt;
+    };
+    const auto getConstant = [&state, &getLiteralConstant](Value* value) -> std::optional<SInt> {
+        auto literal = getLiteralConstant(value);
+        if (!literal.has_value()) {
             // CHIR commonly materializes a loop bound through a load or a
             // same-width cast. It remains a sound threshold when the current
             // abstract state proves that operand is a singleton.
@@ -7481,14 +7506,56 @@ std::vector<SInt> CollectLoopWideningThresholds(
                 ? std::optional<SInt>{domain.NumericBound().GetSingleElement()}
                 : std::nullopt;
         }
-        auto literal = StaticCast<const Constant*>(expression)->GetValue();
-        if (literal == nullptr || !literal->IsIntLiteral()) {
-            return std::nullopt;
+        return literal;
+    };
+    const auto addAffineThreshold = [&](Value* affineValue, const SInt& comparisonThreshold) {
+        auto expression = GetDefiningExprForWidening(affineValue);
+        if (expression == nullptr || expression->GetExprMajorKind() != ExprMajorKind::BINARY_EXPR ||
+            (expression->GetExprKind() != ExprKind::ADD && expression->GetExprKind() != ExprKind::SUB)) {
+            return;
         }
-        auto domain = SIntDomain::From(*literal);
-        return domain.IsSingleValue()
-            ? std::optional<SInt>{domain.NumericBound().GetSingleElement()}
-            : std::nullopt;
+        auto binary = StaticCast<const BinaryExpression*>(expression);
+        auto lhs = binary->GetLHSOperand();
+        auto rhs = binary->GetRHSOperand();
+        auto lhsConstant = getLiteralConstant(lhs);
+        auto rhsConstant = getLiteralConstant(rhs);
+        Value* source = nullptr;
+        __int128 offset = 0;
+        if (expression->GetExprKind() == ExprKind::ADD) {
+            if (lhsConstant.has_value() == rhsConstant.has_value()) {
+                return;
+            }
+            if (lhsConstant.has_value()) {
+                source = rhs;
+                offset = ToMathematicalInteger(lhsConstant.value(), isUnsigned);
+            } else {
+                source = lhs;
+                offset = ToMathematicalInteger(rhsConstant.value(), isUnsigned);
+            }
+        } else {
+            if (lhsConstant.has_value() || !rhsConstant.has_value()) {
+                return;
+            }
+            source = lhs;
+            offset = -ToMathematicalInteger(rhsConstant.value(), isUnsigned);
+        }
+        if (source == nullptr || source->GetType() == nullptr || !source->GetType()->IsInteger() ||
+            source->GetType()->IsUnsignedInteger() != isUnsigned || ToWidth(*source->GetType()) != width) {
+            return;
+        }
+        const auto mathematicalThreshold =
+            ToMathematicalInteger(comparisonThreshold, isUnsigned) - offset;
+        const auto minimum = isUnsigned
+            ? static_cast<__int128>(SInt::UMinValue(width).UVal())
+            : static_cast<__int128>(SInt::SMinValue(width).SVal());
+        const auto maximum = isUnsigned
+            ? static_cast<__int128>(SInt::UMaxValue(width).UVal())
+            : static_cast<__int128>(SInt::SMaxValue(width).SVal());
+        if (mathematicalThreshold < minimum || mathematicalThreshold > maximum) {
+            return;
+        }
+        addThresholdAndNeighbors(
+            SInt{width, static_cast<uint64_t>(mathematicalThreshold)});
     };
     for (auto loopBlock : loop->blocks) {
         for (auto expression : loopBlock->GetExpressions()) {
@@ -7508,15 +7575,15 @@ std::vector<SInt> CollectLoopWideningThresholds(
                 if (!constant.has_value()) {
                     continue;
                 }
-                addThreshold(constant.value());
-                auto minimum = isUnsigned ? SInt::UMinValue(width) : SInt::SMinValue(width);
-                auto maximum = isUnsigned ? SInt::UMaxValue(width) : SInt::SMaxValue(width);
-                if (StrictlyGreater(constant.value(), minimum, isUnsigned)) {
-                    addThreshold(constant.value() - 1U);
-                }
-                if (StrictlyLess(constant.value(), maximum, isUnsigned)) {
-                    addThreshold(constant.value() + 1U);
-                }
+                addThresholdAndNeighbors(constant.value());
+            }
+            auto lhsConstant = getConstant(binary->GetLHSOperand());
+            auto rhsConstant = getConstant(binary->GetRHSOperand());
+            if (rhsConstant.has_value()) {
+                addAffineThreshold(binary->GetLHSOperand(), rhsConstant.value());
+            }
+            if (lhsConstant.has_value()) {
+                addAffineThreshold(binary->GetRHSOperand(), lhsConstant.value());
             }
         }
     }
@@ -11294,6 +11361,7 @@ RelationalOperation SwapRelation(RelationalOperation rel)
 bool CanReachBlock(const Block* start, const Block* target, std::unordered_set<const Block*>& visited);
 bool IsLoopBranch(const Branch* branch);
 bool NarrowSIntByRelationToConstant(RangeDomain& state, Value* value, RelationalOperation rel, const SInt& constant);
+std::optional<SInt> GetSingleIntFromDefiningConstant(Value* value);
 std::optional<int64_t> GetUpdateStepFromLocation(Value* value, Value* location);
 std::optional<int64_t> FindIncomingSignedStoreConstantThroughPredecessors(const Block* header, Value* location);
 std::unordered_set<const Block*> CollectLoopBackPathBlockSet(
@@ -11503,6 +11571,86 @@ bool ExcludeLoadedSIntConstant(RangeDomain& state, Value* value, const SInt& con
     return true;
 }
 
+struct NonWrappingAffineSource {
+    Value* source;
+    __int128 offset;
+};
+
+std::optional<NonWrappingAffineSource> GetNonWrappingAffineSource(
+    const RangeDomain& state, Value* value)
+{
+    auto expression = GetDefiningExpr(value);
+    auto type = value == nullptr ? nullptr : value->GetType();
+    if (expression == nullptr || type == nullptr || !type->IsInteger() ||
+        type->IsUnsignedInteger() || expression->GetExprMajorKind() != ExprMajorKind::BINARY_EXPR ||
+        (expression->GetExprKind() != ExprKind::ADD && expression->GetExprKind() != ExprKind::SUB)) {
+        return std::nullopt;
+    }
+    auto binary = StaticCast<const BinaryExpression*>(expression);
+    auto lhs = binary->GetLHSOperand();
+    auto rhs = binary->GetRHSOperand();
+    auto lhsConstant = GetSingleIntFromDefiningConstant(lhs);
+    auto rhsConstant = GetSingleIntFromDefiningConstant(rhs);
+    Value* source = nullptr;
+    __int128 offset = 0;
+    if (expression->GetExprKind() == ExprKind::ADD) {
+        if (lhsConstant.has_value() == rhsConstant.has_value()) {
+            return std::nullopt;
+        }
+        if (lhsConstant.has_value()) {
+            source = rhs;
+            offset = lhsConstant->SVal();
+        } else {
+            source = lhs;
+            offset = rhsConstant->SVal();
+        }
+    } else {
+        if (lhsConstant.has_value() || !rhsConstant.has_value()) {
+            return std::nullopt;
+        }
+        source = lhs;
+        offset = -static_cast<__int128>(rhsConstant->SVal());
+    }
+    auto sourceType = source == nullptr ? nullptr : source->GetType();
+    if (sourceType == nullptr || !sourceType->IsInteger() || sourceType->IsUnsignedInteger() ||
+        ToWidth(*sourceType) != ToWidth(*type)) {
+        return std::nullopt;
+    }
+    const auto& sourceDomain = RangeAnalysis::GetSIntDomainFromState(state, source);
+    const auto& numeric = sourceDomain.NumericBound();
+    if (sourceDomain.IsBottom() || numeric.IsFullSet() || numeric.IsEmptySet() ||
+        numeric.IsWrappedSet() || numeric.IsSignWrappedSet()) {
+        return std::nullopt;
+    }
+    const auto width = ToWidth(*sourceType);
+    const auto minimum = static_cast<__int128>(SInt::SMinValue(width).SVal());
+    const auto maximum = static_cast<__int128>(SInt::SMaxValue(width).SVal());
+    const auto sourceMinimum = static_cast<__int128>(numeric.MinValue(false).SVal());
+    const auto sourceMaximum = static_cast<__int128>(numeric.MaxValue(false).SVal());
+    if (sourceMinimum + offset < minimum || sourceMaximum + offset > maximum) {
+        return std::nullopt;
+    }
+    return NonWrappingAffineSource{source, offset};
+}
+
+bool NarrowNonWrappingAffineSource(RangeDomain& state, Value* value,
+    RelationalOperation rel, const SInt& constant)
+{
+    auto affine = GetNonWrappingAffineSource(state, value);
+    if (!affine.has_value()) {
+        return true;
+    }
+    const auto width = ToWidth(*affine->source->GetType());
+    const auto adjusted = static_cast<__int128>(constant.SVal()) - affine->offset;
+    const auto minimum = static_cast<__int128>(SInt::SMinValue(width).SVal());
+    const auto maximum = static_cast<__int128>(SInt::SMaxValue(width).SVal());
+    if (adjusted < minimum || adjusted > maximum) {
+        return true;
+    }
+    return NarrowSIntByRelationToConstant(state, affine->source, rel,
+        SInt{width, static_cast<uint64_t>(adjusted)});
+}
+
 // 按照与常量的关系收窄整数值。
 bool NarrowSIntByRelationToConstant(RangeDomain& state, Value* value, RelationalOperation rel, const SInt& constant)
 {
@@ -11511,7 +11659,8 @@ bool NarrowSIntByRelationToConstant(RangeDomain& state, Value* value, Relational
         const auto& current = RangeAnalysis::GetSIntDomainFromState(state, value);
         const auto* currentRange = GetSIntRangeFromState(state, value);
         state.Update(value, ExcludeSIntConstant(current, currentRange, constant));
-        return ExcludeLoadedSIntConstant(state, value, constant);
+        return ExcludeLoadedSIntConstant(state, value, constant) &&
+            NarrowNonWrappingAffineSource(state, value, rel, constant);
     }
     auto constraint = SIntDomain::FromNumeric(rel, constant, type->IsUnsignedInteger());
     if (!NarrowSIntValue(state, value, constraint)) {
@@ -11540,7 +11689,7 @@ bool NarrowSIntByRelationToConstant(RangeDomain& state, Value* value, Relational
             }
         }
     }
-    return true;
+    return NarrowNonWrappingAffineSource(state, value, rel, constant);
 }
 
 // 从定义常量中读取单点整数值。
