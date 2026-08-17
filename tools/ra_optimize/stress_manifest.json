@@ -1,0 +1,59 @@
+[
+  {
+    "directory": "/home/gunseller/project/ra_loop_gap_tests/long_for_in_range"
+  },
+  {
+    "directory": "/home/gunseller/project/ra_loop_gap_tests/descending_variable_contexts"
+  },
+  {
+    "directory": "/home/gunseller/project/ra_loop_gap_tests/reused_long_for_in_range"
+  },
+  {
+    "directory": "/home/gunseller/project/ra_loop_gap_tests/iv_exit_branch_orientation"
+  },
+  {
+    "directory": "/home/gunseller/project/ra_loop_gap_tests/descending_negative_step_contexts"
+  },
+  {
+    "directory": "/home/gunseller/project/ra_loop_gap_tests/negative_helper_loop"
+  },
+  {
+    "directory": "/home/gunseller/project/ra_global_mapping_tests/global_erased_location_probe"
+  },
+  {
+    "directory": "/home/gunseller/project/ra_global_mapping_tests/global_range_direct_update"
+  },
+  {
+    "directory": "/home/gunseller/project/ra_global_mapping_tests/global_cross_file_lifetime"
+  },
+  {
+    "directory": "/home/gunseller/project/ra_global_mapping_tests/global_static_member_lifetime"
+  },
+  {
+    "directory": "/home/gunseller/project/ra_global_mapping_tests/global_range_driver"
+  },
+  {
+    "directory": "/home/gunseller/project/ra_global_mapping_tests/global_public_lifetime"
+  },
+  {
+    "directory": "/home/gunseller/project/ra_global_mapping_tests/global_initializer_call_line"
+  },
+  {
+    "directory": "/home/gunseller/project/ra_memory_gap_tests/returned_aggregate_chain"
+  },
+  {
+    "directory": "/home/gunseller/project/ra_memory_gap_tests/spawn_helper_result"
+  },
+  {
+    "directory": "/home/gunseller/project/ra_memory_gap_tests/global_public_multiline"
+  },
+  {
+    "directory": "/home/gunseller/project/ra_memory_gap_tests/ip_chain_context_over_budget"
+  },
+  {
+    "directory": "/home/gunseller/project/ra_memory_gap_tests/returned_aggregate_state"
+  },
+  {
+    "directory": "/home/gunseller/project/ra_override_global_stress"
+  }
+]

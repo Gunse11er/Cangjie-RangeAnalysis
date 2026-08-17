@@ -47,6 +47,8 @@ autoconf/autom4te.cache
 .ccls-cache
 .cache
 .claude/
+.ra_optimize/
+tools/ra_optimize/.venv/
 
 # emacs
 *~
