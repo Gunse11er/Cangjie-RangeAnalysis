@@ -234,7 +234,7 @@ public:
             if (auto lambda = IsApplyToLambda(terminator); lambda) {
                 analysis->HandleVarStateCapturedByLambda(state, lambda);
             }
-            std::optional<Block*> targetSucc = analysis->PropagateTerminatorEffect(state, terminator);       // 处理 branch/goto 等终结符
+            std::optional<Block*> targetSucc = analysis->PropagateTerminatorEffect(state, terminator);       // 处理 branch/goto 等终结符     决定传播哪条后继
 #ifdef AnalysisDevDebug
             std::cout << "exit: " << state.ToString() << std::endl;
 #endif
@@ -250,7 +250,7 @@ public:
                 std::cout << succ->GetIdentifier() << ":\n" << entryStates->at(succ).ToString() << std::endl;
                 std::cout << bb->GetIdentifier() << ":\n" << state.ToString() << std::endl;
 #endif
-                auto succState = GetTerminatorStateForSuccessor(*analysis, state, terminator, succ);         // 向每条后继边传播
+                auto succState = GetTerminatorStateForSuccessor(*analysis, state, terminator, succ);         // 向每条后继边传播   决定沿succ具体控制流边，传播什么 RangeDomain 状态
                 auto hasChanged = entryStates->at(succ).Join(succState);                      // 合流
                 if (hasChanged && worklistSet.find(succ) == worklistSet.end()) {
                     worklist.push_back(succ);
