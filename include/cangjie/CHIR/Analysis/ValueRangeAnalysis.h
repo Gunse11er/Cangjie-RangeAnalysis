@@ -367,12 +367,18 @@ private:
 
     const Lambda* ResolvePureSpawnLambdaForApply(const ApplyWithException* apply) const;
 
+    const Lambda* ResolvePureSpawnLambdaForProjection(const Expression* projection, Value* future,
+        Value* callee, Type* resultType, Type* parentType, const Expression* expectedInitializer) const;
+
     bool IsUniqueSpawnValueProjection(
         Value* future, Value* callee, Type* resultType, Type* parentType) const;
 
     bool IsFullyModeledPureSpawnFutureInitializer(const Apply* apply) const;
 
     bool IsFullyModeledPureSpawnFutureInitializer(const ApplyWithException* apply) const;
+
+    bool IsFullyModeledPureSpawnFutureInitializer(
+        const Expression* initializer, const std::vector<Value*>& args) const;
 
     bool ApplyPureSpawnLambdaResult(
         RangeDomain& state, const Lambda* lambda, Value* result, const Expression* callExpression);

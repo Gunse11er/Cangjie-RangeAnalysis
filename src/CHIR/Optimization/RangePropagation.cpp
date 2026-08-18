@@ -1164,6 +1164,37 @@ ContestLoopLifetime CollectContestLoopLifetime(const ContestAggregateBinding& ag
     bool hasLoopStore = false;
     std::unique_ptr<ValueRange> prefixEvidence;
     size_t loopUses = 0;
+
+    // Establish that this binding is loop-carried before collecting its full
+    // observable lifetime.  A declaration query denotes every reachable value
+    // of the binding, including reads and writes after a loop exit.
+    for (auto user : binding->GetUsers()) {
+        if (user == nullptr || user == aggregateBinding.initializationStore ||
+            (user->GetExprKind() == ExprKind::DEBUGEXPR &&
+                StaticCast<const Debug*>(user)->GetValue() == binding)) {
+            continue;
+        }
+        const bool directLoad = user->GetExprKind() == ExprKind::LOAD &&
+            StaticCast<const Load*>(user)->GetLocation() == binding;
+        const bool directStore = user->GetExprKind() == ExprKind::STORE &&
+            StaticCast<const Store*>(user)->GetLocation() == binding;
+        if (!directLoad && !directStore) {
+            continue;
+        }
+        auto cycle = IsBlockInContestCycle(user->GetParentBlock());
+        if (cycle == ContestReachability::UNREACHABLE) {
+            continue;
+        }
+        lifetime.hasLoopUse = true;
+        hasLoopStore = hasLoopStore || directStore;
+        if (cycle == ContestReachability::UNKNOWN) {
+            lifetime.complete = false;
+        }
+    }
+    if (!hasLoopStore) {
+        return ContestLoopLifetime{};
+    }
+
     for (auto user : binding->GetUsers()) {
         if (user == nullptr) {
             escaped = true;
@@ -1185,14 +1216,8 @@ ContestLoopLifetime CollectContestLoopLifetime(const ContestAggregateBinding& ag
             continue;
         }
         auto cycle = IsBlockInContestCycle(user->GetParentBlock());
-        if (cycle == ContestReachability::UNREACHABLE) {
-            continue;
-        }
-        lifetime.hasLoopUse = true;
-        hasLoopStore = hasLoopStore || directStore;
         if (cycle == ContestReachability::UNKNOWN) {
             lifetime.complete = false;
-            continue;
         }
         if (++loopUses > MAX_CONTEST_LOOP_USES) {
             lifetime.complete = false;
@@ -1221,7 +1246,7 @@ ContestLoopLifetime CollectContestLoopLifetime(const ContestAggregateBinding& ag
             continue;
         }
         MergeContestLoopLifetime(lifetime, type, observed.get());
-        if (prefix != nullptr &&
+        if (cycle != ContestReachability::UNREACHABLE && prefix != nullptr &&
             observed->GetRangeKind() == prefix->GetRangeKind()) {
             if (prefixEvidence == nullptr) {
                 prefixEvidence = std::move(prefix);
@@ -1230,9 +1255,6 @@ ContestLoopLifetime CollectContestLoopLifetime(const ContestAggregateBinding& ag
                 prefixEvidence = std::move(joined.value());
             }
         }
-    }
-    if (!hasLoopStore) {
-        return ContestLoopLifetime{};
     }
     if (lifetime.hasLoopUse && escaped) {
         lifetime.complete = false;
@@ -1258,9 +1280,7 @@ bool CollectContestContextLoopObservations(
     const auto collectObservation = [&](const RangeDomain& state,
                                         Expression* expression, Value* value) {
         if (!withinBudget || expression == nullptr || value == nullptr ||
-            state.IsBottom() ||
-            IsBlockInContestCycle(expression->GetParentBlock()) !=
-                ContestReachability::REACHABLE) {
+            state.IsBottom()) {
             return;
         }
         auto found = observations.find(expression);

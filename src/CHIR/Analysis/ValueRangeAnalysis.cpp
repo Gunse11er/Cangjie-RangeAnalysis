@@ -5443,8 +5443,193 @@ bool RangeAnalysis::IsUniqueSpawnValueProjection(
     return valueProjectionMethods.size() == 1 && valueProjectionMethods.front() == callee;
 }
 
+namespace {
+std::optional<std::vector<Value*>> GetApplyLikeArgs(const Expression* expression)
+{
+    if (expression == nullptr) {
+        return std::nullopt;
+    }
+    switch (expression->GetExprKind()) {
+        case ExprKind::APPLY:
+            return StaticCast<const Apply*>(expression)->GetArgs();
+        case ExprKind::APPLY_WITH_EXCEPTION:
+            return StaticCast<const ApplyWithException*>(expression)->GetArgs();
+        default:
+            return std::nullopt;
+    }
+}
+
+Block* GetUniqueNormalSuccessor(const Block* block)
+{
+    auto terminator = block == nullptr ? nullptr : block->GetTerminator();
+    if (terminator == nullptr) {
+        return nullptr;
+    }
+    switch (terminator->GetExprKind()) {
+        case ExprKind::APPLY_WITH_EXCEPTION:
+            return StaticCast<const ApplyWithException*>(terminator)->GetSuccessBlock();
+        case ExprKind::SPAWN_WITH_EXCEPTION:
+            return StaticCast<const SpawnWithException*>(terminator)->GetSuccessBlock();
+        default: {
+            auto successors = terminator->GetSuccessors();
+            return successors.size() == 1 ? successors.front() : nullptr;
+        }
+    }
+}
+
+bool IsOrderedOnUniqueNormalFlow(const Expression* before, const Expression* after)
+{
+    if (before == nullptr || after == nullptr || before->GetParentBlock() == nullptr ||
+        after->GetParentBlock() == nullptr) {
+        return false;
+    }
+    auto beforeBlock = before->GetParentBlock();
+    auto afterBlock = after->GetParentBlock();
+    if (beforeBlock == afterBlock) {
+        const auto& expressions = beforeBlock->GetExpressions();
+        auto beforePosition = std::find(expressions.begin(), expressions.end(), before);
+        auto afterPosition = std::find(expressions.begin(), expressions.end(), after);
+        return beforePosition != expressions.end() && afterPosition != expressions.end() &&
+            beforePosition < afterPosition;
+    }
+
+    constexpr size_t MAX_NORMAL_CHAIN_BLOCKS = 32;
+    auto current = GetUniqueNormalSuccessor(beforeBlock);
+    std::unordered_set<const Block*> visited;
+    for (size_t depth = 0; current != nullptr && depth < MAX_NORMAL_CHAIN_BLOCKS; ++depth) {
+        if (!visited.emplace(current).second) {
+            return false;
+        }
+        if (current == afterBlock) {
+            return current->GetPredecessors().size() == 1;
+        }
+        if (current->GetPredecessors().size() != 1) {
+            return false;
+        }
+        current = GetUniqueNormalSuccessor(current);
+    }
+    return false;
+}
+
+bool IsSpawnForFuture(const Expression* expression, Value* future)
+{
+    if (expression == nullptr || future == nullptr) {
+        return false;
+    }
+    if (expression->GetExprKind() == ExprKind::SPAWN) {
+        auto spawn = StaticCast<const Spawn*>(expression);
+        return !spawn->IsExecuteClosure() && spawn->GetFuture() == future;
+    }
+    if (expression->GetExprKind() == ExprKind::SPAWN_WITH_EXCEPTION) {
+        auto spawn = StaticCast<const SpawnWithException*>(expression);
+        return !spawn->IsExecuteClosure() && spawn->GetFuture() == future;
+    }
+    return false;
+}
+} // namespace
+
+const Lambda* RangeAnalysis::ResolvePureSpawnLambdaForProjection(const Expression* projection, Value* future,
+    Value* callee, Type* resultType, Type* parentType, const Expression* expectedInitializer) const
+{
+    if (projection == nullptr || future == nullptr || resultType == nullptr ||
+        !IsUniqueSpawnValueProjection(future, callee, resultType, parentType)) {
+        return nullptr;
+    }
+
+    const Expression* spawn = nullptr;
+    for (auto user : future->GetUsers()) {
+        if (!IsSpawnForFuture(user, future) || !IsOrderedOnUniqueNormalFlow(user, projection)) {
+            continue;
+        }
+        if (spawn != nullptr) {
+            return nullptr;
+        }
+        spawn = user;
+    }
+    if (spawn == nullptr) {
+        return nullptr;
+    }
+
+    const Expression* initializer = nullptr;
+    const Lambda* lambda = nullptr;
+    for (auto user : future->GetUsers()) {
+        if (user == projection) {
+            continue;
+        }
+        auto args = GetApplyLikeArgs(user);
+        if (!args.has_value() || args->empty() || args->front() != future) {
+            continue;
+        }
+        const Lambda* candidateLambda = nullptr;
+        for (size_t i = 1; i < args->size(); ++i) {
+            auto candidate = ResolveContextLambdaForValue((*args)[i]);
+            if (candidate == nullptr) {
+                continue;
+            }
+            if (candidateLambda != nullptr) {
+                return nullptr;
+            }
+            candidateLambda = candidate;
+        }
+        if (candidateLambda == nullptr || !IsOrderedOnUniqueNormalFlow(user, spawn)) {
+            continue;
+        }
+        if (initializer != nullptr) {
+            return nullptr;
+        }
+        initializer = user;
+        lambda = candidateLambda;
+    }
+    if (initializer == nullptr || (expectedInitializer != nullptr && initializer != expectedInitializer) ||
+        !IsPureSpawnLambda(lambda) || lambda->GetReturnType() != resultType) {
+        return nullptr;
+    }
+    return lambda;
+}
+
+bool RangeAnalysis::IsFullyModeledPureSpawnFutureInitializer(
+    const Expression* initializer, const std::vector<Value*>& args) const
+{
+    if (initializer == nullptr || args.size() < 2) {
+        return false;
+    }
+    auto future = args.front();
+    if (future == nullptr) {
+        return false;
+    }
+    for (auto user : future->GetUsers()) {
+        if (user == initializer || user == nullptr || user->GetResult() == nullptr) {
+            continue;
+        }
+        auto resultType = user->GetResult()->GetType();
+        if (resultType == nullptr || (!resultType->IsInteger() && !resultType->IsBoolean())) {
+            continue;
+        }
+        if (user->GetExprKind() == ExprKind::APPLY) {
+            auto projection = StaticCast<const Apply*>(user);
+            if (projection->GetArgs().size() == 1 && projection->GetArgs().front() == future &&
+                ResolvePureSpawnLambdaForProjection(projection, future, projection->GetCallee(), resultType,
+                    projection->GetInstParentCustomTyOfCallee(builder), initializer) != nullptr) {
+                return true;
+            }
+        } else if (user->GetExprKind() == ExprKind::APPLY_WITH_EXCEPTION) {
+            auto projection = StaticCast<const ApplyWithException*>(user);
+            if (projection->GetArgs().size() == 1 && projection->GetArgs().front() == future &&
+                ResolvePureSpawnLambdaForProjection(projection, future, projection->GetCallee(), resultType,
+                    projection->GetInstParentCustomTyOfCallee(builder), initializer) != nullptr) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 bool RangeAnalysis::IsFullyModeledPureSpawnFutureInitializer(const Apply* initializer) const
 {
+    if (initializer != nullptr &&
+        IsFullyModeledPureSpawnFutureInitializer(initializer, initializer->GetArgs())) {
+        return true;
+    }
     if (initializer == nullptr || initializer->GetArgs().size() < 2 || initializer->GetParentBlock() == nullptr) {
         return false;
     }
@@ -5516,6 +5701,10 @@ bool RangeAnalysis::IsFullyModeledPureSpawnFutureInitializer(const Apply* initia
 
 bool RangeAnalysis::IsFullyModeledPureSpawnFutureInitializer(const ApplyWithException* initializer) const
 {
+    if (initializer != nullptr &&
+        IsFullyModeledPureSpawnFutureInitializer(initializer, initializer->GetArgs())) {
+        return true;
+    }
     if (initializer == nullptr || initializer->GetArgs().size() < 2 || initializer->GetSuccessBlock() == nullptr) {
         return false;
     }
@@ -5581,6 +5770,10 @@ const Lambda* RangeAnalysis::ResolvePureSpawnLambdaForApply(const Apply* apply) 
     auto block = apply->GetParentBlock();
     if (future == nullptr || block == nullptr) {
         return nullptr;
+    }
+    if (auto lambda = ResolvePureSpawnLambdaForProjection(apply, future, apply->GetCallee(),
+            apply->GetResult()->GetType(), apply->GetInstParentCustomTyOfCallee(builder), nullptr)) {
+        return lambda;
     }
     const auto& expressions = block->GetExpressions();
     auto applyPosition = std::find(expressions.begin(), expressions.end(), apply);
@@ -5658,6 +5851,10 @@ const Lambda* RangeAnalysis::ResolvePureSpawnLambdaForApply(const ApplyWithExcep
     auto future = apply->GetArgs().front();
     if (future == nullptr || apply->GetParentBlock() == nullptr) {
         return nullptr;
+    }
+    if (auto lambda = ResolvePureSpawnLambdaForProjection(apply, future, apply->GetCallee(),
+            apply->GetResult()->GetType(), apply->GetInstParentCustomTyOfCallee(builder), nullptr)) {
+        return lambda;
     }
 
     const SpawnWithException* spawn = nullptr;
@@ -5810,7 +6007,19 @@ void RangeAnalysis::HandleContextSensitiveCall(RangeDomain& state, const Express
             fullyModeled =
                 IsFullyModeledPureSpawnFutureInitializer(StaticCast<const ApplyWithException*>(callExpression));
         }
-        if (fullyModeled) {
+        // An imported leaf that receives only by-value scalar arguments cannot
+        // carry a callback or a mutable alias into current-package code.  Its
+        // value/memory effects remain conservatively havoced below, but it does
+        // not make the set of reachable local call contexts incomplete.
+        auto externalFunction = DynamicCast<Function*>(calleeValue);
+        const bool scalarExternalLeaf = externalFunction != nullptr &&
+            externalFunction->GetBody() == nullptr &&
+            std::all_of(args.begin(), args.end(), [](const Value* argument) {
+                auto type = argument == nullptr ? nullptr : argument->GetType();
+                return type != nullptr && !type->IsRef() &&
+                    (type->IsInteger() || type->IsBoolean());
+            });
+        if (fullyModeled || scalarExternalLeaf) {
             RecordFullyModeledCallContext(analysisContextKey, callExpression);
             if (boundedLoopCallContextRecorder != nullptr && boundedLoopEvaluationOwner == this) {
                 (void)(*boundedLoopCallContextRecorder)[callExpression];
