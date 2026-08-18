@@ -84,6 +84,20 @@ public:
         return &loops[found->second.front()];
     }
 
+    std::vector<const LoopDescriptor*> FindContainingLoops(const Block* block) const
+    {
+        std::vector<const LoopDescriptor*> result;
+        auto found = blockToLoops.find(block);
+        if (found == blockToLoops.end()) {
+            return result;
+        }
+        result.reserve(found->second.size());
+        for (auto index : found->second) {
+            result.emplace_back(&loops[index]);
+        }
+        return result;
+    }
+
     bool IsBackedge(const Block* predecessor, const Block* header) const
     {
         auto loop = FindByHeader(header);
@@ -5883,10 +5897,15 @@ void RangeAnalysis::HandleContextSensitiveCall(RangeDomain& state, const Express
         contextGlobals.emplace_back(global, CaptureContextValue(state, global, /* preserveIntervals = */ true));
     }
     auto childContext = BuildContextKey(callee, contextArgs, contextGlobals);
-    RecordAnalyzedCallContext(analysisContextKey, callExpression, childContext);
     if (boundedLoopCallContextRecorder != nullptr && boundedLoopEvaluationOwner == this &&
         callExpression != nullptr) {
         (*boundedLoopCallContextRecorder)[callExpression].keys.emplace(childContext);
+    } else {
+        // Concrete bounded-loop replay is speculative until the whole replay
+        // succeeds. Keep its per-iteration contexts isolated from the stable
+        // worklist contexts so a budget-aborted replay can be discarded
+        // without leaving an unsound prefix in interprocedural aggregation.
+        RecordAnalyzedCallContext(analysisContextKey, callExpression, childContext);
     }
 
     std::vector<std::optional<ContextAbstractValue>> refArgValues;
@@ -7314,6 +7333,26 @@ std::optional<SInt> FindLowerWideningThreshold(
     return result;
 }
 
+bool CrossedUpperWideningThreshold(const std::vector<SInt>& thresholds,
+    const SInt& previousBound, const SInt& currentBound, bool isUnsigned)
+{
+    return std::any_of(thresholds.begin(), thresholds.end(), [&](const SInt& threshold) {
+        return threshold.Width() == previousBound.Width() &&
+            !StrictlyLess(threshold, previousBound, isUnsigned) &&
+            StrictlyLess(threshold, currentBound, isUnsigned);
+    });
+}
+
+bool CrossedLowerWideningThreshold(const std::vector<SInt>& thresholds,
+    const SInt& previousBound, const SInt& currentBound, bool isUnsigned)
+{
+    return std::any_of(thresholds.begin(), thresholds.end(), [&](const SInt& threshold) {
+        return threshold.Width() == previousBound.Width() &&
+            !StrictlyGreater(threshold, previousBound, isUnsigned) &&
+            StrictlyGreater(threshold, currentBound, isUnsigned);
+    });
+}
+
 SIntDomain MakeFiniteWideningRange(const SInt& lower, const SInt& upper, bool isUnsigned)
 {
     return SIntDomain::Intersects(
@@ -7352,9 +7391,15 @@ SIntDomain WidenSIntDomain(const SIntDomain& previous, const SIntDomain& current
         auto thresholdMin = FindLowerWideningThreshold(thresholds, joinedMin, isUnsigned);
         auto thresholdMax = FindUpperWideningThreshold(thresholds, joinedMax, isUnsigned);
         auto lower = thresholdMin.value_or(
-            isUnsigned ? SInt::UMinValue(width) : SInt::SMinValue(width));
+            CrossedLowerWideningThreshold(
+                thresholds, previousMin, joinedMin, isUnsigned)
+                ? joinedMin
+                : (isUnsigned ? SInt::UMinValue(width) : SInt::SMinValue(width)));
         auto upper = thresholdMax.value_or(
-            isUnsigned ? SInt::UMaxValue(width) : SInt::SMaxValue(width));
+            CrossedUpperWideningThreshold(
+                thresholds, previousMax, joinedMax, isUnsigned)
+                ? joinedMax
+                : (isUnsigned ? SInt::UMaxValue(width) : SInt::SMaxValue(width)));
         return MakeFiniteWideningRange(lower, upper, isUnsigned);
     }
     if (upperMovedUp) {
@@ -7362,12 +7407,25 @@ SIntDomain WidenSIntDomain(const SIntDomain& previous, const SIntDomain& current
             threshold.has_value()) {
             return MakeFiniteWideningRange(joinedMin, threshold.value(), isUnsigned);
         }
+        // A transfer can step over the final landmark (for example T to
+        // T + k) even though the loop guard makes that first post-threshold
+        // image stable. Keep it for one round. If it grows again, no
+        // landmark remains between the old and new bounds and the next
+        // widening still jumps to the type maximum.
+        if (CrossedUpperWideningThreshold(
+                thresholds, previousMax, joinedMax, isUnsigned)) {
+            return MakeFiniteWideningRange(joinedMin, joinedMax, isUnsigned);
+        }
         return SIntDomain::FromNumeric(RelationalOperation::GE, joinedMin, isUnsigned);
     }
     if (lowerMovedDown) {
         if (auto threshold = FindLowerWideningThreshold(thresholds, joinedMin, isUnsigned);
             threshold.has_value()) {
             return MakeFiniteWideningRange(threshold.value(), joinedMax, isUnsigned);
+        }
+        if (CrossedLowerWideningThreshold(
+                thresholds, previousMin, joinedMin, isUnsigned)) {
+            return MakeFiniteWideningRange(joinedMin, joinedMax, isUnsigned);
         }
         return SIntDomain::FromNumeric(RelationalOperation::LE, joinedMax, isUnsigned);
     }
@@ -7455,8 +7513,10 @@ std::vector<SInt> CollectLoopWideningThresholds(
 {
     std::vector<SInt> thresholds;
     auto forest = GetLoopForest(block);
-    auto loop = forest == nullptr ? nullptr : forest->FindInnermost(block);
-    if (loop == nullptr) {
+    auto containingLoops = forest == nullptr
+        ? std::vector<const LoopDescriptor*>{}
+        : forest->FindContainingLoops(block);
+    if (containingLoops.empty()) {
         return thresholds;
     }
     const auto addThreshold = [&](const SInt& threshold) {
@@ -7557,33 +7617,35 @@ std::vector<SInt> CollectLoopWideningThresholds(
         addThresholdAndNeighbors(
             SInt{width, static_cast<uint64_t>(mathematicalThreshold)});
     };
-    for (auto loopBlock : loop->blocks) {
-        for (auto expression : loopBlock->GetExpressions()) {
-            if (expression == nullptr ||
-                !IsRelationalExprKindForWidening(expression->GetExprKind())) {
-                continue;
-            }
-            auto binary = StaticCast<const BinaryExpression*>(expression);
-            for (auto operand : {binary->GetLHSOperand(), binary->GetRHSOperand()}) {
-                if (operand == nullptr || operand->GetType() == nullptr ||
-                    !operand->GetType()->IsInteger() ||
-                    operand->GetType()->IsUnsignedInteger() != isUnsigned ||
-                    ToWidth(*operand->GetType()) != width) {
+    for (auto loop : containingLoops) {
+        for (auto loopBlock : loop->blocks) {
+            for (auto expression : loopBlock->GetExpressions()) {
+                if (expression == nullptr ||
+                    !IsRelationalExprKindForWidening(expression->GetExprKind())) {
                     continue;
                 }
-                auto constant = getConstant(operand);
-                if (!constant.has_value()) {
-                    continue;
+                auto binary = StaticCast<const BinaryExpression*>(expression);
+                for (auto operand : {binary->GetLHSOperand(), binary->GetRHSOperand()}) {
+                    if (operand == nullptr || operand->GetType() == nullptr ||
+                        !operand->GetType()->IsInteger() ||
+                        operand->GetType()->IsUnsignedInteger() != isUnsigned ||
+                        ToWidth(*operand->GetType()) != width) {
+                        continue;
+                    }
+                    auto constant = getConstant(operand);
+                    if (!constant.has_value()) {
+                        continue;
+                    }
+                    addThresholdAndNeighbors(constant.value());
                 }
-                addThresholdAndNeighbors(constant.value());
-            }
-            auto lhsConstant = getConstant(binary->GetLHSOperand());
-            auto rhsConstant = getConstant(binary->GetRHSOperand());
-            if (rhsConstant.has_value()) {
-                addAffineThreshold(binary->GetLHSOperand(), rhsConstant.value());
-            }
-            if (lhsConstant.has_value()) {
-                addAffineThreshold(binary->GetRHSOperand(), lhsConstant.value());
+                auto lhsConstant = getConstant(binary->GetLHSOperand());
+                auto rhsConstant = getConstant(binary->GetRHSOperand());
+                if (rhsConstant.has_value()) {
+                    addAffineThreshold(binary->GetLHSOperand(), rhsConstant.value());
+                }
+                if (lhsConstant.has_value()) {
+                    addAffineThreshold(binary->GetRHSOperand(), lhsConstant.value());
+                }
             }
         }
     }
@@ -8005,7 +8067,8 @@ void ApplyLoopWidening(
         if (!widened.IsSame(current) || droppedSymbolics ||
             (currentRange != nullptr && (currentRange->GetCongruence() != widenedCongruence ||
                 currentRange->GetKnownBits() != widenedKnownBits ||
-                currentRange->GetExcludedValues() != widenedExcludedValues))) {
+                currentRange->GetExcludedValues() != widenedExcludedValues ||
+                currentRange->GetIntervalFragments().has_value()))) {
             state.Update(value, std::make_unique<SIntRange>(
                 std::move(widened), std::nullopt, std::move(widenedCongruence), std::move(widenedKnownBits),
                 std::move(widenedExcludedValues)));
@@ -8964,6 +9027,74 @@ std::optional<SIntRange> TryComputeExactArithmeticRange(const BinaryExpression* 
         binaryExpr->GetRHSOperand()->GetType(), binaryExpr->GetOverflowStrategy(), lhsValues, rhsValues, isUnsigned);
 }
 
+std::optional<std::vector<SIntIntervalFragment>> ComputeAffineIntervalFragments(
+    ExprKind kind, const SIntRange* lhsRange, const SIntRange* rhsRange,
+    const SIntDomain& lhsDomain, const SIntDomain& rhsDomain,
+    Type* resultType, OverflowStrategy overflowStrategy,
+    const SIntDomain& resultDomain)
+{
+    if ((kind != ExprKind::ADD && kind != ExprKind::SUB) || resultType == nullptr ||
+        !resultType->IsInteger() ||
+        !CanProveNoArithmeticOverflow(kind, lhsDomain, rhsDomain,
+            ToWidth(*resultType), resultType->IsUnsignedInteger())) {
+        return std::nullopt;
+    }
+    (void)overflowStrategy;
+
+    const SIntRange* sourceRange = nullptr;
+    __int128 constant = 0;
+    bool reverse = false;
+    if (kind == ExprKind::ADD) {
+        if (lhsDomain.IsSingleValue() && rhsRange != nullptr &&
+            rhsRange->GetIntervalFragments().has_value()) {
+            sourceRange = rhsRange;
+            constant = ToMathematicalInteger(
+                lhsDomain.NumericBound().GetSingleElement(), lhsDomain.IsUnsigned());
+        } else if (rhsDomain.IsSingleValue() && lhsRange != nullptr &&
+            lhsRange->GetIntervalFragments().has_value()) {
+            sourceRange = lhsRange;
+            constant = ToMathematicalInteger(
+                rhsDomain.NumericBound().GetSingleElement(), rhsDomain.IsUnsigned());
+        }
+    } else if (rhsDomain.IsSingleValue() && lhsRange != nullptr &&
+        lhsRange->GetIntervalFragments().has_value()) {
+        sourceRange = lhsRange;
+        constant = -ToMathematicalInteger(
+            rhsDomain.NumericBound().GetSingleElement(), rhsDomain.IsUnsigned());
+    } else if (lhsDomain.IsSingleValue() && rhsRange != nullptr &&
+        rhsRange->GetIntervalFragments().has_value()) {
+        sourceRange = rhsRange;
+        constant = ToMathematicalInteger(
+            lhsDomain.NumericBound().GetSingleElement(), lhsDomain.IsUnsigned());
+        reverse = true;
+    }
+    if (sourceRange == nullptr) {
+        return std::nullopt;
+    }
+
+    const auto sourceUnsigned = sourceRange->GetVal().IsUnsigned();
+    const auto width = ToWidth(*resultType);
+    std::vector<SIntIntervalFragment> translated;
+    translated.reserve(sourceRange->GetIntervalFragments()->size());
+    for (const auto& fragment : *sourceRange->GetIntervalFragments()) {
+        const auto lower = ToMathematicalInteger(fragment.lower, sourceUnsigned);
+        const auto upper = ToMathematicalInteger(fragment.upper, sourceUnsigned);
+        const auto translatedLower = reverse ? constant - upper : lower + constant;
+        const auto translatedUpper = reverse ? constant - lower : upper + constant;
+        const auto translatedResidue = fragment.stride <= 1
+            ? 0
+            : CanonicalResidue(reverse
+                    ? constant - static_cast<__int128>(fragment.residue)
+                    : static_cast<__int128>(fragment.residue) + constant,
+                fragment.stride);
+        translated.emplace_back(SIntIntervalFragment{
+            SInt{width, static_cast<uint64_t>(translatedLower)},
+            SInt{width, static_cast<uint64_t>(translatedUpper)},
+            fragment.stride, translatedResidue});
+    }
+    return NormalizeSIntIntervalFragments(std::move(translated), resultDomain);
+}
+
 std::optional<SIntRange> TryComputeCountedAccumulatorUpdateRange(
     const RangeDomain& state, const BinaryExpression* binaryExpr);
 std::optional<SIntRange> TryComputeSimpleInductionLoadExitRange(const RangeDomain& state, const Load* load);
@@ -9599,9 +9730,12 @@ void RangeAnalysis::HandleBinaryExpr(RangeDomain& state, const BinaryExpression*
         auto res = ComputeArithmeticBinop(CHIRArithmeticBinopArgs{lRange, rRange, lhs, rhs, kind, ov, isUnsigned});
         auto congruence = ComputeArithmeticCongruence(
             kind, lhsRange, rhsRange, lRange, rRange, dest->GetType(), ov);
-        if (res.IsNonTrivial() || congruence.has_value()) {
+        auto intervalFragments = ComputeAffineIntervalFragments(kind, lhsRange,
+            rhsRange, lRange, rRange, dest->GetType(), ov, res);
+        if (res.IsNonTrivial() || congruence.has_value() || intervalFragments.has_value()) {
             return state.Update(dest, std::make_unique<SIntRange>(
-                std::move(res), std::nullopt, std::move(congruence)));
+                std::move(res), std::nullopt, std::move(congruence), std::nullopt,
+                std::nullopt, std::move(intervalFragments)));
         }
     }
     if (dest->GetType()->IsBoolean()) {
@@ -12193,6 +12327,8 @@ struct ReplayInductionCondition {
     bool isUnsigned;
 };
 
+Value* ResolveLocallyForwardedBooleanCondition(Value* condition);
+
 // 识别 load(location) 与有符号常量比较形成的循环 guard。
 std::optional<SimpleInductionCondition> GetSimpleInductionCondition(Value* condition)
 {
@@ -12416,6 +12552,52 @@ std::optional<std::vector<int64_t>> TryEnumerateInductionValues(
         return std::nullopt;
     }
     return values.empty() ? std::nullopt : std::optional<std::vector<int64_t>>{std::move(values)};
+}
+
+// Build the values observed on the loop body edge. Small loops retain their
+// exact set; larger proven inductions use a finite strided interval instead of
+// abandoning the guard refinement once the exact-set budget is exceeded.
+std::optional<SIntRange> BuildSignedInductionBodyRange(
+    Type* type, int64_t init, int64_t step, RelationalOperation relation, int64_t bound)
+{
+    if (type == nullptr || !type->IsInteger() || type->IsUnsignedInteger() || step == 0 ||
+        !SatisfiesSignedRelation(init, relation, bound)) {
+        return std::nullopt;
+    }
+    auto width = ToWidth(*type);
+    if (auto values = TryEnumerateInductionValues(init, step, relation, bound, width);
+        values.has_value()) {
+        return BuildSignedExactRange(type, values.value());
+    }
+
+    auto exit = ComputeExactInductionExit(init, step, relation, bound, width);
+    if (!exit.has_value()) {
+        return std::nullopt;
+    }
+    const auto last = static_cast<__int128>(exit->SVal()) - static_cast<__int128>(step);
+    if (!FitsSignedWidth(last, width) || !SatisfiesSignedRelation(last, relation, bound)) {
+        return std::nullopt;
+    }
+    const auto lower = std::min(static_cast<__int128>(init), last);
+    const auto upper = std::max(static_cast<__int128>(init), last);
+    if (!FitsSignedWidth(lower, width) || !FitsSignedWidth(upper, width)) {
+        return std::nullopt;
+    }
+
+    const auto lowerValue = SInt{width, static_cast<uint64_t>(static_cast<int64_t>(lower))};
+    const auto upperValue = SInt{width, static_cast<uint64_t>(static_cast<int64_t>(upper))};
+    auto domain = SIntDomain::Intersects(
+        SIntDomain::FromNumeric(RelationalOperation::GE, lowerValue, false),
+        SIntDomain::FromNumeric(RelationalOperation::LE, upperValue, false));
+    const auto wideStride = step > 0
+        ? static_cast<unsigned __int128>(step)
+        : static_cast<unsigned __int128>(-static_cast<__int128>(step));
+    std::optional<SIntCongruence> congruence;
+    if (wideStride > 1 && wideStride <= std::numeric_limits<uint64_t>::max()) {
+        const auto stride = static_cast<uint64_t>(wideStride);
+        congruence = SIntCongruence{stride, CanonicalResidue(init, stride)};
+    }
+    return SIntRange{std::move(domain), std::nullopt, std::move(congruence)};
 }
 
 std::optional<std::vector<int64_t>> TryEnumerateInclusiveUntilBound(
@@ -13134,7 +13316,8 @@ std::optional<int64_t> FindEqualityExitConstantBound(const Block* header, Value*
         auto terminator = block->GetTerminator();
         if (terminator != nullptr && terminator->GetExprKind() == ExprKind::BRANCH) {
             auto branch = StaticCast<const Branch*>(terminator);
-            auto expr = GetDefiningExpr(branch->GetCondition());
+            auto resolvedCondition = ResolveLocallyForwardedBooleanCondition(branch->GetCondition());
+            auto expr = GetDefiningExpr(resolvedCondition);
             if (expr != nullptr && IsRelationalExprKind(expr->GetExprKind())) {
                 auto rel = ToRelationalOperation(expr->GetExprKind());
                 auto binary = StaticCast<const BinaryExpression*>(expr);
@@ -13229,21 +13412,48 @@ std::optional<SIntRange> TryComputeSimpleLoopLoadRange(const RangeDomain& state,
         return std::nullopt;
     }
     auto values = TryEnumerateSimpleLoopLoadValues(state, value);
-    if (!values.has_value()) {
+    if (values.has_value()) {
+        auto width = ToWidth(*value->GetType());
+        std::vector<SInt> exact;
+        exact.reserve(values->size());
+        for (auto item : *values) {
+            exact.emplace_back(width, static_cast<uint64_t>(item));
+        }
+        auto exactValues = NormalizeExactIntSet(std::move(exact));
+        if (!exactValues.has_value()) {
+            return std::nullopt;
+        }
+        auto domain = DomainFromExactIntValues(*exactValues, value->GetType()->IsUnsignedInteger());
+        return SIntRange{std::move(domain), std::move(exactValues)};
+    }
+
+    // A lowered for-in loop commonly consumes the induction load in its
+    // header and tests `value != bound` near the latch. Once the value count
+    // exceeds the exact-set budget, retain the proven finite lifetime as a
+    // strided interval instead of falling back to the widened header state.
+    auto location = GetLoadLocation(value);
+    auto loadExpr = GetDefiningExpr(value);
+    auto header = loadExpr == nullptr ? nullptr : loadExpr->GetParentBlock();
+    if (location == nullptr || header == nullptr) {
         return std::nullopt;
     }
-    auto width = ToWidth(*value->GetType());
-    std::vector<SInt> exact;
-    exact.reserve(values->size());
-    for (auto item : *values) {
-        exact.emplace_back(width, static_cast<uint64_t>(item));
+    auto init = FindIncomingSignedStoreConstant(header, location);
+    if (!init.has_value()) {
+        init = FindIncomingSignedStoreConstantThroughPredecessors(header, location);
     }
-    auto exactValues = NormalizeExactIntSet(std::move(exact));
-    if (!exactValues.has_value()) {
+    auto step = FindSingleReachableLoopUpdateStep(header, location);
+    auto bound = FindEqualityExitConstantBound(header, location);
+    if (!init.has_value() || !step.has_value() || step.value() == 0 || !bound.has_value()) {
         return std::nullopt;
     }
-    auto domain = DomainFromExactIntValues(*exactValues, value->GetType()->IsUnsignedInteger());
-    return SIntRange{std::move(domain), std::move(exactValues)};
+    const auto distance = static_cast<__int128>(bound.value()) - static_cast<__int128>(init.value());
+    if ((distance > 0 && step.value() < 0) || (distance < 0 && step.value() > 0) ||
+        distance % static_cast<__int128>(step.value()) != 0) {
+        return std::nullopt;
+    }
+    const auto relation = step.value() > 0 ? RelationalOperation::LE : RelationalOperation::GE;
+    return BuildSignedInductionBodyRange(
+        value->GetType(), init.value(), step.value(), relation, bound.value());
 }
 
 std::unordered_set<const Block*> CollectLoopBackPathBlockSet(
@@ -16776,6 +16986,159 @@ bool NarrowSIntByKnownBits(
     return reachable && objectReachable;
 }
 
+constexpr uint64_t MAX_MASK_COMPLEMENT_PERIOD = 256;
+constexpr uint64_t MAX_MASK_COMPLEMENT_CRT_MODULUS = 4096;
+
+std::unique_ptr<SIntRange> BuildMaskedInequalityNarrowing(
+    const SIntDomain& current, const SIntRange* currentRange,
+    uint64_t rawMask, uint64_t rawCompared, bool& changed)
+{
+    changed = false;
+    if (currentRange == nullptr) {
+        return nullptr;
+    }
+
+    if (currentRange->GetExactValues().has_value()) {
+        std::vector<SInt> filtered;
+        filtered.reserve(currentRange->GetExactValues()->size());
+        for (const auto& value : *currentRange->GetExactValues()) {
+            if ((value.UVal() & rawMask) != rawCompared) {
+                filtered.emplace_back(value);
+            }
+        }
+        if (filtered.size() == currentRange->GetExactValues()->size()) {
+            return nullptr;
+        }
+        changed = true;
+        if (filtered.empty()) {
+            return std::make_unique<SIntRange>(
+                SIntDomain::Bottom(current.Width(), current.IsUnsigned()));
+        }
+        auto domain = DomainFromExactIntValues(filtered, current.IsUnsigned());
+        auto knownBits = InferKnownBitsFromExactValues(filtered, current.Width());
+        return std::make_unique<SIntRange>(std::move(domain), std::move(filtered),
+            std::nullopt, std::move(knownBits), currentRange->GetExcludedValues());
+    }
+
+    // A masked inequality is generally a non-convex set.  Refine it only
+    // when its low-bit period and the resulting CRT partition stay within a
+    // small, explicit budget; otherwise retaining the original range is the
+    // sound fallback.
+    if (rawMask >= MAX_MASK_COMPLEMENT_PERIOD) {
+        return nullptr;
+    }
+    uint64_t period = 1;
+    while (period <= rawMask) {
+        period <<= 1U;
+    }
+    auto fragments = GetSIntIntervalFragmentsForUnion(*currentRange);
+    if (!fragments.has_value()) {
+        return nullptr;
+    }
+
+    std::vector<SIntIntervalFragment> filtered;
+    filtered.reserve(MAX_DISJOINT_SINT_INTERVALS);
+    for (const auto& fragment : *fragments) {
+        if (fragment.lower == fragment.upper) {
+            if ((fragment.lower.UVal() & rawMask) != rawCompared) {
+                filtered.emplace_back(fragment);
+            } else {
+                changed = true;
+            }
+            continue;
+        }
+        const auto stride = std::max<uint64_t>(fragment.stride, 1);
+        const auto common = std::gcd(stride, period);
+        if (stride / common > MAX_MASK_COMPLEMENT_CRT_MODULUS / period) {
+            return nullptr;
+        }
+        const auto modulus = (stride / common) * period;
+        if (modulus > MAX_MASK_COMPLEMENT_CRT_MODULUS) {
+            return nullptr;
+        }
+
+        std::vector<uint64_t> acceptedResidues;
+        size_t compatibleResidues = 0;
+        for (uint64_t residue = 0; residue < modulus; ++residue) {
+            if (residue % stride != fragment.residue % stride) {
+                continue;
+            }
+            ++compatibleResidues;
+            if ((residue & rawMask) != rawCompared) {
+                acceptedResidues.emplace_back(residue);
+            }
+        }
+        if (acceptedResidues.size() == compatibleResidues) {
+            filtered.emplace_back(fragment);
+            continue;
+        }
+        changed = true;
+        for (auto residue : acceptedResidues) {
+            filtered.emplace_back(SIntIntervalFragment{
+                fragment.lower, fragment.upper, modulus, residue});
+            if (filtered.size() > MAX_DISJOINT_SINT_INTERVALS) {
+                changed = false;
+                return nullptr;
+            }
+        }
+    }
+    if (!changed) {
+        return nullptr;
+    }
+    if (filtered.empty()) {
+        return std::make_unique<SIntRange>(
+            SIntDomain::Bottom(current.Width(), current.IsUnsigned()));
+    }
+    auto normalized = NormalizeSIntIntervalFragments(std::move(filtered), current);
+    if (!normalized.has_value()) {
+        changed = false;
+        return nullptr;
+    }
+    return std::make_unique<SIntRange>(current, std::nullopt,
+        currentRange->GetCongruence(), currentRange->GetKnownBits(),
+        currentRange->GetExcludedValues(), std::move(normalized));
+}
+
+bool NarrowSIntByMaskedInequality(
+    RangeDomain& state, Value* value, uint64_t rawMask, uint64_t rawCompared)
+{
+    if (!IsIntegerValue(value)) {
+        return true;
+    }
+    bool changed = false;
+    const auto& current = RangeAnalysis::GetSIntDomainFromState(state, value);
+    auto narrowed = BuildMaskedInequalityNarrowing(
+        current, GetSIntRangeFromState(state, value), rawMask, rawCompared, changed);
+    bool reachable = true;
+    if (changed && narrowed != nullptr) {
+        reachable = !narrowed->GetVal().IsBottom();
+        state.Update(value, std::move(narrowed));
+    }
+
+    auto expr = GetDefiningExpr(value);
+    if (expr == nullptr || expr->GetExprKind() != ExprKind::LOAD) {
+        return reachable;
+    }
+    auto location = StaticCast<const Load*>(expr)->GetLocation();
+    auto rootType = location == nullptr || !location->GetType()->IsRef()
+        ? nullptr
+        : StaticCast<RefType*>(location->GetType())->GetRootBaseType();
+    auto object = location == nullptr ? nullptr : state.CheckAbstractObjectRefBy(location);
+    if (rootType == nullptr || !rootType->IsInteger() || object == nullptr) {
+        return reachable;
+    }
+    bool objectChanged = false;
+    const auto& objectDomain = GetSIntDomainFromState(state, object, rootType);
+    auto narrowedObject = BuildMaskedInequalityNarrowing(objectDomain,
+        GetSIntRangeFromState(state, object, rootType), rawMask, rawCompared, objectChanged);
+    bool objectReachable = true;
+    if (objectChanged && narrowedObject != nullptr) {
+        objectReachable = !narrowedObject->GetVal().IsBottom();
+        state.Update(object, std::move(narrowedObject));
+    }
+    return reachable && objectReachable;
+}
+
 bool ApplyBitMaskComparisonConstraint(RangeDomain& state, Value* maskedValue,
     RelationalOperation relation, const SInt& comparedValue)
 {
@@ -16822,7 +17185,8 @@ bool ApplyBitMaskComparisonConstraint(RangeDomain& state, Value* maskedValue,
     uint64_t required = rawCompared;
     if (relation == RelationalOperation::NE) {
         if ((rawMask & (rawMask - 1U)) != 0) {
-            return true;
+            return NarrowSIntByMaskedInequality(
+                state, source, rawMask, rawCompared);
         }
         required = rawCompared == 0 ? rawMask : 0;
     }
