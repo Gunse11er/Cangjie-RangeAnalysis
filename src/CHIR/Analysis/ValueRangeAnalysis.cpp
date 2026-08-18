@@ -1620,7 +1620,10 @@ bool ExactValueSatisfiesDomain(const SInt& value, const SIntDomain& domain)
     return !SIntDomain::Intersects(singleton, domain).IsBottom();
 }
 
-constexpr size_t MAX_EXCLUDED_SINT_VALUES = 8;
+// Exclusions are stored out of line and only allocated for genuinely holed
+// ranges. Keep enough points to survive realistic chains of `!=` guards
+// while retaining a strict bound below the default exact-set budget.
+constexpr size_t MAX_EXCLUDED_SINT_VALUES = 32;
 constexpr size_t MAX_DISJOINT_SINT_INTERVALS = 4;
 
 std::optional<std::vector<SInt>> NormalizeExcludedSIntValues(
@@ -17515,6 +17518,8 @@ bool ApplyBoolEqualityConstraint(RangeDomain& state, Value* lhs, Value* rhs, Rel
 bool ApplyLogicalBoolConstraint(
     RangeDomain& state, const BinaryExpression* binary, ExprKind kind, bool branchCondition)
 {
+    constexpr size_t MAX_LOGICAL_CONSTRAINT_SPLIT_DEPTH = 4;
+    thread_local size_t logicalConstraintSplitDepth = 0;
     auto lhs = binary->GetLHSOperand();
     auto rhs = binary->GetRHSOperand();
     if (!IsBooleanValue(lhs) || !IsBooleanValue(rhs)) {
@@ -17539,6 +17544,42 @@ bool ApplyLogicalBoolConstraint(
         if (!branchCondition) {
             return ApplyConditionConstraint(state, lhs, false) && ApplyConditionConstraint(state, rhs, false);
         }
+        if (logicalConstraintSplitDepth >= MAX_LOGICAL_CONSTRAINT_SPLIT_DEPTH) {
+            return true;
+        }
+        struct SplitDepthGuard {
+            explicit SplitDepthGuard(size_t& splitDepth) : counter(splitDepth)
+            {
+                ++counter;
+            }
+            ~SplitDepthGuard()
+            {
+                --counter;
+            }
+            size_t& counter;
+        } splitDepthGuard{logicalConstraintSplitDepth};
+
+        // OR is true through either `lhs` or `!lhs && rhs`. Preserve both
+        // predecessor-sensitive states so non-convex numeric components can
+        // survive the merge instead of dropping all constraints.
+        auto lhsTrueState = state;
+        const bool lhsTrueReachable =
+            ApplyConditionConstraint(lhsTrueState, lhs, true);
+        auto rhsTrueState = state;
+        const bool rhsTrueReachable =
+            ApplyConditionConstraint(rhsTrueState, lhs, false) &&
+            ApplyConditionConstraint(rhsTrueState, rhs, true);
+        if (!lhsTrueReachable && !rhsTrueReachable) {
+            return false;
+        }
+        if (!lhsTrueReachable) {
+            state = std::move(rhsTrueState);
+            return true;
+        }
+        state = std::move(lhsTrueState);
+        if (rhsTrueReachable) {
+            state.Join(rhsTrueState);
+        }
         return true;
     }
 
@@ -17557,6 +17598,40 @@ bool ApplyLogicalBoolConstraint(
         }
         if (branchCondition) {
             return ApplyConditionConstraint(state, lhs, true) && ApplyConditionConstraint(state, rhs, true);
+        }
+        if (logicalConstraintSplitDepth >= MAX_LOGICAL_CONSTRAINT_SPLIT_DEPTH) {
+            return true;
+        }
+        struct SplitDepthGuard {
+            explicit SplitDepthGuard(size_t& splitDepth) : counter(splitDepth)
+            {
+                ++counter;
+            }
+            ~SplitDepthGuard()
+            {
+                --counter;
+            }
+            size_t& counter;
+        } splitDepthGuard{logicalConstraintSplitDepth};
+
+        // AND is false through either `!lhs` or `lhs && !rhs`.
+        auto lhsFalseState = state;
+        const bool lhsFalseReachable =
+            ApplyConditionConstraint(lhsFalseState, lhs, false);
+        auto rhsFalseState = state;
+        const bool rhsFalseReachable =
+            ApplyConditionConstraint(rhsFalseState, lhs, true) &&
+            ApplyConditionConstraint(rhsFalseState, rhs, false);
+        if (!lhsFalseReachable && !rhsFalseReachable) {
+            return false;
+        }
+        if (!lhsFalseReachable) {
+            state = std::move(rhsFalseState);
+            return true;
+        }
+        state = std::move(lhsFalseState);
+        if (rhsFalseReachable) {
+            state.Join(rhsFalseState);
         }
     }
     return true;
@@ -17577,6 +17652,118 @@ std::optional<bool> FindStoredBoolConstant(const Block* block, Value* location)
         return GetSingleBoolFromDefiningConstant(store->GetValue());
     }
     return std::nullopt;
+}
+
+Value* FindStoredBoolValue(const Block* block, Value* location)
+{
+    if (block == nullptr || location == nullptr) {
+        return nullptr;
+    }
+    auto expressions = block->GetExpressions();
+    for (auto it = expressions.rbegin(); it != expressions.rend(); ++it) {
+        if ((*it)->GetExprKind() != ExprKind::STORE) {
+            continue;
+        }
+        auto store = StaticCast<const Store*>(*it);
+        if (store->GetLocation() == location &&
+            IsBooleanValue(store->GetValue())) {
+            return store->GetValue();
+        }
+    }
+    return nullptr;
+}
+
+bool ApplyImmediateIncomingBranchConstraint(
+    RangeDomain& state, const Block* destination)
+{
+    if (destination == nullptr) {
+        return true;
+    }
+    const auto& incoming = destination->GetPredecessors();
+    if (incoming.size() != 1) {
+        return true;
+    }
+    auto controller = incoming.front();
+    auto terminator = controller == nullptr ? nullptr : controller->GetTerminator();
+    if (terminator == nullptr || terminator->GetExprKind() != ExprKind::BRANCH) {
+        return true;
+    }
+    auto branch = StaticCast<const Branch*>(terminator);
+    if (branch->GetTrueBlock() == branch->GetFalseBlock() ||
+        (destination != branch->GetTrueBlock() && destination != branch->GetFalseBlock())) {
+        return true;
+    }
+    return ApplyConditionConstraint(
+        state, branch->GetCondition(), destination == branch->GetTrueBlock());
+}
+
+std::optional<bool> ApplyStoredBoolPhiConstraint(
+    RangeDomain& state, Value* condition, bool branchCondition)
+{
+    constexpr size_t MAX_STORED_BOOL_PHI_PREDECESSORS = 8;
+    constexpr size_t MAX_STORED_BOOL_PHI_DEPTH = 8;
+    thread_local size_t storedBoolPhiDepth = 0;
+    thread_local std::unordered_set<Value*> activeStoredBoolLocations;
+
+    auto expression = GetDefiningExpr(condition);
+    if (expression == nullptr || expression->GetExprKind() != ExprKind::LOAD ||
+        storedBoolPhiDepth >= MAX_STORED_BOOL_PHI_DEPTH) {
+        return std::nullopt;
+    }
+    auto load = StaticCast<const Load*>(expression);
+    auto location = load->GetLocation();
+    auto block = expression->GetParentBlock();
+    if (location == nullptr || block == nullptr || !IsBooleanValue(condition) ||
+        !activeStoredBoolLocations.emplace(location).second) {
+        return std::nullopt;
+    }
+    struct ActiveLocationGuard {
+        ActiveLocationGuard(size_t& currentDepth,
+            std::unordered_set<Value*>& activeLocations, Value* storedLocation)
+            : depth(currentDepth), active(activeLocations), location(storedLocation)
+        {
+            ++depth;
+        }
+        ~ActiveLocationGuard()
+        {
+            --depth;
+            active.erase(location);
+        }
+        size_t& depth;
+        std::unordered_set<Value*>& active;
+        Value* location;
+    } activeGuard{storedBoolPhiDepth, activeStoredBoolLocations, location};
+
+    const auto& predecessors = block->GetPredecessors();
+    if (predecessors.size() < 2 ||
+        predecessors.size() > MAX_STORED_BOOL_PHI_PREDECESSORS) {
+        return std::nullopt;
+    }
+
+    std::optional<RangeDomain> merged;
+    for (auto predecessor : predecessors) {
+        auto storedValue = FindStoredBoolValue(predecessor, location);
+        if (storedValue == nullptr) {
+            // A missing incoming definition means the boolean memory phi is
+            // incomplete. Keeping the original state is the sound fallback.
+            return std::nullopt;
+        }
+        auto incomingState = state;
+        if (!ApplyImmediateIncomingBranchConstraint(incomingState, predecessor) ||
+            !ApplyConditionConstraint(incomingState, storedValue, branchCondition)) {
+            continue;
+        }
+        if (!merged.has_value()) {
+            merged = std::move(incomingState);
+        } else {
+            merged->Join(incomingState);
+        }
+    }
+    if (!merged.has_value()) {
+        return false;
+    }
+    state = std::move(*merged);
+    return true;
 }
 
 struct ShortCircuitBoolAlias {
@@ -17641,6 +17828,14 @@ bool ApplyConditionConstraint(RangeDomain& state, Value* condition, bool branchC
     auto expr = GetDefiningExpr(condition);
     if (expr == nullptr) {
         return NarrowBoolValue(state, condition, branchCondition);
+    }
+    if (auto storedPhi = ApplyStoredBoolPhiConstraint(
+            state, condition, branchCondition); storedPhi.has_value()) {
+        if (!storedPhi.value()) {
+            return false;
+        }
+        (void)NarrowBoolValue(state, condition, branchCondition);
+        return true;
     }
     if (auto alias = GetShortCircuitBoolAlias(condition); alias.has_value()) {
         if (!ApplyConditionConstraint(state, alias->source, alias->inverted ? !branchCondition : branchCondition)) {
