@@ -6534,7 +6534,9 @@ std::optional<RangeAnalysis::ContextAbstractValue> RangeAnalysis::AnalyzeCalleeW
     auto returnType = callee == nullptr || !callee->HasReturnValue()
         ? nullptr
         : callee->GetReturnValue()->GetType();
-    const bool hasScalarReturn = IsSupportedLambdaResultType(returnType);
+    const bool hasSupportedReturn = callee != nullptr &&
+        (IsSupportedLambdaResultType(returnType) || callee->GetReturnType()->IsUnit() ||
+            callee->GetReturnType()->IsVoid());
     const bool isRecursiveCall = callee != nullptr &&
         std::find(contextSummaryFunctionStack.begin(), contextSummaryFunctionStack.end(), callee) !=
             contextSummaryFunctionStack.end();
@@ -6553,7 +6555,7 @@ std::optional<RangeAnalysis::ContextAbstractValue> RangeAnalysis::AnalyzeCalleeW
                 user->GetParentBlock()->GetTopLevelFunc() == callee;
         });
     const bool isExactScalarRecursiveContext = (isRecursiveCall || hasDirectSelfCall) && globalValues.empty() &&
-        hasScalarReturn &&
+        hasSupportedReturn &&
         params.size() == arguments.size() &&
         std::all_of(arguments.begin(), arguments.end(),
             [](const auto& argument) { return argument.IsSingleValue(); }) &&
@@ -6676,7 +6678,7 @@ std::optional<RangeAnalysis::ContextAbstractValue> RangeAnalysis::AnalyzeCalleeW
                       << " globals=" << globalValues.size()
                       << " params=" << params.size()
                       << " arguments=" << arguments.size()
-                      << " scalar-return=" << hasScalarReturn
+                      << " supported-return=" << hasSupportedReturn
                       << " all-single="
                       << std::all_of(arguments.begin(), arguments.end(),
                              [](const auto& argument) { return argument.IsSingleValue(); })
@@ -11747,6 +11749,7 @@ std::optional<int64_t> FindIncomingSignedStoreValueBeforeLoop(const RangeDomain&
 std::optional<SIntRange> BuildSignedExactRange(Type* type, const std::vector<int64_t>& values);
 bool ApplyConditionConstraint(RangeDomain& state, Value* condition, bool branchCondition);
 Type* GetIntegerRefRootType(Value* location);
+bool IsUnaliasedLocalLocation(Value* location);
 
 constexpr size_t MAX_BOUNDED_LOOP_STEPS = 16384;
 
@@ -13317,6 +13320,10 @@ struct VariableBoundInductionExit {
     RelationalOperation relation{RelationalOperation::LE};
 };
 
+std::optional<VariableBoundInductionExit> GetVariableBoundInductionExit(
+    const RangeDomain& state, const Branch* branch, const Block* successor,
+    bool resolveForwardedCondition);
+
 struct CountedAccumulatorUpdate {
     Value* location;
     Type* type;
@@ -13648,9 +13655,12 @@ std::optional<std::vector<int64_t>> TryEnumerateSimpleLoopLoadValues(const Range
     return values;
 }
 
-std::optional<SIntRange> TryComputeSimpleLoopLoadRange(const RangeDomain& state, Value* value)
+std::optional<SIntRange> TryComputeSimpleLoopLoadRangeImpl(
+    const RangeDomain& state, Value* value, size_t enclosingDepth)
 {
-    if (value == nullptr || !value->GetType()->IsInteger() || value->GetType()->IsUnsignedInteger()) {
+    constexpr size_t MAX_ENCLOSING_INDUCTION_DEPTH = 8;
+    if (value == nullptr || !value->GetType()->IsInteger() || value->GetType()->IsUnsignedInteger() ||
+        enclosingDepth > MAX_ENCLOSING_INDUCTION_DEPTH) {
         return std::nullopt;
     }
     auto values = TryEnumerateSimpleLoopLoadValues(state, value);
@@ -13685,17 +13695,104 @@ std::optional<SIntRange> TryComputeSimpleLoopLoadRange(const RangeDomain& state,
     }
     auto step = FindSingleReachableLoopUpdateStep(header, location);
     auto bound = FindEqualityExitConstantBound(header, location);
-    if (!init.has_value() || !step.has_value() || step.value() == 0 || !bound.has_value()) {
+    if (init.has_value() && step.has_value() && step.value() != 0 && bound.has_value()) {
+        const auto distance = static_cast<__int128>(bound.value()) - static_cast<__int128>(init.value());
+        if (!((distance > 0 && step.value() < 0) || (distance < 0 && step.value() > 0) ||
+            distance % static_cast<__int128>(step.value()) != 0)) {
+            const auto relation = step.value() > 0 ? RelationalOperation::LE : RelationalOperation::GE;
+            return BuildSignedInductionBodyRange(
+                value->GetType(), init.value(), step.value(), relation, bound.value());
+        }
+    }
+
+    // Recover an enclosing induction lifetime, recursively resolving a
+    // finite outer bound for guards such as `inner <= outer`.
+    if (!IsUnaliasedLocalLocation(location)) {
         return std::nullopt;
     }
-    const auto distance = static_cast<__int128>(bound.value()) - static_cast<__int128>(init.value());
-    if ((distance > 0 && step.value() < 0) || (distance < 0 && step.value() > 0) ||
-        distance % static_cast<__int128>(step.value()) != 0) {
-        return std::nullopt;
+    auto forest = GetLoopForest(header);
+    auto containingLoops = forest == nullptr
+        ? std::vector<const LoopDescriptor*>{}
+        : forest->FindContainingLoops(header);
+    for (auto loop : containingLoops) {
+        auto outerHeader = loop == nullptr ? nullptr : loop->header;
+        auto terminator = outerHeader == nullptr ? nullptr : outerHeader->GetTerminator();
+        if (outerHeader == header || terminator == nullptr || terminator->GetExprKind() != ExprKind::BRANCH) {
+            continue;
+        }
+        auto branch = StaticCast<const Branch*>(terminator);
+        const bool trueIsBody = forest->IsLoopBodySuccessor(outerHeader, branch->GetTrueBlock());
+        const bool falseIsBody = forest->IsLoopBodySuccessor(outerHeader, branch->GetFalseBlock());
+        if (trueIsBody == falseIsBody) {
+            continue;
+        }
+        auto exitSuccessor = trueIsBody ? branch->GetFalseBlock() : branch->GetTrueBlock();
+        auto condition = GetSimpleInductionCondition(
+            ResolveLocallyForwardedBooleanCondition(branch->GetCondition()));
+        if (condition.has_value() && condition->location == location) {
+            if (enclosingDepth == 0) {
+                continue;
+            }
+            auto outerInit = FindIncomingSignedStoreConstant(outerHeader, location);
+            if (!outerInit.has_value()) {
+                outerInit = FindIncomingSignedStoreConstantThroughPredecessors(outerHeader, location);
+            }
+            auto outerStep = FindSingleReachableLoopUpdateStep(outerHeader, location);
+            if (!outerInit.has_value() || !outerStep.has_value() || outerStep.value() == 0) {
+                continue;
+            }
+            auto relation = trueIsBody ? condition->relation : NegateRelation(condition->relation);
+            auto exit = ComputeExactInductionExit(outerInit.value(), outerStep.value(), relation,
+                condition->bound, ToWidth(*value->GetType()));
+            if (!exit.has_value()) {
+                continue;
+            }
+            auto lifetimeRelation = outerStep.value() > 0
+                ? RelationalOperation::LE
+                : RelationalOperation::GE;
+            if (auto range = BuildSignedInductionBodyRange(value->GetType(), outerInit.value(),
+                outerStep.value(), lifetimeRelation, exit->SVal()); range.has_value()) {
+                return range;
+            }
+            continue;
+        }
+
+        auto induction = GetVariableBoundInductionExit(
+            state, branch, exitSuccessor, /* resolveForwardedCondition = */ true);
+        if (!induction.has_value() || induction->location != location ||
+            induction->boundValue == value || GetLoadLocation(induction->boundValue) == location) {
+            continue;
+        }
+        auto boundRange = TryComputeSimpleLoopLoadRangeImpl(
+            state, induction->boundValue, enclosingDepth + 1);
+        auto stateBoundRange = boundRange.has_value()
+            ? &boundRange.value()
+            : GetSIntRangeFromState(state, induction->boundValue);
+        if (stateBoundRange == nullptr) {
+            continue;
+        }
+        const auto& numeric = stateBoundRange->GetVal().NumericBound();
+        if (numeric.IsEmptySet() || numeric.IsFullSet() || numeric.IsWrappedSet() ||
+            numeric.IsSignWrappedSet()) {
+            continue;
+        }
+        auto relation = induction->relation;
+        if (induction->step != 1 ||
+            (relation != RelationalOperation::LT && relation != RelationalOperation::LE)) {
+            continue;
+        }
+        if (auto range = BuildSignedInductionBodyRange(value->GetType(), induction->init,
+            induction->step, relation, numeric.MaxValue(false).SVal()); range.has_value()) {
+            return range;
+        }
     }
-    const auto relation = step.value() > 0 ? RelationalOperation::LE : RelationalOperation::GE;
-    return BuildSignedInductionBodyRange(
-        value->GetType(), init.value(), step.value(), relation, bound.value());
+    return std::nullopt;
+}
+
+std::optional<SIntRange> TryComputeSimpleLoopLoadRange(const RangeDomain& state, Value* value)
+{
+    return TryComputeSimpleLoopLoadRangeImpl(
+        state, value, /* enclosingDepth = */ 0);
 }
 
 std::unordered_set<const Block*> CollectLoopBackPathBlockSet(
