@@ -373,6 +373,8 @@ std::mutex contextEffectClosureCacheMtx;
 constexpr size_t MAX_GLOBAL_CONTEXT_PER_FUNCTION = 8;
 constexpr size_t MAX_BOUNDED_LOOP_CONTEXT_PER_FUNCTION = 1024;
 constexpr size_t MAX_TOTAL_BOUNDED_LOOP_CONTEXT_SUMMARIES = 2048;
+constexpr size_t MAX_EXACT_SCALAR_RECURSION_DEPTH = 512;
+constexpr size_t MAX_EXACT_SCALAR_RECURSION_CONTEXTS_PER_FUNCTION = 512;
 constexpr size_t MAX_CONTEXT_GLOBALS = 64;
 constexpr size_t MAX_CONTEXT_CALL_CLOSURE_FUNCTIONS = 128;
 constexpr size_t MAX_LAMBDA_CONTEXTS_PER_ANALYSIS = 32;
@@ -983,6 +985,7 @@ void ClearContextObjectIdentities()
 using BoundedLoopObservationMap = std::unordered_map<const Expression*, std::unique_ptr<ValueRange>>;
 BoundedLoopObservationMap boundedLoopObservations;
 BoundedLoopObservationMap boundedLoopPrefixObservations;
+std::unordered_set<const Expression*> incompleteBoundedLoopObservations;
 std::unordered_map<const RangeAnalysis*, BoundedLoopObservationMap>
     localBoundedLoopPrefixObservations;
 std::unordered_map<const RangeAnalysis*, std::unordered_set<std::string>>
@@ -1002,6 +1005,8 @@ void CommitBoundedLoopObservations(const BoundedLoopObservationMap& observations
     size_t newEntries = 0;
     for (const auto& [expression, range] : observations) {
         if (expression != nullptr && range != nullptr &&
+            incompleteBoundedLoopObservations.find(expression) ==
+                incompleteBoundedLoopObservations.end() &&
             boundedLoopObservations.find(expression) == boundedLoopObservations.end()) {
             ++newEntries;
         }
@@ -1013,6 +1018,10 @@ void CommitBoundedLoopObservations(const BoundedLoopObservationMap& observations
     }
     for (const auto& [expression, range] : observations) {
         if (expression == nullptr || range == nullptr) {
+            continue;
+        }
+        if (incompleteBoundedLoopObservations.find(expression) !=
+            incompleteBoundedLoopObservations.end()) {
             continue;
         }
         auto current = boundedLoopObservations.find(expression);
@@ -3701,7 +3710,10 @@ std::unique_ptr<ValueRange> RangeAnalysis::GetBoundedLoopObservedRange(const Exp
         }
         return nullptr;
     }
-    auto found = boundedLoopObservations.find(expression);
+    auto found = incompleteBoundedLoopObservations.find(expression) ==
+            incompleteBoundedLoopObservations.end()
+        ? boundedLoopObservations.find(expression)
+        : boundedLoopObservations.end();
     if (std::getenv("CANGJIE_RA_TRACE_OUTPUT") != nullptr && expression != nullptr) {
         const auto& location = expression->GetDebugLocation();
         std::cerr << "[RangeAnalysisBoundedLookup] expression=" << expression
@@ -3815,6 +3827,7 @@ void RangeAnalysis::ClearBoundedLoopObservedRanges()
     std::lock_guard<std::mutex> lock(boundedLoopObservationsMtx);
     boundedLoopObservations.clear();
     boundedLoopPrefixObservations.clear();
+    incompleteBoundedLoopObservations.clear();
     localBoundedLoopPrefixObservations.clear();
     completedBoundedLoopPrefixAttempts.clear();
     boundedLoopObservationsComplete = true;
@@ -6517,8 +6530,6 @@ std::optional<RangeAnalysis::ContextAbstractValue> RangeAnalysis::AnalyzeCalleeW
     // single concrete argument tuple.  A separate, still-bounded budget lets
     // finite descending recurrences finish without weakening the general
     // context limits used by interval, reference, and side-effecting calls.
-    constexpr size_t MAX_EXACT_SCALAR_RECURSION_DEPTH = 512;
-    constexpr size_t MAX_EXACT_SCALAR_RECURSION_CONTEXTS_PER_FUNCTION = 512;
     const auto params = callee == nullptr ? std::vector<Parameter*>{} : callee->GetParams();
     auto returnType = callee == nullptr || !callee->HasReturnValue()
         ? nullptr
@@ -6527,7 +6538,21 @@ std::optional<RangeAnalysis::ContextAbstractValue> RangeAnalysis::AnalyzeCalleeW
     const bool isRecursiveCall = callee != nullptr &&
         std::find(contextSummaryFunctionStack.begin(), contextSummaryFunctionStack.end(), callee) !=
             contextSummaryFunctionStack.end();
-    const bool isExactScalarRecursiveContext = isRecursiveCall && globalValues.empty() &&
+    const auto calleeUsers = callee == nullptr ? std::vector<Expression*>{} : callee->GetUsers();
+    const bool hasDirectSelfCall =
+        std::any_of(calleeUsers.begin(), calleeUsers.end(), [callee](const Expression* user) {
+            if (user == nullptr) {
+                return false;
+            }
+            auto directCallee = user->GetExprKind() == ExprKind::APPLY
+                ? StaticCast<const Apply*>(user)->GetCallee()
+                : user->GetExprKind() == ExprKind::APPLY_WITH_EXCEPTION
+                ? StaticCast<const ApplyWithException*>(user)->GetCallee()
+                : nullptr;
+            return directCallee == callee && user->GetParentBlock() != nullptr &&
+                user->GetParentBlock()->GetTopLevelFunc() == callee;
+        });
+    const bool isExactScalarRecursiveContext = (isRecursiveCall || hasDirectSelfCall) && globalValues.empty() &&
         hasScalarReturn &&
         params.size() == arguments.size() &&
         std::all_of(arguments.begin(), arguments.end(),
@@ -6680,7 +6705,7 @@ std::optional<RangeAnalysis::ContextAbstractValue> RangeAnalysis::AnalyzeCalleeW
         } else {
             auto& count = GetContextCounts()[callee];
             auto contextLimit = isExactScalarRecursiveContext
-                ? MAX_EXACT_SCALAR_RECURSION_CONTEXTS_PER_FUNCTION
+                ? MAX_EXACT_SCALAR_RECURSION_CONTEXTS_PER_FUNCTION + rangeAnalysisConfig.maxContextPerFunction
                 : globalValues.empty() ? rangeAnalysisConfig.maxContextPerFunction
                                        : MAX_GLOBAL_CONTEXT_PER_FUNCTION;
             if (count >= contextLimit) {
@@ -9316,6 +9341,7 @@ std::optional<SIntRange> TryComputeLockstepDifferenceRange(
     const RangeDomain& state, const BinaryExpression* binaryExpr);
 std::optional<SIntRange> TryComputeCommonSymbolDifferenceRange(
     const RangeDomain& state, const BinaryExpression* binaryExpr);
+std::optional<SIntDomain> TryComputeRelationalDifferenceConstraint(const BinaryExpression* binaryExpr);
 namespace {
 std::optional<SIntRange> TryComputeSimpleLoopLoadRange(const RangeDomain& state, Value* value);
 std::optional<SIntRange> TryComputePairLoopLoadRange(const RangeDomain& state, const Load* load);
@@ -9940,6 +9966,10 @@ void RangeAnalysis::HandleBinaryExpr(RangeDomain& state, const BinaryExpression*
             return;
         }
         auto res = ComputeArithmeticBinop(CHIRArithmeticBinopArgs{lRange, rRange, lhs, rhs, kind, ov, isUnsigned});
+        if (auto relationalConstraint = TryComputeRelationalDifferenceConstraint(binaryExpr);
+            relationalConstraint.has_value()) {
+            res = SIntDomain::Intersects(res, relationalConstraint.value());
+        }
         auto congruence = ComputeArithmeticCongruence(
             kind, lhsRange, rhsRange, lRange, rRange, dest->GetType(), ov);
         auto intervalFragments = ComputeAffineIntervalFragments(kind, lhsRange,
@@ -16629,6 +16659,130 @@ std::optional<SIntRange> TryComputeCommonSymbolDifferenceRangeImpl(
         binaryExpr->GetResult()->GetType(), {inferredDifference.value()});
 }
 
+bool IsUnaliasedLocalLocation(Value* location)
+{
+    auto definition = GetDefiningExpr(location);
+    if (definition == nullptr || definition->GetExprKind() != ExprKind::ALLOCATE) {
+        return false;
+    }
+    const auto users = location->GetUsers();
+    return std::all_of(users.begin(), users.end(),
+        [location](const Expression* user) {
+            if (user == nullptr || user->GetExprKind() == ExprKind::DEBUGEXPR) {
+                return true;
+            }
+            return (user->GetExprKind() == ExprKind::LOAD &&
+                       StaticCast<const Load*>(user)->GetLocation() == location) ||
+                (user->GetExprKind() == ExprKind::STORE &&
+                    StaticCast<const Store*>(user)->GetLocation() == location);
+        });
+}
+
+bool HasStoreAfterEitherLoad(
+    const Block* block, const Load* lhsLoad, const Load* rhsLoad, Value* lhsLocation, Value* rhsLocation)
+{
+    if (block == nullptr || lhsLoad == nullptr || rhsLoad == nullptr) {
+        return true;
+    }
+    bool seenLhs = false;
+    bool seenRhs = false;
+    for (auto expression : block->GetExpressions()) {
+        seenLhs = seenLhs || expression == lhsLoad;
+        seenRhs = seenRhs || expression == rhsLoad;
+        if (expression->GetExprKind() != ExprKind::STORE) {
+            continue;
+        }
+        auto location = StaticCast<const Store*>(expression)->GetLocation();
+        if ((seenLhs && location == lhsLocation) || (seenRhs && location == rhsLocation)) {
+            return true;
+        }
+    }
+    return !seenLhs || !seenRhs;
+}
+
+std::optional<SIntDomain> TryComputeRelationalDifferenceConstraintImpl(const BinaryExpression* binaryExpr)
+{
+    if (binaryExpr == nullptr || binaryExpr->GetExprKind() != ExprKind::SUB ||
+        binaryExpr->GetOverflowStrategy() != OverflowStrategy::THROWING ||
+        binaryExpr->GetResult() == nullptr || binaryExpr->GetResult()->GetType() == nullptr ||
+        !binaryExpr->GetResult()->GetType()->IsInteger() ||
+        binaryExpr->GetResult()->GetType()->IsUnsignedInteger()) {
+        return std::nullopt;
+    }
+    auto lhsLoad = GetRootIntegerLoad(binaryExpr->GetLHSOperand());
+    auto rhsLoad = GetRootIntegerLoad(binaryExpr->GetRHSOperand());
+    auto targetBlock = binaryExpr->GetParentBlock();
+    if (lhsLoad == nullptr || rhsLoad == nullptr || targetBlock == nullptr ||
+        lhsLoad->GetParentBlock() != targetBlock || rhsLoad->GetParentBlock() != targetBlock) {
+        return std::nullopt;
+    }
+    auto lhsLocation = lhsLoad->GetLocation();
+    auto rhsLocation = rhsLoad->GetLocation();
+    if (lhsLocation == nullptr || rhsLocation == nullptr || lhsLocation == rhsLocation ||
+        !IsUnaliasedLocalLocation(lhsLocation) || !IsUnaliasedLocalLocation(rhsLocation) ||
+        HasStoreToEitherLocationBeforeExpression(binaryExpr, lhsLocation, rhsLocation)) {
+        return std::nullopt;
+    }
+
+    auto forest = GetLoopForest(targetBlock);
+    auto loops = forest == nullptr ? std::vector<const LoopDescriptor*>{}
+                                   : forest->FindContainingLoops(targetBlock);
+    for (auto loop : loops) {
+        auto terminator = loop == nullptr || loop->header == nullptr
+            ? nullptr
+            : loop->header->GetTerminator();
+        if (terminator == nullptr || terminator->GetExprKind() != ExprKind::BRANCH) {
+            continue;
+        }
+        auto branch = StaticCast<const Branch*>(terminator);
+        const bool trueIsBody = forest->IsLoopBodySuccessor(loop->header, branch->GetTrueBlock());
+        const bool falseIsBody = forest->IsLoopBodySuccessor(loop->header, branch->GetFalseBlock());
+        auto body = trueIsBody != falseIsBody
+            ? (trueIsBody ? branch->GetTrueBlock() : branch->GetFalseBlock())
+            : nullptr;
+        if (body != targetBlock) {
+            continue;
+        }
+        auto condition = ResolveLocallyForwardedBooleanCondition(branch->GetCondition());
+        auto conditionExpr = GetDefiningExpr(condition);
+        if (conditionExpr == nullptr || !IsRelationalExprKind(conditionExpr->GetExprKind()) ||
+            conditionExpr->GetParentBlock() != loop->header) {
+            continue;
+        }
+        auto comparison = StaticCast<const BinaryExpression*>(conditionExpr);
+        auto guardLhsLoad = GetRootIntegerLoad(comparison->GetLHSOperand());
+        auto guardRhsLoad = GetRootIntegerLoad(comparison->GetRHSOperand());
+        auto resultWidth = ToWidth(*binaryExpr->GetResult()->GetType());
+        if (guardLhsLoad == nullptr || guardRhsLoad == nullptr ||
+            guardLhsLoad->GetParentBlock() != loop->header || guardRhsLoad->GetParentBlock() != loop->header ||
+            guardLhsLoad->GetResult()->GetType()->IsUnsignedInteger() ||
+            guardRhsLoad->GetResult()->GetType()->IsUnsignedInteger() ||
+            ToWidth(*guardLhsLoad->GetResult()->GetType()) != resultWidth ||
+            ToWidth(*guardRhsLoad->GetResult()->GetType()) != resultWidth ||
+            HasStoreAfterEitherLoad(loop->header, guardLhsLoad, guardRhsLoad,
+                guardLhsLoad->GetLocation(), guardRhsLoad->GetLocation())) {
+            continue;
+        }
+        auto relation = trueIsBody ? ToRelationalOperation(conditionExpr->GetExprKind())
+                                   : NegateRelation(ToRelationalOperation(conditionExpr->GetExprKind()));
+        const bool sameOrder = guardLhsLoad->GetLocation() == lhsLocation &&
+            guardRhsLoad->GetLocation() == rhsLocation;
+        const bool swappedOrder = guardLhsLoad->GetLocation() == rhsLocation &&
+            guardRhsLoad->GetLocation() == lhsLocation;
+        if (!sameOrder && !swappedOrder) {
+            continue;
+        }
+        if (swappedOrder) {
+            relation = SwapRelation(relation);
+        }
+        if (relation == RelationalOperation::NE) {
+            continue;
+        }
+        return SIntDomain::FromNumeric(relation, SInt{resultWidth, 0}, false);
+    }
+    return std::nullopt;
+}
+
 std::optional<SIntRange> BuildSignedValuesRange(Type* type, std::vector<int64_t> values)
 {
     if (type == nullptr || values.empty()) {
@@ -18685,6 +18839,7 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
     if (boundedLoopEvaluationOwner != nullptr && boundedLoopEvaluationOwner != this) {
         return std::nullopt;
     }
+    const bool isNestedBoundedEvaluation = boundedLoopEvaluationOwner == this;
     auto* parentCallContextRecorder = boundedLoopCallContextRecorder;
     const Block* exitSuccessor = nullptr;
     for (auto candidate : {branch->GetTrueBlock(), branch->GetFalseBlock()}) {
@@ -18779,6 +18934,13 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
             if (incompleteObservations != nullptr) {
                 incompleteObservations->insert(loopExpressions.begin(), loopExpressions.end());
             }
+            if (invalidateGlobalObservations) {
+                std::lock_guard<std::mutex> lock(boundedLoopObservationsMtx);
+                for (auto expression : loopExpressions) {
+                    boundedLoopObservations.erase(expression);
+                    incompleteBoundedLoopObservations.emplace(expression);
+                }
+            }
             if (!callExpressions.empty()) {
                 if (parentRecorder != nullptr) {
                     MarkBoundedLoopCallContextsIncomplete(*parentRecorder, callExpressions);
@@ -18798,11 +18960,13 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
         const std::vector<const Expression*>& callExpressions;
         BoundedLoopCallContextMap* parentRecorder;
         std::unordered_set<const Expression*>* incompleteObservations;
+        bool invalidateGlobalObservations;
         bool succeeded{false};
     } boundedContextAttempt{analysisContext, loopExpressions,
         publishPrefixOnBudget ? noCallExpressions : loopCallExpressions,
         parentCallContextRecorder,
-        isContextAnalysis && !publishPrefixOnBudget ? &incompleteLocalBoundedLoopObservations : nullptr};
+        isContextAnalysis && !publishPrefixOnBudget ? &incompleteLocalBoundedLoopObservations : nullptr,
+        !isContextAnalysis && !publishPrefixOnBudget};
     const Block* loopEntry = nullptr;
     for (auto block : loopBlocks) {
         bool hasOutsidePredecessor = false;
@@ -20045,7 +20209,7 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
         // Publish observations only after every loop-carried location has a
         // complete exit summary. A failed concrete evaluation must not leave
         // a prefix of its observations visible to contest-query aggregation.
-        if (isContextAnalysis) {
+        if (!isNestedBoundedEvaluation && isContextAnalysis) {
             for (const auto& [expression, range] : observedRanges) {
                 if (expression == nullptr || range == nullptr ||
                     incompleteLocalBoundedLoopObservations.find(expression) !=
@@ -20060,7 +20224,7 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
                     current->second = std::move(joined.value());
                 }
             }
-        } else {
+        } else if (!isNestedBoundedEvaluation) {
             CommitBoundedLoopObservations(observedRanges);
         }
         if (cacheableLoop) {
@@ -20391,7 +20555,7 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
         current = next;
     }
     if (publishPrefixOnBudget) {
-        if (isContextAnalysis) {
+        if (!isNestedBoundedEvaluation && isContextAnalysis) {
             std::lock_guard<std::mutex> lock(boundedLoopObservationsMtx);
             auto& ownerObservations = localBoundedLoopPrefixObservations[this];
             for (const auto& [expression, range] : observedRanges) {
@@ -20406,7 +20570,7 @@ std::optional<RangeDomain> RangeAnalysis::TryEvaluateBoundedScalarLoopExit(
                     currentRange->second = std::move(joined.value());
                 }
             }
-        } else {
+        } else if (!isNestedBoundedEvaluation) {
             CommitBoundedLoopPrefixObservations(observedRanges);
         }
         {
@@ -20436,6 +20600,11 @@ std::optional<SIntRange> TryComputeCommonSymbolDifferenceRange(
     const RangeDomain& state, const BinaryExpression* binaryExpr)
 {
     return TryComputeCommonSymbolDifferenceRangeImpl(state, binaryExpr);
+}
+
+std::optional<SIntDomain> TryComputeRelationalDifferenceConstraint(const BinaryExpression* binaryExpr)
+{
+    return TryComputeRelationalDifferenceConstraintImpl(binaryExpr);
 }
 
 std::optional<SIntRange> TryComputeSimpleInductionLoadExitRange(const RangeDomain& state, const Load* load)

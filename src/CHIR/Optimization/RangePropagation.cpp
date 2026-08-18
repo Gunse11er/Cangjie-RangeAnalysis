@@ -3165,7 +3165,8 @@ void CollectContextCandidatesFromVisibleNames(const std::vector<ContestQuery>& q
                           << " range=" << FormatContestRange(observation.range, type) << '\n';
             }
             MergeContestContextCandidate(candidates, index, type, observation.range,
-                observation.kind == ContestRangeObservationKind::UNKNOWN, /* auxiliary = */ true);
+                observation.kind == ContestRangeObservationKind::UNKNOWN,
+                /* auxiliary = */ !value->IsParameter());
         }
     }
 }

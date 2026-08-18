@@ -286,6 +286,17 @@ SIntDomain ComputeSub(const CHIRArithmeticBinopArgs& args)
     if (numeric.IsEmptySet() || args.ov != OverflowStrategy::THROWING) {
         return {numeric, args.uns};
     }
+    if (!args.uns) {
+        if (auto direct = lhs.FindSymbolicBound(args.r); direct != nullptr) {
+            numeric = numeric.IntersectWith(*direct, Signed);
+        }
+        if (auto reverse = rhs.FindSymbolicBound(args.l); reverse != nullptr) {
+            numeric = numeric.IntersectWith(reverse->Negate(), Signed);
+        }
+        if (numeric.IsEmptySet()) {
+            return {numeric, args.uns};
+        }
+    }
     if (!ln.IsSingleElement() && rn.IsNonTrivial()) {
         // symbola - symbolb: if a is not a single element, add a symbolic bound:
         // symbola:[-b.upper,-b.lower]
