@@ -371,7 +371,7 @@ bool analyzedCallContextRecordingComplete{true};
 std::mutex boundedLoopCallContextsMtx;
 std::mutex contextEffectClosureCacheMtx;
 constexpr size_t MAX_GLOBAL_CONTEXT_PER_FUNCTION = 8;
-constexpr size_t MAX_BOUNDED_LOOP_CONTEXT_PER_FUNCTION = 1024;
+constexpr size_t MAX_BOUNDED_LOOP_CONTEXT_PER_FUNCTION = 2048;
 constexpr size_t MAX_TOTAL_BOUNDED_LOOP_CONTEXT_SUMMARIES = 2048;
 constexpr size_t MAX_EXACT_SCALAR_CONTEXTS_PER_FUNCTION = 64;
 constexpr size_t MAX_EXACT_SCALAR_RECURSION_DEPTH = 512;
@@ -13961,9 +13961,6 @@ std::optional<SIntRange> TryComputeSimpleLoopLoadRangeImpl(
         auto condition = GetSimpleInductionCondition(
             ResolveLocallyForwardedBooleanCondition(branch->GetCondition()));
         if (condition.has_value() && condition->location == location) {
-            if (enclosingDepth == 0) {
-                continue;
-            }
             auto outerInit = FindIncomingSignedStoreConstant(outerHeader, location);
             if (!outerInit.has_value()) {
                 outerInit = FindIncomingSignedStoreConstantThroughPredecessors(outerHeader, location);
@@ -13973,19 +13970,75 @@ std::optional<SIntRange> TryComputeSimpleLoopLoadRangeImpl(
                 continue;
             }
             auto relation = trueIsBody ? condition->relation : NegateRelation(condition->relation);
-            auto exit = ComputeExactInductionExit(outerInit.value(), outerStep.value(), relation,
-                condition->bound, ToWidth(*value->GetType()));
-            if (!exit.has_value()) {
-                continue;
-            }
-            auto lifetimeRelation = outerStep.value() > 0
-                ? RelationalOperation::LE
-                : RelationalOperation::GE;
             if (auto range = BuildSignedInductionBodyRange(value->GetType(), outerInit.value(),
-                outerStep.value(), lifetimeRelation, exit->SVal()); range.has_value()) {
+                outerStep.value(), relation, condition->bound); range.has_value()) {
                 return range;
             }
             continue;
+        }
+
+        // Recover an unconditionally updated loop-carried scalar from the
+        // proven trip count when concrete replay is too expensive.
+        auto bodySuccessor = trueIsBody ? branch->GetTrueBlock() : branch->GetFalseBlock();
+        bool storedBeforeLoad = false;
+        bool hasBodySuccessorUpdate = false;
+        if (loadExpr->GetParentBlock() == bodySuccessor) {
+            bool beforeLoad = true;
+            for (auto expression : bodySuccessor->GetExpressions()) {
+                if (expression == loadExpr) {
+                    beforeLoad = false;
+                    continue;
+                }
+                if (expression->GetExprKind() != ExprKind::STORE ||
+                    StaticCast<const Store*>(expression)->GetLocation() != location) {
+                    continue;
+                }
+                storedBeforeLoad = storedBeforeLoad || beforeLoad;
+                hasBodySuccessorUpdate = true;
+            }
+        }
+        if (condition.has_value() && loadExpr->GetParentBlock() == bodySuccessor &&
+            !storedBeforeLoad && hasBodySuccessorUpdate) {
+            auto controlInit = FindIncomingSignedStoreConstant(outerHeader, condition->location);
+            if (!controlInit.has_value()) {
+                controlInit = FindIncomingSignedStoreConstantThroughPredecessors(
+                    outerHeader, condition->location);
+            }
+            auto controlStep = FindSingleStepOnLoopBackPath(
+                branch, exitSuccessor, outerHeader, condition->location);
+            auto candidateInit = FindIncomingSignedStoreConstant(outerHeader, location);
+            if (!candidateInit.has_value()) {
+                candidateInit = FindIncomingSignedStoreConstantThroughPredecessors(
+                    outerHeader, location);
+            }
+            auto candidateStep = FindSingleStepOnLoopBackPath(
+                branch, exitSuccessor, outerHeader, location);
+            auto relation = trueIsBody ? condition->relation : NegateRelation(condition->relation);
+            if (controlInit.has_value() && controlStep.has_value() && controlStep.value() != 0 &&
+                candidateInit.has_value() && candidateStep.has_value()) {
+                auto tripCount = ComputeProvenInductionTripCount(controlInit.value(),
+                    controlStep.value(), relation, condition->bound,
+                    ToWidth(*condition->loadValue->GetType()),
+                    condition->loadValue->GetType()->IsUnsignedInteger());
+                if (tripCount.has_value()) {
+                    auto last = static_cast<__int128>(candidateInit.value()) +
+                        (tripCount.value() - 1) * candidateStep.value();
+                    if (FitsModeledIntegerWidth(last, value->GetType())) {
+                        if (candidateStep.value() == 0) {
+                            return BuildSignedExactRange(
+                                value->GetType(), {candidateInit.value()});
+                        }
+                        auto candidateRelation = candidateStep.value() > 0
+                            ? RelationalOperation::LE
+                            : RelationalOperation::GE;
+                        if (auto range = BuildSignedInductionBodyRange(value->GetType(),
+                            candidateInit.value(), candidateStep.value(), candidateRelation,
+                            static_cast<int64_t>(last)); range.has_value()) {
+                            return range;
+                        }
+                    }
+                }
+            }
         }
 
         auto induction = GetVariableBoundInductionExit(
