@@ -409,6 +409,8 @@ private:
         const Function* callee, const ContextArguments& arguments,
         const ContextGlobalValues& globalValues) const;
 
+    void SeedAffineRecursiveParameterLifetime(RangeDomain& state);
+
     void SummarizeContextOutputs(const Function* callee, const ContextGlobalValues& globals,
         Results<RangeDomain>& results, std::optional<ContextAbstractValue>& returnValue,
         std::vector<std::optional<ContextAbstractValue>>& refArgValues,

@@ -373,6 +373,7 @@ std::mutex contextEffectClosureCacheMtx;
 constexpr size_t MAX_GLOBAL_CONTEXT_PER_FUNCTION = 8;
 constexpr size_t MAX_BOUNDED_LOOP_CONTEXT_PER_FUNCTION = 1024;
 constexpr size_t MAX_TOTAL_BOUNDED_LOOP_CONTEXT_SUMMARIES = 2048;
+constexpr size_t MAX_EXACT_SCALAR_CONTEXTS_PER_FUNCTION = 64;
 constexpr size_t MAX_EXACT_SCALAR_RECURSION_DEPTH = 512;
 constexpr size_t MAX_EXACT_SCALAR_RECURSION_CONTEXTS_PER_FUNCTION = 512;
 constexpr size_t MAX_CONTEXT_GLOBALS = 64;
@@ -2676,6 +2677,15 @@ struct AffineRecursiveSummaryDescriptor {
     __int128 resultStep{0};
 };
 
+struct AffineRecursiveParameterDescriptor {
+    Type* type{nullptr};
+    Parameter* parameter{nullptr};
+    const Apply* recursiveApply{nullptr};
+    RelationalOperation baseRelation{RelationalOperation::EQ};
+    __int128 bound{0};
+    __int128 parameterStep{0};
+};
+
 std::optional<__int128> GetMathematicalConstant(Value* value, bool isUnsigned)
 {
     auto constant = GetSingleIntFromDefiningConstant(value);
@@ -2718,6 +2728,143 @@ std::optional<__int128> GetAffineConstantDelta(Value* value, Value* base)
         return GetMathematicalConstant(lhs, isUnsigned);
     }
     return std::nullopt;
+}
+
+Value* ResolveSingleAssignmentLoad(
+    Value* value, std::unordered_set<Value*>& visited, size_t depth)
+{
+    if (value == nullptr || depth >= 8 || !visited.emplace(value).second) {
+        return nullptr;
+    }
+    auto expression = GetDefiningExpr(value);
+    if (expression == nullptr || expression->GetExprKind() != ExprKind::LOAD) {
+        return value;
+    }
+    auto location = StaticCast<const Load*>(expression)->GetLocation();
+    Value* storedValue = nullptr;
+    for (auto user : location->GetUsers()) {
+        if (user->GetExprKind() != ExprKind::STORE ||
+            StaticCast<const Store*>(user)->GetLocation() != location) {
+            continue;
+        }
+        if (storedValue != nullptr) {
+            return nullptr;
+        }
+        storedValue = StaticCast<const Store*>(user)->GetValue();
+    }
+    return storedValue == nullptr
+        ? nullptr
+        : ResolveSingleAssignmentLoad(storedValue, visited, depth + 1);
+}
+
+std::optional<__int128> GetAffineRecursiveArgumentDelta(Value* value, Value* base)
+{
+    std::unordered_set<Value*> visited;
+    auto resolved = ResolveSingleAssignmentLoad(value, visited, 0);
+    return resolved == nullptr ? std::nullopt : GetAffineConstantDelta(resolved, base);
+}
+
+std::optional<AffineRecursiveParameterDescriptor> ExtractAffineRecursiveParameterDescriptor(
+    const Function* callee)
+{
+    if (callee == nullptr || callee->GetBody() == nullptr) {
+        return std::nullopt;
+    }
+    const auto params = callee->GetParams();
+    if (params.size() != 1 || params.front() == nullptr ||
+        params.front()->GetType() == nullptr || !params.front()->GetType()->IsInteger()) {
+        return std::nullopt;
+    }
+    auto entry = callee->GetEntryBlock();
+    if (entry == nullptr || entry->GetTerminator() == nullptr ||
+        entry->GetTerminator()->GetExprKind() != ExprKind::BRANCH) {
+        return std::nullopt;
+    }
+    auto branch = StaticCast<const Branch*>(entry->GetTerminator());
+    auto conditionExpression = GetDefiningExpr(branch->GetCondition());
+    if (conditionExpression == nullptr ||
+        !IsRelationalKindForRecursiveSummary(conditionExpression->GetExprKind())) {
+        return std::nullopt;
+    }
+    auto condition = StaticCast<const BinaryExpression*>(conditionExpression);
+    auto parameter = params.front();
+    const bool isUnsigned = parameter->GetType()->IsUnsignedInteger();
+    RelationalOperation trueRelation;
+    std::optional<__int128> bound;
+    if (condition->GetLHSOperand() == parameter) {
+        trueRelation = ToRelationalOperation(conditionExpression->GetExprKind());
+        bound = GetMathematicalConstant(condition->GetRHSOperand(), isUnsigned);
+    } else if (condition->GetRHSOperand() == parameter) {
+        auto relation = ToRelationalOperation(conditionExpression->GetExprKind());
+        switch (relation) {
+            case RelationalOperation::LT:
+                trueRelation = RelationalOperation::GT;
+                break;
+            case RelationalOperation::LE:
+                trueRelation = RelationalOperation::GE;
+                break;
+            case RelationalOperation::GT:
+                trueRelation = RelationalOperation::LT;
+                break;
+            case RelationalOperation::GE:
+                trueRelation = RelationalOperation::LE;
+                break;
+            case RelationalOperation::EQ:
+            case RelationalOperation::NE:
+                trueRelation = relation;
+                break;
+        }
+        bound = GetMathematicalConstant(condition->GetLHSOperand(), isUnsigned);
+    } else {
+        return std::nullopt;
+    }
+    if (!bound.has_value()) {
+        return std::nullopt;
+    }
+
+    const Apply* recursiveApply = nullptr;
+    for (auto block : callee->GetBody()->GetBlocks()) {
+        for (auto expression : block->GetNonTerminatorExpressions()) {
+            if (expression->GetExprKind() != ExprKind::APPLY) {
+                continue;
+            }
+            auto apply = StaticCast<const Apply*>(expression);
+            if (DynamicCast<Function*>(apply->GetCallee()) != callee) {
+                continue;
+            }
+            if (recursiveApply != nullptr) {
+                return std::nullopt;
+            }
+            recursiveApply = apply;
+        }
+    }
+    if (recursiveApply == nullptr || recursiveApply->GetArgs().size() != 1) {
+        return std::nullopt;
+    }
+    auto recursiveBlock = recursiveApply->GetParentBlock();
+    RelationalOperation baseRelation;
+    if (branch->GetTrueBlock() == recursiveBlock) {
+        baseRelation = NegateRelation(trueRelation);
+    } else if (branch->GetFalseBlock() == recursiveBlock) {
+        baseRelation = trueRelation;
+    } else {
+        return std::nullopt;
+    }
+    auto parameterStep = GetAffineRecursiveArgumentDelta(recursiveApply->GetArgs().front(), parameter);
+    if (!parameterStep.has_value() || parameterStep.value() == 0) {
+        return std::nullopt;
+    }
+    const bool descendsToLowerBase =
+        baseRelation == RelationalOperation::LT || baseRelation == RelationalOperation::LE;
+    const bool ascendsToUpperBase =
+        baseRelation == RelationalOperation::GT || baseRelation == RelationalOperation::GE;
+    if ((!descendsToLowerBase && !ascendsToUpperBase) ||
+        (descendsToLowerBase && parameterStep.value() >= 0) ||
+        (ascendsToUpperBase && parameterStep.value() <= 0)) {
+        return std::nullopt;
+    }
+    return AffineRecursiveParameterDescriptor{parameter->GetType(), parameter, recursiveApply,
+        baseRelation, bound.value(), parameterStep.value()};
 }
 
 std::optional<AffineRecursiveSummaryDescriptor> ExtractAffineRecursiveSummaryDescriptor(const Function* callee)
@@ -2929,8 +3076,9 @@ bool RelationHolds(__int128 value, RelationalOperation relation, __int128 bound)
     }
 }
 
+template<typename Descriptor>
 std::optional<uint64_t> GetAffineRecursionIterationCount(
-    __int128 input, const AffineRecursiveSummaryDescriptor& descriptor)
+    __int128 input, const Descriptor& descriptor)
 {
     if (RelationHolds(input, descriptor.baseRelation, descriptor.bound)) {
         return uint64_t{0};
@@ -3111,6 +3259,84 @@ std::optional<RangeAnalysis::ContextAbstractValue> RangeAnalysis::TryAnalyzeAffi
         congruence = SIntCongruence{stride, CanonicalResidue(descriptor->baseResult, stride)};
     }
     return ContextAbstractValue{domain, std::move(exactValues), std::move(congruence)};
+}
+
+void RangeAnalysis::SeedAffineRecursiveParameterLifetime(RangeDomain& state)
+{
+    // The user scan below is a closed-world proof only for non-exported top-level functions.
+    if (func == nullptr || func->IsMemberFunc() || func->TestAttr(Attribute::PUBLIC) ||
+        func->TestAttr(Attribute::PROTECTED)) {
+        return;
+    }
+    auto descriptor = ExtractAffineRecursiveParameterDescriptor(func);
+    if (!descriptor.has_value()) {
+        return;
+    }
+    const auto width = ToWidth(*descriptor->type);
+    const bool isUnsigned = descriptor->type->IsUnsignedInteger();
+    const __int128 typeLower = isUnsigned
+        ? __int128{0}
+        : static_cast<__int128>(SInt::SMinValue(width).SVal());
+    const __int128 typeUpper = isUnsigned
+        ? static_cast<__int128>(SInt::UMaxValue(width).UVal())
+        : static_cast<__int128>(SInt::SMaxValue(width).SVal());
+    std::optional<ContextAbstractValue> lifetime;
+    bool foundEntry = false;
+    for (auto user : func->GetUsers()) {
+        if (user == descriptor->recursiveApply) {
+            continue;
+        }
+        if (user == nullptr || user->GetExprKind() != ExprKind::APPLY) {
+            return;
+        }
+        auto apply = StaticCast<const Apply*>(user);
+        if (DynamicCast<Function*>(apply->GetCallee()) != func || apply->GetArgs().size() != 1) {
+            return;
+        }
+        std::unordered_set<Value*> visited;
+        auto entryValue = ResolveSingleAssignmentLoad(apply->GetArgs().front(), visited, 0);
+        auto entry = entryValue == nullptr
+            ? std::optional<__int128>{}
+            : GetMathematicalConstant(entryValue, isUnsigned);
+        if (!entry.has_value() || !IsWithin(entry.value(), typeLower, typeUpper)) {
+            return;
+        }
+        auto iterations = GetAffineRecursionIterationCount(entry.value(), descriptor.value());
+        if (!iterations.has_value()) {
+            return;
+        }
+        const auto count = static_cast<__int128>(iterations.value());
+        if ((descriptor->parameterStep < 0 &&
+                count > (entry.value() - typeLower) / -descriptor->parameterStep) ||
+            (descriptor->parameterStep > 0 &&
+                count > (typeUpper - entry.value()) / descriptor->parameterStep)) {
+            return;
+        }
+        const auto terminal = entry.value() + count * descriptor->parameterStep;
+        const auto lowerValue = std::min(entry.value(), terminal);
+        const auto upperValue = std::max(entry.value(), terminal);
+        auto lower = MakeSIntFromMathematicalInteger(width, lowerValue);
+        auto upper = MakeSIntFromMathematicalInteger(width, upperValue);
+        auto domain = SIntDomain::Intersects(
+            SIntDomain::FromNumeric(RelationalOperation::GE, lower, isUnsigned),
+            SIntDomain::FromNumeric(RelationalOperation::LE, upper, isUnsigned));
+        std::optional<SIntCongruence> congruence;
+        const auto absoluteStep = descriptor->parameterStep < 0
+            ? static_cast<unsigned __int128>(-descriptor->parameterStep)
+            : static_cast<unsigned __int128>(descriptor->parameterStep);
+        if (absoluteStep > 1 && absoluteStep <= std::numeric_limits<uint64_t>::max()) {
+            auto stride = static_cast<uint64_t>(absoluteStep);
+            congruence = SIntCongruence{stride, CanonicalResidue(entry.value(), stride)};
+        }
+        ContextAbstractValue entryLifetime{domain, std::nullopt, std::move(congruence)};
+        lifetime = lifetime.has_value()
+            ? JoinContextValues(lifetime.value(), entryLifetime)
+            : std::move(entryLifetime);
+        foundEntry = true;
+    }
+    if (foundEntry && lifetime.has_value() && !lifetime->IsTop()) {
+        ApplyContextValue(state, descriptor->parameter, lifetime.value());
+    }
 }
 
 std::optional<std::vector<GlobalVar*>> RangeAnalysis::CollectContextMutableGlobals(
@@ -6554,15 +6780,15 @@ std::optional<RangeAnalysis::ContextAbstractValue> RangeAnalysis::AnalyzeCalleeW
             return directCallee == callee && user->GetParentBlock() != nullptr &&
                 user->GetParentBlock()->GetTopLevelFunc() == callee;
         });
-    const bool isExactScalarRecursiveContext = (isRecursiveCall || hasDirectSelfCall) && globalValues.empty() &&
-        hasSupportedReturn &&
-        params.size() == arguments.size() &&
+    const bool hasExactScalarArguments = globalValues.empty() && params.size() == arguments.size() &&
         std::all_of(arguments.begin(), arguments.end(),
             [](const auto& argument) { return argument.IsSingleValue(); }) &&
         std::all_of(params.begin(), params.end(), [](const Parameter* parameter) {
             auto type = parameter == nullptr ? nullptr : parameter->GetType();
             return type != nullptr && !type->IsRef() && (type->IsInteger() || type->IsBoolean());
         });
+    const bool isExactScalarRecursiveContext =
+        (isRecursiveCall || hasDirectSelfCall) && hasSupportedReturn && hasExactScalarArguments;
     const auto setUnknownOutputs = [&refArgValues, &globalValues]() {
         refArgValues.clear();
         for (auto& entry : globalValues) {
@@ -6708,6 +6934,8 @@ std::optional<RangeAnalysis::ContextAbstractValue> RangeAnalysis::AnalyzeCalleeW
             auto& count = GetContextCounts()[callee];
             auto contextLimit = isExactScalarRecursiveContext
                 ? MAX_EXACT_SCALAR_RECURSION_CONTEXTS_PER_FUNCTION + rangeAnalysisConfig.maxContextPerFunction
+                : hasExactScalarArguments
+                ? MAX_EXACT_SCALAR_CONTEXTS_PER_FUNCTION
                 : globalValues.empty() ? rangeAnalysisConfig.maxContextPerFunction
                                        : MAX_GLOBAL_CONTEXT_PER_FUNCTION;
             if (count >= contextLimit) {
@@ -7400,6 +7628,9 @@ void RangeAnalysis::SeedMutableGlobalInitializers(RangeDomain& state)
 void RangeAnalysis::InitializeFuncEntryState(RangeDomain& state)
 {
     ValueAnalysis<RangeValueDomain>::InitializeFuncEntryState(state);
+    if (!isContextAnalysis) {
+        SeedAffineRecursiveParameterLifetime(state);
+    }
     for (auto global : CollectTrackedMutableGlobals(func, builder.GetCurPackage())) {
         EnsureMutableGlobalValueInitialized(state, global);
     }
